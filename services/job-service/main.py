@@ -1046,6 +1046,31 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
                         ),
                         {"ids": sib_ids},
                     )
+                    # Full-revert semantics: also mark sibling
+                    # COMPLETED/PARTIAL snapshots so the sweep at
+                    # backup-scheduler:1019 deletes blobs+items+rows for
+                    # work that finished in the race window between
+                    # "user clicked cancel" and "this UPDATE ran." Status
+                    # stays as-is (the data was genuinely walked); the
+                    # cancelled_at marker is enough for the sweep to
+                    # pick it up. Previous successful snapshots for the
+                    # same resource have a different job_id and are
+                    # untouched.
+                    await db.execute(
+                        text(
+                            "UPDATE snapshots SET "
+                            "  extra_data = (COALESCE(extra_data::jsonb, '{}'::jsonb) "
+                            "               || jsonb_build_object( "
+                            "                   'cancelled_at', NOW(), "
+                            "                   'cancelled_by_batch_cascade', true, "
+                            "                   'cancel_phase', "
+                            "                   'completed_before_cancel'))::json "
+                            " WHERE job_id = ANY(:ids) "
+                            "   AND status IN ('COMPLETED', 'PARTIAL') "
+                            "   AND (extra_data::jsonb ->> 'cancelled_at') IS NULL"
+                        ),
+                        {"ids": sib_ids},
+                    )
                     print(
                         f"[JOB_SERVICE] cancel-on-terminal cascaded to "
                         f"{len(sib_ids)} sibling job(s) in batch "
@@ -1149,6 +1174,11 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
         # jsonb result back to the column type so UPDATE doesn't trip
         # an implicit-cast warning. Same idea is used by the reaper
         # SQL in backup-scheduler.
+        # IN_PROGRESS branch — race-safe flip to FAILED + cancelled_at
+        # marker so the sweep at backup-scheduler:1019 reaps blobs + items
+        # + snapshot row. Worker self-flips on its next _is_job_cancelled
+        # check would also reach this state, but doing it here closes the
+        # window where the worker is still inside a Graph page.
         await db.execute(
             text(
                 "UPDATE snapshots SET "
@@ -1161,6 +1191,35 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
                 "                   'cancelled_by_job_id', cast(:jid AS text), "
                 "                   'cancel_phase', 'flip_pending_sweep'))::json "
                 " WHERE job_id = cast(:jid AS uuid) AND status = 'IN_PROGRESS'"
+            ),
+            {"jid": str(job.id)},
+        )
+        # COMPLETED / PARTIAL branch — the snapshot already stamped a
+        # terminal state in the milliseconds before cancel landed (race
+        # observed 2026-05-17: Gajraj USER_CHATS 18:59:44 COMPLETED, then
+        # batch cancel at 19:04:47). Per operator requirement, a cancelled
+        # backup must leave NO durable artifacts — its blobs and rows
+        # must be purged so the next incremental anchors against the
+        # PREVIOUS successful snapshot, not the cancelled one. We keep
+        # snapshot.status here (don't downgrade COMPLETED to FAILED — it
+        # genuinely walked the data) but stamp the cancelled_at marker so
+        # the sweep picks it up. The sweep's WHERE-clause already accepts
+        # "cancelled_at IS NOT NULL" as sufficient for revert regardless
+        # of snapshot.status, so blob teardown + row delete will follow.
+        # Previous successful snapshots for the same resource have a
+        # different job_id and are untouched.
+        await db.execute(
+            text(
+                "UPDATE snapshots SET "
+                "  extra_data = (COALESCE(extra_data::jsonb, '{}'::jsonb) "
+                "               || jsonb_build_object( "
+                "                   'cancelled_at', NOW(), "
+                "                   'cancelled_by_job_id', cast(:jid AS text), "
+                "                   'cancel_phase', "
+                "                   'completed_before_cancel'))::json "
+                " WHERE job_id = cast(:jid AS uuid) "
+                "   AND status IN ('COMPLETED', 'PARTIAL') "
+                "   AND (extra_data::jsonb ->> 'cancelled_at') IS NULL"
             ),
             {"jid": str(job.id)},
         )
@@ -1241,6 +1300,31 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
                             "                   'flip_pending_sweep'))::json "
                             " WHERE job_id = ANY(:ids) "
                             "   AND status = 'IN_PROGRESS'"
+                        ),
+                        {"ids": sib_ids},
+                    )
+                    # Full-revert semantics: also mark sibling
+                    # COMPLETED/PARTIAL snapshots so the sweep at
+                    # backup-scheduler:1019 deletes blobs+items+rows for
+                    # work that finished in the race window between
+                    # "user clicked cancel" and "this UPDATE ran." Status
+                    # stays as-is (the data was genuinely walked); the
+                    # cancelled_at marker is enough for the sweep to
+                    # pick it up. Previous successful snapshots for the
+                    # same resource have a different job_id and are
+                    # untouched.
+                    await db.execute(
+                        text(
+                            "UPDATE snapshots SET "
+                            "  extra_data = (COALESCE(extra_data::jsonb, '{}'::jsonb) "
+                            "               || jsonb_build_object( "
+                            "                   'cancelled_at', NOW(), "
+                            "                   'cancelled_by_batch_cascade', true, "
+                            "                   'cancel_phase', "
+                            "                   'completed_before_cancel'))::json "
+                            " WHERE job_id = ANY(:ids) "
+                            "   AND status IN ('COMPLETED', 'PARTIAL') "
+                            "   AND (extra_data::jsonb ->> 'cancelled_at') IS NULL"
                         ),
                         {"ids": sib_ids},
                     )
