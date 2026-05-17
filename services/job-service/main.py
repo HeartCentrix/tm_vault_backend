@@ -178,6 +178,69 @@ async def _create_batch_backup_jobs(
     if not resources_map:
         raise HTTPException(status_code=404, detail="No valid resources found")
 
+    # ── Batch-level debounce — protects against rapid duplicate triggers.
+    #
+    # The existing G1 dedup (further below) checks for IN_PROGRESS
+    # snapshots on the requested resource_ids. That misses the
+    # MANUAL_DATASOURCE_M365 case where the bulk request carries
+    # ENTRA_USER ids but the in-flight snapshots live on Tier-2 children
+    # (USER_CHATS, USER_MAIL, ...) — different resource_ids, so the snapshot
+    # check doesn't trip. Result observed 2026-05-17: two manual_bulk
+    # batches 43 seconds apart (88fd531b + 21d856e7) each dispatched a
+    # USER_CHATS job for Gajraj — one finished with 0 items (ghost
+    # snapshot), the other anchored against the ghost and stamped a bogus
+    # 64MB bytes_added.
+    #
+    # This guard runs BEFORE the batch INSERT. If a manual_bulk batch for
+    # the same tenant is IN_PROGRESS and was created in the last 30s,
+    # treat the new trigger as a duplicate and return a pointer to the
+    # existing batch instead of creating a parallel run.
+    if not tier2:
+        try:
+            sample_res = next(iter(resources_map.values()))
+            tenant_for_debounce = str(sample_res.tenant_id)
+            async with db.begin_nested():
+                existing = (await db.execute(
+                    text(
+                        """
+                        SELECT id::text AS bid, created_at
+                          FROM backup_batches
+                         WHERE tenant_id = cast(:tid AS uuid)
+                           AND source = 'manual_bulk'
+                           AND status = 'IN_PROGRESS'
+                           AND created_at > NOW() - INTERVAL '30 seconds'
+                           AND (cast(:bid AS uuid) IS NULL OR id <> cast(:bid AS uuid))
+                         ORDER BY created_at DESC
+                         LIMIT 1
+                        """
+                    ),
+                    {"tid": tenant_for_debounce, "bid": batch_id},
+                )).first()
+            if existing is not None:
+                existing_bid = str(existing[0])
+                print(
+                    f"[JOB_SERVICE] BATCH_DEBOUNCE: duplicate manual_bulk "
+                    f"trigger within 30s for tenant={tenant_for_debounce} — "
+                    f"returning existing batch {existing_bid} instead of "
+                    f"creating new batch {batch_id}"
+                )
+                return [{
+                    "jobId": None,
+                    "status": "RUNNING",
+                    "resourceId": "BATCH",
+                    "resourceCount": 0,
+                    "queue": "deduped_batch",
+                    "deduped": True,
+                    "duplicateBatchId": existing_bid,
+                    "message": (
+                        "Another bulk backup just started for this tenant; "
+                        "tracking the existing batch."
+                    ),
+                }]
+        except Exception as _debounce_exc:
+            # Never block a real trigger on a debounce-check failure.
+            print(f"[JOB_SERVICE] BATCH_DEBOUNCE check failed (non-fatal): {_debounce_exc}")
+
     # Ensure a backup_batches row exists for batch_id. Idempotent:
     # when tenant-service already inserted the row, ON CONFLICT keeps
     # its source/actor_email/bytes_expected. When the caller is the UI

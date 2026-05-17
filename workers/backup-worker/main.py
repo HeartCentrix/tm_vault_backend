@@ -1338,6 +1338,41 @@ async def _raise_if_job_cancelled(job_id) -> None:
         raise JobCancelledMidFlight(f"job {job_id} cancelled mid-flight")
 
 
+async def _coerce_snapshot_terminal_on_cancel(snapshot, proposed_status):
+    """When parent job is CANCELLED, downgrade a would-be terminal snapshot
+    status to FAILED so the cancelled work is excluded from delta-from-prior
+    and the UI shows ✗ instead of ✓.
+
+    Without this guard, a job that gets cancelled AFTER its snapshot already
+    walked the data ends up:
+      * job.status = CANCELLED (set by cancel_job)
+      * snapshot.status = COMPLETED (set here, blind to the cancel)
+
+    The next incremental then anchors delta math against this "complete"
+    cancelled snapshot — producing the ghost-prior pattern seen on
+    2026-05-17 (Gajraj USER_CHATS: ghost @18:59:06 + real @18:59:44 anchored
+    on it for 4685-items / 80 MB bogus bytes_added). The duplicate-trigger
+    root cause (two batches in 43s) is upstream; this guard is the defensive
+    correction at finalize time so racing cancel + completion is consistent
+    regardless of upstream dedup.
+    """
+    job_id = getattr(snapshot, "job_id", None)
+    if not job_id or not await _is_job_cancelled(job_id):
+        return proposed_status
+    try:
+        ed = dict(snapshot.extra_data or {})
+        ed["finalize_cancelled"] = True
+        ed["finalize_cancelled_at"] = datetime.utcnow().isoformat()
+        ed["original_proposed_status"] = (
+            proposed_status.name if hasattr(proposed_status, "name")
+            else str(proposed_status)
+        )
+        snapshot.extra_data = ed
+    except Exception:
+        pass
+    return SnapshotStatus.FAILED
+
+
 async def _update_job_pct(job_id, pct: int) -> None:
     """Write live `jobs.progress_pct` on a short-lived session.
 
@@ -7842,7 +7877,9 @@ class BackupWorker:
                     # last finisher own the status flip.
                     _snap_extra = snap.extra_data or {}
                     if not _snap_extra.get("partitioned"):
-                        snap.status = SnapshotStatus.COMPLETED
+                        snap.status = await _coerce_snapshot_terminal_on_cancel(
+                            snap, SnapshotStatus.COMPLETED,
+                        )
                         snap.completed_at = datetime.utcnow()
                         if snap.started_at:
                             snap.duration_secs = int((snap.completed_at - snap.started_at).total_seconds())
@@ -10975,6 +11012,16 @@ class BackupWorker:
                     **(snap.extra_data or {}),
                     "partition_reconciled": True,
                 }
+                # Cancel-aware coercion — last say. Whatever the partition
+                # integrity correction decided, if the parent job was
+                # CANCELLED in flight, this snapshot must NOT pose as a
+                # clean prior for the next incremental's delta math.
+                if snap.status in (
+                    SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL,
+                ):
+                    snap.status = await _coerce_snapshot_terminal_on_cancel(
+                        snap, snap.status,
+                    )
                 if snap.completed_at is None:
                     snap.completed_at = datetime.utcnow()
                 if snap.started_at and snap.completed_at:
@@ -20934,13 +20981,19 @@ class BackupWorker:
             print(f"[{self.worker_id}]   [VERSIONS] pre-status flush warning: "
                   f"{type(fe).__name__}: {fe}")
 
-        # Set status: PARTIAL if there are failed files, COMPLETE otherwise
+        # Set status: PARTIAL if there are failed files, COMPLETE otherwise.
+        # Cancel-aware: if the parent job was CANCELLED in flight, coerce to
+        # FAILED so the snapshot doesn't pose as a clean prior for the next
+        # incremental's delta math (see _coerce_snapshot_terminal_on_cancel).
         file_tracking = snapshot.delta_tokens_json or {}
         files_failed = file_tracking.get("files_failed", 0)
-        if files_failed > 0:
-            snapshot.status = SnapshotStatus.PARTIAL
-        else:
-            snapshot.status = SnapshotStatus.COMPLETED
+        proposed = (
+            SnapshotStatus.PARTIAL if files_failed > 0
+            else SnapshotStatus.COMPLETED
+        )
+        snapshot.status = await _coerce_snapshot_terminal_on_cancel(
+            snapshot, proposed,
+        )
 
         # Calculate duration
         if snapshot.started_at:
