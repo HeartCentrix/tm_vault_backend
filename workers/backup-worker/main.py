@@ -7322,33 +7322,41 @@ class BackupWorker:
                             f"{type(_re).__name__}: {_re}"
                         )
 
-                    # ─── Final-resort: parse chat_id for 1:1 chats ───
+                    # ─── Final-resort A: parse chat_id for 1:1-format ids ───
                     # When neither the members API nor the message-author
                     # scan resolved a 1:1 chat's other party (typical
                     # cause: chat has 0 drained messages this run because
                     # Graph chat-delta is still in its 30s–15min indexing
-                    # lag window, or the only drained messages are
-                    # authored by self), we can still recover by parsing
-                    # the chat ID itself. Microsoft encodes 1:1 chat IDs
-                    # as `19:<oidA>_<oidB>@unq.gbl.spaces` where oidA
-                    # and oidB are the two participants' AAD object IDs.
-                    # Extract the OTHER oid, call /users/{oid} to fetch
-                    # the displayName, write it into chat_meta. Group
-                    # chats (@thread.v2) don't encode participants in
-                    # the id, so this path skips them — they rely on
-                    # the message-author fallback already run above.
+                    # lag window, OR all drained messages are authored
+                    # by self, OR this is an incremental run with no new
+                    # traffic since the last cursor), we can still
+                    # recover by parsing the chat ID itself. Microsoft
+                    # encodes 1:1 chat IDs as `19:<oidA>_<oidB>@<suffix>`
+                    # where oidA and oidB are AAD object GUIDs and the
+                    # suffix varies (`@unq.gbl.spaces` is the current
+                    # form, older / federated chats use other suffixes).
+                    # We match strictly on the GUID structure and accept
+                    # any suffix — this also catches 2-person chats that
+                    # Teams flags as chatType="group" but whose IDs
+                    # still follow the 1:1 OID-pair format. Group chats
+                    # using `19:<random>@thread.v2` never match because
+                    # they have no `_` separator.
                     try:
                         _CID_1ON1 = re.compile(
-                            r"^19:([0-9a-fA-F-]+)_([0-9a-fA-F-]+)"
-                            r"@unq\.gbl\.spaces$"
+                            r"^19:"
+                            r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
+                            r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                            r"[0-9a-fA-F]{12})"
+                            r"_"
+                            r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
+                            r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                            r"[0-9a-fA-F]{12})"
+                            r"@.+$"
                         )
                         _cid_parse_lookup: Dict[str, str] = {}  # other_uid → cid
                         for _cid_loc, _info_loc in chat_meta.items():
                             _dn_loc = (_info_loc or {}).get("displayName") or ""
-                            if not (_dn_loc.startswith("Untitled chat #")
-                                    or _dn_loc.startswith("1-on-1 Chat (19:")):
-                                continue
-                            if (_info_loc or {}).get("chatType") != "oneOnOne":
+                            if not _is_legacy_fallback(_dn_loc):
                                 continue
                             _m = _CID_1ON1.match(_cid_loc)
                             if not _m:
@@ -7439,6 +7447,121 @@ class BackupWorker:
                             f"[{self.worker_id}] [USER_CHATS] chat-id parse "
                             f"fallback failed: "
                             f"{type(_ce).__name__}: {_ce}"
+                        )
+
+                    # ─── Final-resort B: DB historical-author scan ───
+                    # When every prior resolution path is empty for a chat
+                    # (members API returned nothing, no userIds to backfill,
+                    # this run drained 0 new messages so the in-memory
+                    # message-author scan had nothing to peek at, and the
+                    # chat ID didn't fit the 1:1 OID-pair format — e.g. a
+                    # 2-person group, or an older `@thread.v2` chat with
+                    # no current members), the tenant-scoped
+                    # `chat_thread_messages` table is still authoritative:
+                    # every historical sender we've ever drained has its
+                    # from_display_name stored there. One JOIN against
+                    # chat_threads recovers a real name even on an
+                    # incremental run with zero current traffic.
+                    try:
+                        _db_unresolved_cids = [
+                            cid for cid, info in chat_meta.items()
+                            if _is_legacy_fallback(
+                                (info or {}).get("displayName") or ""
+                            )
+                        ]
+                        if _db_unresolved_cids:
+                            async with async_session_factory() as _s_db:
+                                _db_rows = (await _s_db.execute(
+                                    text("""
+                                        SELECT
+                                          ct.chat_id AS cid,
+                                          COALESCE(
+                                            array_agg(
+                                              DISTINCT ctm.from_display_name
+                                            ) FILTER (
+                                              WHERE ctm.from_user_id IS NOT NULL
+                                                AND ctm.from_user_id != :self_uid
+                                                AND ctm.from_display_name IS NOT NULL
+                                                AND ctm.from_display_name != ''
+                                            ),
+                                            ARRAY[]::varchar[]
+                                          ) AS author_names
+                                        FROM chat_threads ct
+                                        LEFT JOIN chat_thread_messages ctm
+                                          ON ctm.chat_thread_id = ct.id
+                                        WHERE ct.tenant_id = :tid
+                                          AND ct.chat_id = ANY(:cids)
+                                        GROUP BY ct.chat_id
+                                    """),
+                                    {
+                                        "self_uid": str(user_id),
+                                        "tid": str(tenant.id),
+                                        "cids": _db_unresolved_cids,
+                                    },
+                                )).fetchall()
+                            _resolved_db = 0
+                            for _row in _db_rows:
+                                _cid_db = _row[0]
+                                _authors = list(_row[1] or [])
+                                if not _authors:
+                                    continue
+                                _info_db = chat_meta.get(_cid_db) or {}
+                                _ctype_db = (
+                                    (_info_db.get("chatType") or "").lower()
+                                )
+                                if _ctype_db == "oneonone":
+                                    _new_dn_db = _authors[0]
+                                else:
+                                    _joined = ", ".join(_authors)
+                                    if len(_joined) <= _CHAT_NAME_MAX_LEN:
+                                        _new_dn_db = _joined
+                                    else:
+                                        _picked: List[str] = []
+                                        _used = 0
+                                        for _n in _authors:
+                                            _sep = 2 if _picked else 0
+                                            _tail = 10
+                                            if (_used + _sep + len(_n) + _tail
+                                                    > _CHAT_NAME_MAX_LEN):
+                                                break
+                                            _picked.append(_n)
+                                            _used += _sep + len(_n)
+                                        _remaining = (
+                                            len(_authors) - len(_picked)
+                                        )
+                                        if _remaining > 0:
+                                            _new_dn_db = (
+                                                f"{', '.join(_picked)} "
+                                                f"+{_remaining} more"
+                                            )
+                                        else:
+                                            _new_dn_db = ", ".join(_picked)
+                                _merged_names = list(dict.fromkeys(
+                                    (_info_db.get("memberNames") or [])
+                                    + _authors
+                                ))
+                                chat_meta[_cid_db] = {
+                                    **_info_db,
+                                    "displayName": _new_dn_db,
+                                    "memberNames": _merged_names,
+                                    "memberCount": max(
+                                        int(_info_db.get("memberCount") or 0),
+                                        len(_authors),
+                                    ),
+                                }
+                                _resolved_db += 1
+                            if _resolved_db:
+                                print(
+                                    f"[{self.worker_id}] [USER_CHATS] "
+                                    f"resolved {_resolved_db} chat name(s) "
+                                    f"from chat_thread_messages historical "
+                                    f"authors (DB final-resort)"
+                                )
+                    except Exception as _de:
+                        print(
+                            f"[{self.worker_id}] [USER_CHATS] DB historical "
+                            f"author fallback failed: "
+                            f"{type(_de).__name__}: {_de}"
                         )
 
                     # Per-chat drain cursors + failure state now live in
