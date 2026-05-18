@@ -3024,9 +3024,86 @@ class BackupWorker:
                     f"ACKing without re-running."
                 )
                 return
+
+            # ── Cross-job concurrency guard ────────────────────────────────
+            # The same-job IN_PROGRESS check above only catches dupes within
+            # one job. A fresh job (e.g. instant-run started while a
+            # scheduled job is still walking the resource graph) can
+            # publish a task for a resource that another job is actively
+            # processing — its snapshot row passes the partial unique
+            # index ix_snapshots_job_resource_inprogress because job_id
+            # differs, but both handlers race on the same Graph cursor
+            # and per-folder deltaLink. Observed 2026-05-18 as Narendra
+            # Calendar 806 phantom items, Rashmi mail 3-worker race.
+            #
+            # Treat a recent IN_PROGRESS row from ANOTHER job (lease not
+            # expired, OR started under 25 min ago — the stale-sweep
+            # threshold) as evidence the resource is already being
+            # processed. We still need this job's FANOUT/FINALIZE counter
+            # (c.terminal >= e.n) incremented, so we record `other_active`
+            # here and below create + immediately COMPLETED-mark a
+            # skipped_concurrent snapshot.
+            other_active = None
+            if os.getenv("BACKUP_SKIP_CONCURRENT_JOBS", "true").lower() in ("1", "true", "yes"):
+                other_active = (await session.execute(
+                    select(Snapshot.id, Snapshot.job_id, Snapshot.started_at).where(
+                        Snapshot.resource_id == resource.id,
+                        Snapshot.job_id != job_id,
+                        Snapshot.status == SnapshotStatus.IN_PROGRESS,
+                        or_(
+                            # lease_expires_at is tz-aware (DateTime(timezone=True));
+                            # started_at is naive — compare each against the right kind
+                            # of "now" to avoid offset-naive vs offset-aware TypeError.
+                            Snapshot.lease_expires_at > datetime.now(timezone.utc),
+                            and_(
+                                Snapshot.lease_expires_at == None,  # noqa: E711
+                                Snapshot.started_at > datetime.utcnow() - timedelta(minutes=25),
+                            ),
+                        ),
+                    ).limit(1)
+                )).first()
+
             # Detach so we can use these objects after the session closes.
             session.expunge_all()
         # Connection released to pool here.
+
+        if other_active is not None:
+            other_id, other_job, other_started = other_active
+            # Create the snapshot row so this job's FANOUT/FINALIZE math
+            # balances (consumer count must equal the bulk_fanout_seen
+            # expectation), then immediately mark it COMPLETED with
+            # skipped_concurrent so operators can see why no items were
+            # ingested for this (job, resource) pair.
+            snapshot = await self.create_snapshot(resource, message, job_id)
+            try:
+                async with async_session_factory() as _skip_s:
+                    _live = await _skip_s.get(Snapshot, snapshot.id)
+                    if _live and _live.status == SnapshotStatus.IN_PROGRESS:
+                        _live.status = SnapshotStatus.COMPLETED
+                        _live.completed_at = datetime.utcnow()
+                        _live.duration_secs = 0
+                        _live.item_count = 0
+                        _live.bytes_added = 0
+                        _live.bytes_total = 0
+                        _ed = dict(_live.extra_data or {})
+                        _ed["skipped_concurrent"] = True
+                        _ed["concurrent_job_id"] = str(other_job)
+                        _ed["concurrent_snapshot_id"] = str(other_id)
+                        _live.extra_data = _ed
+                        await _skip_s.commit()
+            except Exception as _skip_exc:
+                print(
+                    f"[{self.worker_id}] [SKIP_CONCURRENT] couldn't mark "
+                    f"skip-snapshot COMPLETED for resource={resource.id}: "
+                    f"{_skip_exc}"
+                )
+            print(
+                f"[{self.worker_id}] [SKIP_CONCURRENT] resource={resource.id} "
+                f"active in job={other_job} since {other_started} "
+                f"(this job={job_id}); created skip-snapshot {snapshot.id} "
+                f"COMPLETED skipped_concurrent=true."
+            )
+            return
 
         # ── Step 2: network work without a pinned session ─────────────────
         resource_type = resource.type.value if hasattr(resource.type, 'value') else str(resource.type)
