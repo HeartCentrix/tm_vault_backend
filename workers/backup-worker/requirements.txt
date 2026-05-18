@@ -6,6 +6,11 @@ azure-storage-blob>=12.19
 azure-mgmt-storage>=21.0
 azure-identity>=1.15
 httpx>=0.26
+# h2: HTTP/2 client lib for httpx — enabled when GRAPHCLIENT_HTTP2=true
+# is set. HTTP/2 multiplexes 100+ concurrent streams on one TCP connection
+# so per-mailbox concurrent /$value MIME fetches don't queue behind each
+# other. Without h2 installed, httpx raises ImportError on http2=True.
+h2>=4.1.0,<5.0
 sqlalchemy>=2.0
 asyncpg>=0.29
 pydantic>=2.5
@@ -26,3 +31,9 @@ blake3>=1.0
 aioboto3>=15.5.0,<16
 aiobotocore>=2.25.0,<3
 boto3>=1.40.0,<2
+
+# Observability — Prometheus metrics scraped on CORE_METRICS_PORT (default 9103)
+prometheus_client>=0.20.0
+
+# Alembic for prod-safe schema migrations
+alembic>=1.13.0,<2

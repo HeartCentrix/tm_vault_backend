@@ -162,6 +162,8 @@ def _compose_chat_name(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from shared.storage.startup import startup_router, shutdown_router
+    from shared import core_metrics
+    core_metrics.init()
     await init_db()
     try:
         await _backfill_folder_paths()

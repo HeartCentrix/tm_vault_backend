@@ -18,6 +18,7 @@ Architecture:
 """
 import asyncio
 import json
+import re
 import uuid
 import hashlib
 import logging
@@ -275,6 +276,169 @@ async def _bulk_upsert_snapshot_items(
     return total
 
 
+# ==================== mail_message_bodies helpers (cross-user dedup) ====================
+#
+# Item B: Mirror of the chat_thread_messages dedup pattern, applied to
+# mail. Tenant-scoped table keyed by (tenant_id, fingerprint). Phase 1
+# is a write-only dual-write — the body still lands in
+# snapshot_items.extra_data['raw'] so restore paths don't change.
+# Future Phase 2 will JOIN here and stop the inline write.
+
+def _mail_message_fingerprint(msg: Dict[str, Any]) -> str:
+    """Stable per-tenant dedup key for a Graph message.
+
+    Outlook gives each mailbox its own message.id even for the same
+    logical email, so we can't dedup on Graph id. We hash a tuple
+    that is (in practice) unique per logical message:
+
+      from_addr | sent_iso | subject | content_size | first 64KB body sha256
+
+    sent_date_time is microsecond-precise on Graph payloads; combined
+    with from + subject it discriminates well past mailbox boundaries.
+    The body-prefix hash guards against the rare case where two
+    different replies have identical headers (Outlook generates
+    "Re:" + same minute + same sender + same subject when you reply
+    twice in 30 seconds with different bodies).
+    """
+    sender = ""
+    fr = (msg.get("from") or {}).get("emailAddress") or {}
+    if isinstance(fr, dict):
+        sender = (fr.get("address") or "").lower()
+    sent = str(msg.get("sentDateTime") or "")
+    subj = (msg.get("subject") or "")[:512]
+    body = (msg.get("body") or {})
+    body_text = body.get("content") if isinstance(body, dict) else ""
+    body_text = body_text or ""
+    body_size = len(body_text)
+    # First 64KB only — large attached HTML bodies don't need full hashing.
+    prefix_hash = hashlib.sha256(body_text[:65536].encode("utf-8", errors="replace")).hexdigest()
+    key = f"{sender}|{sent}|{subj}|{body_size}|{prefix_hash}"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def _parse_graph_iso_dt(s) -> Optional[datetime]:
+    """Convert Graph API ISO-8601 timestamp string to datetime.datetime.
+
+    Graph returns strings like ``2025-03-10T04:32:42Z`` or
+    ``2025-03-10T04:32:42.1234567Z``. asyncpg requires a real datetime
+    object for TIMESTAMPTZ columns. Returns None on parse failure so
+    the dedup-table insert can still proceed with a NULL timestamp
+    rather than aborting the whole row.
+    """
+    if s is None:
+        return None
+    if isinstance(s, datetime):
+        return s
+    if not isinstance(s, str):
+        return None
+    raw = s.strip()
+    if not raw:
+        return None
+    try:
+        # Python 3.11+ fromisoformat handles trailing Z and fractional
+        # seconds with up to 6 digits. Truncate >6-digit fractions
+        # (Graph occasionally emits 7) which would otherwise raise.
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        # Cap fractional seconds at 6 digits (Python's max for datetime).
+        if "." in raw and "+" in raw:
+            base, tz = raw.rsplit("+", 1)
+            if "." in base:
+                head, frac = base.rsplit(".", 1)
+                base = head + "." + frac[:6]
+            raw = base + "+" + tz
+        return datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        return None
+
+
+async def _bulk_upsert_mail_message_bodies(
+    session, tenant_id, user_id: str, snapshot_id, messages: List[Dict[str, Any]],
+) -> int:
+    """Bulk-insert mail_message_bodies rows with ON CONFLICT DO NOTHING.
+
+    Phase 1 dual-write: caller still writes the full body to
+    snapshot_items.extra_data['raw']. This function adds a parallel
+    dedup record so we can measure the cross-user hit ratio in prod
+    before flipping reads in Phase 2.
+
+    Errors are caught and logged but do NOT abort the snapshot — this
+    is best-effort optimization metadata.
+    """
+    if not messages:
+        return 0
+    try:
+        from sqlalchemy.dialects.postgresql import insert as _pg_insert
+        from shared.models import MailMessageBody as _MMB
+        rows: List[Dict[str, Any]] = []
+        seen_fp: set = set()
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            try:
+                fp = _mail_message_fingerprint(m)
+            except Exception:
+                continue
+            if fp in seen_fp:
+                continue
+            seen_fp.add(fp)
+            body = (m.get("body") or {}) if isinstance(m.get("body"), dict) else {}
+            from_obj = (m.get("from") or {}).get("emailAddress") or {}
+            if not isinstance(from_obj, dict):
+                from_obj = {}
+            body_content = body.get("content")
+            body_type = body.get("contentType")
+            content_size = len((body_content or "").encode("utf-8", errors="replace")) if body_content else 0
+            content_hash = (
+                hashlib.sha256((body_content or "").encode("utf-8", errors="replace")).hexdigest()
+                if body_content else None
+            )
+            rows.append({
+                "id": uuid.uuid4(),
+                "tenant_id": tenant_id,
+                "fingerprint": fp,
+                "first_user_id": user_id,
+                "first_snapshot_id": snapshot_id,
+                "from_user_id": user_id,
+                "from_address": (from_obj.get("address") or "")[:256] or None,
+                "from_display_name": (from_obj.get("name") or "")[:256] or None,
+                "subject": m.get("subject"),
+                # Graph returns ISO-8601 strings; asyncpg requires datetime
+                # objects for TIMESTAMPTZ columns. Parse on insert, NULL on
+                # parse failure (better than the whole batch failing).
+                "sent_date_time": _parse_graph_iso_dt(m.get("sentDateTime")),
+                "received_date_time": _parse_graph_iso_dt(m.get("receivedDateTime")),
+                "body_content": body_content,
+                "body_content_type": (body_type or "")[:16] or None,
+                "has_attachments": m.get("hasAttachments"),
+                "metadata_raw": m,
+                "content_hash": content_hash,
+                "content_size": content_size,
+                "ref_count": 1,
+            })
+        if not rows:
+            return 0
+        # Chunked insert — same chunk size as snapshot_items for parity.
+        total = 0
+        for i in range(0, len(rows), _BULK_INSERT_CHUNK):
+            chunk = rows[i:i + _BULK_INSERT_CHUNK]
+            stmt = _pg_insert(_MMB).values(chunk).on_conflict_do_nothing(
+                index_elements=["tenant_id", "fingerprint"],
+            )
+            await session.execute(stmt)
+            total += len(chunk)
+        await session.commit()
+        return total
+    except Exception as e:
+        # Best-effort. Don't fail a snapshot over a dedup-table issue.
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+        print(f"[MAIL_DEDUP] bulk upsert failed (continuing): {type(e).__name__}: {e}")
+        return 0
+
+
 # ==================== chat_threads helpers (cross-user dedup) ====================
 #
 # These helpers implement the tenant-singleton chat-thread store (see
@@ -287,6 +451,67 @@ async def _bulk_upsert_snapshot_items(
 _CHAT_THREAD_DRAIN_FRESHNESS_S = int(
     os.getenv("CHAT_THREAD_DRAIN_FRESHNESS_S", "25200"),
 )
+
+
+# OneDrive per-file retry queue classifier. The producer (per-file
+# gather in _useronedrive_backup_files) calls this on each failure
+# string to decide whether to enqueue the file for retry. Permanent
+# errors are not retryable — re-trying a 404 / 410 / 403 wastes the
+# consumer's Graph budget.
+_ONEDRIVE_RETRY_PERMANENT_CODES = ("404", "410", "401", "403")
+_ONEDRIVE_RETRY_THROTTLE_CODES = ("429", "503")
+
+
+def _classify_onedrive_file_error(err_text: Optional[str]) -> str:
+    """Return one of: "throttle", "stream_drop", "permanent", "unknown".
+
+    Used by the OneDrive per-file retry queue to skip permanent
+    failures (which would burn retry budget forever) and bias the
+    initial next_retry_at by error class — throttled files get a
+    longer base delay than stream drops.
+    """
+    if not err_text:
+        return "unknown"
+    low = err_text.lower()
+    for code in _ONEDRIVE_RETRY_PERMANENT_CODES:
+        if code in err_text:
+            return "permanent"
+    for code in _ONEDRIVE_RETRY_THROTTLE_CODES:
+        if code in err_text:
+            return "throttle"
+    if (
+        "remoteprotocolerror" in low or "readerror" in low
+        or "readtimeout" in low or "stream dropped" in low
+        or "writeerror" in low or "connecterror" in low
+        or "timeout" in low
+    ):
+        return "stream_drop"
+    return "unknown"
+
+
+_HOSTED_CONTENT_URL_RE = re.compile(
+    r"/messages/[^/\"'<>\s]+/hostedContents/[^/\"'<>\s]+/\$value"
+)
+
+
+def _msg_likely_has_hosted_content(m: Dict[str, Any]) -> bool:
+    """Strict pre-check for whether a Graph chat message has inline
+    hostedContents worth fetching.
+
+    Only inline-image refs in a message's HTML body match the canonical
+    Graph URL shape ``/messages/{mid}/hostedContents/{hid}/$value``.
+    Quoted-reply HTML that merely echoes the substring "hostedContents"
+    from a parent message does NOT match, avoiding a stampede of empty
+    per-msg ``/hostedContents`` GETs that produced the slowdown after
+    fix #2.
+    """
+    body = m.get("body") or {}
+    if body.get("contentType") != "html":
+        return False
+    content = body.get("content") or ""
+    if not isinstance(content, str) or not content:
+        return False
+    return bool(_HOSTED_CONTENT_URL_RE.search(content))
 
 
 def _parse_iso_to_dt(s: Optional[str]) -> Optional[datetime]:
@@ -367,10 +592,12 @@ async def _claim_or_load_chat_thread(
                 "    last_updated_at   = COALESCE(EXCLUDED.last_updated_at, chat_threads.last_updated_at), "
                 "    updated_at        = NOW() "
                 "  RETURNING id, drain_cursor, last_updated_at, drain_failure_state, "
-                "            last_drained_at, (xmax = 0) AS inserted "
+                "            last_drained_at, last_drained_msg_count, "
+                "            (xmax = 0) AS inserted "
                 ") "
                 "SELECT u.id, u.drain_cursor, u.last_updated_at, u.drain_failure_state, "
-                "       u.last_drained_at, u.inserted, p.prior_lu "
+                "       u.last_drained_at, u.last_drained_msg_count, u.inserted, "
+                "       p.prior_lu "
                 "  FROM upserted u "
                 "  LEFT JOIN prior p ON TRUE"
             ),
@@ -390,6 +617,7 @@ async def _claim_or_load_chat_thread(
                 "thread_id": None, "claimed": True,
                 "drain_cursor": None, "last_updated_at": None,
                 "drain_failure_state": {},
+                "last_drained_msg_count": 0,
             }
 
         thread_id = str(row.id)
@@ -475,6 +703,7 @@ async def _claim_or_load_chat_thread(
             "drain_cursor": prior_drain_cursor,
             "last_updated_at": prior_last_updated_at,
             "drain_failure_state": prior_failure if isinstance(prior_failure, dict) else {},
+            "last_drained_msg_count": int(row.last_drained_msg_count or 0),
         }
 
 
@@ -483,6 +712,7 @@ async def _mark_chat_thread_drained(
     thread_id: str,
     drain_cursor: Optional[str],
     failure_state: Optional[Dict[str, Any]],
+    msg_count: Optional[int] = None,
 ) -> None:
     """End-of-drain checkpoint. Bumps ``last_drained_at`` to NOW() and
     stores the new cursor + failure state.
@@ -493,6 +723,10 @@ async def _mark_chat_thread_drained(
       * ``failure_state=None``    → leave drain_failure_state untouched.
       * ``failure_state={}``      → clear (success after a prior failure).
       * ``failure_state={...}``   → record this failure.
+      * ``msg_count=None``        → leave last_drained_msg_count untouched.
+      * ``msg_count=N``           → record persisted-message count after
+                                    a successful drain. Used by the
+                                    completeness gate on subsequent runs.
     """
     if not thread_id:
         return
@@ -506,6 +740,9 @@ async def _mark_chat_thread_drained(
     if failure_state is not None:
         set_parts.append("drain_failure_state = CAST(:fs AS JSONB)")
         params["fs"] = json.dumps(failure_state)
+    if msg_count is not None:
+        set_parts.append("last_drained_msg_count = :mc")
+        params["mc"] = int(msg_count)
     # Plan P5 — this is the FINAL step in the drain chain and must
     # commit, because earlier steps (chat_thread_messages upsert,
     # snapshot_items pointer-write) already succeeded by the time we
@@ -1101,6 +1338,41 @@ async def _raise_if_job_cancelled(job_id) -> None:
         raise JobCancelledMidFlight(f"job {job_id} cancelled mid-flight")
 
 
+async def _coerce_snapshot_terminal_on_cancel(snapshot, proposed_status):
+    """When parent job is CANCELLED, downgrade a would-be terminal snapshot
+    status to FAILED so the cancelled work is excluded from delta-from-prior
+    and the UI shows ✗ instead of ✓.
+
+    Without this guard, a job that gets cancelled AFTER its snapshot already
+    walked the data ends up:
+      * job.status = CANCELLED (set by cancel_job)
+      * snapshot.status = COMPLETED (set here, blind to the cancel)
+
+    The next incremental then anchors delta math against this "complete"
+    cancelled snapshot — producing the ghost-prior pattern seen on
+    2026-05-17 (Gajraj USER_CHATS: ghost @18:59:06 + real @18:59:44 anchored
+    on it for 4685-items / 80 MB bogus bytes_added). The duplicate-trigger
+    root cause (two batches in 43s) is upstream; this guard is the defensive
+    correction at finalize time so racing cancel + completion is consistent
+    regardless of upstream dedup.
+    """
+    job_id = getattr(snapshot, "job_id", None)
+    if not job_id or not await _is_job_cancelled(job_id):
+        return proposed_status
+    try:
+        ed = dict(snapshot.extra_data or {})
+        ed["finalize_cancelled"] = True
+        ed["finalize_cancelled_at"] = datetime.utcnow().isoformat()
+        ed["original_proposed_status"] = (
+            proposed_status.name if hasattr(proposed_status, "name")
+            else str(proposed_status)
+        )
+        snapshot.extra_data = ed
+    except Exception:
+        pass
+    return SnapshotStatus.FAILED
+
+
 async def _update_job_pct(job_id, pct: int) -> None:
     """Write live `jobs.progress_pct` on a short-lived session.
 
@@ -1138,7 +1410,7 @@ async def _update_job_pct(job_id, pct: int) -> None:
 import aio_pika
 from aio_pika import IncomingMessage
 import httpx
-from sqlalchemy import select, and_, func, text, desc
+from sqlalchemy import select, and_, or_, func, text, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -1408,12 +1680,33 @@ def _message_to_contact_shape(msg: dict) -> dict:
     return shape
 
 
-async def _backup_contacts_for_user(graph_client, user_id: str, item_limit: int = 999):
+async def _backup_contacts_for_user(
+    graph_client, user_id: str, item_limit: int = 999,
+    prior_deltas: Optional[Dict[str, str]] = None,
+):
     """Aggregate a user's contacts from /contactFolders + (optionally)
     Deleted Items + Recoverable Items folders.
 
-    Returns row tuples in the shape the caller previously built inline:
-    (item_type, name, external_id, payload_dict, folder_name)
+    Delta semantics (fix for "contacts re-fetched every backup"):
+      * ``prior_deltas`` is a dict ``{source_key -> deltaLink_url}`` from
+        the previous backup. ``source_key`` is ``"__root__"`` for the
+        top-level /users/{uid}/contacts/delta stream, or a folder id
+        for /contactFolders/{fid}/contacts/delta.
+      * On a fresh user (no prior_deltas) we walk the delta endpoint
+        from scratch — Graph returns the full contact list followed
+        by an ``@odata.deltaLink`` on the terminal page. We persist
+        that link so subsequent runs only fetch CHANGED contacts.
+      * On incremental runs we use the saved deltaLink directly as
+        ``next_url``; Graph treats it as "give me changes since X."
+      * Deleted contacts come back as ``{"@removed": {"reason":...}}``
+        objects with just an ``id`` field — we surface those to the
+        caller too so it can mark snapshot_items deleted.
+
+    Returns ``(row_tuples, new_deltas)``:
+      * ``row_tuples`` — list of
+        ``(item_type, name, external_id, payload_dict, folder_name)``.
+      * ``new_deltas`` — fresh ``{source_key -> deltaLink}`` to persist
+        in ``resource.extra_data['contacts_deltas']`` for the next run.
     """
     from shared.config import settings
 
@@ -1422,6 +1715,9 @@ async def _backup_contacts_for_user(graph_client, user_id: str, item_limit: int 
         "businessPhones,mobilePhone,homePhones,parentFolderId,categories,"
         "imAddresses,personalNotes,birthday"
     )
+
+    prior_deltas = prior_deltas or {}
+    new_deltas: Dict[str, str] = {}
 
     folder_map: dict = {}
     folder_ids: list = []
@@ -1439,6 +1735,9 @@ async def _backup_contacts_for_user(graph_client, user_id: str, item_limit: int 
         pass
 
     async def _fetch_contacts(url):
+        """Plain (non-delta) page walk — preserved for the Deleted-
+        Items and Recoverable-Items folders below which don't have a
+        delta endpoint."""
         all_rows = []
         next_url = url
         params = {"$top": str(item_limit), "$select": select_fields}
@@ -1452,6 +1751,51 @@ async def _backup_contacts_for_user(graph_client, user_id: str, item_limit: int 
             all_rows.extend(page_data.get("value", []) or [])
             next_url = page_data.get("@odata.nextLink")
             params = None
+            pages += 1
+        return all_rows
+
+    async def _fetch_contacts_delta(source_key: str, initial_url: str):
+        """Walk the /contacts/delta endpoint and capture the terminal
+        ``@odata.deltaLink`` into ``new_deltas[source_key]``. Resumes
+        from ``prior_deltas[source_key]`` when present — Graph returns
+        ONLY changes since that token, including ``@removed`` tombstones.
+
+        Returns the list of value rows (changed contacts + tombstones)."""
+        all_rows: List[Dict[str, Any]] = []
+        prior = prior_deltas.get(source_key)
+        if prior:
+            # Resume — pass the saved deltaLink verbatim. It encodes
+            # its own $deltatoken so we drop our own params.
+            next_url = prior
+            params = None
+        else:
+            next_url = initial_url
+            params = {"$top": str(item_limit), "$select": select_fields}
+        pages = 0
+        while next_url and pages < 100:
+            try:
+                page_data = await graph_client._get(next_url, params=params)
+            except Exception as exc:
+                logger.warning(
+                    "Contact delta fetch failed on %s: %s",
+                    next_url[:120], exc,
+                )
+                # On error we deliberately DO NOT update new_deltas[key]
+                # — the caller will fall back to prior_deltas (or full
+                # fetch on next run if there was none), which is the
+                # correct durability guarantee.
+                return all_rows
+            all_rows.extend(page_data.get("value", []) or [])
+            params = None
+            # @odata.nextLink continues paging; @odata.deltaLink marks
+            # the terminal page and gives us the cursor for next time.
+            nlink = page_data.get("@odata.nextLink")
+            dlink = page_data.get("@odata.deltaLink")
+            if dlink:
+                new_deltas[source_key] = dlink
+                next_url = None
+            else:
+                next_url = nlink
             pages += 1
         return all_rows
 
@@ -1472,17 +1816,41 @@ async def _backup_contacts_for_user(graph_client, user_id: str, item_limit: int 
 
     aggregated: dict = {}
     folder_override: dict = {}
+    tombstone_ids: List[str] = []
 
-    for c in await _fetch_contacts(f"{graph_client.GRAPH_URL}/users/{user_id}/contacts"):
+    def _ingest_delta_row(c: Dict[str, Any]) -> None:
+        """Apply one row from a /contacts/delta page to ``aggregated``.
+
+        Graph delta encodes deletes as ``{"@removed": {...}, "id": "..."}``
+        rather than returning a normal contact. We collect those ids
+        into ``tombstone_ids`` so the caller can surface them as
+        deletion events (snapshot_items.deleted_at marking happens at
+        the upsert layer downstream)."""
         cid = c.get("id")
-        if cid and cid not in aggregated:
+        if not cid:
+            return
+        if c.get("@removed"):
+            tombstone_ids.append(cid)
+            return
+        if cid not in aggregated:
             aggregated[cid] = c
+
+    # Top-level /contacts/delta — covers contacts not nested in a custom
+    # folder. On first run returns everything + a deltaLink; subsequent
+    # runs return only changes since the last cursor.
+    root_url = f"{graph_client.GRAPH_URL}/users/{user_id}/contacts/delta"
+    for c in await _fetch_contacts_delta("__root__", root_url):
+        _ingest_delta_row(c)
+    # Per-folder /contactFolders/{fid}/contacts/delta — same shape,
+    # one cursor per folder so adding/removing a folder doesn't reset
+    # the others.
     for fid in folder_ids:
-        url = f"{graph_client.GRAPH_URL}/users/{user_id}/contactFolders/{fid}/contacts"
-        for c in await _fetch_contacts(url):
-            cid = c.get("id")
-            if cid and cid not in aggregated:
-                aggregated[cid] = c
+        f_url = (
+            f"{graph_client.GRAPH_URL}/users/{user_id}"
+            f"/contactFolders/{fid}/contacts/delta"
+        )
+        for c in await _fetch_contacts_delta(fid, f_url):
+            _ingest_delta_row(c)
 
     # itemClass isn't a native property of microsoft.graph.message, so
     # filtering by it returns 400. Contact items live in mail folders with
@@ -1544,7 +1912,16 @@ async def _backup_contacts_for_user(graph_client, user_id: str, item_limit: int 
             or "(unnamed)"
         )
         out_rows.append(("USER_CONTACT", name, cid, {"raw": c}, folder_name))
-    return out_rows
+    # Tombstones — surface as DELETED rows so the snapshot_items diff
+    # layer can mark them removed. payload carries the bare id so the
+    # downstream upsert path can locate the existing row.
+    for tid in tombstone_ids:
+        out_rows.append((
+            "USER_CONTACT", "(deleted)", tid,
+            {"raw": {"id": tid, "@removed": True}},
+            "Contacts",
+        ))
+    return out_rows, new_deltas
 
 
 class AuditLogger:
@@ -1672,17 +2049,17 @@ class BackupWorker:
         """Start consuming from all backup queues"""
         await self.initialize()
 
-        # Override the channel-wide prefetch (set to 50 by message_bus). With
-        # 50, a single worker grabs all queued messages and the other replicas
-        # sit idle while it processes them serially. Setting prefetch=2 gives
-        # each replica one in-flight + one ready, so 3 replicas cover ~6 jobs
-        # at once and fair distribution is enforced by the broker.
-        if message_bus.channel:
-            try:
-                await message_bus.channel.set_qos(prefetch_count=2)
-                print(f"[{self.worker_id}] Set channel prefetch_count=2 for fair work distribution")
-            except Exception as exc:
-                print(f"[{self.worker_id}] Could not adjust prefetch_count: {exc}")
+        # NOTE: prefetch is now applied per-queue inside consume_queue() by
+        # opening a dedicated channel per queue and calling set_qos on it.
+        # The previous global override here (set_qos(prefetch_count=2) on
+        # the shared publishing channel) silently capped every queue at
+        # prefetch=2 because aio_pika's default global_=False makes set_qos
+        # apply per-consumer-on-the-channel — and we had one consumer per
+        # queue on one shared channel, so each queue got 2. Cluster-wide
+        # this paced parent-job throughput at (replicas × 2) regardless of
+        # the per-queue values listed below. Per-queue channels let
+        # urgent/high/normal/low/heavy/partition lanes each carry their
+        # intended prefetch independently. See consume_queue() below.
 
         # Per-queue prefetch.
         # Urgent = manually triggered backups (Teams chats, mailboxes). Each
@@ -1719,11 +2096,34 @@ class BackupWorker:
                 f"consuming ONLY {self._backup_queue_name}"
             )
         else:
+            # Per-queue prefetch defaults (2026-05-17 prod tuning,
+            # sized for the 8-light + 4-heavy Railway Pro fleet):
+            #
+            # backup.urgent (1 → 8): manual user-triggered backups.
+            #   Original prefetch=1 was set to keep one slow chat from
+            #   starving the others. That rationale is obsolete now that
+            #   consume_queue (faa67e1) dispatches each delivery to its
+            #   own task — a slow user no longer pins the replica.
+            #   With 8 light replicas this lands 64 concurrent (8×8),
+            #   comfortably covering a 50-user manual burst with ~25%
+            #   headroom. Per-replica memory at 8 concurrent USER_CHATS:
+            #   ~8 × 800 MB peak = 6-8 GB out of Railway Pro's 32 GB.
+            #
+            # backup.high (5 → 10): scheduled bulk triggers. Across
+            #   8 light replicas = 80 concurrent. Handles a fleet-wide
+            #   5K-user scheduled run as ~63 waves of 80, well within
+            #   the 8h window.
+            #
+            # backup.low (50 → 50): unchanged — already amply sized;
+            #   this lane is for retention sweeps where latency is fine.
+            #
+            # Each value still env-overridable; production may further
+            # raise via BACKUP_URGENT_PREFETCH / BACKUP_HIGH_PREFETCH.
             queues = [
-                ("backup.urgent", 1),
-                ("backup.high", 5),
-                (self._backup_queue_name, 20),
-                ("backup.low", 50),
+                ("backup.urgent", int(os.getenv("BACKUP_URGENT_PREFETCH", "8"))),
+                ("backup.high", int(os.getenv("BACKUP_HIGH_PREFETCH", "10"))),
+                (self._backup_queue_name, int(os.getenv("BACKUP_NORMAL_PREFETCH", "20"))),
+                ("backup.low", int(os.getenv("BACKUP_LOW_PREFETCH", "50"))),
             ]
         # OneDrive partition lane — both the light and heavy pools
         # subscribe so any free replica can drain a shard. Prefetch=2
@@ -1734,33 +2134,67 @@ class BackupWorker:
         if settings.ONEDRIVE_PARTITION_ENABLED:
             queues.append(("backup.onedrive_partition", 2))
         # Chats partition lane — I/O-light, higher prefetch is fine.
+        # Bumped 4 → 8 (perf #D 2026-05-17): now that consume_queue
+        # actually runs handlers concurrently up to the prefetch budget
+        # (previously serialized inside the iterator), an 8-way lane lets
+        # each replica drain 8 chat-partition shards in parallel. With
+        # 6 replicas that's 48 concurrent shards cluster-wide — enough
+        # to cover 9 users × 4 shards = 36 in one wave.
         if getattr(settings, "CHATS_PARTITION_ENABLED", False):
-            queues.append(("backup.chats_partition", 4))
+            # 8 → 12 (2026-05-17 prod tuning). With 8 light replicas
+            # this gives 96 concurrent partition shards cluster-wide.
+            # A 5K-user run at MIN_CHATS=25 generates ~9.5K shards
+            # (avg 2 shards/user) → ~99 waves of 96, well inside the
+            # 8h window even at 90s/shard.
+            queues.append(("backup.chats_partition", int(
+                os.getenv("BACKUP_CHATS_PARTITION_PREFETCH", "12"),
+            )))
         # Mail partition lane — many small folder drains per shard.
-        # Prefetch=2 mirrors OneDrive: a shard can fan out to ~20+
-        # folder drains inside, so one in-flight is plenty.
+        # Bumped 2 → 4 (perf #D): same reason as chats. Mail shards are
+        # small-IO so a few in-flight per replica is fine.
         if getattr(settings, "MAIL_PARTITION_ENABLED", False):
-            queues.append(("backup.mail_partition", 2))
+            queues.append(("backup.mail_partition", int(
+                os.getenv("BACKUP_MAIL_PARTITION_PREFETCH", "4"),
+            )))
         # SharePoint partition lane — drive shards are I/O-heavy.
+        # Kept at 2: SP drives can be many GB per shard, OOM risk if we
+        # stack too many on one replica.
         if getattr(settings, "SP_PARTITION_ENABLED", False):
-            queues.append(("backup.sharepoint_partition", 2))
+            queues.append(("backup.sharepoint_partition", int(
+                os.getenv("BACKUP_SP_PARTITION_PREFETCH", "2"),
+            )))
         # Groups (Teams channels) partition lane — fat-team channel
         # shards. Channels carry message + reply payloads but most are
-        # smaller per-shard than SP drives; prefetch=2 keeps a replica
-        # from monopolizing more than two shards at once.
+        # smaller per-shard than SP drives.
+        # Bumped 2 → 4 (perf #D).
         if getattr(settings, "GROUPS_PARTITION_ENABLED", False):
-            queues.append(("backup.groups_partition", 2))
+            queues.append(("backup.groups_partition", int(
+                os.getenv("BACKUP_GROUPS_PARTITION_PREFETCH", "4"),
+            )))
         # Entra directory partition lane — directory-category shards.
         # Most categories are I/O-light (one Graph page each) but the
-        # Groups category fans out to per-group owner+member calls
-        # which can dominate. Prefetch=2 keeps replicas balanced.
+        # Groups category fans out to per-group owner+member calls.
+        # Bumped 2 → 4 (perf #D).
         if getattr(settings, "ENTRA_PARTITION_ENABLED", False):
-            queues.append(("backup.entra_partition", 2))
+            queues.append(("backup.entra_partition", int(
+                os.getenv("BACKUP_ENTRA_PARTITION_PREFETCH", "4"),
+            )))
 
         tasks = []
         for queue_name, prefetch in queues:
             task = asyncio.create_task(self._supervised_consume(queue_name, prefetch))
             tasks.append(task)
+
+        # OneDrive per-file retry queue consumer. Runs as a peer of the
+        # RMQ consumers under the same gather so a crash here propagates
+        # the same way (SIGTERM-clean shutdown still works). Gated by
+        # ONEDRIVE_RETRY_QUEUE_ENABLED so operators can disable cleanly.
+        if os.getenv(
+            "ONEDRIVE_RETRY_QUEUE_ENABLED", "true",
+        ).lower() == "true":
+            tasks.append(asyncio.create_task(
+                self._onedrive_retry_consumer_loop(),
+            ))
 
         print(f"[{self.worker_id}] Started consuming from {len(queues)} queues (supervised)")
         await asyncio.gather(*tasks)
@@ -1826,11 +2260,29 @@ class BackupWorker:
                 await asyncio.sleep(1)
 
     async def consume_queue(self, queue_name: str, prefetch_count: int):
-        if not message_bus.channel:
+        if not message_bus.connection or message_bus.connection.is_closed:
             return
 
-        queue = await message_bus.channel.get_queue(queue_name)
-        print(f"[{self.worker_id}] Listening on {queue_name}...")
+        # Per-queue channel so set_qos(prefetch_count=N) actually scopes to
+        # this consumer only. A shared channel forces every consumer to the
+        # last set_qos call (because aio_pika defaults global_=False — "per
+        # consumer on this channel"), which made the per-queue prefetch
+        # values dead code. With one channel per queue:
+        #   urgent      → prefetch=1   (fairness, slow user-initiated jobs)
+        #   high        → prefetch=5
+        #   dedicated   → prefetch=20  (was effectively 2 before this fix)
+        #   low         → prefetch=50
+        #   *_partition → prefetch=2/4 per partition lane comments above
+        # That lifts the per-replica in-flight cap on the dedicated lane
+        # from 2 → 20 (10× headroom), unblocking parent-job parallelism on
+        # both light and heavy pools.
+        channel = await message_bus.connection.channel()
+        await channel.set_qos(prefetch_count=prefetch_count)
+        queue = await channel.get_queue(queue_name)
+        print(
+            f"[{self.worker_id}] Listening on {queue_name} "
+            f"(prefetch={prefetch_count})..."
+        )
 
         # Graph-rate-limit priority is derived from the queue: a single
         # backup-worker handles backup.urgent (HIGH) + backup.normal
@@ -1841,8 +2293,30 @@ class BackupWorker:
         from shared.graph_priority import priority_for_queue
         queue_priority = priority_for_queue(queue_name)
 
-        async with queue.iterator() as queue_iter:
-            async for message in queue_iter:
+        # Concurrent-handler refactor (perf #user-chats 2026-05-17):
+        # The previous shape — `async for message: await process; await ack` —
+        # serialized message processing within ONE consumer. Even though we
+        # told the broker prefetch=N, we awaited each handler before
+        # pulling the next message from the iterator, so each replica
+        # effectively ran one message at a time per queue.
+        #
+        # Observable symptom: USER_CHATS shards ran user-by-user on each
+        # replica (Hemant → Gajraj → Rashmi …) instead of in parallel,
+        # leaving the prefetch budget idle and the chat-partition queue
+        # under-utilised.
+        #
+        # New shape: each delivery is dispatched to a detached
+        # asyncio.Task. A semaphore equal to prefetch_count caps concurrent
+        # in-flight tasks so the iterator naturally pauses when full;
+        # aio_pika's broker-level prefetch already limits unacked messages
+        # to the same number, so we match the two budgets exactly.
+        # ack/reject still happens inside each task; idempotency on crash
+        # is unchanged (RMQ redelivers any unacked message).
+        handler_sem = asyncio.Semaphore(max(1, prefetch_count))
+        in_flight: "set[asyncio.Task]" = set()
+
+        async def _handle_one(message) -> None:
+            try:
                 try:
                     body = json.loads(message.body.decode())
                     with graph_priority(queue_priority):
@@ -1850,8 +2324,8 @@ class BackupWorker:
                     await message.ack()
                 except PoisonMessageError as e:
                     # Structurally invalid envelope — never retryable.
-                    # Skip the delivery-count gate and route straight
-                    # to DLQ so one bad payload can't pin a consumer.
+                    # Skip the delivery-count gate and route straight to
+                    # DLQ so one bad payload can't pin a consumer.
                     print(
                         f"[{self.worker_id}] poison message ({e}) — "
                         f"routing to DLQ without retry"
@@ -1871,10 +2345,63 @@ class BackupWorker:
                         if delivery_count < settings.MAX_RETRIES:
                             await message.reject(requeue=True)
                         else:
-                            print(f"[{self.worker_id}] Message exceeded max retries ({settings.MAX_RETRIES}), routing to DLQ")
+                            print(
+                                f"[{self.worker_id}] Message exceeded "
+                                f"max retries ({settings.MAX_RETRIES}), "
+                                f"routing to DLQ"
+                            )
                             await message.reject(requeue=False)
                     except Exception:
                         pass
+            finally:
+                handler_sem.release()
+
+        try:
+            async with queue.iterator() as queue_iter:
+                async for message in queue_iter:
+                    # Block here only when we already have prefetch_count
+                    # handlers running. As soon as one finishes (acks /
+                    # rejects), the sem releases and we pick up the next
+                    # message immediately.
+                    await handler_sem.acquire()
+                    task = asyncio.create_task(_handle_one(message))
+                    in_flight.add(task)
+                    task.add_done_callback(in_flight.discard)
+                    if len(in_flight) >= max(2, prefetch_count // 2):
+                        # Periodic visibility: log only when concurrent
+                        # in-flight count crosses the half-prefetch mark
+                        # so steady-state at low load stays quiet but a
+                        # saturated worker is observable.
+                        if len(in_flight) % max(1, prefetch_count // 4) == 0:
+                            print(
+                                f"[{self.worker_id}] [PERF] {queue_name} "
+                                f"in_flight={len(in_flight)}/{prefetch_count}"
+                            )
+        finally:
+            # Drain any still-running handlers so they get a chance to
+            # ack/reject before the channel closes. Without this an in-
+            # flight task could be killed mid-execute, leaving the
+            # message unacked AND the channel torn down so we can't
+            # reject it cleanly — RMQ would redeliver via delivery-
+            # count, but draining is the polite shutdown.
+            if in_flight:
+                try:
+                    print(
+                        f"[{self.worker_id}] consume_queue({queue_name}) "
+                        f"draining {len(in_flight)} in-flight handler(s) "
+                        f"before channel close"
+                    )
+                    await asyncio.gather(*in_flight, return_exceptions=True)
+                except Exception:
+                    pass
+            # Close the per-queue channel on supervisor restart so we
+            # don't leak channels each time the iterator exits. Connection
+            # stays open (shared by message_bus for publishes).
+            try:
+                if not channel.is_closed:
+                    await channel.close()
+            except Exception:
+                pass
 
     async def _emit_backup_audit(
         self,
@@ -3508,6 +4035,18 @@ class BackupWorker:
                             })
                         async with async_session_factory() as _sess:
                             await _bulk_upsert_snapshot_items(_sess, rows)
+                        # Item B Phase 1: dual-write to mail_message_bodies
+                        # for cross-user dedup. Best-effort; doesn't affect
+                        # the snapshot_items write above. Runs in its own
+                        # session so a constraint mismatch can't poison
+                        # the parent transaction.
+                        try:
+                            async with async_session_factory() as _mmb_sess:
+                                await _bulk_upsert_mail_message_bodies(
+                                    _mmb_sess, tenant.id, user_id, snapshot.id, folder_msgs,
+                                )
+                        except Exception as _mmb_e:
+                            print(f"[MAIL_DEDUP] dual-write skipped: {_mmb_e}")
                         return len(rows), local_bytes
 
                     async def _drain_one_folder(fid: Optional[str]) -> List:
@@ -3669,7 +4208,18 @@ class BackupWorker:
                                         snap.item_count = _mail_persisted_total
                                         snap.new_item_count = _mail_persisted_total
                                         snap.bytes_total = _mail_persisted_bytes
-                                        snap.bytes_added = _mail_persisted_bytes
+                                        # Do NOT touch bytes_added here.
+                                        # _mail_persisted_bytes accumulates body
+                                        # bytes of every message walked this run
+                                        # (including ON CONFLICT NO-OP re-walks
+                                        # of the freshness window). The audit-
+                                        # service Activity feed sums bytes_added
+                                        # for IN_PROGRESS snapshots; writing the
+                                        # full walked-bytes here surfaces a
+                                        # ghost "X MiB so far" on no-data
+                                        # incrementals. The settle path
+                                        # (_compute_snapshot_delta_from_prior)
+                                        # writes the proper delta later.
                                         await _s2.commit()
                             except Exception as _bump_err:
                                 print(
@@ -4038,13 +4588,52 @@ class BackupWorker:
                     return out
 
                 if kind == "USER_CONTACTS":
-                    out_rows = await _backup_contacts_for_user(
-                        graph_client, user_id, item_limit=ITEM_LIMIT
+                    # Incremental contacts via /contacts/delta — load
+                    # prior cursors from resource.extra_data so subsequent
+                    # runs fetch ONLY changes since the last successful
+                    # drain (cuts per-user contact Graph traffic from
+                    # O(total_contacts) to O(changes_since_last)).
+                    _prior_ed = dict(resource.extra_data or {})
+                    _prior_contact_deltas = (
+                        _prior_ed.get("contacts_deltas") or {}
+                    )
+                    out_rows, _new_contact_deltas = await _backup_contacts_for_user(
+                        graph_client, user_id, item_limit=ITEM_LIMIT,
+                        prior_deltas=_prior_contact_deltas,
                     )
                     folder_names = sorted({r[4] for r in out_rows})
+                    # Persist new delta links on the resource — only the
+                    # ones the helper successfully captured a deltaLink
+                    # for. Folders that hit pagination errors retain
+                    # their prior cursor (or stay unset, forcing the
+                    # next run to do a fresh delta walk for that folder
+                    # only).
+                    if _new_contact_deltas:
+                        try:
+                            merged = dict(_prior_contact_deltas)
+                            merged.update(_new_contact_deltas)
+                            _prior_ed["contacts_deltas"] = merged
+                            async with async_session_factory() as _cs:
+                                _res = await _cs.get(Resource, resource.id)
+                                if _res is not None:
+                                    _res.extra_data = _prior_ed
+                                    await _cs.commit()
+                        except Exception as _ed_err:
+                            print(
+                                f"[{self.worker_id}] [USER_CONTACTS] "
+                                f"persist deltas failed: "
+                                f"{type(_ed_err).__name__}: {_ed_err}"
+                            )
+                    _new_count = sum(
+                        1 for r in out_rows
+                        if not (r[3] or {}).get("raw", {}).get("@removed")
+                    )
+                    _del_count = len(out_rows) - _new_count
+                    _mode = "incremental" if _prior_contact_deltas else "full-first"
                     print(
                         f"[{self.worker_id}]   [USER_CONTACTS] {user_id}: "
-                        f"{len(out_rows)} contacts, folders={folder_names}"
+                        f"{_new_count} contacts ({_del_count} deletion(s)), "
+                        f"folders={folder_names} mode={_mode}"
                     )
                     return out_rows
 
@@ -4261,7 +4850,16 @@ class BackupWorker:
                             f"{graph_client.GRAPH_URL}/users/{user_id}/chats",
                             params={
                                 "$top": "200",
-                                "$select": "id,topic,chatType,lastUpdatedDateTime",
+                                # tenantId included so we can pre-filter
+                                # cross-tenant meeting chats (19:meeting_…
+                                # @thread.v2 invitations from other tenants)
+                                # before calling /messages — Graph returns
+                                # 403 AclCheckFailed on those with no path
+                                # to read; our app's app-only Chat.Read.All
+                                # doesn't cross tenant boundaries. Without
+                                # the pre-filter each external chat burns
+                                # ~5 retry attempts in _iter_pages.
+                                "$select": "id,topic,chatType,lastUpdatedDateTime,tenantId",
                                 "$expand": "members",
                             },
                         )
@@ -4283,7 +4881,7 @@ class BackupWorker:
                                     "$top": "200",
                                     "$select": (
                                         "id,topic,chatType,"
-                                        "lastUpdatedDateTime"
+                                        "lastUpdatedDateTime,tenantId"
                                     ),
                                 },
                             )
@@ -4291,6 +4889,38 @@ class BackupWorker:
                         except Exception as e:
                             print(f"[{self.worker_id}] [USER_CHATS] chats list failed for {user_id}: {e}")
                             chats_raw = []
+
+                    # ─── Cross-tenant filter ────────────────────────────
+                    # Drop chats whose tenantId differs from ours. These
+                    # are meeting invitations (19:meeting_…@thread.v2) or
+                    # external 1:1s/groups where the chat resource lives
+                    # in another tenant. Graph returns the chat in our
+                    # user's list (because they're a member) but our app-
+                    # only token can't read /chats/{id}/messages — every
+                    # attempt is a deterministic 403 AclCheckFailed.
+                    # Pre-filtering here avoids ~5 wasted Graph calls per
+                    # external chat per backup run (observed: 20+ such
+                    # chats per run pre-fix).
+                    _our_tenant_id = getattr(tenant, "external_tenant_id", None)
+                    if _our_tenant_id:
+                        _our_tenant_id_norm = str(_our_tenant_id).lower().strip()
+                        _kept: List[Dict[str, Any]] = []
+                        _dropped_external: List[str] = []
+                        for _c in chats_raw:
+                            _c_tid = _c.get("tenantId")
+                            if _c_tid and str(_c_tid).lower().strip() != _our_tenant_id_norm:
+                                _dropped_external.append(_c.get("id") or "?")
+                                continue
+                            _kept.append(_c)
+                        if _dropped_external:
+                            print(
+                                f"[{self.worker_id}] [USER_CHATS] dropped "
+                                f"{len(_dropped_external)} cross-tenant chat(s) "
+                                f"for {user_id} (e.g. "
+                                f"{_dropped_external[0][:32]}); /messages "
+                                f"would 403 with Tenant Id mismatch."
+                            )
+                        chats_raw = _kept
 
                     # ─── Incremental skip-by-activity (Layer A) ────────────
                     # Skip member-batch + display-name rebuild for chats
@@ -4741,8 +5371,19 @@ class BackupWorker:
                         # downstream doesn't fire BACKUP_COMPLETED.
                         return []
 
+                    # Per-user parallel chat drains. Each chat costs ~1 req/sec
+                    # on average (paginated /messages + light per-msg
+                    # /hostedContents). With 6 concurrent backup_workers and
+                    # 12-app multi-rotation, 32 chats per user keeps per-app
+                    # load at ~16 rps (well under the per-app-per-mailbox cap)
+                    # while staying below the tenant-aggregate ceiling
+                    # observed in field (~250-400 rps before 429s). If 429
+                    # rate grows, drop USER_CHATS_PARALLEL_CHATS in env to
+                    # 24 or 20. The multi-app rotation also throttles
+                    # automatically: throttled apps drop out of the shard
+                    # pool so this limit is a ceiling, not a floor.
                     chat_fanout = int(
-                        os.getenv("USER_CHATS_PARALLEL_CHATS", "20"),
+                        os.getenv("USER_CHATS_PARALLEL_CHATS", "32"),
                     )
                     chats_timeout_s = int(
                         os.getenv("USER_CHATS_TIMEOUT_S", "43200"),
@@ -4798,19 +5439,32 @@ class BackupWorker:
                     # whether to retry a previously-403'd chat without
                     # making an extra Graph call per chat. One query per
                     # shard app per backup; result cached on the GraphClient.
+                    # Parallel scope-fingerprint warmup (perf #12 2026-05-17):
+                    # was a serial `for sh in shards: await sh.fp()` loop —
+                    # with 12 shards × ~200ms per call this stole ~2.4s of
+                    # wall-clock from every USER_CHATS start. asyncio.gather
+                    # collapses to ~200ms.
                     _shard_scope_fps: Dict[str, str] = {}
-                    for _sh in _chat_shards:
-                        try:
-                            _shard_scope_fps[_sh.client_id] = (
-                                await _sh.get_granted_scope_fingerprint()
-                            )
-                        except Exception as _fp_err:
+                    _fp_t0 = time.monotonic()
+                    _fp_results = await asyncio.gather(
+                        *(_sh.get_granted_scope_fingerprint() for _sh in _chat_shards),
+                        return_exceptions=True,
+                    )
+                    for _sh, _fp in zip(_chat_shards, _fp_results):
+                        if isinstance(_fp, Exception):
                             print(
                                 f"[{self.worker_id}] [USER_CHATS] scope "
                                 f"fingerprint fetch failed for app "
-                                f"{_sh.client_id[:8]}: {_fp_err}"
+                                f"{_sh.client_id[:8]}: {_fp}"
                             )
                             _shard_scope_fps[_sh.client_id] = ""
+                        else:
+                            _shard_scope_fps[_sh.client_id] = _fp or ""
+                    print(
+                        f"[{self.worker_id}] [USER_CHATS] [PERF] scope "
+                        f"fingerprint warmup: {len(_chat_shards)} shards "
+                        f"in {time.monotonic() - _fp_t0:.2f}s"
+                    )
 
                     cancel_check_every = int(os.getenv(
                         "USER_CHATS_CANCEL_CHECK_EVERY_CHATS", "10",
@@ -4873,8 +5527,15 @@ class BackupWorker:
                     _interleave_hc = os.getenv(
                         "USER_CHATS_INTERLEAVE_HOSTED_CONTENT", "true",
                     ).lower() in ("true", "1", "yes")
+                    # Bumped 12 -> 32 (Option B 2026-05-17): with $expand=
+                    # hostedContents re-enabled (fix #5) most messages carry
+                    # their HC ids inline, so the post-drain barrier mostly
+                    # does cheap /value byte fetches. Pushing this higher
+                    # collapses the barrier wall-clock — the per-app Graph
+                    # rate-limiter caps actual RPS, so this is a ceiling not
+                    # a floor.
                     _hc_concurrency = int(os.getenv(
-                        "CHAT_HOSTED_CONTENT_CONCURRENCY", "8",
+                        "CHAT_HOSTED_CONTENT_CONCURRENCY", "32",
                     ))
                     _hc_sem: Optional[asyncio.Semaphore] = (
                         asyncio.Semaphore(_hc_concurrency) if _interleave_hc else None
@@ -4898,7 +5559,7 @@ class BackupWorker:
                     # UPLOAD_CONCURRENCY); the outer cap prevents N parallel
                     # kicks from blowing past the multi-app Graph RPS budget.
                     _att_chat_concurrency = int(os.getenv(
-                        "USER_CHATS_INTERLEAVE_ATTACHMENT_CONCURRENCY", "12",
+                        "USER_CHATS_INTERLEAVE_ATTACHMENT_CONCURRENCY", "24",
                     ))
                     _att_chat_sem: Optional[asyncio.Semaphore] = (
                         asyncio.Semaphore(_att_chat_concurrency) if _interleave_att else None
@@ -4943,10 +5604,99 @@ class BackupWorker:
                         Counters and Phase-2-skip set are advisory —
                         safe under concurrent increments because the
                         Python `+=` on ints is a single-bytecode update
-                        under the asyncio event loop (no threads)."""
+                        under the asyncio event loop (no threads).
+
+                        With fix #5 (Option C hybrid) the page query
+                        runs with $expand=hostedContents on the fast path,
+                        so for ~95% of inline-image msgs the array is
+                        already inline and we just download bytes. The
+                        per-msg fetch path below is the SLOW fallback
+                        used only for messages whose page hit the 400/500
+                        $expand-strip retry (poisoned page). Detection:
+                          1. `m["hostedContents"]` populated — fast path,
+                             use it directly. No extra Graph call.
+                          2. body HTML references "/hostedContents/" but
+                             `m["hostedContents"]` is empty (rescued page
+                             after $expand strip) — pre-fetch hostedContents
+                             lists for ALL such msgs in this page via
+                             /v1.0/$batch bundles of 20 (graph_client.
+                             batch handles chunking), then process each
+                             message's downloads concurrently below.
+                        Plain text-only messages (~95%) skip both paths."""
                         nonlocal _hc_items_total, _hc_bytes_total
+
+                        # Phase 1: bulk-resolve hostedContents lists via
+                        # /v1.0/$batch for msgs that need them.
+                        from shared.graph_batch import BatchRequest
+                        fetch_targets: List[Tuple[Dict[str, Any], str, str]] = []
                         for m in msgs:
-                            if not m.get("hostedContents"):
+                            if m.get("hostedContents"):
+                                continue
+                            if not _msg_likely_has_hosted_content(m):
+                                continue
+                            m_id_probe = m.get("id")
+                            m_chat_id_probe = (
+                                m.get("chatId")
+                                or (m.get("channelIdentity") or {}).get("channelId")
+                                or cid
+                            )
+                            if not m_id_probe or not m_chat_id_probe:
+                                continue
+                            fetch_targets.append(
+                                (m, m_id_probe, m_chat_id_probe)
+                            )
+                        if fetch_targets:
+                            try:
+                                batch_reqs = [
+                                    BatchRequest(
+                                        id=f"hc_{i}",
+                                        method="GET",
+                                        url=(
+                                            f"/chats/{ch_id}/messages/"
+                                            f"{mid}/hostedContents"
+                                        ),
+                                    )
+                                    for i, (_m, mid, ch_id) in enumerate(
+                                        fetch_targets
+                                    )
+                                ]
+                                batch_result = await graph_client.batch(
+                                    batch_reqs
+                                )
+                                for i, (m_ref, _, _) in enumerate(
+                                    fetch_targets
+                                ):
+                                    resp = batch_result.get(f"hc_{i}")
+                                    if resp is None:
+                                        continue
+                                    if getattr(resp, "status", 0) == 200:
+                                        hc_vals = list(
+                                            (resp.body or {})
+                                            .get("value", []) or []
+                                        )
+                                        if hc_vals:
+                                            m_ref["hostedContents"] = hc_vals
+                                    # Non-200 (404/403/429-after-retries) —
+                                    # leave m_ref without hostedContents
+                                    # so the Phase-2 fallback can retry
+                                    # via its own per-msg path.
+                            except Exception as _hc_batch_err:
+                                print(
+                                    f"[{self.worker_id}] [USER_CHATS] "
+                                    f"hc batch list fetch failed: "
+                                    f"{type(_hc_batch_err).__name__}: "
+                                    f"{_hc_batch_err}; "
+                                    f"falling back to Phase-2 per-msg path"
+                                )
+
+                        # Phase 2: persist each msg's hostedContents
+                        # concurrently under the existing semaphore.
+                        for m in msgs:
+                            inline_hc = m.get("hostedContents")
+                            hc_values: List[Dict[str, Any]] = (
+                                list(inline_hc) if inline_hc else []
+                            )
+                            if not hc_values:
                                 continue
                             m_id = m.get("id")
                             m_chat_id = (
@@ -4963,7 +5713,7 @@ class BackupWorker:
                                         user_id=user_id,
                                         chat_id=m_chat_id,
                                         message_id=m_id,
-                                        hosted_contents=m["hostedContents"],
+                                        hosted_contents=hc_values,
                                     )
                                     _hc_items_total += n
                                     _hc_bytes_total += b
@@ -5464,18 +6214,26 @@ class BackupWorker:
                                     )
                                 return cid, [], saved_cursor
                         url = f"{graph_client.GRAPH_URL}/chats/{cid}/messages"
-                        # $expand=hostedContents inlines each message's
-                        # hostedContents[] array (id + contentType per
-                        # inline image). Without it, Graph returns
-                        # messages with no hostedContents field, so the
-                        # interleave loop sees nothing and EVERY inline
-                        # image / logo / pasted screenshot ends up
-                        # un-backed-up — body HTML still references the
-                        # original graph.microsoft.com URL which the
-                        # browser can't load (401 + CORS), giving the
-                        # "refused to connect" broken-image you see in
-                        # Recovery UI. Bytes are then fetched per-item
-                        # via _userchats_backup_hosted_contents.
+                        # hostedContents strategy (fix #5 — Option C, hybrid):
+                        # Pre-fix-#2 we always used $expand=hostedContents and
+                        # a single poisoned HC id on any message in the page
+                        # 400/500'd the WHOLE page → 29k → 8k variance.
+                        # Fix #2 removed $expand entirely; that fixed the
+                        # variance but added 2 Graph round-trips per inline-
+                        # image message in the post-drain barrier (observed:
+                        # 7-9 min HC-interleave wall on chat-heavy users).
+                        #
+                        # Fix #5 reinstates $expand=hostedContents on the
+                        # fast path AND adds a one-shot fallback in the
+                        # HTTPStatusError arm of the retry loop below: on
+                        # 400/500 we strip $expand from `last_params` /
+                        # `last_next_url` and retry the same page. The
+                        # retry returns plain messages; the per-msg
+                        # /hostedContents fetch in _kick_hosted_content_
+                        # for_chat picks up the inline-image bytes lazily
+                        # (using the existing HTML-body URL detector).
+                        # Net effect: fast path on healthy pages, identical-
+                        # to-fix-#2 path on poisoned pages, no variance.
                         params: Dict[str, str] = {
                             "$top": "50",
                             "$expand": "hostedContents",
@@ -5527,6 +6285,13 @@ class BackupWorker:
                             os.getenv("CHAT_DRAIN_RETRIES", "4")
                         )
                         chat_backoff_s = 2.0
+                        # One-shot $expand=hostedContents strip on 400/500
+                        # (fix #5). See the comment block above the params
+                        # dict. Flips True the first time we fall back and
+                        # stays True for the rest of this chat's drain so a
+                        # second poisoned page later in the same chat
+                        # doesn't loop us back to the fast path.
+                        _expand_stripped = False
                         # _shard_client computed above (pre-skip) — reused here.
                         while True:
                             try:
@@ -5564,6 +6329,57 @@ class BackupWorker:
                                     he.response.status_code
                                     if he.response is not None else 0
                                 )
+                                # Page-poison fallback (fix #5): when
+                                # $expand=hostedContents was sent and Graph
+                                # returns 400/500 because one HC id on any
+                                # message in this page is malformed, strip
+                                # $expand from `last_params` / `last_next_
+                                # url` and retry the SAME page. Per-msg
+                                # HC fetch in the post-drain interleave
+                                # picks up the inline-image bytes for the
+                                # rescued pages. One-shot per chat — sets
+                                # _expand_stripped True so we don't loop.
+                                # Doesn't decrement chat_retries_left
+                                # because this is a structural retry, not
+                                # a transient one.
+                                if (
+                                    status in (400, 500)
+                                    and not _expand_stripped
+                                    and last_next_url
+                                ):
+                                    _expand_stripped = True
+                                    if last_params and "$expand" in last_params:
+                                        last_params = {
+                                            k: v for k, v in last_params.items()
+                                            if k != "$expand"
+                                        }
+                                    if last_next_url and "$expand" in last_next_url:
+                                        from urllib.parse import (
+                                            urlparse as _up,
+                                            parse_qsl as _pqsl,
+                                            urlencode as _ue,
+                                            urlunparse as _uup,
+                                        )
+                                        _p = _up(last_next_url)
+                                        _q = [
+                                            (k, v) for k, v in _pqsl(
+                                                _p.query, keep_blank_values=True,
+                                            )
+                                            if k != "$expand"
+                                        ]
+                                        last_next_url = _uup(
+                                            _p._replace(query=_ue(_q, safe="$"))
+                                        )
+                                    print(
+                                        f"[{self.worker_id}] [USER_CHATS] "
+                                        f"chat {cid[:8]} {status} on page "
+                                        f"with $expand=hostedContents "
+                                        f"(kept {len(msgs_local)} so far); "
+                                        f"stripping $expand and retrying — "
+                                        f"inline images will be fetched "
+                                        f"per-msg in post-drain interleave"
+                                    )
+                                    continue
                                 if (
                                     status in (502, 503, 504)
                                     and chat_retries_left > 0
@@ -5728,7 +6544,18 @@ class BackupWorker:
                                             snap.item_count = _persisted_total
                                             snap.new_item_count = _persisted_total
                                             snap.bytes_total = _persisted_bytes
-                                            snap.bytes_added = _persisted_bytes
+                                            # Do NOT touch bytes_added here.
+                                            # _persisted_bytes counts every body
+                                            # the chat handler walked, including
+                                            # ON CONFLICT NO-OP re-walks via the
+                                            # 7h freshness window. The audit-
+                                            # service Activity feed sums
+                                            # bytes_added for IN_PROGRESS rows
+                                            # so writing walked-bytes surfaces
+                                            # a ghost size on no-data incrementals.
+                                            # The settle / partition finalize
+                                            # write the proper delta via
+                                            # _compute_snapshot_delta_from_prior.
                                             await _s2.commit()
                                 except Exception as _bump_err:
                                     # Progress bump is advisory — a DB
@@ -5761,6 +6588,72 @@ class BackupWorker:
                                     f"{persist_err}"
                                 )
 
+                        # Completeness gate (fix #3) — guards against the
+                        # silent-partial-drain failure mode where a transient
+                        # error consumes our retry budget mid-pagination and
+                        # we accept (kept N) as a successful drain.
+                        #
+                        # Applies ONLY to full drains (saved_cursor is None).
+                        # Incremental drains legitimately return small
+                        # message counts ("nothing changed since cursor")
+                        # and would false-positive the gate.
+                        #
+                        # The full-drain count we just fetched (len(msgs_local))
+                        # is compared against last_drained_msg_count from the
+                        # prior fully-successful run on this chat. If it
+                        # dropped by more than CHAT_DRAIN_COMPLETENESS_DROP_PCT
+                        # (default 50%), mark the drain failed so the cursor
+                        # is not advanced and the next backup re-runs from
+                        # the same starting point.
+                        if drain_succeeded and not saved_cursor:
+                            try:
+                                _prior_count_baseline = int(
+                                    _claim.get("last_drained_msg_count", 0) or 0
+                                )
+                                _drop_pct = float(
+                                    os.getenv(
+                                        "CHAT_DRAIN_COMPLETENESS_DROP_PCT",
+                                        "50",
+                                    )
+                                )
+                                if _prior_count_baseline > 0:
+                                    _threshold = int(
+                                        _prior_count_baseline
+                                        * (1.0 - _drop_pct / 100.0)
+                                    )
+                                    _got = len(msgs_local)
+                                    if _got < _threshold:
+                                        drain_succeeded = False
+                                        new_failures[cid] = {
+                                            **(_thread_failure_state or {}),
+                                            "count": _prior_count + 1,
+                                            "last_error": (
+                                                f"completeness gate: "
+                                                f"got {_got} < "
+                                                f"threshold {_threshold} "
+                                                f"(baseline "
+                                                f"{_prior_count_baseline}, "
+                                                f"drop_pct {_drop_pct})"
+                                            ),
+                                            "error_class": "TRANSIENT",
+                                            "last_failed_at":
+                                                datetime.utcnow().isoformat() + "Z",
+                                        }
+                                        print(
+                                            f"[{self.worker_id}] [USER_CHATS] "
+                                            f"chat {cid[:8]} completeness "
+                                            f"failed: got={_got} "
+                                            f"baseline={_prior_count_baseline} "
+                                            f"threshold={_threshold} "
+                                            f"— cursor preserved, will retry"
+                                        )
+                            except Exception as _cg_err:
+                                print(
+                                    f"[{self.worker_id}] [USER_CHATS] "
+                                    f"chat {cid[:8]} completeness check "
+                                    f"errored ({_cg_err}); treating as ok"
+                                )
+
                         # Resume checkpoint: write THIS chat's drain
                         # cursor + last_drained_at into chat_threads
                         # unconditionally — including failed drains where
@@ -5772,6 +6665,17 @@ class BackupWorker:
                         # Skip the cursor advancement when drain failed
                         # (drain_succeeded=False) but always bump
                         # last_drained_at + failure_state.
+                        #
+                        # On successful drain, stamp last_drained_msg_count
+                        # so the next run's completeness gate has a baseline.
+                        # Uses len(msgs_local) (this drain's page-fetched
+                        # count) instead of a live SELECT count(*) — the
+                        # extra DB roundtrip per chat was costing more than
+                        # the gate's precision is worth. False-positive risk
+                        # is bounded by the 50% drop threshold.
+                        _final_msg_count: Optional[int] = (
+                            len(msgs_local) if drain_succeeded else None
+                        )
                         try:
                             await _mark_chat_thread_drained(
                                 thread_id=thread_id,
@@ -5779,6 +6683,7 @@ class BackupWorker:
                                     max_stamp if drain_succeeded else None
                                 ),
                                 failure_state=new_failures.get(cid),
+                                msg_count=_final_msg_count,
                             )
                         except Exception as _ck_err:
                             # Advisory checkpoint — a DB hiccup here
@@ -5875,37 +6780,212 @@ class BackupWorker:
                             f"(kept {len(all_msgs)})"
                         )
 
-                    # Drain barrier reached — all chats' messages are
-                    # in all_msgs + persisted. If interleaved hc tasks
-                    # are still in flight, wait for them now so Phase 2
-                    # sees a consistent _hc_interleaved_msg_ids set
-                    # before deciding what to skip.
-                    if _interleave_hc and _hc_tasks:
-                        hc_started_mono = time.monotonic()
-                        await asyncio.gather(*_hc_tasks, return_exceptions=True)
-                        hc_elapsed = time.monotonic() - hc_started_mono
-                        print(
-                            f"[{self.worker_id}] [USER_CHATS] hc interleave "
-                            f"drained {len(_hc_interleaved_msg_ids)} msgs "
-                            f"({_hc_items_total} items, "
-                            f"{_hc_bytes_total} bytes) in {hc_elapsed:.1f}s "
-                            f"(overlapped with drain phase)"
-                        )
+                    # Item C: HC barrier overlap with next user's drain.
+                    # When USER_CHATS_HC_BARRIER_DETACHED=true the handler
+                    # spawns a finalize-task that awaits the gathers in
+                    # the background and updates snapshot.hc_drain_status
+                    # to COMPLETE/FAILED. Phase 2 still inspects the
+                    # interleaved-msg sets here — those are mutated in
+                    # the kick tasks BEFORE this point only for messages
+                    # the kicks have already finished, so detaching
+                    # means a small set of HC msgs may double-process
+                    # through the Phase-2 fall-through. That's safe
+                    # because _userchats_backup_hosted_contents uses
+                    # ON CONFLICT DO NOTHING semantics on persist.
+                    # Default ON (2026-05-17 prod tuning): frees the
+                    # consumer slot ~30-60s sooner per user so the
+                    # backup.urgent / backup.high prefetch bumps actually
+                    # translate into faster cluster-wide throughput.
+                    # Restore paths gate on snapshot.hc_drain_status so
+                    # PENDING snapshots can't be restored mid-drain.
+                    _hc_detached = os.getenv(
+                        "USER_CHATS_HC_BARRIER_DETACHED", "true",
+                    ).lower() in ("true", "1", "yes")
 
-                    # Same barrier for file-attachment interleave so Phase 2
-                    # sees consistent _att_interleaved_msg_ids and the
-                    # accumulated items list before it computes the fall-through.
-                    if _interleave_att and _att_tasks:
-                        att_started_mono = time.monotonic()
-                        await asyncio.gather(*_att_tasks, return_exceptions=True)
-                        att_elapsed = time.monotonic() - att_started_mono
-                        print(
-                            f"[{self.worker_id}] [USER_CHATS] att interleave "
-                            f"drained {len(_att_interleaved_msg_ids)} msgs "
-                            f"({_att_items_total_count} items, "
-                            f"{_att_bytes_total} bytes) in {att_elapsed:.1f}s "
-                            f"(overlapped with drain phase, persisted in-task)"
-                        )
+                    if _hc_detached and (
+                        (_interleave_hc and _hc_tasks)
+                        or (_interleave_att and _att_tasks)
+                    ):
+                        # Mark snapshot as HC-pending so restore paths
+                        # refuse it until the background drain settles.
+                        try:
+                            async with async_session_factory() as _hc_sess:
+                                from sqlalchemy import update as _sa_update
+                                await _hc_sess.execute(
+                                    _sa_update(Snapshot)
+                                    .where(Snapshot.id == snapshot.id)
+                                    .values(hc_drain_status="PENDING")
+                                )
+                                await _hc_sess.commit()
+                        except Exception as _e:
+                            print(
+                                f"[{self.worker_id}] [USER_CHATS] failed to "
+                                f"mark hc_drain_status=PENDING (continuing "
+                                f"with attached barrier): {_e}"
+                            )
+                            _hc_detached = False
+
+                    if _hc_detached and (
+                        (_interleave_hc and _hc_tasks)
+                        or (_interleave_att and _att_tasks)
+                    ):
+                        # Fire-and-forget. Worker can return to consumer
+                        # loop and dispatch the next user's queue message
+                        # while this finalizer runs.
+                        _detached_hc_tasks = list(_hc_tasks)
+                        _detached_att_tasks = list(_att_tasks)
+                        _snap_id_for_finalize = snapshot.id
+                        _worker_id_for_finalize = self.worker_id
+                        # Baseline of the nonlocals at detach time. The
+                        # snapshot finalize block (~line 7513) reads these
+                        # synchronously and writes snap.bytes_total before
+                        # the detached gather completes — so any HC/att
+                        # bytes that land AFTER detach are missing from
+                        # the persisted aggregate. We diff against this
+                        # baseline once the gather finishes and fold the
+                        # delta back in atomically. Pre-fix: Amit Mishra
+                        # 3.4 GB → 2.9 GB regression (2026-05-17).
+                        _hc_bytes_baseline = _hc_bytes_total
+                        _hc_items_baseline = _hc_items_total
+                        _att_bytes_baseline = _att_bytes_total
+                        _att_items_baseline = _att_items_total_count
+
+                        async def _hc_drain_finalizer():
+                            status = "COMPLETE"
+                            try:
+                                t0 = time.monotonic()
+                                if _detached_hc_tasks:
+                                    results = await asyncio.gather(
+                                        *_detached_hc_tasks, return_exceptions=True,
+                                    )
+                                    for r in results:
+                                        if isinstance(r, Exception):
+                                            status = "FAILED"
+                                if _detached_att_tasks:
+                                    results = await asyncio.gather(
+                                        *_detached_att_tasks, return_exceptions=True,
+                                    )
+                                    for r in results:
+                                        if isinstance(r, Exception):
+                                            status = "FAILED"
+                                elapsed = time.monotonic() - t0
+                                print(
+                                    f"[{_worker_id_for_finalize}] [HC_FINALIZER] "
+                                    f"snap={_snap_id_for_finalize} settled "
+                                    f"status={status} elapsed={elapsed:.1f}s "
+                                    f"(overlapped with next user's drain)"
+                                )
+                            except Exception as _e:
+                                status = "FAILED"
+                                print(
+                                    f"[{_worker_id_for_finalize}] [HC_FINALIZER] "
+                                    f"snap={_snap_id_for_finalize} crashed: {_e}"
+                                )
+                            # Compute deltas the detached tasks produced
+                            # after the snapshot finalize ran. Closure refs
+                            # _hc_bytes_total / _att_bytes_total are the
+                            # SAME nonlocals the kick tasks mutate, so by
+                            # gather() return they hold the final values.
+                            _hc_bytes_delta = max(
+                                0, _hc_bytes_total - _hc_bytes_baseline,
+                            )
+                            _hc_items_delta = max(
+                                0, _hc_items_total - _hc_items_baseline,
+                            )
+                            _att_bytes_delta = max(
+                                0, _att_bytes_total - _att_bytes_baseline,
+                            )
+                            _att_items_delta = max(
+                                0, _att_items_total_count - _att_items_baseline,
+                            )
+                            _bytes_delta = _hc_bytes_delta + _att_bytes_delta
+                            _items_delta = _hc_items_delta + _att_items_delta
+                            try:
+                                async with async_session_factory() as _fin_sess:
+                                    from sqlalchemy import update as _sa_update
+                                    _values: Dict[str, Any] = {
+                                        "hc_drain_status": status,
+                                    }
+                                    if _bytes_delta or _items_delta:
+                                        # Atomic fold-back so the displayed
+                                        # Backup size matches the data that
+                                        # was actually persisted to blob.
+                                        _values["bytes_total"] = (
+                                            Snapshot.bytes_total + _bytes_delta
+                                        )
+                                        _values["bytes_added"] = (
+                                            Snapshot.bytes_added + _bytes_delta
+                                        )
+                                        _values["item_count"] = (
+                                            Snapshot.item_count + _items_delta
+                                        )
+                                    await _fin_sess.execute(
+                                        _sa_update(Snapshot)
+                                        .where(Snapshot.id == _snap_id_for_finalize)
+                                        .values(**_values)
+                                    )
+                                    await _fin_sess.commit()
+                                if _bytes_delta or _items_delta:
+                                    print(
+                                        f"[{_worker_id_for_finalize}] [HC_FINALIZER] "
+                                        f"snap={_snap_id_for_finalize} "
+                                        f"folded back +{_items_delta} items / "
+                                        f"+{_bytes_delta} bytes "
+                                        f"(hc={_hc_bytes_delta} att={_att_bytes_delta})"
+                                    )
+                            except Exception as _e:
+                                print(
+                                    f"[{_worker_id_for_finalize}] [HC_FINALIZER] "
+                                    f"failed to update hc_drain_status "
+                                    f"for {_snap_id_for_finalize}: {_e}"
+                                )
+
+                        # Spawn as a top-level task so it isn't gc'd when
+                        # the parent handler returns. Reference is held
+                        # by the worker-lifetime list below.
+                        if not hasattr(self, "_detached_hc_finalizers"):
+                            self._detached_hc_finalizers = []
+                        _det_t = asyncio.create_task(_hc_drain_finalizer())
+                        self._detached_hc_finalizers.append(_det_t)
+                        # Best-effort GC of completed finalizers so the
+                        # list doesn't grow unbounded across thousands
+                        # of users.
+                        self._detached_hc_finalizers = [
+                            t for t in self._detached_hc_finalizers
+                            if not t.done()
+                        ]
+                    else:
+                        # Drain barrier reached — all chats' messages are
+                        # in all_msgs + persisted. If interleaved hc tasks
+                        # are still in flight, wait for them now so Phase 2
+                        # sees a consistent _hc_interleaved_msg_ids set
+                        # before deciding what to skip.
+                        if _interleave_hc and _hc_tasks:
+                            hc_started_mono = time.monotonic()
+                            await asyncio.gather(*_hc_tasks, return_exceptions=True)
+                            hc_elapsed = time.monotonic() - hc_started_mono
+                            print(
+                                f"[{self.worker_id}] [USER_CHATS] hc interleave "
+                                f"drained {len(_hc_interleaved_msg_ids)} msgs "
+                                f"({_hc_items_total} items, "
+                                f"{_hc_bytes_total} bytes) in {hc_elapsed:.1f}s "
+                                f"(overlapped with drain phase)"
+                            )
+
+                        # Same barrier for file-attachment interleave so Phase 2
+                        # sees consistent _att_interleaved_msg_ids and the
+                        # accumulated items list before it computes the fall-through.
+                        if _interleave_att and _att_tasks:
+                            att_started_mono = time.monotonic()
+                            await asyncio.gather(*_att_tasks, return_exceptions=True)
+                            att_elapsed = time.monotonic() - att_started_mono
+                            print(
+                                f"[{self.worker_id}] [USER_CHATS] att interleave "
+                                f"drained {len(_att_interleaved_msg_ids)} msgs "
+                                f"({_att_items_total_count} items, "
+                                f"{_att_bytes_total} bytes) in {att_elapsed:.1f}s "
+                                f"(overlapped with drain phase, persisted in-task)"
+                            )
 
                     elapsed = time.monotonic() - chats_start_mono
                     rate = (len(all_msgs) / elapsed) if elapsed > 0 else 0
@@ -6215,7 +7295,7 @@ class BackupWorker:
                         _is_partitioned = False
                     if _is_partitioned:
                         print(
-                            f"[{self.worker_id}] [USER_CHATS] "
+                            f"[{self.worker_id}] [{resource.type.value}] "
                             f"{resource.display_name or resource.id}: "
                             f"partitioned — coordinator returning, "
                             f"awaiting partition consumers."
@@ -6431,11 +7511,24 @@ class BackupWorker:
                     # handler. Messages that FAILED the interleave stay
                     # unmarked and fall through to this phase as a
                     # natural retry path.
+                    # Two-tier filter for Phase-2 hostedContent retry (fix #2):
+                    #   * Tier A — interleave already attempted and populated
+                    #     m["hostedContents"] but the persist call failed; we
+                    #     retry here. `_hc_interleaved` stays unset on failure
+                    #     so this is the natural retry path.
+                    #   * Tier B — interleave was disabled OR the per-msg
+                    #     hostedContents GET hasn't been issued yet (e.g.
+                    #     interleave was off, or fetch is deferred). Detect
+                    #     via body-HTML substring and resolve the list here
+                    #     before handing to _userchats_backup_hosted_contents.
                     msgs_with_hc = [
                         extra.get("raw") for (_t, _n, _e, extra, *_rest) in items_data
                         if isinstance(extra, dict) and isinstance(extra.get("raw"), dict)
-                        and extra["raw"].get("hostedContents")
                         and not extra["raw"].get("_hc_interleaved")
+                        and (
+                            extra["raw"].get("hostedContents")
+                            or _msg_likely_has_hosted_content(extra["raw"])
+                        )
                     ]
                     if msgs_with_hc and user_id:
                         # Bind self so _one_msg can reach the BackupWorker
@@ -6471,13 +7564,42 @@ class BackupWorker:
                             )
                             if not m_chat_id or not message.get("id"):
                                 return 0, 0
+                            # Resolve hostedContents list — either already
+                            # populated (interleave or prior $expand path)
+                            # or fetch lazily because the body indicates
+                            # an inline image is present (fix #2).
+                            hc_values = message.get("hostedContents")
+                            if not hc_values:
+                                try:
+                                    _resp = await graph_client._get(
+                                        f"{graph_client.GRAPH_URL}/chats/"
+                                        f"{m_chat_id}/messages/"
+                                        f"{message['id']}/hostedContents"
+                                    )
+                                    hc_values = list(
+                                        (_resp or {}).get("value", []) or []
+                                    )
+                                    if hc_values:
+                                        message["hostedContents"] = hc_values
+                                except Exception as _fetch_err:
+                                    print(
+                                        f"[{bw_self.worker_id}] [USER_CHATS] "
+                                        f"Phase-2 hc fetch failed "
+                                        f"msg={str(message.get('id'))[:8]} "
+                                        f"chat={str(m_chat_id)[:8]}: "
+                                        f"{type(_fetch_err).__name__}: "
+                                        f"{_fetch_err}"
+                                    )
+                                    return 0, 0
+                            if not hc_values:
+                                return 0, 0
                             async with _msg_sem:
                                 return await bw_self._userchats_backup_hosted_contents(
                                     snapshot_id=snap_id_local,
                                     user_id=user_id_local,
                                     chat_id=m_chat_id,
                                     message_id=message["id"],
-                                    hosted_contents=message["hostedContents"],
+                                    hosted_contents=hc_values,
                                 )
 
                         hc_results = await asyncio.gather(
@@ -6755,7 +7877,9 @@ class BackupWorker:
                     # last finisher own the status flip.
                     _snap_extra = snap.extra_data or {}
                     if not _snap_extra.get("partitioned"):
-                        snap.status = SnapshotStatus.COMPLETED
+                        snap.status = await _coerce_snapshot_terminal_on_cancel(
+                            snap, SnapshotStatus.COMPLETED,
+                        )
                         snap.completed_at = datetime.utcnow()
                         if snap.started_at:
                             snap.duration_secs = int((snap.completed_at - snap.started_at).total_seconds())
@@ -6954,6 +8078,88 @@ class BackupWorker:
                 f"{type(be).__name__}: {be}; falling back to per-msg",
             )
 
+        # ── Multi-app concurrent MIME pre-fetch ──────────────────────
+        # Identify which messages have body cid: refs not covered by
+        # the attachment list, then bulk-fetch their RFC822 MIME via
+        # the 12-app pool in parallel. Without this, every cid:-bearing
+        # message would do a SERIAL /$value GET inside _one_message
+        # under sem=8, which was the documented 0.14 MiB/s bottleneck
+        # on heavy mailboxes — all 8 concurrent fetches piled onto
+        # ONE app's 4-concurrent-per-mailbox limit, queueing 4 deep
+        # server-side every wave.
+        #
+        # The new path uses 12 apps × 4 concurrent = 48 in-flight per
+        # mailbox (Microsoft's hard ceiling per
+        # https://learn.microsoft.com/en-us/graph/throttling-limits).
+        # With HTTP/2 enabled (GRAPHCLIENT_HTTP2=true) each app's 4
+        # streams multiplex over ONE TCP connection so there's no
+        # per-fetch TLS handshake either.
+        #
+        # We do this BEFORE the _one_message gather so the fetch can
+        # truly fan out across the 12-app pool. Doing it inside
+        # _one_message would serialise against sem=8 again (only 8
+        # concurrent invocations of get_messages_mime_concurrent, each
+        # asking for 1 msg — apps barely rotate).
+        mime_pre_map: Dict[str, Optional[bytes]] = {}
+        need_mime_msg_ids: List[str] = []
+        for _m in messages_with_attachments:
+            _mid = _m.get("id")
+            if not _mid:
+                continue
+            _body_html = (_m.get("body") or {}).get("content") or ""
+            if "cid:" not in _body_html and "CID:" not in _body_html:
+                continue
+            try:
+                _body_cids = _extract_cid_refs_from_body(_body_html)
+            except Exception:
+                continue
+            if not _body_cids:
+                continue
+            # Cross-check against the attachment list we just bulk-fetched.
+            # If every body cid is already covered by an attachment, MIME
+            # adds nothing — skip the fetch.
+            _atts = att_lists_cache.get(_mid) or []
+            _captured = {
+                ((a.get("contentId") or a.get("contentID") or "")
+                 .strip().strip("<>").strip().lower())
+                for a in _atts
+            }
+            if _body_cids - _captured - {""}:
+                need_mime_msg_ids.append(_mid)
+
+        if need_mime_msg_ids:
+            print(
+                f"[{self.worker_id}] [MIME-BULK] pre-fetching MIME for "
+                f"{len(need_mime_msg_ids)} msg(s) via {graph_client.__class__.__name__} "
+                f"multi-app pool",
+            )
+            try:
+                bulk_results = await graph_client.get_messages_mime_concurrent(
+                    user_id, need_mime_msg_ids,
+                )
+                _ok = 0
+                _fail = 0
+                for _mid, _r in bulk_results.items():
+                    if isinstance(_r, (bytes, bytearray)):
+                        mime_pre_map[_mid] = bytes(_r)
+                        _ok += 1
+                    else:
+                        mime_pre_map[_mid] = None
+                        _fail += 1
+                print(
+                    f"[{self.worker_id}] [MIME-BULK] result: "
+                    f"{_ok} ok, {_fail} fail of {len(need_mime_msg_ids)}",
+                )
+            except Exception as e:
+                # Hard failure on the bulk path — every msg falls back to
+                # the per-msg serial path inside _one_message. Logs the
+                # root cause for triage; the fallback keeps backups
+                # functional even if the new code path has a bug.
+                print(
+                    f"[{self.worker_id}] [MIME-BULK ERR] "
+                    f"{type(e).__name__}: {e}; falling back to per-msg",
+                )
+
         async def _one_message(msg: Dict[str, Any]) -> Tuple[List[SnapshotItem], int]:
             msg_id = msg.get("id")
             if not msg_id:
@@ -6973,10 +8179,19 @@ class BackupWorker:
             local_bytes = 0
             folder_path = msg.get("_full_folder_path") or msg.get("parentFolderName") or None
 
-            for att in attachments:
+            # Per-attachment processing (perf #1 2026-05-17):
+            # Was a serial `for att in attachments` loop — multi-attachment
+            # emails serialized the Graph content fetch + Azure blob upload
+            # one-att-at-a-time. asyncio.gather processes them concurrently;
+            # the outer `sem` (shared with other in-flight messages) still
+            # caps per-mailbox Graph RPS so this is a wall-clock win without
+            # raising the throttle budget.
+            async def _process_att(
+                att: Dict[str, Any],
+            ) -> Tuple[Optional[SnapshotItem], int]:
                 att_id = att.get("id")
                 if not att_id:
-                    continue
+                    return None, 0
                 att_kind = att.get("@odata.type", "")
                 att_name = att.get("name") or att_id
                 content_type = att.get("contentType")
@@ -6998,7 +8213,7 @@ class BackupWorker:
                                 content_bytes = await graph_client.get_message_attachment_content(user_id, msg_id, att_id)
                         except Exception as e:
                             print(f"[{self.worker_id}] [ATT-FAIL] {att_name} (file) on {msg_id}: {type(e).__name__}: {e}")
-                            continue
+                            return None, 0
                 elif att_kind.endswith("itemAttachment"):
                     # Nested Outlook item — serialize to JSON so it's
                     # downloadable as a .json file and restorable later.
@@ -7021,6 +8236,7 @@ class BackupWorker:
                 content_hash: Optional[str] = None
                 size = declared_size
                 inline_b64: Optional[str] = None
+                bytes_added = 0
 
                 if content_bytes is not None:
                     content_hash = hashlib.sha256(content_bytes).hexdigest()
@@ -7033,7 +8249,7 @@ class BackupWorker:
                     # mailboxes.
                     inline_b64 = _maybe_inline_attachment(content_bytes)
                     if inline_b64 is not None:
-                        local_bytes += size
+                        bytes_added = size
                     else:
                         # Blob path: above threshold. Route through
                         # `_upload_once_per_hash` — identical content
@@ -7046,7 +8262,7 @@ class BackupWorker:
                             )
                             if resolved_path:
                                 blob_path = resolved_path
-                                local_bytes += size
+                                bytes_added = size
                             else:
                                 blob_path = None
                                 content_hash = None
@@ -7056,35 +8272,62 @@ class BackupWorker:
                             content_hash = None
 
                 resolved = (blob_path is not None) or (inline_b64 is not None)
-                local_items.append(SnapshotItem(
-                    id=uuid.uuid4(),
-                    snapshot_id=snapshot.id,
-                    tenant_id=tenant.id,
-                    external_id=f"{msg_id}::{att_id}",
-                    item_type="EMAIL_ATTACHMENT",
-                    name=(att_name or "")[:255],
-                    folder_path=folder_path,
-                    content_hash=content_hash,
-                    content_size=size,
-                    blob_path=blob_path,
-                    content_checksum=content_hash,
-                    extra_data={
-                        "parent_item_id": msg_id,
-                        "attachment_kind": att_kind,
-                        "content_type": content_type,
-                        "is_inline": att.get("isInline", False),
-                        # Preserve original Content-ID so inline images
-                        # restored via MIME resolve against the body's
-                        # cid:xxx references.
-                        "content_id": att.get("contentId") or att.get("contentID"),
-                        "source_url": att.get("sourceUrl"),
-                        "resolved": resolved,
-                        # When inline_b64 is set, restore/download paths
-                        # decode this instead of fetching from blob_path.
-                        # blob_path stays None for inline rows.
-                        "inline_b64": inline_b64,
-                    },
-                ))
+                return (
+                    SnapshotItem(
+                        id=uuid.uuid4(),
+                        snapshot_id=snapshot.id,
+                        tenant_id=tenant.id,
+                        external_id=f"{msg_id}::{att_id}",
+                        item_type="EMAIL_ATTACHMENT",
+                        name=(att_name or "")[:255],
+                        folder_path=folder_path,
+                        content_hash=content_hash,
+                        content_size=size,
+                        blob_path=blob_path,
+                        content_checksum=content_hash,
+                        extra_data={
+                            "parent_item_id": msg_id,
+                            "attachment_kind": att_kind,
+                            "content_type": content_type,
+                            "is_inline": att.get("isInline", False),
+                            # Preserve original Content-ID so inline images
+                            # restored via MIME resolve against the body's
+                            # cid:xxx references.
+                            "content_id": att.get("contentId") or att.get("contentID"),
+                            "source_url": att.get("sourceUrl"),
+                            "resolved": resolved,
+                            # When inline_b64 is set, restore/download paths
+                            # decode this instead of fetching from blob_path.
+                            # blob_path stays None for inline rows.
+                            "inline_b64": inline_b64,
+                        },
+                    ),
+                    bytes_added,
+                )
+
+            if attachments:
+                _att_t0 = time.monotonic()
+                _att_results = await asyncio.gather(
+                    *(_process_att(a) for a in attachments),
+                    return_exceptions=True,
+                )
+                for _r in _att_results:
+                    if isinstance(_r, Exception):
+                        print(
+                            f"[{self.worker_id}] [ATT-TASK] msg {msg_id} "
+                            f"task raised: {type(_r).__name__}: {_r}"
+                        )
+                        continue
+                    _item, _b = _r
+                    if _item is not None:
+                        local_items.append(_item)
+                        local_bytes += _b
+                if len(attachments) >= 4:
+                    print(
+                        f"[{self.worker_id}] [PERF] msg {msg_id[:16]} "
+                        f"{len(attachments)} atts processed in "
+                        f"{time.monotonic() - _att_t0:.2f}s"
+                    )
 
             # ── MIME-source fallback for unresolved cid: refs ──
             # Some emails (Teams activity notifications, OneDrive
@@ -7109,21 +8352,37 @@ class BackupWorker:
                 unresolved = body_cids - already_captured - {""}
                 if unresolved:
                     mime_bytes: Optional[bytes] = None
-                    async with sem:
-                        try:
-                            mime_bytes = await graph_client.get_message_mime_source(
-                                user_id, msg_id,
-                            )
-                        except Exception as e:
-                            # 403 / 404 / size-cap are all silent — the
-                            # original email still reads, we just leave
-                            # the cid: refs broken (same as before this
-                            # fallback existed).
-                            print(
-                                f"[{self.worker_id}] [MIME-FETCH] msg {msg_id}: "
-                                f"{type(e).__name__}: {e}"
-                            )
-                            mime_bytes = None
+                    # Fast path: bulk pre-fetch already grabbed this
+                    # message's MIME via the 12-app concurrent fetcher.
+                    # `mime_pre_map` contains an entry per msg the
+                    # pre-fetch attempted: bytes on success, None on
+                    # failure. A missing key means the pre-fetch step
+                    # decided this msg didn't need MIME (or itself
+                    # failed entirely and skipped population).
+                    if msg_id in mime_pre_map:
+                        mime_bytes = mime_pre_map[msg_id]
+                    else:
+                        # Fallback path: bulk pre-fetch was bypassed
+                        # for this message (e.g. body cids were all
+                        # captured but the attachment list later
+                        # turned out to be incomplete, leaving cids
+                        # unresolved here). Serial single-msg fetch
+                        # under the existing sem=8 cap.
+                        async with sem:
+                            try:
+                                mime_bytes = await graph_client.get_message_mime_source(
+                                    user_id, msg_id,
+                                )
+                            except Exception as e:
+                                # 403 / 404 / size-cap are all silent —
+                                # the original email still reads, we just
+                                # leave the cid: refs broken (same as
+                                # before this fallback existed).
+                                print(
+                                    f"[{self.worker_id}] [MIME-FETCH] msg {msg_id}: "
+                                    f"{type(e).__name__}: {e}"
+                                )
+                                mime_bytes = None
 
                     if mime_bytes:
                         try:
@@ -7135,15 +8394,22 @@ class BackupWorker:
                             )
                             mime_parts = []
 
-                        recovered = 0
-                        for p in mime_parts:
+                        # Per-MIME-part processing (perf #3 2026-05-17):
+                        # Was a serial `for p in mime_parts: await
+                        # _upload_once_per_hash(...)` loop — each inline
+                        # image in the RFC822 envelope waited on its
+                        # predecessor's Azure Blob commit (~200-500ms
+                        # each). asyncio.gather collapses N MIME parts
+                        # into one wall-clock barrier.
+                        async def _process_mime_part(
+                            p: Dict[str, Any],
+                        ) -> Tuple[Optional[SnapshotItem], int, bool]:
                             cid = p["content_id"]
                             if cid not in unresolved:
-                                # Body doesn't reference this part — skip.
-                                continue
+                                return None, 0, False
                             payload = p["payload"] or b""
                             if not payload:
-                                continue
+                                return None, 0, False
                             p_ct = p["content_type"]
                             p_fname = p["filename"] or (
                                 f"inline_{cid[:24]}." +
@@ -7168,40 +8434,74 @@ class BackupWorker:
                             p_resolved = (
                                 p_blob is not None or p_inline_b64 is not None
                             )
-                            if p_resolved:
-                                local_bytes += p_size
-                                recovered += 1
-                            local_items.append(SnapshotItem(
-                                id=uuid.uuid4(),
-                                snapshot_id=snapshot.id,
-                                tenant_id=tenant.id,
-                                # Distinguishes MIME-recovered rows from
-                                # Graph-attachment rows so re-runs are
-                                # idempotent on the same (msg, cid) pair.
-                                external_id=f"{msg_id}::mime::{cid}",
-                                item_type="EMAIL_ATTACHMENT",
-                                name=p_fname[:255],
-                                folder_path=folder_path,
-                                content_hash=p_hash,
-                                content_size=p_size,
-                                blob_path=p_blob,
-                                content_checksum=p_hash,
-                                extra_data={
-                                    "parent_item_id": msg_id,
-                                    # "mime_inline" makes the source
-                                    # path obvious in logs / future
-                                    # diagnostics, distinct from
-                                    # Graph's #microsoft.graph.fileAttachment
-                                    # / itemAttachment / referenceAttachment.
-                                    "attachment_kind": "mime_inline",
-                                    "content_type": p_ct,
-                                    "is_inline": True,
-                                    "content_id": cid,
-                                    "source_url": None,
-                                    "resolved": p_resolved,
-                                    "inline_b64": p_inline_b64,
-                                },
-                            ))
+                            return (
+                                SnapshotItem(
+                                    id=uuid.uuid4(),
+                                    snapshot_id=snapshot.id,
+                                    tenant_id=tenant.id,
+                                    # Distinguishes MIME-recovered rows
+                                    # from Graph-attachment rows so re-
+                                    # runs are idempotent on the same
+                                    # (msg, cid) pair.
+                                    external_id=f"{msg_id}::mime::{cid}",
+                                    item_type="EMAIL_ATTACHMENT",
+                                    name=p_fname[:255],
+                                    folder_path=folder_path,
+                                    content_hash=p_hash,
+                                    content_size=p_size,
+                                    blob_path=p_blob,
+                                    content_checksum=p_hash,
+                                    extra_data={
+                                        "parent_item_id": msg_id,
+                                        # "mime_inline" makes the source
+                                        # path obvious in logs / future
+                                        # diagnostics, distinct from
+                                        # Graph's
+                                        # #microsoft.graph.fileAttachment
+                                        # / itemAttachment /
+                                        # referenceAttachment.
+                                        "attachment_kind": "mime_inline",
+                                        "content_type": p_ct,
+                                        "is_inline": True,
+                                        "content_id": cid,
+                                        "source_url": None,
+                                        "resolved": p_resolved,
+                                        "inline_b64": p_inline_b64,
+                                    },
+                                ),
+                                p_size,
+                                p_resolved,
+                            )
+
+                        recovered = 0
+                        if mime_parts:
+                            _mp_t0 = time.monotonic()
+                            _mime_results = await asyncio.gather(
+                                *(_process_mime_part(p) for p in mime_parts),
+                                return_exceptions=True,
+                            )
+                            for _mr in _mime_results:
+                                if isinstance(_mr, Exception):
+                                    print(
+                                        f"[{self.worker_id}] [MIME-TASK] "
+                                        f"msg {msg_id} task raised: "
+                                        f"{type(_mr).__name__}: {_mr}"
+                                    )
+                                    continue
+                                _mitem, _msize, _mres = _mr
+                                if _mitem is None:
+                                    continue
+                                local_items.append(_mitem)
+                                if _mres:
+                                    local_bytes += _msize
+                                    recovered += 1
+                            if len(mime_parts) >= 3:
+                                print(
+                                    f"[{self.worker_id}] [PERF] msg "
+                                    f"{msg_id[:16]} {len(mime_parts)} "
+                                    f"MIME parts processed in "
+                                    f"{time.monotonic() - _mp_t0:.2f}s"
+                                )
                         if recovered:
                             print(
                                 f"[{self.worker_id}] [MIME-INLINE] "
@@ -7325,6 +8625,24 @@ class BackupWorker:
             att_dedup = _ChatAttDedup()
         url_cache = att_dedup.url_cache
         url_tasks = att_dedup.url_tasks
+        # Bulk-pre-resolved driveItems keyed by source URL. Populated
+        # below — just before the per-message gather — by a single
+        # /v1.0/$batch fan-out resolving up to 20 share-URLs per HTTP
+        # call (vs the prior path of one Graph round-trip per URL,
+        # rate-limit-queued behind every other Graph call the worker
+        # is running). `_go` checks this map BEFORE the resolve_sem
+        # path so when the pre-resolver has the driveItem we skip the
+        # per-URL Graph call entirely.
+        #
+        # Sentinel semantics:
+        #   missing key    — not pre-resolved (e.g. arrived after the
+        #                    batch fired); fall through to single-URL
+        #                    resolve_share_to_drive_item
+        #   value == None  — pre-resolved and confirmed unreachable
+        #                    (permanent 4xx); treat as known-broken
+        #                    without re-hitting Graph
+        #   value == dict  — driveItem ready to download
+        pre_resolved_di: Dict[str, Optional[Dict[str, Any]]] = {}
 
         # driveItem.id-keyed download dedup. A forwarded SharePoint /
         # OneDrive file generates a NEW sharing URL each time it's
@@ -7578,17 +8896,43 @@ class BackupWorker:
                             tenant_cache_stats["hits"] += 1
                         return cached
 
-                    # Layer 3: live Graph resolve.
-                    try:
-                        async with resolve_sem:
-                            drive_item = await graph_client.resolve_share_to_drive_item(u)
-                    except Exception as e:
-                        print(
-                            f"[{self.worker_id}] [CHAT-ATT] "
-                            f"resolve fail {ctx}: "
-                            f"{type(e).__name__}: {e}"
-                        )
-                        return _CachedAttachmentResult()
+                    # Layer 2.5: bulk-pre-resolved driveItem map from
+                    # the /$batch fan-out fired at the top of this
+                    # phase. When present, this path skips both the
+                    # resolve_sem and the Graph round-trip — the
+                    # batch already paid that cost amortized 20:1.
+                    # Sentinel handling matches the existing tenant
+                    # cache: None == known-broken, dict == ready.
+                    if u in pre_resolved_di:
+                        _pre = pre_resolved_di[u]
+                        if _pre is None:
+                            # Same contract as Layer 3's permanent-4xx
+                            # path below: stamp the tenant cache so
+                            # future runs skip without a fresh batch.
+                            await _write_tenant_url_cache(
+                                u_sha, drive_item_id=None,
+                                content_hash=None, blob_path=None,
+                                content_size=0, inline_b64=None,
+                                unreachable=True,
+                            )
+                            return _CachedAttachmentResult(unreachable=True)
+                        drive_item = _pre
+                    else:
+                        # Layer 3: live Graph resolve (fallback path
+                        # for URLs that arrived after the bulk batch
+                        # — partition shards, late-fan-out messages,
+                        # or the rare batch transient that didn't
+                        # surface this URL).
+                        try:
+                            async with resolve_sem:
+                                drive_item = await graph_client.resolve_share_to_drive_item(u)
+                        except Exception as e:
+                            print(
+                                f"[{self.worker_id}] [CHAT-ATT] "
+                                f"resolve fail {ctx}: "
+                                f"{type(e).__name__}: {e}"
+                            )
+                            return _CachedAttachmentResult()
                     if drive_item is None:
                         # Permanent: resolve_share_to_drive_item only
                         # returns None for "known-broken" (403/404/410).
@@ -7867,6 +9211,156 @@ class BackupWorker:
                         f"{type(r).__name__}: {r}"
                     )
             return local_items, local_bytes
+
+        # ── Pre-warm url_cache from persisted tenant cache ───────
+        # Single bulk SELECT against chat_url_cache before the $batch
+        # resolve. Hits are stored into url_cache so the very first
+        # check in _fetch_url_deduped short-circuits with no Graph
+        # round-trip and no CDN download. Phases where every
+        # attachment is a cross-snapshot duplicate (~68% of phases
+        # in 2026-05-17 telemetry) now skip the $batch resolve
+        # entirely — the bulk SQL is one round-trip vs ceil(N/20)
+        # /$batch HTTPs.
+        _cand_urls: List[str] = []
+        _cand_seen: set = set()
+        _url_by_sha: Dict[str, str] = {}
+        for _m in messages_with_attachments:
+            for _a in (_m.get("attachments") or []):
+                if not isinstance(_a, dict):
+                    continue
+                _ct = (_a.get("contentType") or "").strip()
+                if _ct not in REFERENCE_TYPES and not (
+                    _ct and _ct not in POINTER_TYPES
+                    and not _ct.startswith("application/vnd.microsoft.card")
+                ):
+                    continue
+                _u = _a.get("contentUrl")
+                if not _u or _u in _cand_seen or _u in url_cache:
+                    continue
+                _cand_seen.add(_u)
+                _cand_urls.append(_u)
+                _url_by_sha[hashlib.sha256(_u.encode("utf-8")).hexdigest()] = _u
+        if _cand_urls:
+            _t0 = time.monotonic()
+            try:
+                async with async_session_factory() as s:
+                    _rows = (await s.execute(
+                        text(
+                            "UPDATE chat_url_cache "
+                            "   SET last_used_at = NOW() "
+                            " WHERE tenant_id = :t "
+                            "   AND url_sha256 = ANY(:shas) "
+                            "   AND last_used_at > NOW() - (:d || ' days')::interval "
+                            "RETURNING url_sha256, drive_item_id, content_hash, "
+                            "          blob_path, content_size, inline_b64, unreachable"
+                        ),
+                        {
+                            "t": tenant_id_str,
+                            "shas": list(_url_by_sha.keys()),
+                            "d": str(url_cache_ttl_days),
+                        },
+                    )).all()
+                    await s.commit()
+                _bulk_hits = 0
+                _bulk_unreachable = 0
+                for _row in _rows:
+                    _hit_url = _url_by_sha.get(_row.url_sha256)
+                    if not _hit_url:
+                        continue
+                    if _row.unreachable:
+                        url_cache[_hit_url] = _CachedAttachmentResult(
+                            unreachable=True,
+                        )
+                        _bulk_unreachable += 1
+                    elif _row.content_hash and (
+                        _row.blob_path or _row.inline_b64
+                    ):
+                        url_cache[_hit_url] = _CachedAttachmentResult(
+                            content_hash=_row.content_hash,
+                            blob_path=_row.blob_path,
+                            inline_b64=_row.inline_b64,
+                            content_size=_row.content_size or 0,
+                        )
+                        _bulk_hits += 1
+                tenant_cache_stats["hits"] += _bulk_hits
+                tenant_cache_stats["unreachable_skip"] += _bulk_unreachable
+                print(
+                    f"[{self.worker_id}] [CHAT-ATT] tenant-cache "
+                    f"bulk pre-warm: {_bulk_hits} hits, "
+                    f"{_bulk_unreachable} unreachable, "
+                    f"{len(_cand_urls) - _bulk_hits - _bulk_unreachable} "
+                    f"misses (will resolve) in "
+                    f"{time.monotonic() - _t0:.2f}s"
+                )
+            except Exception as _e:
+                # Best-effort — fall through to the $batch resolve.
+                print(
+                    f"[{self.worker_id}] [CHAT-ATT] tenant-cache bulk "
+                    f"pre-warm failed: {type(_e).__name__}: {_e}"
+                )
+
+        # ── Bulk pre-resolve attachment share-URLs via /$batch ────
+        # Mirrors the OneDrive ``url pre-fetch`` pattern: instead of
+        # paying one Graph round-trip per attachment in the per-msg
+        # gather below, fire a single /v1.0/$batch wave (chunked
+        # 20-per-call by graph_batch) that resolves up to N share-URLs
+        # → driveItems in parallel.
+        #
+        # Why this beats raising resolve_sem: the bottleneck wasn't
+        # local concurrency (sem was already 16 deep), it was the
+        # per-app Graph rate-limit budget — every resolve queued
+        # against the multi-app pool. $batch amortizes 20 resolves
+        # into one HTTP call against that budget, so a 37-URL
+        # resolve drops from ~35s wall to ~3-5s.
+        #
+        # Skipped URLs:
+        #   * already in url_cache (snapshot-wide hit OR
+        #     tenant-cache pre-warm hit above)
+        #   * already in driveitem_tasks (in-flight from another chat)
+        #   * blank / non-reference attachments
+        # Any URL absent from the bulk-resolved map after the batch
+        # falls through to the Layer-3 single-URL path inside ``_go``.
+        try:
+            _bulk_urls: List[str] = []
+            _seen: set = set()
+            for _m in messages_with_attachments:
+                for _a in (_m.get("attachments") or []):
+                    if not isinstance(_a, dict):
+                        continue
+                    _ct = (_a.get("contentType") or "").strip()
+                    if _ct not in REFERENCE_TYPES and not (
+                        _ct and _ct not in POINTER_TYPES
+                        and not _ct.startswith("application/vnd.microsoft.card")
+                    ):
+                        continue
+                    _u = _a.get("contentUrl")
+                    if not _u or _u in _seen or _u in url_cache:
+                        continue
+                    _seen.add(_u)
+                    _bulk_urls.append(_u)
+            if _bulk_urls:
+                _t0 = time.monotonic()
+                pre_resolved_di = await graph_client.resolve_shares_batch(
+                    _bulk_urls,
+                )
+                _hits = sum(1 for v in pre_resolved_di.values() if isinstance(v, dict))
+                _misses = sum(1 for v in pre_resolved_di.values() if v is None)
+                _absent = len(_bulk_urls) - len(pre_resolved_di)
+                print(
+                    f"[{self.worker_id}] [CHAT-ATT] bulk pre-resolved "
+                    f"{_hits}/{len(_bulk_urls)} share-URLs via $batch "
+                    f"({_misses} unreachable, {_absent} deferred to "
+                    f"single-URL) in {time.monotonic() - _t0:.1f}s"
+                )
+        except Exception as _bulk_exc:
+            # Fall back to the single-URL path for everything — same
+            # behaviour as before this fix.
+            print(
+                f"[{self.worker_id}] [CHAT-ATT] bulk pre-resolve "
+                f"failed (falling back to single-URL): "
+                f"{type(_bulk_exc).__name__}: {_bulk_exc}"
+            )
+            pre_resolved_di = {}
 
         results = await asyncio.gather(
             *[_one_message(m) for m in messages_with_attachments],
@@ -9518,6 +11012,16 @@ class BackupWorker:
                     **(snap.extra_data or {}),
                     "partition_reconciled": True,
                 }
+                # Cancel-aware coercion — last say. Whatever the partition
+                # integrity correction decided, if the parent job was
+                # CANCELLED in flight, this snapshot must NOT pose as a
+                # clean prior for the next incremental's delta math.
+                if snap.status in (
+                    SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL,
+                ):
+                    snap.status = await _coerce_snapshot_terminal_on_cancel(
+                        snap, snap.status,
+                    )
                 if snap.completed_at is None:
                     snap.completed_at = datetime.utcnow()
                 if snap.started_at and snap.completed_at:
@@ -9625,6 +11129,46 @@ class BackupWorker:
             f"{persisted_count} items, "
             f"{persisted_bytes / (1024 * 1024):.1f} MB)"
         )
+
+        # Emit partitioned-snapshot metrics. Same shape as complete_snapshot
+        # so dashboards aggregate cleanly across partitioned and
+        # non-partitioned paths. Best-effort — never blocks finalize.
+        try:
+            from shared import core_metrics as _cm
+            from shared.storage.router import router as _router
+            _snap_type = "UNKNOWN"
+            _tenant_id = ""
+            try:
+                async with async_session_factory() as _s:
+                    _snap_row = await _s.get(Snapshot, snapshot_id)
+                    if _snap_row is not None:
+                        _snap_type = (
+                            _snap_row.type.value
+                            if hasattr(_snap_row.type, "value") else str(_snap_row.type)
+                        )
+                        _res = await _s.get(Resource, _snap_row.resource_id)
+                        _tenant_id = str(_res.tenant_id) if _res else ""
+            except Exception:
+                pass
+            _backend_name = "unknown"
+            try:
+                _store = _router.get_active_store()
+                _backend_name = (
+                    getattr(_store, "name", None)
+                    or getattr(_store, "kind", None) or "unknown"
+                )
+            except Exception:
+                pass
+            _cm.inc_snapshot(_snap_type, str(new_status))
+            if persisted_bytes > 0:
+                _cm.add_backup_bytes(_snap_type, _backend_name, int(persisted_bytes))
+                if _tenant_id:
+                    _cm.add_cost_storage(_tenant_id, _backend_name, _snap_type, int(persisted_bytes))
+                    if "seaweed" in _backend_name.lower():
+                        _cm.add_cost_seaweed_write(_tenant_id, _backend_name, int(persisted_bytes))
+                    _cm.add_cost_egress(_tenant_id, "from_graph", int(persisted_bytes))
+        except Exception:
+            pass
 
         # ---- backup_batches finalizer hook ----
         # When BATCH_ROW_REDESIGN_ENABLED, walk the Job's spec.batch_id
@@ -11257,11 +12801,21 @@ class BackupWorker:
             # behind every chat message). Firing batches concurrently
             # under a bounded semaphore lets pre-fetch claim its fair
             # share of the Graph budget and finish in ~30-60s even with
-            # chats running. Cap is env-tunable; default sized for the
-            # per-app 10 RPS ceiling (6 concurrent batches × ~1s wire
-            # = headroom for other resources).
+            # chats running.
+            #
+            # Default raised from 6 to 16: the original 6 assumed a
+            # single Graph app's 10 RPS ceiling. With the multi-app
+            # pool (12 apps observed rotating in prod) the per-tenant
+            # effective ceiling is ~40+ RPS, so 16 concurrent batches
+            # × ~1s wire still leaves headroom for the chats handler
+            # to fan out in parallel. Field measurement showed fast
+            # tenants saturating at 22 URL/s with concurrency=14;
+            # bumping to 16 captures that headroom for the median
+            # tenant. Throttled tenants are bounded by Graph budget
+            # not local concurrency — they'll see no harm. Operators
+            # can still tune via ONEDRIVE_PREFETCH_CONCURRENCY.
             prefetch_concurrency = int(os.getenv(
-                "ONEDRIVE_PREFETCH_CONCURRENCY", "6"
+                "ONEDRIVE_PREFETCH_CONCURRENCY", "16"
             ))
             sem = asyncio.Semaphore(prefetch_concurrency)
             _prefetch_t0 = time.monotonic()
@@ -11639,14 +13193,30 @@ class BackupWorker:
                             upload_result = await _stream_pipe()
                         sha256 = upload_result.get("content_sha256") or ""
                 except asyncio.TimeoutError:
-                    print(f"[{self.worker_id}] [USER_ONEDRIVE] timeout for {file_name} (>{per_file_timeout}s); skipping")
+                    print(f"[{self.worker_id}] [USER_ONEDRIVE] timeout for {file_name} (>{per_file_timeout}s); enqueueing retry")
+                    await self._enqueue_onedrive_retry(
+                        tenant=tenant, resource=resource, snapshot=snapshot,
+                        file_payload=f, drive_id=drive_id,
+                        err_text=f"TimeoutError: >{per_file_timeout}s",
+                    )
                     return
                 except Exception as e:
-                    print(f"[{self.worker_id}] [USER_ONEDRIVE] stream-backup failed for {file_name}: {type(e).__name__}: {e}")
+                    err_text = f"{type(e).__name__}: {e}"
+                    print(f"[{self.worker_id}] [USER_ONEDRIVE] stream-backup failed for {file_name}: {err_text}")
+                    await self._enqueue_onedrive_retry(
+                        tenant=tenant, resource=resource, snapshot=snapshot,
+                        file_payload=f, drive_id=drive_id, err_text=err_text,
+                    )
                     return
 
                 if not upload_result.get("success"):
-                    print(f"[{self.worker_id}] [USER_ONEDRIVE] blob upload failed for {file_name}: {upload_result.get('error')}")
+                    err_msg = str(upload_result.get('error') or "")
+                    print(f"[{self.worker_id}] [USER_ONEDRIVE] blob upload failed for {file_name}: {err_msg}")
+                    await self._enqueue_onedrive_retry(
+                        tenant=tenant, resource=resource, snapshot=snapshot,
+                        file_payload=f, drive_id=drive_id,
+                        err_text=err_msg or "blob_upload_failed",
+                    )
                     return
 
                 extra_patch = {
@@ -11708,6 +13278,636 @@ class BackupWorker:
             f"concurrency={file_concurrency}, huge_parallel={max_huge_files_inflight})"
         )
         return state["uploaded_count"], state["bytes_uploaded"]
+
+    # ==================== Tier 2 OneDrive per-file retry queue ====================
+    #
+    # A file that exhausts its inline resume budget no longer blocks
+    # snapshot completion. _process_one in _useronedrive_backup_files
+    # captures the failure, calls _enqueue_onedrive_retry to insert a
+    # row into onedrive_file_retries, and returns. The snapshot
+    # completes with its other files; this row sits in the queue.
+    #
+    # _onedrive_retry_consumer_loop (background asyncio task spawned
+    # from start()) polls the table on a fixed interval, claims rows
+    # whose next_retry_at has elapsed via SELECT FOR UPDATE SKIP
+    # LOCKED, and re-attempts each file. On success the file is
+    # upserted into snapshot_items pointing at the ORIGINAL snapshot;
+    # on retryable failure attempt_count++ and next_retry_at slides
+    # forward (exponential); after MAX_ATTEMPTS the row is marked
+    # FAILED_PERMANENT for operator review.
+
+    async def _enqueue_onedrive_retry(
+        self,
+        *,
+        tenant: Tenant,
+        resource: Resource,
+        snapshot: Snapshot,
+        file_payload: Dict[str, Any],
+        drive_id: Optional[str],
+        err_text: str,
+    ) -> None:
+        """Producer side: stamp a row into onedrive_file_retries so the
+        background consumer can pick the file back up. Idempotent on
+        (snapshot_id, file_external_id): a second failure on the same
+        file refreshes last_error + bumps next_retry_at but does NOT
+        zero attempt_count (so a flapping file doesn't retry forever).
+
+        Permanent error classes (404/410/401/403) are recorded with
+        status=FAILED_PERMANENT immediately — the consumer's
+        SELECT-eligible filter (status=PENDING) skips them, so no
+        Graph budget is burned on never-rescue-able files.
+        """
+        if os.getenv("ONEDRIVE_RETRY_QUEUE_ENABLED", "true").lower() != "true":
+            return
+        file_id = file_payload.get("id")
+        if not file_id:
+            return
+        try:
+            err_class = _classify_onedrive_file_error(err_text)
+            status_val = (
+                "FAILED_PERMANENT" if err_class == "permanent" else "PENDING"
+            )
+            # Base retry delay by error class. Throttles need longer
+            # to clear than transient stream drops.
+            base_delay_s = {
+                "throttle": 120.0,
+                "stream_drop": 30.0,
+                "unknown": 60.0,
+                "permanent": 0.0,
+            }.get(err_class, 60.0)
+            from sqlalchemy.dialects.postgresql import insert as pg_insert
+            from shared.models import OneDriveFileRetry
+            payload = {
+                "tenant_id": tenant.id,
+                "resource_id": resource.id,
+                "snapshot_id": snapshot.id,
+                "file_external_id": file_id,
+                "file_name": file_payload.get("name") or "?",
+                "drive_id": drive_id,
+                "file_payload": file_payload,
+                "attempt_count": 0,
+                "last_error": (err_text or "")[:1000],
+                "last_error_class": err_class,
+                "next_retry_at": datetime.now(timezone.utc) + timedelta(
+                    seconds=base_delay_s,
+                ),
+                "status": status_val,
+            }
+            async with async_session_factory() as s:
+                stmt = pg_insert(OneDriveFileRetry).values(**payload)
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["snapshot_id", "file_external_id"],
+                    set_={
+                        # Don't reset attempt_count — a flapping file
+                        # should still hit MAX_ATTEMPTS eventually.
+                        "last_error": stmt.excluded.last_error,
+                        "last_error_class": stmt.excluded.last_error_class,
+                        "next_retry_at": stmt.excluded.next_retry_at,
+                        "status": stmt.excluded.status,
+                        "updated_at": func.now(),
+                    },
+                )
+                await s.execute(stmt)
+                await s.commit()
+        except Exception as e:
+            print(
+                f"[{self.worker_id}] [USER_ONEDRIVE] retry-enqueue "
+                f"failed for {file_id}: {type(e).__name__}: {e}"
+            )
+
+    async def _onedrive_retry_consumer_loop(self) -> None:
+        """Background poller: drains onedrive_file_retries.
+
+        Runs forever (until the asyncio loop is cancelled). Each tick:
+          1. Claim up to BATCH rows via SELECT … FOR UPDATE SKIP LOCKED
+             where status=PENDING AND next_retry_at <= NOW().
+          2. Mark them IN_PROGRESS so peers don't double-process.
+          3. For each row, rebuild graph_client + call backup_single_file
+             with the saved file_payload.
+          4. Success → mark RESCUED, upsert SnapshotItem under the
+             original snapshot_id. Failure → bump attempt_count, slide
+             next_retry_at, or mark FAILED_PERMANENT after MAX_ATTEMPTS.
+
+        The loop is best-effort: any DB / Graph error is caught and
+        logged, then the next tick continues. We never let this loop
+        crash the worker process.
+        """
+        if os.getenv("ONEDRIVE_RETRY_QUEUE_ENABLED", "true").lower() != "true":
+            return
+        poll_interval_s = int(
+            os.getenv("ONEDRIVE_RETRY_POLL_INTERVAL_S", "60"),
+        )
+        batch_size = int(os.getenv("ONEDRIVE_RETRY_BATCH_SIZE", "20"))
+        max_attempts = int(os.getenv("ONEDRIVE_RETRY_MAX_ATTEMPTS", "8"))
+        # Allow the worker to settle before the first tick — avoids a
+        # thundering-herd on startup after a redeploy.
+        await asyncio.sleep(min(60, poll_interval_s))
+        print(
+            f"[{self.worker_id}] [ONEDRIVE_RETRY] consumer started "
+            f"(poll={poll_interval_s}s, batch={batch_size}, "
+            f"max_attempts={max_attempts})"
+        )
+        while True:
+            try:
+                await self._drain_onedrive_retry_batch(
+                    batch_size=batch_size, max_attempts=max_attempts,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(
+                    f"[{self.worker_id}] [ONEDRIVE_RETRY] tick failed: "
+                    f"{type(e).__name__}: {e}"
+                )
+            await asyncio.sleep(poll_interval_s)
+
+    async def _drain_onedrive_retry_batch(
+        self, *, batch_size: int, max_attempts: int,
+    ) -> None:
+        """One tick of the retry consumer. Reclaims stale IN_PROGRESS
+        rows (worker died mid-retry), then claims up to ``batch_size``
+        ready PENDING rows and processes them with bounded parallelism.
+        """
+        from sqlalchemy import text as _sqltext
+        from shared.models import OneDriveFileRetry
+        # Reaper: any IN_PROGRESS row whose updated_at hasn't moved
+        # in stall_minutes is presumed orphaned (worker crashed
+        # between claim and terminal-update). Flip it back to
+        # PENDING with attempt_count++ so a flapping payload still
+        # hits max_attempts and doesn't loop forever. Logs the count
+        # so operators see when reclaiming is happening; a healthy
+        # cluster should reclaim 0 per tick.
+        #
+        # 5-minute default is safe because _retry_one_onedrive_file
+        # heartbeats updated_at every 60s while a rescue is in
+        # flight — so updated_at silence > 5 min implies the
+        # worker is dead, not slow. Without heartbeating we'd need
+        # 6h+ to cover the per-file timeout (a legitimate huge-file
+        # rescue can take that long). Tunable via
+        # ONEDRIVE_RETRY_STALL_MINUTES if operators want a tighter
+        # window on a known-healthy fleet.
+        stall_minutes = int(
+            os.getenv("ONEDRIVE_RETRY_STALL_MINUTES", "5"),
+        )
+        try:
+            async with async_session_factory() as s:
+                reaped = (await s.execute(
+                    _sqltext(
+                        "UPDATE onedrive_file_retries "
+                        "   SET status = 'PENDING', "
+                        "       attempt_count = attempt_count + 1, "
+                        "       last_error = COALESCE(last_error, '') "
+                        "                  || ' / reclaimed from stale IN_PROGRESS', "
+                        "       updated_at = NOW(), "
+                        "       next_retry_at = NOW() "
+                        " WHERE status = 'IN_PROGRESS' "
+                        "   AND updated_at < NOW() - (:m || ' minutes')::interval "
+                        "RETURNING id"
+                    ),
+                    {"m": str(stall_minutes)},
+                )).all()
+                await s.commit()
+            if reaped:
+                print(
+                    f"[{self.worker_id}] [ONEDRIVE_RETRY] reaper "
+                    f"reclaimed {len(reaped)} stale IN_PROGRESS row(s)"
+                )
+        except Exception as e:
+            print(
+                f"[{self.worker_id}] [ONEDRIVE_RETRY] reaper failed: "
+                f"{type(e).__name__}: {e}"
+            )
+        claimed_ids: List[uuid.UUID] = []
+        async with async_session_factory() as s:
+            rows = (await s.execute(
+                _sqltext(
+                    "UPDATE onedrive_file_retries "
+                    "   SET status = 'IN_PROGRESS', updated_at = NOW() "
+                    " WHERE id IN ( "
+                    "   SELECT id FROM onedrive_file_retries "
+                    "    WHERE status = 'PENDING' "
+                    "      AND next_retry_at <= NOW() "
+                    "    ORDER BY next_retry_at ASC "
+                    "    LIMIT :lim "
+                    "    FOR UPDATE SKIP LOCKED "
+                    " ) "
+                    "RETURNING id"
+                ),
+                {"lim": batch_size},
+            )).all()
+            claimed_ids = [r.id for r in rows]
+            await s.commit()
+        if not claimed_ids:
+            return
+        # Bounded parallelism. Each retry picks its own fresh app via
+        # multi_app_manager.get_next_app(), so concurrent retries spread
+        # across the 20-app pool's rate-limit buckets — they don't
+        # contend for a single app's budget. Default 8 matches the
+        # main path's ONEDRIVE_BACKUP_FILE_CONCURRENCY so the consumer
+        # can keep up with the producer at steady state.
+        retry_concurrency = int(
+            os.getenv("ONEDRIVE_RETRY_CONCURRENCY", "8"),
+        )
+        sem = asyncio.Semaphore(max(1, retry_concurrency))
+        print(
+            f"[{self.worker_id}] [ONEDRIVE_RETRY] claimed "
+            f"{len(claimed_ids)} file(s) for retry "
+            f"(concurrency={retry_concurrency})"
+        )
+
+        async def _bounded(rid: uuid.UUID) -> None:
+            async with sem:
+                try:
+                    await self._retry_one_onedrive_file(
+                        retry_id=rid, max_attempts=max_attempts,
+                    )
+                except Exception as e:
+                    # Re-mark PENDING so the next tick picks it up
+                    # rather than stranding the row as IN_PROGRESS.
+                    # attempt_count++ guards against an infinite loop
+                    # on a poisoned payload.
+                    print(
+                        f"[{self.worker_id}] [ONEDRIVE_RETRY] {rid} "
+                        f"handler raised: {type(e).__name__}: {e}"
+                    )
+                    try:
+                        async with async_session_factory() as s:
+                            await s.execute(
+                                _sqltext(
+                                    "UPDATE onedrive_file_retries "
+                                    "   SET status = 'PENDING', "
+                                    "       attempt_count = attempt_count + 1, "
+                                    "       last_error = :err, "
+                                    "       next_retry_at = NOW() + INTERVAL '5 minutes', "
+                                    "       updated_at = NOW() "
+                                    " WHERE id = :id"
+                                ),
+                                {
+                                    "id": rid,
+                                    "err": (
+                                        f"{type(e).__name__}: {e}"
+                                    )[:1000],
+                                },
+                            )
+                            await s.commit()
+                    except Exception:
+                        pass
+
+        await asyncio.gather(
+            *(_bounded(r) for r in claimed_ids),
+            return_exceptions=True,
+        )
+
+    async def _retry_one_onedrive_file(
+        self, *, retry_id: uuid.UUID, max_attempts: int,
+    ) -> None:
+        """Process one IN_PROGRESS retry row. Reconstructs the context
+        (tenant + resource + snapshot + graph_client), calls
+        backup_single_file with the saved payload, and updates the
+        row's terminal status. The snapshot row's rollup gets re-
+        derived from snapshot_items by the standard reconcile path —
+        no need to bump per-file counters here.
+        """
+        from sqlalchemy import text as _sqltext
+        from shared.models import (
+            OneDriveFileRetry, Snapshot as _Snap,
+            Resource as _Res, Tenant as _Ten, SnapshotStatus,
+        )
+        async with async_session_factory() as s:
+            row = await s.get(OneDriveFileRetry, retry_id)
+            if row is None:
+                return
+            # Cancel-aware: if the parent snapshot was deleted /
+            # cancelled / failed while this row was in queue, mark
+            # FAILED_PERMANENT so the loop stops re-trying it. There
+            # is no SnapshotStatus.CANCELED — cancel is signalled by
+            # the job, but we conservatively bail on FAILED +
+            # PENDING_DELETION here so a deleting snapshot doesn't
+            # get its child snapshot_items resurrected.
+            snap = await s.get(_Snap, row.snapshot_id)
+            if snap is None or snap.status in (
+                SnapshotStatus.FAILED, SnapshotStatus.PENDING_DELETION,
+            ):
+                await s.execute(
+                    _sqltext(
+                        "UPDATE onedrive_file_retries "
+                        "   SET status = 'FAILED_PERMANENT', "
+                        "       last_error = COALESCE(last_error, '') "
+                        "                  || ' / parent snapshot gone or cancelled', "
+                        "       updated_at = NOW() "
+                        " WHERE id = :id"
+                    ),
+                    {"id": retry_id},
+                )
+                await s.commit()
+                return
+            resource = await s.get(_Res, row.resource_id)
+            tenant = await s.get(_Ten, row.tenant_id)
+            file_payload = dict(row.file_payload or {})
+            attempt = int(row.attempt_count or 0) + 1
+            snapshot_for_call = snap
+        if not resource or not tenant or not file_payload:
+            async with async_session_factory() as s:
+                await s.execute(
+                    _sqltext(
+                        "UPDATE onedrive_file_retries "
+                        "   SET status = 'FAILED_PERMANENT', "
+                        "       last_error = 'missing resource/tenant/payload', "
+                        "       updated_at = NOW() "
+                        " WHERE id = :id"
+                    ),
+                    {"id": retry_id},
+                )
+                await s.commit()
+            return
+        # Build a Graph client scoped to this tenant. Re-using
+        # self._graph_for is not safe across the long lifetime of
+        # the consumer loop — connections age out. Pay the per-tick
+        # ~1 ms cost of a fresh client; the win is durability.
+        graph_client = await self._build_graph_client_for(tenant)
+        # IMPORTANT: We do NOT call backup_single_file here.
+        # backup_single_file is the legacy SharePoint server-side-copy
+        # path; its _create_file_snapshot_item writes
+        # item_type="FILE", but the OneDrive partition path's
+        # pre-INSERTed rows use item_type="ONEDRIVE_FILE". Calling
+        # it would leave the original ONEDRIVE_FILE row with
+        # blob_path=NULL and create a parallel FILE row — a
+        # data-consistency hazard. _rescue_onedrive_file_into_snapshot
+        # streams the file and UPDATEs the existing ONEDRIVE_FILE row
+        # in-place, matching the main path's
+        # _useronedrive_backup_files._process_one semantics.
+        #
+        # Heartbeat: while the rescue is in flight (could be minutes
+        # for a multi-GB file), bump updated_at every HEARTBEAT_S
+        # seconds so the reaper's stall threshold detects DEAD
+        # workers, not slow streams. Drops the safe reaper window
+        # from 30 min to 5 min — crashed workers' rows get reclaimed
+        # 6× faster without false-reclaiming legitimate huge-file
+        # rescues.
+        heartbeat_s = int(
+            os.getenv("ONEDRIVE_RETRY_HEARTBEAT_S", "60"),
+        )
+        stop_hb_evt = asyncio.Event()
+
+        async def _heartbeat() -> None:
+            while not stop_hb_evt.is_set():
+                try:
+                    await asyncio.wait_for(
+                        stop_hb_evt.wait(), timeout=heartbeat_s,
+                    )
+                    # Event fired — exit cleanly.
+                    return
+                except asyncio.TimeoutError:
+                    pass
+                try:
+                    async with async_session_factory() as _hbs:
+                        await _hbs.execute(
+                            _sqltext(
+                                "UPDATE onedrive_file_retries "
+                                "   SET updated_at = NOW() "
+                                " WHERE id = :id "
+                                "   AND status = 'IN_PROGRESS'"
+                            ),
+                            {"id": retry_id},
+                        )
+                        await _hbs.commit()
+                except Exception:
+                    # Heartbeat is best-effort; a DB blip here
+                    # just delays one ping, doesn't break the
+                    # rescue.
+                    pass
+
+        hb_task = asyncio.create_task(_heartbeat())
+        try:
+            ok, err_text = await self._rescue_onedrive_file_into_snapshot(
+                tenant=tenant, resource=resource,
+                snapshot=snapshot_for_call,
+                file_payload=file_payload, graph_client=graph_client,
+            )
+            success = ok
+            if success:
+                err_text = ""
+        except Exception as e:
+            success = False
+            err_text = f"{type(e).__name__}: {e}"
+        finally:
+            stop_hb_evt.set()
+            try:
+                await asyncio.wait_for(hb_task, timeout=2.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                if not hb_task.done():
+                    hb_task.cancel()
+            except Exception:
+                pass
+        if success:
+            async with async_session_factory() as s:
+                await s.execute(
+                    _sqltext(
+                        "UPDATE onedrive_file_retries "
+                        "   SET status = 'RESCUED', "
+                        "       attempt_count = :n, "
+                        "       last_error = NULL, "
+                        "       last_error_class = NULL, "
+                        "       updated_at = NOW() "
+                        " WHERE id = :id"
+                    ),
+                    {"id": retry_id, "n": attempt},
+                )
+                await s.commit()
+            print(
+                f"[{self.worker_id}] [ONEDRIVE_RETRY] {retry_id} RESCUED "
+                f"on attempt {attempt} ({file_payload.get('name', '?')})"
+            )
+            return
+        # Retry failed. Decide whether to keep trying.
+        err_class = _classify_onedrive_file_error(err_text)
+        if err_class == "permanent" or attempt >= max_attempts:
+            async with async_session_factory() as s:
+                await s.execute(
+                    _sqltext(
+                        "UPDATE onedrive_file_retries "
+                        "   SET status = 'FAILED_PERMANENT', "
+                        "       attempt_count = :n, "
+                        "       last_error = :err, "
+                        "       last_error_class = :cls, "
+                        "       updated_at = NOW() "
+                        " WHERE id = :id"
+                    ),
+                    {
+                        "id": retry_id, "n": attempt,
+                        "err": err_text[:1000], "cls": err_class,
+                    },
+                )
+                await s.commit()
+            print(
+                f"[{self.worker_id}] [ONEDRIVE_RETRY] {retry_id} "
+                f"FAILED_PERMANENT after {attempt} attempts: {err_text[:120]}"
+            )
+            return
+        # Schedule next attempt with capped exponential backoff —
+        # 2m, 4m, 8m, 16m, 32m, capped at 60m. Throttles get a
+        # longer base than stream drops because Graph buckets refill
+        # on a coarser cadence than CDN connections do.
+        base = 120.0 if err_class == "throttle" else 60.0
+        delay_s = min(3600.0, base * (2 ** (attempt - 1)))
+        async with async_session_factory() as s:
+            await s.execute(
+                _sqltext(
+                    "UPDATE onedrive_file_retries "
+                    "   SET status = 'PENDING', "
+                    "       attempt_count = :n, "
+                    "       last_error = :err, "
+                    "       last_error_class = :cls, "
+                    "       next_retry_at = NOW() + (:d || ' seconds')::interval, "
+                    "       updated_at = NOW() "
+                    " WHERE id = :id"
+                ),
+                {
+                    "id": retry_id, "n": attempt,
+                    "err": err_text[:1000], "cls": err_class,
+                    "d": str(int(delay_s)),
+                },
+            )
+            await s.commit()
+
+    async def _build_graph_client_for(self, tenant: Tenant) -> "GraphClient":
+        """Build a GraphClient scoped to ``tenant`` for the retry
+        consumer. Picks the next-rotation app from multi_app_manager —
+        same pattern the main `get_graph_client` cache uses. Fresh
+        per-tick instance (cache key would race against the main
+        handler's cache and steal connections mid-call).
+        """
+        app = multi_app_manager.get_next_app()
+        return GraphClient(
+            client_id=app.client_id,
+            client_secret=app.client_secret,
+            tenant_id=tenant.external_tenant_id,
+        )
+
+    async def _rescue_onedrive_file_into_snapshot(
+        self,
+        *,
+        tenant: Tenant,
+        resource: Resource,
+        snapshot: Snapshot,
+        file_payload: Dict[str, Any],
+        graph_client: "GraphClient",
+    ) -> Tuple[bool, str]:
+        """Stream a single OneDrive file's bytes and UPDATE its
+        existing ONEDRIVE_FILE row in-place. Returns (success, err).
+
+        Why not call backup_single_file? That entry point writes a
+        FRESH SnapshotItem with item_type="FILE" via
+        _create_file_snapshot_item. The OneDrive main path
+        (_useronedrive_backup_files) pre-INSERTs rows with
+        item_type="ONEDRIVE_FILE" and later UPDATEs them. A retry
+        consumer using backup_single_file would leave the original
+        ONEDRIVE_FILE row stranded with blob_path=NULL and produce
+        a duplicate FILE row — a data-consistency hazard. This
+        helper mirrors the main path's UPDATE semantics so the
+        rescued bytes land on the SAME row the snapshot tracks.
+        """
+        file_id = file_payload.get("id")
+        if not file_id:
+            return False, "missing_file_id"
+        file_name = file_payload.get("name") or "?"
+        drive_id = (
+            file_payload.get("_drive_id")
+            or (file_payload.get("parentReference") or {}).get("driveId")
+            or resource.external_id
+        )
+        if not drive_id:
+            return False, "missing_drive_id"
+        # Step 1: resolve a fresh download URL. The one we tried
+        # originally may have expired; Graph URLs live ~1 hour.
+        try:
+            download_url, real_size, qxh = await graph_client.get_download_url(
+                drive_id, file_id,
+            )
+        except RuntimeError as e:
+            msg = str(e)
+            if "no_download_url" in msg.lower() or "downloadurl" in msg.lower():
+                # Cloud-native (Whiteboard / OneNote) — never
+                # downloadable. Mark FAILED_PERMANENT in caller.
+                return False, "no_download_url"
+            return False, f"get_download_url: {msg}"
+        except Exception as e:
+            return False, f"get_download_url: {type(e).__name__}: {e}"
+        if real_size <= 0:
+            real_size = int(file_payload.get("size") or 0)
+        # Step 2: stream to backend.
+        shard = azure_storage_manager.get_shard_for_resource(
+            str(resource.id), str(tenant.id),
+        )
+        container = azure_storage_manager.get_container_name(
+            str(tenant.id), "files",
+        )
+        blob_path = azure_storage_manager.build_blob_path(
+            str(tenant.id), str(resource.id), str(snapshot.id), file_id,
+        )
+        try:
+            upload_result = await self._stream_graph_to_backend(
+                download_url=download_url,
+                expected_size=real_size,
+                container=container,
+                blob_path=blob_path,
+                shard=shard,
+                file_name=file_name,
+                metadata={
+                    "source_item_id": file_id,
+                    "source_drive_id": drive_id,
+                    "original-name": file_name,
+                    "quickxor": qxh or "",
+                    "rescue": "true",
+                },
+            )
+        except Exception as e:
+            return False, f"stream: {type(e).__name__}: {e}"
+        if not upload_result.get("success"):
+            return False, f"upload: {upload_result.get('error') or 'failed'}"
+        sha256 = upload_result.get("content_sha256") or ""
+        # Step 3: UPDATE the existing ONEDRIVE_FILE row in-place.
+        # Mirrors the flusher SQL in _useronedrive_backup_files — we
+        # patch blob_path / content_size / content_hash on the row
+        # the partition-walk phase pre-INSERTed. Match on item_type
+        # so a hypothetical FILE row from the legacy path isn't
+        # touched. If no row matches we still return success — the
+        # bytes are in storage; the inventory layer will reconcile.
+        from sqlalchemy import text as _sqltext
+        import json as _json
+        extra_patch = {
+            "raw": file_payload,
+            "sha256": sha256,
+            "quickxor": qxh,
+            "rescued_at": datetime.utcnow().isoformat() + "Z",
+        }
+        try:
+            async with async_session_factory() as s:
+                await s.execute(
+                    _sqltext(
+                        "UPDATE snapshot_items SET "
+                        "  blob_path = :bp, "
+                        "  content_size = CAST(:sz AS bigint), "
+                        "  content_hash = :sh, "
+                        "  content_checksum = :sh, "
+                        "  metadata = CAST(:ex AS json) "
+                        " WHERE snapshot_id = CAST(:snap_id AS uuid) "
+                        "   AND external_id = :ext_id "
+                        "   AND item_type = 'ONEDRIVE_FILE'"
+                    ),
+                    {
+                        "bp": blob_path,
+                        "sz": real_size,
+                        "sh": sha256,
+                        "ex": _json.dumps(extra_patch, default=str),
+                        "snap_id": str(snapshot.id),
+                        "ext_id": file_id,
+                    },
+                )
+                await s.commit()
+        except Exception as e:
+            return False, f"row_update: {type(e).__name__}: {e}"
+        return True, ""
 
     async def _commit_backup_checkpoint(self, job_id, checkpoint) -> None:
         """Merge the current BackupCheckpoint into Job.result.backup_checkpoint."""
@@ -12817,7 +15017,20 @@ class BackupWorker:
                             # immediately and the file was lost.
                             if resp.status_code in (429, 503):
                                 body = await resp.aread()
-                                retry_secs = 10.0
+                                # Default backoff: exponential per resume
+                                # attempt (2s, 4s, 8s, 16s — cap 30s).
+                                # Replaces the prior fixed 10s default,
+                                # which made transient single-file SP
+                                # glitches gate the whole snapshot on
+                                # ~40s of sleep per slow file even when
+                                # SP would have served on retry-1 at 2s.
+                                # The header-supplied Retry-After /
+                                # retryAfterSeconds path overrides this
+                                # — SharePoint speaking authoritatively
+                                # about its own backoff wins, our
+                                # heuristic only fills the gap when SP
+                                # returns 429/503 with no advisory.
+                                retry_secs = float(min(30, 2 ** (resume_attempt + 1)))
                                 ra = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
                                 if ra:
                                     try:
@@ -13381,7 +15594,16 @@ class BackupWorker:
                                             snap.item_count = totals["items"]
                                             snap.new_item_count = totals["items"]
                                             snap.bytes_total = totals["bytes"]
-                                            snap.bytes_added = totals["bytes"]
+                                            # Do NOT touch bytes_added here.
+                                            # totals["bytes"] is the walked-
+                                            # body sum (may include re-walk via
+                                            # folder fingerprint skip). The
+                                            # audit-service Activity feed sums
+                                            # bytes_added for IN_PROGRESS rows
+                                            # so writing walked-bytes surfaces
+                                            # a ghost size on no-data
+                                            # incrementals. The settle path
+                                            # writes the proper delta later.
                                             await _s2.commit()
                                 except Exception as bump_err:
                                     print(
@@ -13492,7 +15714,11 @@ class BackupWorker:
                                         snap.item_count = totals["items"]
                                         snap.new_item_count = totals["items"]
                                         snap.bytes_total = totals["bytes"]
-                                        snap.bytes_added = totals["bytes"]
+                                        # See note at the other MAILBOX live
+                                        # bump: bytes_added must be written by
+                                        # the settle path only, to keep the
+                                        # Activity feed from showing ghost
+                                        # bytes on no-data incrementals.
                                         await _s3.commit()
                             except Exception as bump_err:
                                 print(
@@ -14052,16 +16278,27 @@ class BackupWorker:
 
             local_items: List[dict] = []
             local_bytes = 0
-            for att in attachments:
+
+            # Per-event-attachment processing (perf #4 2026-05-17):
+            # mirrors the mail-attachment fix — was a serial
+            # `for att in attachments: await get_event_attachment_content(...)`
+            # loop. Now runs in parallel under the same outer `sem` so
+            # Azure Blob uploads and Graph fetches overlap. Multi-
+            # attachment calendar events (large meeting decks) used to
+            # take N x ~300ms; now O(longest single att).
+            async def _process_event_att(
+                att: Dict[str, Any],
+            ) -> Tuple[Optional[Dict[str, Any]], int]:
                 att_id = att.get("id")
                 if not att_id:
-                    continue
+                    return None, 0
                 att_kind = att.get("@odata.type", "")
                 att_name = att.get("name") or att_id
                 att_size = att.get("size") or 0
                 content_bytes: Optional[bytes] = None
                 blob_path: Optional[str] = None
                 content_hash: Optional[str] = None
+                bytes_added_local = 0
 
                 if att_kind.endswith("fileAttachment"):
                     raw_b64 = att.get("contentBytes")
@@ -14079,10 +16316,10 @@ class BackupWorker:
                                 )
                         except Exception as e:
                             print(f"[{self.worker_id}]   [EVENT ATT FAIL] {att_name} on event {event_id}: {type(e).__name__}: {e}")
-                            continue
+                            return None, 0
 
                     if content_bytes is None:
-                        continue
+                        return None, 0
                     content_hash = hashlib.sha256(content_bytes).hexdigest()
                     blob_path = azure_storage_manager.build_blob_path(
                         str(tenant.id), str(resource.id), str(snapshot.id),
@@ -14092,10 +16329,10 @@ class BackupWorker:
                         container, blob_path, content_bytes, shard, max_retries=3,
                     )
                     if not (isinstance(upload_result, dict) and upload_result.get("success")):
-                        continue
-                    local_bytes += len(content_bytes)
+                        return None, 0
+                    bytes_added_local = len(content_bytes)
 
-                local_items.append({
+                row = {
                     "snapshot_id": snapshot.id,
                     "tenant_id": tenant.id,
                     "external_id": f"{event_id}::{att_id}",
@@ -14113,7 +16350,32 @@ class BackupWorker:
                         "content_id": att.get("contentId") or att.get("contentID"),
                         "source_url": att.get("sourceUrl"),
                     },
-                })
+                }
+                return row, bytes_added_local
+
+            if attachments:
+                _ev_t0 = time.monotonic()
+                _ev_results = await asyncio.gather(
+                    *(_process_event_att(a) for a in attachments),
+                    return_exceptions=True,
+                )
+                for _r in _ev_results:
+                    if isinstance(_r, Exception):
+                        print(
+                            f"[{self.worker_id}] [EVENT-ATT-TASK] event "
+                            f"{event_id} task raised: {type(_r).__name__}: {_r}"
+                        )
+                        continue
+                    _row, _b = _r
+                    if _row is not None:
+                        local_items.append(_row)
+                        local_bytes += _b
+                if len(attachments) >= 3:
+                    print(
+                        f"[{self.worker_id}] [PERF] event {event_id[:16]} "
+                        f"{len(attachments)} atts processed in "
+                        f"{time.monotonic() - _ev_t0:.2f}s"
+                    )
             return local_items, local_bytes
 
         results = await asyncio.gather(
@@ -14235,6 +16497,67 @@ class BackupWorker:
                 item_metas = []
                 reply_msg_ids = set()  # Track which message IDs are replies
 
+                # Bulk-resolve replies via /v1.0/$batch (perf #2 2026-05-17):
+                # Was a serial `for msg in msg_list: await get_channel_
+                # messages_replies(team, ch, msg_id)` — N msgs with
+                # replies = N serial Graph calls. /$batch bundles up to
+                # 20 per call (graph_client.batch handles chunking).
+                from shared.graph_batch import BatchRequest as _BReq
+                _reply_targets = [
+                    m for m in msg_list
+                    if (m.get("replyCount") or 0) > 0 and m.get("id")
+                ]
+                _replies_by_msg: Dict[str, List[Dict[str, Any]]] = {}
+                if _reply_targets:
+                    _rt0 = time.monotonic()
+                    _reply_reqs = [
+                        _BReq(
+                            id=m["id"], method="GET",
+                            url=(
+                                f"/teams/{team_id}/channels/{ch_id}/"
+                                f"messages/{m['id']}/replies"
+                            ),
+                        )
+                        for m in _reply_targets
+                    ]
+                    try:
+                        _reply_batch = await graph_client.batch(_reply_reqs)
+                        for _mid, _resp in _reply_batch.items():
+                            if 200 <= _resp.status < 300:
+                                _replies_by_msg[_mid] = (
+                                    (_resp.body or {}).get("value") or []
+                                )
+                            else:
+                                print(
+                                    f"[{self.worker_id}]   [CHANNEL_REPLY] "
+                                    f"batch sub-response {_mid[:24]} "
+                                    f"status={_resp.status}"
+                                )
+                    except Exception as e:
+                        print(
+                            f"[{self.worker_id}]   [CHANNEL_REPLY] $batch "
+                            f"failed ({type(e).__name__}: {e}); falling "
+                            f"back to per-msg serial"
+                        )
+                        for _m in _reply_targets:
+                            try:
+                                _rs = await graph_client.get_channel_messages_replies(
+                                    team_id, ch_id, _m["id"],
+                                )
+                                _replies_by_msg[_m["id"]] = _rs.get("value", []) or []
+                            except Exception as _ex:
+                                print(
+                                    f"[{self.worker_id}]   [CHANNEL_REPLY] "
+                                    f"per-msg fallback failed for "
+                                    f"{_m['id']}: {_ex}"
+                                )
+                    print(
+                        f"[{self.worker_id}] [PERF] channel {ch_name} "
+                        f"replies: {len(_reply_targets)} msg(s) batched "
+                        f"in {time.monotonic() - _rt0:.2f}s "
+                        f"({sum(len(v) for v in _replies_by_msg.values())} replies)"
+                    )
+
                 for msg in msg_list:
                     msg_id = msg.get("id", str(uuid.uuid4()))
                     content_bytes = json.dumps(msg).encode()
@@ -14245,25 +16568,20 @@ class BackupWorker:
                     upload_tasks.append(upload_blob_with_retry(container, bp, content_bytes, shard))
                     item_metas.append((msg_id, msg, content_bytes, content_hash, bp, ch_id, ch_name))
 
-                    # Fetch replies for this message (if it has replies)
-                    reply_count = msg.get("replyCount", 0)
-                    if reply_count > 0:
-                        try:
-                            replies = await graph_client.get_channel_messages_replies(team_id, ch_id, msg_id)
-                            reply_list = replies.get("value", [])
-                            for reply in reply_list:
-                                reply_id = reply.get("id", str(uuid.uuid4()))
-                                reply_content_bytes = json.dumps(reply).encode()
-                                reply_content_hash = hashlib.sha256(reply_content_bytes).hexdigest()
-                                reply_bp = azure_storage_manager.build_blob_path(
-                                    str(tenant.id), str(resource.id), str(snapshot.id),
-                                    f"ch_{ch_id}_msg_{msg_id}_reply_{reply_id}"
-                                )
-                                upload_tasks.append(upload_blob_with_retry(container, reply_bp, reply_content_bytes, shard))
-                                item_metas.append((reply_id, reply, reply_content_bytes, reply_content_hash, reply_bp, ch_id, ch_name))
-                                reply_msg_ids.add(reply_id)
-                        except Exception as e:
-                            print(f"[{self.worker_id}]   [CHANNEL_REPLY] Failed to fetch replies for {msg_id}: {e}")
+                    # Replies were pre-batched above; this loop now only
+                    # builds the upload + meta records from the result.
+                    reply_list = _replies_by_msg.get(msg_id) or []
+                    for reply in reply_list:
+                        reply_id = reply.get("id", str(uuid.uuid4()))
+                        reply_content_bytes = json.dumps(reply).encode()
+                        reply_content_hash = hashlib.sha256(reply_content_bytes).hexdigest()
+                        reply_bp = azure_storage_manager.build_blob_path(
+                            str(tenant.id), str(resource.id), str(snapshot.id),
+                            f"ch_{ch_id}_msg_{msg_id}_reply_{reply_id}"
+                        )
+                        upload_tasks.append(upload_blob_with_retry(container, reply_bp, reply_content_bytes, shard))
+                        item_metas.append((reply_id, reply, reply_content_bytes, reply_content_hash, reply_bp, ch_id, ch_name))
+                        reply_msg_ids.add(reply_id)
 
                 upload_results = await asyncio.gather(*upload_tasks, return_exceptions=True)
 
@@ -14466,6 +16784,64 @@ class BackupWorker:
             upload_tasks = []
             item_metas = []
             reply_ids: set = set()
+
+            # Bulk-resolve replies via /v1.0/$batch (perf #2 2026-05-17,
+            # second occurrence — mirrors the channel-MSG path above).
+            from shared.graph_batch import BatchRequest as _BReq
+            _reply_targets2 = [
+                m for m in msg_list
+                if (m.get("replyCount") or 0) > 0 and m.get("id")
+            ]
+            _replies_by_msg2: Dict[str, List[Dict[str, Any]]] = {}
+            if _reply_targets2:
+                _rt0 = time.monotonic()
+                _reply_reqs2 = [
+                    _BReq(
+                        id=m["id"], method="GET",
+                        url=(
+                            f"/teams/{team_id}/channels/{ch_id}/"
+                            f"messages/{m['id']}/replies"
+                        ),
+                    )
+                    for m in _reply_targets2
+                ]
+                try:
+                    _reply_batch2 = await graph_client.batch(_reply_reqs2)
+                    for _mid, _resp in _reply_batch2.items():
+                        if 200 <= _resp.status < 300:
+                            _replies_by_msg2[_mid] = (
+                                (_resp.body or {}).get("value") or []
+                            )
+                        else:
+                            print(
+                                f"[{self.worker_id}]   [CHANNEL_REPLY] "
+                                f"batch sub-response {_mid[:24]} "
+                                f"status={_resp.status}"
+                            )
+                except Exception as exc:
+                    print(
+                        f"[{self.worker_id}]   [CHANNEL_REPLY] $batch "
+                        f"failed ({type(exc).__name__}: {exc}); falling "
+                        f"back to per-msg serial"
+                    )
+                    for _m in _reply_targets2:
+                        try:
+                            _rs = await graph_client.get_channel_messages_replies(
+                                team_id, ch_id, _m["id"],
+                            )
+                            _replies_by_msg2[_m["id"]] = _rs.get("value", []) or []
+                        except Exception as _ex:
+                            print(
+                                f"[{self.worker_id}]   [CHANNEL_REPLY FAIL] "
+                                f"{ch_name}/{_m['id']}: {_ex}"
+                            )
+                print(
+                    f"[{self.worker_id}] [PERF] channel {ch_name} "
+                    f"replies: {len(_reply_targets2)} msg(s) batched "
+                    f"in {time.monotonic() - _rt0:.2f}s "
+                    f"({sum(len(v) for v in _replies_by_msg2.values())} replies)"
+                )
+
             for msg in msg_list:
                 msg_id = msg.get("id", str(uuid.uuid4()))
                 cb = json.dumps(msg).encode()
@@ -14476,22 +16852,19 @@ class BackupWorker:
                 upload_tasks.append(upload_blob_with_retry(container, bp, cb, shard))
                 item_metas.append((msg_id, msg, cb, ch_content_hash, bp, ch_id, ch_name))
 
-                if (msg.get("replyCount") or 0) > 0:
-                    try:
-                        replies = await graph_client.get_channel_messages_replies(team_id, ch_id, msg_id)
-                        for r in (replies.get("value") or []):
-                            rid = r.get("id", str(uuid.uuid4()))
-                            rb = json.dumps(r).encode()
-                            rh = hashlib.sha256(rb).hexdigest()
-                            rbp = azure_storage_manager.build_blob_path(
-                                str(tenant.id), str(resource.id), str(snapshot.id),
-                                f"ch_{ch_id}_msg_{msg_id}_reply_{rid}"
-                            )
-                            upload_tasks.append(upload_blob_with_retry(container, rbp, rb, shard))
-                            item_metas.append((rid, r, rb, rh, rbp, ch_id, ch_name))
-                            reply_ids.add(rid)
-                    except Exception as exc:
-                        print(f"[{self.worker_id}]   [CHANNEL_REPLY FAIL] {ch_name}/{msg_id}: {exc}")
+                # Replies were pre-batched above (or single-fetched in
+                # the fallback path).
+                for r in _replies_by_msg2.get(msg_id) or []:
+                    rid = r.get("id", str(uuid.uuid4()))
+                    rb = json.dumps(r).encode()
+                    rh = hashlib.sha256(rb).hexdigest()
+                    rbp = azure_storage_manager.build_blob_path(
+                        str(tenant.id), str(resource.id), str(snapshot.id),
+                        f"ch_{ch_id}_msg_{msg_id}_reply_{rid}"
+                    )
+                    upload_tasks.append(upload_blob_with_retry(container, rbp, rb, shard))
+                    item_metas.append((rid, r, rb, rh, rbp, ch_id, ch_name))
+                    reply_ids.add(rid)
 
             upload_results = await asyncio.gather(*upload_tasks, return_exceptions=True)
             local_items = 0
@@ -15061,38 +17434,40 @@ class BackupWorker:
         manual_actions: List[str] = []
         unsupported_artifacts: List[str] = []
 
-        for artifact_key, artifact in current_artifacts.items():
-            previous_item = previous_items.get(artifact_key)
-            should_materialize = snapshot_type == SnapshotType.FULL or self._power_bi_artifact_changed(previous_item, artifact)
-            if not should_materialize:
-                continue
+        # PERF #11: parallelize per-artifact payload build + upload via gather under sem(8).
+        # Each artifact does an independent Power BI REST call + blob upload, so
+        # serial wait was leaving the worker idle. Counters are merged after.
+        _pbi_sem = asyncio.Semaphore(8)
+        _t0_pbi = time.time()
 
-            payload, blob_bytes = await self._build_power_bi_artifact_payload(
-                power_bi_client,
-                workspace_id,
-                artifact,
-            )
-            content_hash = hashlib.sha256(blob_bytes).hexdigest()
-            previous_checksum = getattr(previous_item, "content_checksum", None) if previous_item else None
-            if previous_checksum and previous_checksum == content_hash:
-                continue
+        async def _process_artifact(artifact_key: str, artifact: Dict):
+            async with _pbi_sem:
+                previous_item = previous_items.get(artifact_key)
+                should_materialize = snapshot_type == SnapshotType.FULL or self._power_bi_artifact_changed(previous_item, artifact)
+                if not should_materialize:
+                    return None
 
-            if not payload["restore_supported"]:
-                unsupported_artifacts.append(f"{artifact['item_type']}:{artifact['name']}")
-            manual_actions.extend(payload["manual_actions"])
+                payload, blob_bytes = await self._build_power_bi_artifact_payload(
+                    power_bi_client,
+                    workspace_id,
+                    artifact,
+                )
+                content_hash = hashlib.sha256(blob_bytes).hexdigest()
+                previous_checksum = getattr(previous_item, "content_checksum", None) if previous_item else None
+                if previous_checksum and previous_checksum == content_hash:
+                    return None
 
-            blob_path = azure_storage_manager.build_blob_path(
-                str(tenant.id),
-                str(resource.id),
-                str(snapshot.id),
-                artifact["blob_id"],
-            )
-            result = await upload_blob_with_retry(container, blob_path, blob_bytes, shard)
-            if not result.get("success"):
-                raise RuntimeError(f"Failed to upload Power BI artifact {artifact['name']}: {result.get('error')}")
+                blob_path = azure_storage_manager.build_blob_path(
+                    str(tenant.id),
+                    str(resource.id),
+                    str(snapshot.id),
+                    artifact["blob_id"],
+                )
+                result = await upload_blob_with_retry(container, blob_path, blob_bytes, shard)
+                if not result.get("success"):
+                    raise RuntimeError(f"Failed to upload Power BI artifact {artifact['name']}: {result.get('error')}")
 
-            db_items.append(
-                SnapshotItem(
+                item = SnapshotItem(
                     snapshot_id=snapshot.id,
                     tenant_id=tenant.id,
                     external_id=artifact["external_id"],
@@ -15106,8 +17481,33 @@ class BackupWorker:
                     extra_data=payload["summary"],
                     is_deleted=False,
                 )
+                return {
+                    "item": item,
+                    "bytes": len(blob_bytes),
+                    "unsupported_label": (f"{artifact['item_type']}:{artifact['name']}"
+                                          if not payload["restore_supported"] else None),
+                    "manual_actions": payload["manual_actions"],
+                }
+
+        if current_artifacts:
+            _pbi_results = await asyncio.gather(
+                *[_process_artifact(k, a) for k, a in current_artifacts.items()],
+                return_exceptions=True,
             )
-            bytes_added += len(blob_bytes)
+            for _r in _pbi_results:
+                if isinstance(_r, Exception):
+                    # Preserve fail-fast semantics: an artifact upload failure
+                    # was previously a raise — re-raise to abort the snapshot.
+                    raise _r
+                if _r is None:
+                    continue
+                db_items.append(_r["item"])
+                bytes_added += _r["bytes"]
+                if _r["unsupported_label"]:
+                    unsupported_artifacts.append(_r["unsupported_label"])
+                manual_actions.extend(_r["manual_actions"])
+            if len(current_artifacts) >= 4:
+                print(f"[PERF][POWERBI] processed {len(current_artifacts)} artifacts in {time.time()-_t0_pbi:.2f}s")
 
         if snapshot_type == SnapshotType.INCREMENTAL:
             for artifact_key, previous_item in previous_items.items():
@@ -15767,32 +18167,17 @@ class BackupWorker:
         plan_list = plans.get("value", [])
         print(f"[{self.worker_id}]   [PLANNER] {len(plan_list)} plans found")
 
-        for plan in plan_list:
-            plan_id = plan.get("id", str(uuid.uuid4()))
-            content_bytes = json.dumps(plan).encode()
-            content_hash = hashlib.sha256(content_bytes).hexdigest()
-            blob_path = azure_storage_manager.build_blob_path(
-                str(tenant.id), str(resource.id), str(snapshot.id), f"plan_{plan_id}"
-            )
-            r = await upload_blob_with_retry(container, blob_path, content_bytes, shard)
-            if r.get("success"):
-                db_items.append(SnapshotItem(
-                    snapshot_id=snapshot.id, tenant_id=tenant.id,
-                    external_id=plan_id, item_type="PLANNER_PLAN",
-                    name=plan.get("title", plan_id),
-                    content_hash=content_hash, content_size=len(content_bytes),
-                    blob_path=blob_path, extra_data={"raw": plan}, content_checksum=content_hash,
-                ))
-                bytes_added += len(content_bytes)
+        # PERF #10: parallelize plans (sem 4) and within each plan tasks (sem 8).
+        # Per-task details fetch + upload also parallel inside the task gather.
+        _plan_sem = asyncio.Semaphore(4)
+        _task_sem = asyncio.Semaphore(8)
+        _t0_planner = time.time()
 
-            try:
-                tasks = await graph_client.get_planner_tasks(plan_id=plan_id)
-            except Exception as e:
-                files_failed += 1
-                print(f"[{self.worker_id}]   [PLANNER] Tasks list failed for plan {plan_id}: {e}")
-                continue
-
-            for task in tasks.get("value", []):
+        async def _process_task(plan_id: str, task: Dict):
+            async with _task_sem:
+                _items: List[SnapshotItem] = []
+                _bytes = 0
+                _failed = 0
                 task_id = task.get("id", str(uuid.uuid4()))
                 tb = json.dumps(task).encode()
                 th = hashlib.sha256(tb).hexdigest()
@@ -15801,7 +18186,7 @@ class BackupWorker:
                 )
                 tr = await upload_blob_with_retry(container, tp, tb, shard)
                 if tr.get("success"):
-                    db_items.append(SnapshotItem(
+                    _items.append(SnapshotItem(
                         snapshot_id=snapshot.id, tenant_id=tenant.id,
                         external_id=task_id, item_type="PLANNER_TASK",
                         name=task.get("title", task_id),
@@ -15809,15 +18194,14 @@ class BackupWorker:
                         blob_path=tp, extra_data={"raw": task, "planId": plan_id},
                         content_checksum=th,
                     ))
-                    bytes_added += len(tb)
+                    _bytes += len(tb)
 
-                # Fetch task details (description, checklist, references) — separate endpoint
                 try:
                     details = await graph_client.get_planner_task_details(task_id)
                 except Exception as e:
-                    files_failed += 1
+                    _failed += 1
                     print(f"[{self.worker_id}]   [PLANNER] Task details failed for {task_id}: {e}")
-                    continue
+                    return _items, _bytes, _failed
 
                 if details:
                     db = json.dumps(details).encode()
@@ -15827,7 +18211,7 @@ class BackupWorker:
                     )
                     dr = await upload_blob_with_retry(container, dp, db, shard)
                     if dr.get("success"):
-                        db_items.append(SnapshotItem(
+                        _items.append(SnapshotItem(
                             snapshot_id=snapshot.id, tenant_id=tenant.id,
                             external_id=f"{task_id}:details", item_type="PLANNER_TASK_DETAILS",
                             name=(task.get("title") or task_id) + " (details)",
@@ -15835,7 +18219,69 @@ class BackupWorker:
                             blob_path=dp, extra_data={"taskId": task_id, "planId": plan_id},
                             content_checksum=dh,
                         ))
-                        bytes_added += len(db)
+                        _bytes += len(db)
+                return _items, _bytes, _failed
+
+        async def _process_plan(plan: Dict):
+            async with _plan_sem:
+                _items: List[SnapshotItem] = []
+                _bytes = 0
+                _failed = 0
+                plan_id = plan.get("id", str(uuid.uuid4()))
+                content_bytes = json.dumps(plan).encode()
+                content_hash = hashlib.sha256(content_bytes).hexdigest()
+                blob_path = azure_storage_manager.build_blob_path(
+                    str(tenant.id), str(resource.id), str(snapshot.id), f"plan_{plan_id}"
+                )
+                r = await upload_blob_with_retry(container, blob_path, content_bytes, shard)
+                if r.get("success"):
+                    _items.append(SnapshotItem(
+                        snapshot_id=snapshot.id, tenant_id=tenant.id,
+                        external_id=plan_id, item_type="PLANNER_PLAN",
+                        name=plan.get("title", plan_id),
+                        content_hash=content_hash, content_size=len(content_bytes),
+                        blob_path=blob_path, extra_data={"raw": plan}, content_checksum=content_hash,
+                    ))
+                    _bytes += len(content_bytes)
+
+                try:
+                    tasks = await graph_client.get_planner_tasks(plan_id=plan_id)
+                except Exception as e:
+                    _failed += 1
+                    print(f"[{self.worker_id}]   [PLANNER] Tasks list failed for plan {plan_id}: {e}")
+                    return _items, _bytes, _failed
+
+                _task_list = tasks.get("value", []) or []
+                if _task_list:
+                    _task_results = await asyncio.gather(
+                        *[_process_task(plan_id, t) for t in _task_list],
+                        return_exceptions=True,
+                    )
+                    for _tr in _task_results:
+                        if isinstance(_tr, tuple):
+                            _items.extend(_tr[0])
+                            _bytes += _tr[1]
+                            _failed += _tr[2]
+                        else:
+                            _failed += 1
+                            print(f"[{self.worker_id}]   [PLANNER] Task task error: {_tr}")
+                return _items, _bytes, _failed
+
+        if plan_list:
+            _plan_results = await asyncio.gather(
+                *[_process_plan(p) for p in plan_list],
+                return_exceptions=True,
+            )
+            for _pr in _plan_results:
+                if isinstance(_pr, tuple):
+                    db_items.extend(_pr[0])
+                    bytes_added += _pr[1]
+                    files_failed += _pr[2]
+                else:
+                    files_failed += 1
+                    print(f"[{self.worker_id}]   [PLANNER] Plan task error: {_pr}")
+            if len(plan_list) >= 2:
+                print(f"[PERF][PLANNER] processed {len(plan_list)} plans in {time.time()-_t0_planner:.2f}s")
 
         if db_items:
             async with async_session_factory() as session:
@@ -16055,34 +18501,59 @@ class BackupWorker:
                     local_bytes += len(html)
 
                 # 3. inline resources (images / attachments) — dedupe URLs per page
+                # PERF #8: parallelize resource fetches with bounded sem(8)
                 try:
                     urls: List[str] = []
                     for m in resource_url_re.finditer(html.decode("utf-8", errors="replace")):
                         u = m.group(1) or m.group(2)
                         if u and u not in urls:
                             urls.append(u)
-                    for u in urls:
-                        try:
-                            data = await graph_client.get_onenote_resource(u)
-                            rid_match = re.search(r"resources/([^/?]+)", u)
-                            rid = rid_match.group(1) if rid_match else hashlib.md5(u.encode()).hexdigest()[:16]
-                            rhash = hashlib.sha256(data).hexdigest()
-                            rpath = azure_storage_manager.build_blob_path(
-                                str(tenant.id), str(resource.id), str(snapshot.id), f"resource_{rid}"
-                            )
-                            if await _upload(rpath, data):
-                                local_items.append(SnapshotItem(
-                                    snapshot_id=snapshot.id, tenant_id=tenant.id,
-                                    external_id=rid, item_type="ONENOTE_RESOURCE",
-                                    name=rid,
-                                    content_hash=rhash, content_size=len(data), blob_path=rpath,
-                                    extra_data={"pageId": pg_id, "sourceUrl": u},
-                                    content_checksum=rhash,
-                                ))
-                                local_bytes += len(data)
-                        except Exception as e:
-                            files_failed += 1
-                            print(f"[{self.worker_id}]   [ONENOTE] Resource fetch failed for {u}: {e}")
+
+                    _res_sem = asyncio.Semaphore(8)
+                    _t0_res = time.time()
+
+                    async def _process_resource(u: str):
+                        async with _res_sem:
+                            try:
+                                data = await graph_client.get_onenote_resource(u)
+                                rid_match = re.search(r"resources/([^/?]+)", u)
+                                rid = rid_match.group(1) if rid_match else hashlib.md5(u.encode()).hexdigest()[:16]
+                                rhash = hashlib.sha256(data).hexdigest()
+                                rpath = azure_storage_manager.build_blob_path(
+                                    str(tenant.id), str(resource.id), str(snapshot.id), f"resource_{rid}"
+                                )
+                                if await _upload(rpath, data):
+                                    return (SnapshotItem(
+                                        snapshot_id=snapshot.id, tenant_id=tenant.id,
+                                        external_id=rid, item_type="ONENOTE_RESOURCE",
+                                        name=rid,
+                                        content_hash=rhash, content_size=len(data), blob_path=rpath,
+                                        extra_data={"pageId": pg_id, "sourceUrl": u},
+                                        content_checksum=rhash,
+                                    ), len(data), False)
+                                return (None, 0, False)
+                            except Exception as e:
+                                print(f"[{self.worker_id}]   [ONENOTE] Resource fetch failed for {u}: {e}")
+                                return (None, 0, True)
+
+                    if urls:
+                        _res_results = await asyncio.gather(
+                            *[_process_resource(u) for u in urls],
+                            return_exceptions=True,
+                        )
+                        for _r in _res_results:
+                            if isinstance(_r, tuple):
+                                _it, _sz, _failed = _r
+                                if _it is not None:
+                                    local_items.append(_it)
+                                    local_bytes += _sz
+                                if _failed:
+                                    files_failed += 1
+                            else:
+                                files_failed += 1
+                                print(f"[{self.worker_id}]   [ONENOTE] Resource task error: {_r}")
+                        if len(urls) >= 5:
+                            print(f"[PERF][ONENOTE-RES] page={pg_id} fetched {len(urls)} resources in {time.time()-_t0_res:.2f}s")
                 except Exception as e:
                     print(f"[{self.worker_id}]   [ONENOTE] Resource parse failed for {pg_id}: {e}")
 
@@ -16114,37 +18585,60 @@ class BackupWorker:
                 print(f"[{self.worker_id}]   [ONENOTE] Sections fetch failed for notebook {nb_id}: {e}")
                 return local_items, local_bytes
 
-            for sec in sections.get("value", []):
-                sec_id = sec.get("id", str(uuid.uuid4()))
-                sb = json.dumps(sec).encode()
-                sh = hashlib.sha256(sb).hexdigest()
-                sp = azure_storage_manager.build_blob_path(
-                    str(tenant.id), str(resource.id), str(snapshot.id), f"section_{sec_id}"
-                )
-                if await _upload(sp, sb):
-                    local_items.append(SnapshotItem(
-                        snapshot_id=snapshot.id, tenant_id=tenant.id,
-                        external_id=sec_id, item_type="ONENOTE_SECTION",
-                        name=sec.get("displayName", sec_id),
-                        content_hash=sh, content_size=len(sb), blob_path=sp,
-                        extra_data={"raw": sec, "notebookId": nb_id}, content_checksum=sh,
-                    ))
-                    local_bytes += len(sb)
+            # PERF #9: parallelize section processing with bounded sem(4)
+            _sec_sem = asyncio.Semaphore(4)
+            _sec_list = sections.get("value", []) or []
+            _t0_sec = time.time()
 
-                try:
-                    pages = await graph_client.get_onenote_pages(obj_id, sec_id)
-                    page_results = await asyncio.gather(
-                        *[backup_page(obj_id, pg, nb_id, sec_id) for pg in pages.get("value", [])],
-                        return_exceptions=True,
+            async def _process_section(sec: Dict):
+                async with _sec_sem:
+                    _local_items: List[SnapshotItem] = []
+                    _local_bytes = 0
+                    sec_id = sec.get("id", str(uuid.uuid4()))
+                    sb = json.dumps(sec).encode()
+                    sh = hashlib.sha256(sb).hexdigest()
+                    sp = azure_storage_manager.build_blob_path(
+                        str(tenant.id), str(resource.id), str(snapshot.id), f"section_{sec_id}"
                     )
-                    for pr in page_results:
-                        if isinstance(pr, tuple):
-                            local_items.extend(pr[0])
-                            local_bytes += pr[1]
-                        else:
-                            print(f"[{self.worker_id}]   [ONENOTE] Page task error: {pr}")
-                except Exception as e:
-                    print(f"[{self.worker_id}]   [ONENOTE] Pages fetch failed for section {sec_id}: {e}")
+                    if await _upload(sp, sb):
+                        _local_items.append(SnapshotItem(
+                            snapshot_id=snapshot.id, tenant_id=tenant.id,
+                            external_id=sec_id, item_type="ONENOTE_SECTION",
+                            name=sec.get("displayName", sec_id),
+                            content_hash=sh, content_size=len(sb), blob_path=sp,
+                            extra_data={"raw": sec, "notebookId": nb_id}, content_checksum=sh,
+                        ))
+                        _local_bytes += len(sb)
+
+                    try:
+                        pages = await graph_client.get_onenote_pages(obj_id, sec_id)
+                        page_results = await asyncio.gather(
+                            *[backup_page(obj_id, pg, nb_id, sec_id) for pg in pages.get("value", [])],
+                            return_exceptions=True,
+                        )
+                        for pr in page_results:
+                            if isinstance(pr, tuple):
+                                _local_items.extend(pr[0])
+                                _local_bytes += pr[1]
+                            else:
+                                print(f"[{self.worker_id}]   [ONENOTE] Page task error: {pr}")
+                    except Exception as e:
+                        print(f"[{self.worker_id}]   [ONENOTE] Pages fetch failed for section {sec_id}: {e}")
+                    return _local_items, _local_bytes
+
+            if _sec_list:
+                _sec_results = await asyncio.gather(
+                    *[_process_section(sec) for sec in _sec_list],
+                    return_exceptions=True,
+                )
+                for _sr in _sec_results:
+                    if isinstance(_sr, tuple):
+                        local_items.extend(_sr[0])
+                        local_bytes += _sr[1]
+                    else:
+                        print(f"[{self.worker_id}]   [ONENOTE] Section task error: {_sr}")
+                if len(_sec_list) >= 3:
+                    print(f"[PERF][ONENOTE-SEC] notebook={nb_id} processed {len(_sec_list)} sections in {time.time()-_t0_sec:.2f}s")
 
             return local_items, local_bytes
 
@@ -16547,12 +19041,85 @@ class BackupWorker:
         #    Recovery right-pane can render them without N×M refetches.
         if "GROUPS" in _ep_categories:
             groups = await _safe_fetch(f"{base}/groups", {"$top": "999", "$select": "id,displayName,mail,description,groupTypes,securityEnabled,mailEnabled,visibility,membershipRule,createdDateTime"})
+            # Bulk-resolve owners + members via /v1.0/$batch (perf #6
+            # 2026-05-17): was 2 serial Graph calls per group (N groups
+            # = 2N round-trips). graph_client.batch chunks at
+            # GRAPH_BATCH_MAX_SIZE internally, so a tenant with 200
+            # groups goes from 400 sequential calls to ~20 $batch posts.
+            from shared.graph_batch import BatchRequest as _BReq
+            _gids = [g.get("id") for g in groups if g.get("id")]
+            _gowners_by_gid: Dict[str, List[Dict[str, Any]]] = {}
+            _gmembers_by_gid: Dict[str, List[Dict[str, Any]]] = {}
+            if _gids:
+                _gbt0 = time.monotonic()
+                _g_reqs: List[_BReq] = []
+                for _gid in _gids:
+                    _g_reqs.append(_BReq(
+                        id=f"own::{_gid}", method="GET",
+                        url=(
+                            f"/groups/{_gid}/owners?$top=50"
+                            f"&$select=id,displayName,userPrincipalName,mail"
+                        ),
+                    ))
+                    _g_reqs.append(_BReq(
+                        id=f"mem::{_gid}", method="GET",
+                        url=(
+                            f"/groups/{_gid}/members?$top=50"
+                            f"&$select=id,displayName,userPrincipalName,mail"
+                        ),
+                    ))
+                try:
+                    _g_resp = await graph_client.batch(_g_reqs)
+                    for _rid, _r in _g_resp.items():
+                        if not (200 <= _r.status < 300):
+                            continue
+                        _vals = ((_r.body or {}).get("value") or [])
+                        if _rid.startswith("own::"):
+                            _gowners_by_gid[_rid[5:]] = _vals
+                        elif _rid.startswith("mem::"):
+                            _gmembers_by_gid[_rid[5:]] = _vals
+                    print(
+                        f"[{self.worker_id}] [PERF] entra groups owners+"
+                        f"members $batch: {len(_gids)} groups in "
+                        f"{time.monotonic() - _gbt0:.2f}s"
+                    )
+                except Exception as _ge:
+                    logger.warning(
+                        "[%s] [ENTRA_DIR] groups $batch owners/members "
+                        "failed (%s) — falling back to parallel per-group "
+                        "(asyncio.gather sem=8)",
+                        self.worker_id, _ge,
+                    )
+                    _gsem = asyncio.Semaphore(8)
+
+                    async def _one_gid(_gid: str):
+                        async with _gsem:
+                            _o = await _safe_fetch(
+                                f"{base}/groups/{_gid}/owners",
+                                {"$top": "50", "$select": "id,displayName,userPrincipalName,mail"},
+                            )
+                            _m = await _safe_fetch(
+                                f"{base}/groups/{_gid}/members",
+                                {"$top": "50", "$select": "id,displayName,userPrincipalName,mail"},
+                            )
+                            return _gid, _o, _m
+
+                    _g_par_results = await asyncio.gather(
+                        *(_one_gid(_g) for _g in _gids),
+                        return_exceptions=True,
+                    )
+                    for _r in _g_par_results:
+                        if isinstance(_r, tuple):
+                            _gid, _o, _m = _r
+                            _gowners_by_gid[_gid] = _o
+                            _gmembers_by_gid[_gid] = _m
+
             for g in groups:
                 gid = g.get("id")
                 if not gid:
                     continue
-                owners = await _safe_fetch(f"{base}/groups/{gid}/owners", {"$top": "50", "$select": "id,displayName,userPrincipalName,mail"})
-                members = await _safe_fetch(f"{base}/groups/{gid}/members", {"$top": "50", "$select": "id,displayName,userPrincipalName,mail"})
+                owners = _gowners_by_gid.get(gid, [])
+                members = _gmembers_by_gid.get(gid, [])
                 g["_owners"] = owners
                 g["_members"] = members
                 g["_memberCount"] = len(members)
@@ -16633,14 +19200,71 @@ class BackupWorker:
             entra_devices = await _safe_fetch(f"{base}/devices", {"$top": "500", "$select": "id,displayName,accountEnabled,operatingSystem,operatingSystemVersion,trustType,registrationDateTime,isCompliant,isManaged"})
             for d in entra_devices:
                 d["_intune_bucket"] = "Devices"
-                # Owner lookup — first registered user per device.
+
+            # Bulk-resolve device owners via /v1.0/$batch (perf #7
+            # 2026-05-17): was 1 serial Graph call per device (N
+            # devices = N round-trips). graph_client.batch chunks
+            # at GRAPH_BATCH_MAX_SIZE internally; a tenant with 500
+            # devices goes from 500 sequential calls to ~25 \$batch
+            # posts. We only need the first registered owner per
+            # device for the "_owner_display" / "_owner_upn" hints.
+            from shared.graph_batch import BatchRequest as _BReq
+            _dids = [d.get("id") for d in entra_devices if d.get("id")]
+            _downers_by_did: Dict[str, List[Dict[str, Any]]] = {}
+            if _dids:
+                _dbt0 = time.monotonic()
+                _d_reqs = [
+                    _BReq(
+                        id=_did, method="GET",
+                        url=(
+                            f"/devices/{_did}/registeredOwners?$top=1"
+                            f"&$select=id,displayName,userPrincipalName"
+                        ),
+                    )
+                    for _did in _dids
+                ]
                 try:
-                    owners = await _safe_fetch(f"{base}/devices/{d.get('id')}/registeredOwners", {"$top": "1", "$select": "id,displayName,userPrincipalName"})
-                    if owners:
-                        d["_owner_display"] = owners[0].get("displayName")
-                        d["_owner_upn"] = owners[0].get("userPrincipalName")
-                except Exception:
-                    pass
+                    _d_resp = await graph_client.batch(_d_reqs)
+                    for _did, _r in _d_resp.items():
+                        if 200 <= _r.status < 300:
+                            _downers_by_did[_did] = (
+                                (_r.body or {}).get("value") or []
+                            )
+                    print(
+                        f"[{self.worker_id}] [PERF] entra devices owners "
+                        f"$batch: {len(_dids)} devices in "
+                        f"{time.monotonic() - _dbt0:.2f}s"
+                    )
+                except Exception as _de:
+                    logger.warning(
+                        "[%s] [ENTRA_DIR] devices $batch owners failed "
+                        "(%s) — falling back to parallel per-device "
+                        "(asyncio.gather sem=8)",
+                        self.worker_id, _de,
+                    )
+                    _dsem = asyncio.Semaphore(8)
+
+                    async def _one_did(_did: str):
+                        async with _dsem:
+                            return _did, await _safe_fetch(
+                                f"{base}/devices/{_did}/registeredOwners",
+                                {"$top": "1", "$select": "id,displayName,userPrincipalName"},
+                            )
+
+                    _d_par_results = await asyncio.gather(
+                        *(_one_did(_d) for _d in _dids),
+                        return_exceptions=True,
+                    )
+                    for _r in _d_par_results:
+                        if isinstance(_r, tuple):
+                            _did, _o = _r
+                            _downers_by_did[_did] = _o
+
+            for d in entra_devices:
+                owners = _downers_by_did.get(d.get("id"), [])
+                if owners:
+                    d["_owner_display"] = owners[0].get("displayName")
+                    d["_owner_upn"] = owners[0].get("userPrincipalName")
             comp_policies = await _safe_fetch(f"{base}/deviceManagement/deviceCompliancePolicies", {"$top": "500"})
             for c in comp_policies:
                 c["_intune_bucket"] = "Compliance Policies"
@@ -18049,6 +20673,20 @@ class BackupWorker:
             Snapshot.status.in_(
                 [SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL]
             ),
+            # Skip ghost prior snapshots — empty COMPLETED rows from
+            # partition coordinators, aborted handlers, or chat-fanout
+            # outer snapshots that flipped terminal before any work
+            # landed. Picking one of those as the "prior" makes the next
+            # incremental look like a full re-backup because
+            # delta = current - 0 = full inventory. Observed 2026-05-18:
+            # Hemant's chats showed "+4685 items / +80 MB added" on a
+            # no-new-data incremental because the most recent prior
+            # COMPLETED snapshot was an item_count=0 ghost from 38s
+            # earlier. Underlying blobs were idempotently deduped — the
+            # number was a display bug. By requiring the prior to have
+            # actually persisted something, we pick the next-most-recent
+            # snapshot that holds real inventory.
+            or_(Snapshot.item_count > 0, Snapshot.bytes_total > 0),
         ]
         if current_job_id is not None:
             filters.append(Snapshot.job_id != current_job_id)
@@ -18343,22 +20981,82 @@ class BackupWorker:
             print(f"[{self.worker_id}]   [VERSIONS] pre-status flush warning: "
                   f"{type(fe).__name__}: {fe}")
 
-        # Set status: PARTIAL if there are failed files, COMPLETE otherwise
+        # Set status: PARTIAL if there are failed files, COMPLETE otherwise.
+        # Cancel-aware: if the parent job was CANCELLED in flight, coerce to
+        # FAILED so the snapshot doesn't pose as a clean prior for the next
+        # incremental's delta math (see _coerce_snapshot_terminal_on_cancel).
         file_tracking = snapshot.delta_tokens_json or {}
         files_failed = file_tracking.get("files_failed", 0)
-        if files_failed > 0:
-            snapshot.status = SnapshotStatus.PARTIAL
-        else:
-            snapshot.status = SnapshotStatus.COMPLETED
+        proposed = (
+            SnapshotStatus.PARTIAL if files_failed > 0
+            else SnapshotStatus.COMPLETED
+        )
+        snapshot.status = await _coerce_snapshot_terminal_on_cancel(
+            snapshot, proposed,
+        )
 
         # Calculate duration
         if snapshot.started_at:
             duration = (now - snapshot.started_at).total_seconds()
             snapshot.duration_secs = int(duration)
 
+        # Capture metric values BEFORE merge/commit. After merge the
+        # original snapshot instance becomes detached + expired, and
+        # reading a column attribute (e.g. resource_id) would either
+        # trigger a lazy-load against a closed session or raise
+        # DetachedInstanceError. Hoisting these reads also keeps the
+        # critical-section short.
+        _metric_snap_type = (
+            snapshot.type.value if hasattr(snapshot.type, "value") else str(snapshot.type)
+        )
+        _metric_status = (
+            snapshot.status.value if hasattr(snapshot.status, "value") else str(snapshot.status)
+        )
+        _metric_bytes = int(snapshot.bytes_added or 0)
+        _metric_duration = int(snapshot.duration_secs or 0)
+        _metric_resource_id = snapshot.resource_id
+
         # merge() handles detached instances (snapshot was created in a separate session)
         await session.merge(snapshot)
         await session.commit()
+
+        # Emit observability + operational cost telemetry. Safe no-op when
+        # prometheus_client missing. Wrapped in try/except so a metrics
+        # bug never blocks backup completion.
+        try:
+            from shared import core_metrics as _cm
+            from shared.storage.router import router as _router
+            _tenant_id = ""
+            try:
+                _res = await session.get(Resource, _metric_resource_id)
+                _tenant_id = str(_res.tenant_id) if _res else ""
+            except Exception:
+                pass
+            _backend_name = "unknown"
+            try:
+                _store = _router.get_active_store()
+                _backend_name = (
+                    getattr(_store, "name", None)
+                    or getattr(_store, "kind", None) or "unknown"
+                )
+            except Exception:
+                pass
+            _cm.inc_snapshot(_metric_snap_type, _metric_status)
+            if _metric_duration > 0:
+                _cm.observe_backup_duration(
+                    _metric_snap_type, _metric_status, float(_metric_duration),
+                )
+            if _metric_bytes > 0:
+                _cm.add_backup_bytes(_metric_snap_type, _backend_name, _metric_bytes)
+                if _tenant_id:
+                    _cm.add_cost_storage(
+                        _tenant_id, _backend_name, _metric_snap_type, _metric_bytes,
+                    )
+                    if _backend_name and "seaweed" in _backend_name.lower():
+                        _cm.add_cost_seaweed_write(_tenant_id, _backend_name, _metric_bytes)
+                    _cm.add_cost_egress(_tenant_id, "from_graph", _metric_bytes)
+        except Exception:
+            pass
 
         # Persist delta token on resource for incremental backups
         if result.get("new_delta_token"):
@@ -19011,32 +21709,64 @@ class BackupWorker:
             if not reqs:
                 return
             try:
+                _gb_t0 = time.monotonic()
                 responses = await graph_client.batch(reqs)
+                if len(reqs) >= 5:
+                    print(
+                        f"[{self.worker_id}] [PERF] group threads "
+                        f"$batch posts: {len(reqs)} threads in "
+                        f"{time.monotonic() - _gb_t0:.2f}s"
+                    )
             except Exception as e:
                 logger.warning(
                     "[%s] [GROUP_MAILBOX] $batch posts failed for %s: "
-                    "%s — retrying per-thread",
+                    "%s — retrying per-thread (parallel)",
                     self.worker_id, resource.display_name, e,
                 )
-                # Per-thread fallback so one bad thread doesn't poison
-                # the whole batch.
+                # Per-thread fallback (perf #5 2026-05-17): was serial,
+                # now bounded-parallel via asyncio.gather + sem(8). Same
+                # idempotency — one bad thread returns None without
+                # poisoning the rest.
                 responses = {}
-                for t in batch_threads:
-                    tid = t.get("id")
-                    if not tid:
-                        continue
-                    try:
-                        resp_body = await graph_client.get_group_thread_posts(group_id, tid)
-                        class _R: status = 200; body = resp_body  # noqa: E701,E702
-                        responses[tid] = _R()
-                    except httpx.HTTPStatusError as exc:
-                        if exc.response.status_code == 404:
-                            continue
-                        logger.warning(
-                            "[%s] [GROUP_MAILBOX] posts fallback "
-                            "failed for %s: %s",
-                            self.worker_id, tid, exc,
-                        )
+                _fb_sem = asyncio.Semaphore(8)
+                _fb_tids = [
+                    t.get("id") for t in batch_threads if t.get("id")
+                ]
+
+                async def _fb_one(tid: str):
+                    async with _fb_sem:
+                        try:
+                            resp_body = await graph_client.get_group_thread_posts(
+                                group_id, tid,
+                            )
+                            class _R: status = 200; body = resp_body  # noqa: E701,E702
+                            return tid, _R()
+                        except httpx.HTTPStatusError as exc:
+                            if exc.response.status_code == 404:
+                                return tid, None
+                            logger.warning(
+                                "[%s] [GROUP_MAILBOX] posts fallback "
+                                "failed for %s: %s",
+                                self.worker_id, tid, exc,
+                            )
+                            return tid, None
+                        except Exception as exc:
+                            logger.warning(
+                                "[%s] [GROUP_MAILBOX] posts fallback "
+                                "task raised for %s: %s",
+                                self.worker_id, tid, exc,
+                            )
+                            return tid, None
+
+                _fb_results = await asyncio.gather(
+                    *(_fb_one(tid) for tid in _fb_tids),
+                    return_exceptions=True,
+                )
+                for _r in _fb_results:
+                    if isinstance(_r, tuple):
+                        _tid, _resp = _r
+                        if _resp is not None:
+                            responses[_tid] = _resp
 
             post_rows: List[Dict[str, Any]] = []
             post_uploads: List[Tuple[str, str, bytes]] = []
@@ -19284,7 +22014,15 @@ class BackupWorker:
                 return winner
 
     async def fail_snapshot(self, session: AsyncSession, snapshot: Snapshot, error: Exception):
-        """Mark snapshot as FAILED with error details so it leaves IN_PROGRESS state."""
+        """Mark snapshot as FAILED with error details so it leaves IN_PROGRESS state.
+
+        Distinguishes "cancelled mid-flight" from "genuinely failed" so the
+        backup-scheduler reaper (``_sweep_cancelled_snapshots``) can free
+        the blobs + delete the row asynchronously. Without this marker, a
+        late-arrival snapshot created right after the user clicked Cancel
+        gets stuck FAILED in the DB forever (no reaper key, retention
+        treats it as a normal failed run).
+        """
         now = datetime.utcnow()
         snapshot.status = SnapshotStatus.FAILED
         snapshot.completed_at = now
@@ -19292,6 +22030,13 @@ class BackupWorker:
             snapshot.duration_secs = int((now - snapshot.started_at).total_seconds())
         existing = dict(snapshot.extra_data or {})
         existing["error"] = str(error)[:2000]
+        # Self-mark cancellation when the handler exited via the
+        # JobCancelledMidFlight signal (and the belt-and-braces case
+        # where the exception message indicates a cancel even when
+        # it's wrapped). Matched by the scheduler's reaper SQL.
+        if isinstance(error, JobCancelledMidFlight) or "cancelled mid-flight" in str(error).lower():
+            existing["cancelled_at"] = now.isoformat() + "Z"
+            existing["cancel_phase"] = "worker_self_flip"
         snapshot.extra_data = existing
         await session.merge(snapshot)
         await session.commit()
@@ -19527,6 +22272,10 @@ class BackupWorker:
 
 async def main():
     from shared.storage.startup import startup_router, shutdown_router
+    from shared import core_metrics
+    from shared.graph_rate_limiter import graph_rate_limiter
+    core_metrics.init()
+    await graph_rate_limiter.maybe_init_redis()
     await startup_router()
     worker = BackupWorker()
     try:

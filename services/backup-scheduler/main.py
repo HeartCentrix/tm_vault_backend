@@ -369,6 +369,8 @@ async def startup():
     # Auto-create schema and tables if they don't exist
     from shared.database import init_db as db_init_db
     from shared.storage.startup import startup_router
+    from shared import core_metrics
+    core_metrics.init()
     await db_init_db()
     await startup_router()
 
@@ -986,6 +988,168 @@ async def startup():
 
     scheduler.add_job(
         _sweep_stale_snapshots, "interval", minutes=5,
+    )
+
+    # Cancelled-snapshot sweep — paired with the job-service cancel
+    # endpoint's atomic-flip refactor.
+    #
+    # Cancel used to do destructive deletes inline (DELETE FROM
+    # snapshot_items + DELETE FROM snapshots) which raced with concurrent
+    # backup_worker INSERTs and threw two real prod errors:
+    #   * ForeignKeyViolationError on snapshot_items_snapshot_id_fkey
+    #     (worker inserted a row between cancel's two deletes)
+    #   * DeadlockDetectedError (two concurrent cancels colliding)
+    # The cancel endpoint now atomically flips status to FAILED and
+    # writes ``extra_data.cancelled_at`` as a marker. This sweep owns
+    # the destructive teardown — runs at 30s cadence so the UI stops
+    # showing "In Progress 16%" within one polling cycle and the
+    # backing storage actually gets freed.
+    #
+    # Catches three populations:
+    #   A. Cancel-flipped snapshots — status=FAILED with cancelled_at.
+    #      Cleanest population; cancel endpoint already wrote the marker.
+    #   B. Late-arrival orphans — IN_PROGRESS snapshots whose owning
+    #      job.status IN ('CANCELLED','FAILED'). Worker created the
+    #      snapshot AFTER cancel ran but before _is_job_cancelled fired.
+    #      No cancelled_at marker (worker doesn't write one), so we key
+    #      on the join.
+    #   C. Worker-self-flipped — IN_PROGRESS snapshots with cancelled_at.
+    #      Belt-and-braces with backup-worker's JobCancelledMidFlight
+    #      handler (see workers/backup-worker/main.py).
+    async def _sweep_cancelled_snapshots() -> None:
+        from shared.storage.router import router as _storage_router
+
+        try:
+            async with async_session_factory() as session:
+                # Find candidates first — keep the destructive work
+                # OUT of a long transaction so one slow blob delete
+                # doesn't block the next batch.
+                # NOTE: snapshots.extra_data is plain JSON (not JSONB) per the
+                # model definition (shared/models.py:216). The `?` key-exists
+                # operator is JSONB-only — using it on a JSON column raises
+                # ``operator does not exist: json ? unknown``. We use
+                # ``(extra_data::jsonb ->> 'cancelled_at') IS NOT NULL``
+                # instead which works regardless of the underlying type
+                # (the cast is a no-op when the column is already jsonb).
+                candidates = (await session.execute(text("""
+                    SELECT s.id AS sid, s.resource_id, s.started_at,
+                           s.extra_data,
+                           r.type::text   AS resource_type,
+                           r.tenant_id::text AS tenant_id,
+                           j.status::text   AS job_status,
+                           (s.extra_data::jsonb ->> 'cancelled_at') AS cancelled_at
+                      FROM snapshots s
+                      LEFT JOIN resources r ON r.id = s.resource_id
+                      LEFT JOIN jobs j      ON j.id = s.job_id
+                     WHERE (
+                            -- Population A + C: explicit cancellation marker.
+                            (s.extra_data::jsonb ->> 'cancelled_at') IS NOT NULL
+                          ) OR (
+                            -- Population B: late-arrival orphans.
+                            s.status = 'IN_PROGRESS'
+                            AND j.status IN ('CANCELLED', 'FAILED')
+                          )
+                       -- Defense against partitioned-shard double-cleanup.
+                       AND NOT EXISTS (
+                           SELECT 1 FROM snapshot_partitions sp
+                            WHERE sp.snapshot_id = s.id
+                              AND sp.status IN ('QUEUED','CLAIMED','IN_PROGRESS')
+                       )
+                     LIMIT 200
+                """))).all()
+
+            if not candidates:
+                return
+
+            cleaned = 0
+            blob_errors = 0
+            blobs_deleted = 0
+            for row in candidates:
+                sid = row.sid
+                resource_type = (row.resource_type or "generic").lower().replace("_", "-")
+                tenant_short = (row.tenant_id or "").replace("-", "")[:8]
+                container = f"backup-{resource_type}-{tenant_short}"
+
+                # Step 1 — delete blobs. Done in its own short
+                # transaction-per-snapshot so any one snapshot stuck on
+                # a slow backend doesn't pin the whole sweep.
+                try:
+                    async with async_session_factory() as ds:
+                        items = (await ds.execute(
+                            text(
+                                "SELECT blob_path, backend_id "
+                                "  FROM snapshot_items "
+                                " WHERE snapshot_id = :sid "
+                                "   AND blob_path IS NOT NULL "
+                                "   AND backend_id IS NOT NULL"
+                            ),
+                            {"sid": sid},
+                        )).all()
+                    for blob_path, backend_id in items:
+                        try:
+                            store = _storage_router.get_store_by_id(str(backend_id))
+                            await store.delete(container, blob_path)
+                            blobs_deleted += 1
+                        except Exception as bx:
+                            blob_errors += 1
+                            print(
+                                f"[backup-scheduler] cancelled_sweep "
+                                f"blob delete failed sid={sid} "
+                                f"path={blob_path}: {bx}"
+                            )
+
+                    # Step 2 — DB cleanup (items first, then snapshot).
+                    # Re-confirms candidacy inside the txn so a snapshot
+                    # that COMPLETED between SELECT and DELETE doesn't
+                    # get nuked.
+                    async with async_session_factory() as ds:
+                        await ds.execute(
+                            text(
+                                "DELETE FROM snapshot_items WHERE snapshot_id = :sid"
+                            ),
+                            {"sid": sid},
+                        )
+                        # Only delete the snapshot row if it still
+                        # qualifies (cancellation marker present OR
+                        # owning job is CANCELLED/FAILED). Protects
+                        # against the rare race where a partition
+                        # finalizer flipped status to COMPLETED while
+                        # we were deleting items.
+                        res = await ds.execute(
+                            text(
+                                "DELETE FROM snapshots s "
+                                " USING jobs j "
+                                " WHERE s.id = :sid "
+                                "   AND s.job_id = j.id "
+                                "   AND ( (s.extra_data::jsonb ->> 'cancelled_at') IS NOT NULL "
+                                "         OR (s.status = 'FAILED' "
+                                "             AND j.status IN ('CANCELLED','FAILED')) "
+                                "         OR (s.status = 'IN_PROGRESS' "
+                                "             AND j.status IN ('CANCELLED','FAILED')) )"
+                            ),
+                            {"sid": sid},
+                        )
+                        await ds.commit()
+                        if res.rowcount and res.rowcount > 0:
+                            cleaned += 1
+                except Exception as cleanup_exc:
+                    print(
+                        f"[backup-scheduler] cancelled_sweep "
+                        f"snapshot cleanup failed sid={sid}: {cleanup_exc}"
+                    )
+
+            if cleaned or blobs_deleted or blob_errors:
+                print(
+                    f"[backup-scheduler] cancelled_sweep: "
+                    f"reaped {cleaned} snapshot(s), "
+                    f"deleted {blobs_deleted} blob(s), "
+                    f"{blob_errors} blob error(s)"
+                )
+        except Exception as exc:
+            print(f"[backup-scheduler] cancelled_sweep failed: {exc}")
+
+    scheduler.add_job(
+        _sweep_cancelled_snapshots, "interval", seconds=30,
     )
 
     # Job outbox reconciler — fixes the classic "row committed but

@@ -31,6 +31,8 @@ async def get_db():
 @app.on_event("startup")
 async def startup():
     """Initialize database and search index"""
+    from shared import core_metrics
+    core_metrics.init()
     await init_db()
     # Create GIN index on metadata for faster JSONB search
     await create_search_index()

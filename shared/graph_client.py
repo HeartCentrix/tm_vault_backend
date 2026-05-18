@@ -5,7 +5,7 @@ import os
 import httpx
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import AsyncGenerator, AsyncIterator, Iterator, List, Optional, Dict, Any, Set, Tuple
+from typing import AsyncGenerator, AsyncIterator, Iterator, List, Optional, Dict, Any, Set, Tuple, Union
 from datetime import datetime, timedelta
 import hashlib
 import time
@@ -53,6 +53,17 @@ def graph_priority(priority: int) -> Iterator[None]:
 # Timeout constants — tuned for Graph API and token endpoint behavior
 _DEFAULT_TIMEOUT = httpx.Timeout(connect=15.0, read=60.0, write=30.0, pool=10.0)
 _TOKEN_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
+
+# Module-level cache of GraphClient instances keyed by (app_client_id,
+# tenant_id). Populated lazily by `get_messages_mime_concurrent` so a
+# 12-app rotation against one mailbox doesn't reopen 12 token exchanges
+# and httpx sessions on every call. Each cached client owns its own
+# persistent http session (HTTP/2 multiplexed if GRAPHCLIENT_HTTP2=true),
+# so 12 cached clients = 12 long-lived TCP connections to Graph,
+# multiplexing up to 4 streams each per the per-app per-mailbox limit.
+# Lifetime is process-scoped — clients are never evicted (12 × tenants
+# worth of sockets is bounded and tiny for a single-tenant deployment).
+_MULTI_APP_CLIENT_CACHE: Dict[Tuple[str, str], "GraphClient"] = {}
 
 
 def _parse_retry_after(resp: httpx.Response, default: float = 30.0, cap: float = 120.0) -> float:
@@ -123,21 +134,55 @@ class GraphClient:
             # max_keepalive_connections=50 sized so a worker with 10
             # parallel folder drains × 2-4 in-flight pages each fits
             # without recycling sockets.
-            # HTTP/2: opt-in via GRAPHCLIENT_HTTP2=true. h2 is in requirements
-            # but disabled by default until rolled out behind the flag — flip
-            # the env var to true on one replica first and watch for stream
-            # reset / connection errors before enabling fleet-wide. HTTP/2
-            # multiplexes hundreds of in-flight requests on one TCP
-            # connection → no per-request TLS handshake on the hot path.
-            use_http2 = os.environ.get("GRAPHCLIENT_HTTP2", "false").lower() == "true"
+            # HTTP/2: default ON (2026-05-17 prod tuning). The `h2` lib is
+            # pinned in every worker's requirements.txt; if a custom image
+            # lacks it the ImportError path below falls back to HTTP/1.1
+            # with a warning so the worker keeps serving. HTTP/2 multiplexes
+            # hundreds of in-flight requests on one TCP connection → no
+            # per-request TLS handshake on the hot path. Critical for the
+            # 12-replica × 20-app fleet where each replica may have
+            # 8 concurrent USER_CHATS handlers × 32 in-flight HC fetches
+            # = 256 concurrent Graph requests; HTTP/1.1 would force 256
+            # parallel sockets per replica, blowing the pool budget.
+            use_http2 = os.environ.get("GRAPHCLIENT_HTTP2", "true").lower() == "true"
+            # HTTP/2 needs the `h2` lib. It's pinned in every worker's
+            # requirements.txt — but if a custom image somehow lacks
+            # it, httpx raises ImportError at construct time. Detect
+            # and fall back to HTTP/1.1 with a loud warning so the
+            # worker keeps serving instead of crash-looping.
+            if use_http2:
+                try:
+                    import h2  # noqa: F401 — presence check only
+                except ImportError:
+                    print(
+                        "[GraphClient] WARN: GRAPHCLIENT_HTTP2=true but "
+                        "the `h2` package isn't installed. Falling back "
+                        "to HTTP/1.1. Add `h2>=4.1.0,<5.0` to this "
+                        "service's requirements.txt to enable multiplexing."
+                    )
+                    use_http2 = False
+            # Pool sizing rationale (validated against the worker's
+            # actual concurrency budget):
+            #   - HTTP/2 OFF (legacy): each Graph call needs its own
+            #     TCP socket; 50 keepalive covers 10 folders × 2-4
+            #     in-flight pages + headroom.
+            #   - HTTP/2 ON: one socket handles 100+ multiplexed
+            #     streams, so max_connections matters less — the cap
+            #     just bounds the number of distinct host:port pairs
+            #     we keep open (graph.microsoft.com, login.* for the
+            #     token service, plus the per-shard SharePoint hosts).
+            # Bumped to 200/100 to accommodate higher per-worker
+            # concurrency after the throughput overhaul (folder
+            # parallelism + multi-app concurrent MIME fetch). No prior
+            # commit documented a smaller value being load-bearing.
             self._http = httpx.AsyncClient(
                 http2=use_http2,
                 timeout=httpx.Timeout(
                     connect=30.0, read=600.0, write=300.0, pool=30.0,
                 ),
                 limits=httpx.Limits(
-                    max_connections=100,
-                    max_keepalive_connections=50,
+                    max_connections=200,
+                    max_keepalive_connections=100,
                     keepalive_expiry=300.0,
                 ),
                 # Several SharePoint/CDN download sites need 3xx
@@ -291,6 +336,69 @@ class GraphClient:
                 print(f"[GraphClient] Token fetch timeout (attempt {attempt}/3), retry in {wait}s: {e}")
                 await asyncio.sleep(wait)
         raise RuntimeError(f"Could not acquire token after 3 attempts: {last_exc}")
+
+    async def _try_migrate_app(
+        self, throttled_app_id: str,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Pick a healthy alternate app and fetch a fresh token for it.
+
+        Called by 429/503 retry sites to swap apps **instead of sleeping**.
+        With N apps registered (currently 20), most 429s only apply to the
+        app that just sent the request — the other N-1 apps still have full
+        per-app budget. Burning 30s of Retry-After sleep is pure waste when
+        we could immediately retry on a different app's token.
+
+        The migration cost is one token-fetch round-trip (~150-300ms)
+        amortized against avoiding the Retry-After sleep (~5-60s). Net win
+        in 100% of cases where at least one other app is healthy.
+
+        Args:
+            throttled_app_id: the client_id whose request just hit 429/503.
+                Used to ensure we don't migrate back to the same app.
+
+        Returns:
+            (token, new_app_id) — caller uses this token in retry's
+            Authorization header and reports mark_success against new_app_id.
+            (None, None) when no other healthy app is available
+            (single-app deployment OR all apps throttled simultaneously);
+            caller should fall back to sleep+retry-on-same-app.
+
+        Tokens are NOT cached here; the migration is rare and the multi_app
+        manager already does adaptive ban-ladder bookkeeping. Caching would
+        invite stale-token bugs on the slow path.
+        """
+        from shared.multi_app_manager import multi_app_manager
+        if multi_app_manager.app_count <= 1:
+            return None, None
+        # get_next_app() applies round-robin admission filtered by
+        # throttle state; it returns the chosen AppRegistry even when all
+        # apps are throttled (least-loaded fallback) so we double-check
+        # is_throttled + client_id distinct here.
+        pick = multi_app_manager.get_next_app()
+        if not pick or pick.client_id == throttled_app_id or pick.is_throttled:
+            return None, None
+        try:
+            async with self._http_session() as client:
+                resp = await client.post(
+                    self.TOKEN_URL.format(tenant_id=pick.tenant_id),
+                    data={
+                        "grant_type": "client_credentials",
+                        "client_id": pick.client_id,
+                        "client_secret": pick.client_secret,
+                        "scope": "https://graph.microsoft.com/.default",
+                    },
+                )
+                resp.raise_for_status()
+                token = resp.json().get("access_token")
+                if not token:
+                    return None, None
+                return token, pick.client_id
+        except Exception as exc:
+            print(
+                f"[GraphClient] migration token fetch failed "
+                f"({pick.client_id[:8]}): {type(exc).__name__}: {exc}"
+            )
+            return None, None
     
     @property
     def _policy(self) -> RateLimitPolicy:
@@ -329,6 +437,10 @@ class GraphClient:
     async def _get_legacy(self, url: str, params: Optional[Dict] = None) -> Dict[str, Any]:
         """Pre-hardening _get — preserved verbatim as the kill-switch path."""
         token = await self._get_token()
+        # Track which app's token is currently in use. Starts as self
+        # but may migrate on 429 to a healthier app — see _try_migrate_app
+        # docstring for why this beats sleep+retry-on-same-app.
+        current_app_id = self.client_id
         all_items = []
         next_url = url
         max_retries = 5
@@ -336,6 +448,7 @@ class GraphClient:
         delta_link = None
         last_data = {}
 
+        from shared.graph_rate_limiter import graph_rate_limiter
         while next_url:
             try:
                 async with self._http_session() as client:
@@ -344,15 +457,32 @@ class GraphClient:
                         headers = {"Authorization": f"Bearer {token}", "ConsistencyLevel": "eventual"}
                     else:
                         headers = {"Authorization": f"Bearer {token}"}
+                    await graph_rate_limiter.acquire(reason="graph_get_legacy")
                     resp = await client.get(next_url, headers=headers, params=params if not next_url.startswith("http") else None)
 
                     # Handle 429 throttling
                     if resp.status_code == 429:
                         retry_after = int(resp.headers.get("Retry-After", "30"))
                         from shared.multi_app_manager import multi_app_manager
-                        multi_app_manager.mark_throttled(self.client_id, retry_after)
+                        multi_app_manager.mark_throttled(current_app_id, retry_after)
                         if retry_count < max_retries:
                             retry_count += 1
+                            # Try to swap to a different healthy app FIRST.
+                            # If one's available, immediate retry — no
+                            # sleep, no wasted minutes burning through
+                            # Retry-After when 19 other apps could serve.
+                            new_token, new_app = await self._try_migrate_app(current_app_id)
+                            if new_token and new_app:
+                                token = new_token
+                                current_app_id = new_app
+                                # Skip the Retry-After sleep entirely;
+                                # the new app's per-app budget hasn't
+                                # been throttled — Graph's per-app caps
+                                # are independent.
+                                continue
+                            # All other apps throttled (or single-app
+                            # deployment) — fall back to honoring
+                            # Retry-After on the same app.
                             await __import__('asyncio').sleep(retry_after)
                             continue
                         resp.raise_for_status()
@@ -364,7 +494,9 @@ class GraphClient:
                     try:
                         from shared.multi_app_manager import multi_app_manager
                         _lat_ms = float(resp.elapsed.total_seconds() * 1000) if getattr(resp, "elapsed", None) else 0.0
-                        multi_app_manager.mark_success(self.client_id, _lat_ms)
+                        # Credit the app that actually served the request
+                        # (may have migrated from self.client_id on prior 429).
+                        multi_app_manager.mark_success(current_app_id, _lat_ms)
                     except Exception:
                         pass
                     data = resp.json()
@@ -422,6 +554,7 @@ class GraphClient:
         delta_link: Optional[str] = None
         last_data: Dict[str, Any] = {}
 
+        from shared.graph_rate_limiter import graph_rate_limiter
         async with self._http_session() as client:
             while next_url:
                 prio = self._effective_priority()
@@ -435,6 +568,7 @@ class GraphClient:
                 else:
                     headers = {"Authorization": f"Bearer {token}"}
                 try:
+                    await graph_rate_limiter.acquire(reason="graph_get_hardened")
                     resp = await client.get(
                         next_url, headers=headers,
                         params=params if not next_url.startswith("http") else None,
@@ -464,6 +598,22 @@ class GraphClient:
                     multi_app_manager.mark_throttled(
                         self.client_id, int(action.sleep_seconds),
                     )
+                    # Multi-app rotation: same reasoning as the legacy
+                    # path — sleeping ~30s of Retry-After is wasteful
+                    # when other apps have full budget. We don't track
+                    # `current_app` locally here because the hardened
+                    # `_get` is a single-URL call (not paginated); the
+                    # next iteration of this while-loop just retries
+                    # next_url with the swapped token.
+                    new_token, _new_app = await self._try_migrate_app(self.client_id)
+                    if new_token:
+                        token = new_token
+                        print(
+                            f"[GraphClient/hardened] {resp.status_code} on "
+                            f"{next_url[:80]} — migrating app "
+                            f"(skipping {action.sleep_seconds:.1f}s sleep)"
+                        )
+                        continue
                     print(f"[GraphClient/hardened] {resp.status_code} on "
                           f"{next_url[:80]} — {action.reason}")
                     await asyncio.sleep(action.sleep_seconds)
@@ -536,9 +686,14 @@ class GraphClient:
         # this the legacy path silently breaks incremental backups (every
         # run re-fetches full history because the token is never stored).
         self._last_delta_link: Optional[str] = None
+        # Tracks which app's token is currently in use for this stream;
+        # migrates on 429 (see _try_migrate_app). Streams stay on the
+        # failover app for the remainder of pagination — re-pinning to
+        # self.client_id every page would defeat the migration.
+        token = await self._get_token()
+        current_app_id = self.client_id
 
         while next_url:
-            token = await self._get_token()
             try:
                 async with self._http_session() as client:
                     if params and params.get("$count") == "true":
@@ -552,13 +707,24 @@ class GraphClient:
                     if resp.status_code == 429:
                         retry_after = int(resp.headers.get("Retry-After", "30"))
                         from shared.multi_app_manager import multi_app_manager
-                        multi_app_manager.mark_throttled(self.client_id, retry_after)
-                        print(
-                            f"[GraphClient] 429 on {next_url[:100]} — sleeping {retry_after}s "
-                            f"(attempt {retry_count + 1}/{max_retries})"
-                        )
+                        multi_app_manager.mark_throttled(current_app_id, retry_after)
                         if retry_count < max_retries:
                             retry_count += 1
+                            # Try app migration before falling back to sleep.
+                            new_token, new_app = await self._try_migrate_app(current_app_id)
+                            if new_token and new_app:
+                                print(
+                                    f"[GraphClient] 429 on {next_url[:80]} — "
+                                    f"migrating app {current_app_id[:8]} → "
+                                    f"{new_app[:8]} (attempt {retry_count}/{max_retries})"
+                                )
+                                token = new_token
+                                current_app_id = new_app
+                                continue
+                            print(
+                                f"[GraphClient] 429 on {next_url[:100]} — sleeping {retry_after}s "
+                                f"(attempt {retry_count}/{max_retries}, no healthy alt-app)"
+                            )
                             await asyncio.sleep(retry_after)
                             continue
                         resp.raise_for_status()
@@ -568,7 +734,7 @@ class GraphClient:
                     try:
                         from shared.multi_app_manager import multi_app_manager as _mam
                         _lat_ms = float(resp.elapsed.total_seconds() * 1000) if getattr(resp, "elapsed", None) else 0.0
-                        _mam.mark_success(self.client_id, _lat_ms)
+                        _mam.mark_success(current_app_id, _lat_ms)
                     except Exception:
                         pass
                     data = resp.json()
@@ -661,16 +827,27 @@ class GraphClient:
                     multi_app_manager.mark_throttled(
                         current_app, int(action.sleep_seconds),
                     )
-                    # Migrate to next healthy app.
-                    try:
-                        pick = multi_app_manager.get_next_app()
-                        if pick and pick.client_id != current_app:
-                            current_app = pick.client_id
-                            pages_on_failover = 0
-                            print(f"[GraphClient/hardened iter] migrating "
-                                  f"{resp.status_code} -> app={current_app}")
-                    except Exception:
-                        pass
+                    # Try to migrate AND obtain a fresh token for the
+                    # new app. If successful, skip the sleep entirely —
+                    # the new app's per-app budget is independent of
+                    # the throttled one. The prior implementation
+                    # migrated `current_app` but kept the OLD token,
+                    # so the retry still hit the throttled app's
+                    # tenant-wide cap; this version actually swaps the
+                    # token used for the next request.
+                    new_token, new_app = await self._try_migrate_app(current_app)
+                    if new_token and new_app:
+                        token = new_token
+                        current_app = new_app
+                        pages_on_failover = 0
+                        print(
+                            f"[GraphClient/hardened iter] migrating "
+                            f"{resp.status_code} -> app={current_app[:8]} "
+                            f"(skipping {action.sleep_seconds:.1f}s sleep)"
+                        )
+                        # Skip the Retry-After sleep and the post-
+                        # throttle brake; the new app needs no cooldown.
+                        continue
                     await asyncio.sleep(action.sleep_seconds)
                     if s.GRAPH_POST_THROTTLE_BRAKE_MS > 0:
                         await asyncio.sleep(
@@ -3467,6 +3644,7 @@ class GraphClient:
         that email; at TM scale (heavy mailboxes + tenant-wide throttle)
         that meant most enterprise inline logos/signatures vanished.
         """
+        from shared.graph_rate_limiter import graph_rate_limiter
         url = f"{self.GRAPH_URL}/users/{user_id}/messages/{message_id}/$value"
         token = await self._get_token()
         max_attempts = 5
@@ -3475,6 +3653,7 @@ class GraphClient:
         for attempt in range(max_attempts):
             try:
                 async with self._http_session() as client:
+                    await graph_rate_limiter.acquire(reason="graph_mime_single")
                     resp = await client.get(
                         url, headers={"Authorization": f"Bearer {token}"},
                     )
@@ -3536,6 +3715,165 @@ class GraphClient:
             raise last_err
         raise RuntimeError("get_message_mime_source: exhausted retries")
 
+    async def get_messages_mime_concurrent(
+        self,
+        user_id: str,
+        message_ids: List[str],
+        *,
+        per_app_concurrency: int = 4,
+    ) -> Dict[str, Union[bytes, Exception]]:
+        """Concurrently fetch RFC822 MIME bodies for many messages of ONE
+        mailbox, spreading load across the entire 12-app pool to escape
+        the per-mailbox-per-app concurrency ceiling.
+
+        Microsoft Graph enforces a hard limit of **4 concurrent requests
+        per mailbox per app** on Outlook endpoints (documented at
+        https://learn.microsoft.com/en-us/graph/throttling-limits). A
+        single GraphClient hitting `/messages/{id}/$value` for one mailbox
+        bottlenecks at ~4 in-flight no matter how much asyncio.gather()
+        fan-out the caller adds — every fifth request queues server-side.
+
+        BUT — and this is the unlock — the limit is **per-app**. With 12
+        registered apps in `multi_app_manager`, the same mailbox can sustain
+        12 × 4 = 48 truly parallel `/$value` GETs at once. That's the only
+        legal way to escape the per-mailbox ceiling without paying for
+        Microsoft 365 Backup Storage API or hitting tenant-wide aggregate
+        throttle.
+
+        Approach:
+          1. For each app in the pool, build (or reuse a cached) GraphClient.
+          2. Round-robin assign message_ids to apps.
+          3. Each app has its own asyncio.Semaphore capped at
+             `per_app_concurrency` (default 4 — Microsoft's hard limit).
+          4. Each fetch reuses the persistent single-call retry chain in
+             `get_message_mime_source` (handles 429 / 503 / transients).
+          5. Returns dict[msg_id, bytes | Exception]. Bulk caller decides
+             per-id whether to skip or surface the error — we don't raise
+             on partial failure, so 1 bad msg doesn't sink the batch.
+
+        Why this beats `$batch` for MIME:
+          - `$batch` on Outlook serializes 4 sub-requests-at-a-time PER
+            MAILBOX (documented at shared/graph_batch.py:9-12). So 20
+            sub-requests for the same mailbox = 5 serial waves of 4.
+            Wall-time equals 4-concurrent serial GETs ≈ no win over
+            asyncio.gather + 4 in-flight.
+          - This method instead exploits the per-APP scope of the
+            concurrency limit. With HTTP/2 enabled, each app's persistent
+            client multiplexes its 4 streams over ONE TCP connection
+            (negligible TLS overhead), and 12 apps = 12 connections =
+            48 streams in flight against ONE mailbox.
+
+        Caller guidance:
+          - Use ONLY for MIME fetches against a single mailbox per call.
+            Mixing mailboxes per-call breaks the per-mailbox isolation
+            model and risks burning all apps' quota on one user.
+          - For 100s of msg_ids, call in batches of 48-96 to bound
+            unwrapped task fan-out.
+          - Token refresh per-app happens inside each per-message retry
+            (existing get_message_mime_source logic) — no token storm.
+
+        Returns:
+          dict mapping each requested message_id to either the bytes of
+          its RFC822 MIME source on success, or the Exception that the
+          per-message retry chain ultimately raised on failure. Missing
+          msg_ids in the result indicate caller bug (we always populate
+          every requested id).
+        """
+        if not message_ids:
+            return {}
+        # Lazy import to avoid circular-import at module load.
+        from shared.multi_app_manager import multi_app_manager
+
+        apps = multi_app_manager.apps
+        # Single-app deployment (or test mocks) — fall back to the
+        # serial path through this same GraphClient. No semaphore games;
+        # at most 4 in-flight per Outlook's own rule.
+        if not apps or len(apps) <= 1:
+            return await self._fetch_mime_serial(
+                user_id, message_ids,
+                concurrency=per_app_concurrency,
+            )
+
+        # Per-app semaphores cap concurrency at Microsoft's documented
+        # ceiling. Going above 4 just queues server-side and burns
+        # cycles in retry loops — it does NOT increase throughput.
+        sem_per_app = max(1, min(per_app_concurrency, 4))
+        app_sems: Dict[str, asyncio.Semaphore] = {
+            app.client_id: asyncio.Semaphore(sem_per_app) for app in apps
+        }
+        # Cache per-app GraphClient for this tenant so we don't reopen
+        # token exchanges + http sessions per batch. Lifetime = caller
+        # scope; weak global cache below absorbs reuse across calls.
+        clients_by_app: Dict[str, GraphClient] = {}
+        for app in apps:
+            cached = _MULTI_APP_CLIENT_CACHE.get((app.client_id, self.tenant_id))
+            if cached is None:
+                cached = GraphClient(
+                    client_id=app.client_id,
+                    client_secret=app.client_secret,
+                    tenant_id=self.tenant_id,
+                )
+                _MULTI_APP_CLIENT_CACHE[(app.client_id, self.tenant_id)] = cached
+            clients_by_app[app.client_id] = cached
+
+        results: Dict[str, Union[bytes, Exception]] = {}
+
+        async def _one(msg_id: str, app_client_id: str) -> None:
+            client = clients_by_app[app_client_id]
+            sem = app_sems[app_client_id]
+            async with sem:
+                try:
+                    data = await client.get_message_mime_source(
+                        user_id, msg_id,
+                    )
+                    results[msg_id] = data
+                except Exception as e:
+                    # Don't raise — bulk semantics. Caller inspects per-id.
+                    results[msg_id] = e
+
+        # Round-robin distribution across apps. If 7 messages and 12 apps,
+        # apps 0-6 each handle one; apps 7-11 idle. With more messages,
+        # apps cycle: msg[12] goes back to app[0]'s semaphore, queueing
+        # behind whatever app[0] is doing.
+        tasks = []
+        for i, msg_id in enumerate(message_ids):
+            chosen_app = apps[i % len(apps)]
+            tasks.append(_one(msg_id, chosen_app.client_id))
+        # gather with return_exceptions=False — our _one() catches all
+        # exceptions and stuffs them into results, so gather always
+        # completes cleanly. (return_exceptions=True would swallow our
+        # already-caught errors twice and complicate the result map.)
+        await asyncio.gather(*tasks)
+        return results
+
+    async def _fetch_mime_serial(
+        self,
+        user_id: str,
+        message_ids: List[str],
+        *,
+        concurrency: int = 4,
+    ) -> Dict[str, Union[bytes, Exception]]:
+        """Single-app fallback for get_messages_mime_concurrent when only
+        one Graph app is configured. Caps in-flight at `concurrency`
+        (default 4 — Microsoft's per-mailbox-per-app limit). Same bulk
+        semantics: each msg_id maps to bytes or Exception, never raises."""
+        if not message_ids:
+            return {}
+        sem = asyncio.Semaphore(max(1, min(concurrency, 4)))
+        out: Dict[str, Union[bytes, Exception]] = {}
+
+        async def _one(msg_id: str) -> None:
+            async with sem:
+                try:
+                    out[msg_id] = await self.get_message_mime_source(
+                        user_id, msg_id,
+                    )
+                except Exception as e:
+                    out[msg_id] = e
+
+        await asyncio.gather(*(_one(mid) for mid in message_ids))
+        return out
+
     async def get_hosted_content(
         self, chat_id: str, message_id: str, hc_id: str, chunk_size: int = 1024 * 1024
     ) -> Tuple[AsyncGenerator[bytes, None], str, int]:
@@ -3567,9 +3905,24 @@ class GraphClient:
         max_attempts = 5
         backoff_s = 2.0
         last_err: Optional[Exception] = None
+        # PERF (Item A): route streaming HC fetch through the SHARED httpx
+        # client (HTTP/2 + persistent pool). Previously each HC fetch built
+        # a per-request AsyncClient → fresh TCP + TLS handshake on every
+        # inline image. With HTTP/2 on (GRAPHCLIENT_HTTP2=true) multiple
+        # HC streams now multiplex on the same connection.
+        #
+        # Item A-followup (2026-05-17): on 429/503, try to migrate to a
+        # healthy app's token BEFORE sleeping Retry-After. Without this,
+        # all 5 retries hit the same throttled app and one transient
+        # 429-storm on app X drops one inline image. With 20 apps and
+        # the BatchClient pattern (see _send_chunk_with_retry), one
+        # app's 429 should swap to another app's bucket immediately.
+        # Caught in prod: "hc interleave failed msg=17751087 chat=19:6d29d:
+        # HTTPStatusError: throttled after 5 attempts".
+        current_app_id: str = self.client_id
         for attempt in range(max_attempts):
-            client_cm = httpx.AsyncClient(timeout=300.0, follow_redirects=True)
-            client = await client_cm.__aenter__()
+            client = await self._get_shared_http()
+            client_cm = None  # shared client must NOT be closed per-request
             stream_cm = None
             resp = None
             try:
@@ -3583,13 +3936,22 @@ class GraphClient:
                     try:
                         from shared.multi_app_manager import multi_app_manager
                         multi_app_manager.mark_throttled(
-                            self.client_id, int(retry_after),
+                            current_app_id, int(retry_after),
                         )
                     except Exception:
                         pass
                     await stream_cm.__aexit__(None, None, None)
-                    await client_cm.__aexit__(None, None, None)
+                    if client_cm is not None:
+                        await client_cm.__aexit__(None, None, None)
                     if attempt < max_attempts - 1:
+                        # Try app migration FIRST — no sleep needed if we
+                        # find a healthy alt. Matches BatchClient retry.
+                        new_token, new_app = await self._try_migrate_app(current_app_id)
+                        if new_token and new_app:
+                            token = new_token
+                            current_app_id = new_app
+                            continue
+                        # No healthy app available → fall back to sleep.
                         await asyncio.sleep(retry_after)
                         token = await self._get_token()
                         continue
@@ -3605,7 +3967,8 @@ class GraphClient:
                 # Permanent 4xx — no retry.
                 if stream_cm is not None:
                     await stream_cm.__aexit__(None, None, None)
-                await client_cm.__aexit__(None, None, None)
+                if client_cm is not None:
+                    await client_cm.__aexit__(None, None, None)
                 status = he.response.status_code if he.response is not None else 0
                 if status in (400, 401, 403, 404, 410, 423):
                     raise
@@ -3624,7 +3987,8 @@ class GraphClient:
             ) as e:
                 if stream_cm is not None:
                     await stream_cm.__aexit__(None, None, None)
-                await client_cm.__aexit__(None, None, None)
+                if client_cm is not None:
+                    await client_cm.__aexit__(None, None, None)
                 last_err = e
                 if attempt < max_attempts - 1:
                     await asyncio.sleep(backoff_s)
@@ -3635,7 +3999,8 @@ class GraphClient:
             except BaseException:
                 if stream_cm is not None:
                     await stream_cm.__aexit__(None, None, None)
-                await client_cm.__aexit__(None, None, None)
+                if client_cm is not None:
+                    await client_cm.__aexit__(None, None, None)
                 raise
 
             try:
@@ -3650,7 +4015,8 @@ class GraphClient:
 
             # Capture context managers in the closure so they outlive this
             # function. The caller MUST fully consume / aclose() the
-            # generator to release them.
+            # generator to release them. With the shared client we no
+            # longer own client_cm — only the stream needs tearing down.
             _stream_cm = stream_cm
             _client_cm = client_cm
             _resp = resp
@@ -3661,7 +4027,8 @@ class GraphClient:
                         yield chunk
                 finally:
                     await _stream_cm.__aexit__(None, None, None)
-                    await _client_cm.__aexit__(None, None, None)
+                    if _client_cm is not None:
+                        await _client_cm.__aexit__(None, None, None)
 
             return _iter(), ctype, size
 
@@ -3733,6 +4100,111 @@ class GraphClient:
             raise
         except Exception:
             return None
+
+    async def resolve_shares_batch(
+        self, source_urls: List[str],
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
+        """Bulk variant of resolve_share_to_drive_item via /v1.0/$batch.
+
+        Mirrors the OneDrive ``get_download_urls_batch`` pattern: bundle
+        up to 20 GET /shares/{u!base64}/driveItem requests per HTTP call
+        instead of issuing N serial round-trips against the per-app
+        rate-limit budget. On the chat-attachment path, a single user
+        with 37 unique attachment URLs was observed taking 35s of pure
+        resolve wall-time; bulked, that becomes ~3-5s (one batch wave
+        of two chunks).
+
+        Returns a map ``{source_url: driveItem|None}``.
+          * ``dict``  — driveItem resolved (caller should download bytes)
+          * ``None``  — permanent 4xx (400/401/403/404/410/423) OR the
+                       URL was already in the unreachable cache; caller
+                       should treat as a known-broken reference.
+
+        URLs absent from the returned map indicate a transient batch
+        failure (network, 5xx after retries). Callers should fall back
+        to the single-URL ``resolve_share_to_drive_item`` path for
+        anything missing — that path's own retry budget will absorb
+        the transient, and per-URL failures don't leak into the bulk
+        unreachable cache (only true permanent 4xx do).
+        """
+        from shared.graph_batch import BatchRequest
+        import base64 as _b64
+        out: Dict[str, Optional[Dict[str, Any]]] = {}
+        if not source_urls:
+            return out
+
+        # Pre-filter URLs already known-broken — those are deterministic
+        # Nones and don't deserve a batch slot.
+        url_by_id: Dict[str, str] = {}
+        reqs: List[BatchRequest] = []
+        for u in source_urls:
+            if not u:
+                continue
+            if self._is_url_unreachable(u):
+                out[u] = None
+                continue
+            try:
+                share_id = (
+                    "u!"
+                    + _b64.urlsafe_b64encode(u.encode("utf-8"))
+                    .decode("ascii")
+                    .rstrip("=")
+                )
+            except Exception:
+                out[u] = None
+                continue
+            # Batch sub-request id must be unique within the batch and
+            # short. Hash the URL to keep it bounded — collision chance
+            # at 20-per-batch with sha256[:16] is astronomical.
+            req_id = hashlib.sha256(u.encode("utf-8")).hexdigest()[:16]
+            url_by_id[req_id] = u
+            reqs.append(
+                BatchRequest(
+                    id=req_id,
+                    method="GET",
+                    # $batch sub-request URLs are root-relative (no host).
+                    url=f"/shares/{share_id}/driveItem",
+                )
+            )
+
+        if not reqs:
+            return out
+
+        try:
+            responses = await self.batch(reqs)
+        except Exception as exc:
+            # Whole-batch failure is rare — graph_batch already retries
+            # 429/503 internally with the Retry-After header honored.
+            # If we still bubble out here, surface nothing so callers
+            # fall back to the single-URL path rather than incorrectly
+            # caching every URL as broken.
+            print(
+                f"[GraphClient] resolve_shares_batch failed for "
+                f"{len(reqs)} URLs: {type(exc).__name__}: {exc}"
+            )
+            return out
+
+        for req_id, resp in responses.items():
+            u = url_by_id.get(req_id)
+            if not u:
+                continue
+            status = getattr(resp, "status", 0)
+            body = getattr(resp, "body", None) or {}
+            if status == 200 and isinstance(body, dict) and body.get("id"):
+                out[u] = body
+            elif status in (400, 401, 403, 404, 410, 423):
+                # Same permanent-4xx contract as the single-URL path —
+                # cache the failure so future runs short-circuit.
+                self._mark_url_unreachable(u)
+                out[u] = None
+            else:
+                # 429/503 after graph_batch's own retry budget, network
+                # errors, or unexpected 5xx — leave URL absent so the
+                # caller falls back to the single-URL path with its own
+                # retry policy.
+                continue
+
+        return out
 
     async def download_drive_item_bytes(
         self,
@@ -4473,34 +4945,129 @@ class GraphClient:
                 "sizeInBytes": int(folder.get("sizeInBytes") or 0),
             }
 
-        async def walk(folder: Dict[str, Any], parent_path: str) -> None:
-            fid = folder.get("id")
-            name = folder.get("displayName") or "(unnamed)"
-            path = f"{parent_path}/{name}"
-            if fid:
-                tree[fid] = _entry(folder, path)
-            # Each folder has a childFolderCount field; only descend if > 0 to
-            # avoid wasted requests on leaves.
-            if folder.get("childFolderCount", 0) <= 0:
-                # If we don't know the count (selective $select), still walk once.
-                if "childFolderCount" in folder:
-                    return
-            try:
-                child_resp = await self._get(
-                    f"{self.GRAPH_URL}/users/{user_id}/mailFolders/{fid}/childFolders",
-                    params={"$top": "200", "$select": sel_stats},
-                )
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code in (403, 404):
-                    return
-                raise
-            children = child_resp.get("value", []) or []
-            for c in children:
-                await walk(c, path)
+        # PERF #13: prewarm folder paths breadth-first with parallel fetches
+        # at each level instead of serial DFS. For mailboxes with deep folder
+        # trees (e.g. legal/archive tenants) this collapses N sequential
+        # GET roundtrips into one parallel burst per level. We try $batch
+        # first (up to 20 parents per round-trip) and fall back to
+        # asyncio.gather of individual GETs on batch failure.
+        try:
+            from shared.graph_batch import BatchClient as _BC, BatchRequest as _BR
+            _batch = _BC(self)
+        except Exception:
+            _batch, _BR = None, None
 
-        # Start each root walk in parallel, then walk children serially within
-        # each subtree (folder trees are usually shallow and bounded).
-        await asyncio.gather(*[walk(r, "") for r in roots], return_exceptions=False)
+        async def _fetch_children_serial(parents: List[Dict[str, Any]],
+                                         parent_paths: Dict[str, str]) -> List[Dict[str, Any]]:
+            next_level: List[Dict[str, Any]] = []
+
+            async def _one(p: Dict[str, Any]):
+                fid = p.get("id")
+                base = parent_paths.get(fid, "")
+                try:
+                    resp = await self._get(
+                        f"{self.GRAPH_URL}/users/{user_id}/mailFolders/{fid}/childFolders",
+                        params={"$top": "200", "$select": sel_stats},
+                    )
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code in (403, 404):
+                        return []
+                    raise
+                children = resp.get("value", []) or []
+                for c in children:
+                    name = c.get("displayName") or "(unnamed)"
+                    cpath = f"{base}/{name}"
+                    cid = c.get("id")
+                    if cid:
+                        tree[cid] = _entry(c, cpath)
+                        parent_paths[cid] = cpath
+                return children
+
+            results = await asyncio.gather(
+                *[_one(p) for p in parents], return_exceptions=True,
+            )
+            for r in results:
+                if isinstance(r, list):
+                    for c in r:
+                        if c.get("childFolderCount", 0) > 0:
+                            next_level.append(c)
+                elif isinstance(r, Exception):
+                    # logged in inner _one fallthrough is missing; surface for visibility
+                    pass
+            return next_level
+
+        async def _fetch_children_batched(parents: List[Dict[str, Any]],
+                                          parent_paths: Dict[str, str]) -> List[Dict[str, Any]]:
+            """Bundle parent childFolders fetches via /$batch (20 at a time).
+            Bails to serial-gather on any batch failure."""
+            if not _batch or not _BR:
+                return await _fetch_children_serial(parents, parent_paths)
+
+            reqs: List[Any] = []
+            id_to_parent: Dict[str, Dict[str, Any]] = {}
+            for i, p in enumerate(parents):
+                pid = p.get("id")
+                if not pid:
+                    continue
+                rid = f"cf::{i}"
+                id_to_parent[rid] = p
+                # IMPORTANT: $batch sub-request urls are PATH-only, no host.
+                reqs.append(_BR(
+                    id=rid,
+                    method="GET",
+                    url=f"/users/{user_id}/mailFolders/{pid}/childFolders?$top=200&$select={sel_stats}",
+                ))
+
+            try:
+                resp_map = await _batch.batch(reqs)
+            except Exception:
+                return await _fetch_children_serial(parents, parent_paths)
+
+            next_level: List[Dict[str, Any]] = []
+            for rid, sub in resp_map.items():
+                if not (200 <= sub.status < 300):
+                    # 403/404 silently skip (matches DFS behavior). Other
+                    # errors: drop this parent's children; tree stays
+                    # partial but caller already tolerates that.
+                    continue
+                parent = id_to_parent.get(rid)
+                if not parent:
+                    continue
+                base = parent_paths.get(parent.get("id"), "")
+                children = (sub.body or {}).get("value", []) or []
+                for c in children:
+                    name = c.get("displayName") or "(unnamed)"
+                    cpath = f"{base}/{name}"
+                    cid = c.get("id")
+                    if cid:
+                        tree[cid] = _entry(c, cpath)
+                        parent_paths[cid] = cpath
+                    if c.get("childFolderCount", 0) > 0:
+                        next_level.append(c)
+            return next_level
+
+        # Seed level 0 from the roots.
+        level0: List[Dict[str, Any]] = []
+        parent_paths: Dict[str, str] = {}
+        for r in roots:
+            rid = r.get("id")
+            rname = r.get("displayName") or "(unnamed)"
+            rpath = f"/{rname}"
+            if rid:
+                tree[rid] = _entry(r, rpath)
+                parent_paths[rid] = rpath
+            if r.get("childFolderCount", 0) > 0 or "childFolderCount" not in r:
+                level0.append(r)
+
+        # BFS: at each level, fetch all parents' childFolders in parallel.
+        # Depth cap of 12 — Outlook UI itself caps at much less; this is just
+        # a safety stop against pathological loops.
+        current_level = level0
+        for _depth in range(12):
+            if not current_level:
+                break
+            current_level = await _fetch_children_batched(current_level, parent_paths)
+
         return tree
 
     async def resolve_mail_folder_path(
@@ -5676,8 +6243,10 @@ class GraphClient:
         """Authenticated GET that returns the raw response body as bytes — for non-JSON
         endpoints like OneNote page content (text/html) or resource $value (binary).
         Follows 302 redirects implicitly via httpx."""
+        from shared.graph_rate_limiter import graph_rate_limiter
         token = await self._get_token()
         async with self._http_session() as client:
+            await graph_rate_limiter.acquire(reason="graph_get_bytes")
             resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
             resp.raise_for_status()
             return resp.content

@@ -96,8 +96,10 @@ class DeltaTokenHistory(BaseModel):
 @app.on_event("startup")
 async def startup():
     """Initialize Redis connection"""
+    from shared import core_metrics
+    core_metrics.init()
     global redis_client
-    
+
     if settings.REDIS_ENABLED:
         try:
             redis_client = Redis(

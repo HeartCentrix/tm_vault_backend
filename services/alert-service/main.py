@@ -13,6 +13,8 @@ from shared.models import Alert, AccessGroup
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from shared import core_metrics
+    core_metrics.init()
     await init_db()
     yield
     await close_db()

@@ -51,6 +51,13 @@ REQUIRED_TABLES = (
     "chat_url_cache",
     "chat_threads",
     "chat_thread_messages",
+    # Cross-user mail dedup (2026-05-17). Required so the backup-worker
+    # waits for init_db before issuing its first mail-body upsert.
+    "mail_message_bodies",
+    # OneDrive per-file retry queue (2026-05-17). Producer + consumer
+    # both expect the table to exist before issuing their INSERT /
+    # SELECT FOR UPDATE SKIP LOCKED.
+    "onedrive_file_retries",
 )
 
 REQUIRED_COLUMNS = {
@@ -837,6 +844,7 @@ async def init_db() -> None:
             drain_cursor TEXT,
             drain_failure_state JSONB,
             archived_at TIMESTAMPTZ,
+            last_drained_msg_count INTEGER,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             UNIQUE (tenant_id, chat_id)
@@ -860,6 +868,36 @@ async def init_db() -> None:
             archived_at TIMESTAMPTZ,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             UNIQUE (chat_thread_id, message_external_id)
+        )
+        """,
+        # Cross-user mail dedup. Same role chat_thread_messages plays
+        # for chats: one row per logical message body, shared across
+        # every user whose mailbox contained that email. snapshot_items
+        # carries thin pointer rows that JOIN here at read time once
+        # Phase 2 lands. See MailMessageBody in shared/models.py.
+        """
+        CREATE TABLE IF NOT EXISTS mail_message_bodies (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+            fingerprint CHAR(64) NOT NULL,
+            first_user_id VARCHAR(128),
+            first_snapshot_id UUID,
+            from_user_id VARCHAR(128),
+            from_address VARCHAR(256),
+            from_display_name VARCHAR(256),
+            subject TEXT,
+            sent_date_time TIMESTAMPTZ,
+            received_date_time TIMESTAMPTZ,
+            body_content TEXT,
+            body_content_type VARCHAR(16),
+            has_attachments BOOLEAN,
+            metadata_raw JSONB,
+            content_hash CHAR(64),
+            content_size BIGINT,
+            ref_count INTEGER NOT NULL DEFAULT 1,
+            last_referenced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (tenant_id, fingerprint)
         )
         """,
         # snapshot_partitions — cross-replica OneDrive partition split.
@@ -1004,6 +1042,36 @@ async def init_db() -> None:
             created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
         """,
+        # onedrive_file_retries — per-file retry queue for OneDrive
+        # downloads that exhaust their inline resume budget. The main
+        # gather no longer blocks on slow/throttled files; instead it
+        # INSERTs a row here and lets the snapshot complete. A separate
+        # consumer drains this table, retrying each file individually
+        # with exponential backoff (next_retry_at gates pickup). On
+        # success the file is upserted into snapshot_items pointing at
+        # the original snapshot; on exhaustion it's marked
+        # FAILED_PERMANENT for the audit trail.
+        """
+        CREATE TABLE IF NOT EXISTS onedrive_file_retries (
+            id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            tenant_id                UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+            resource_id              UUID NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+            snapshot_id              UUID NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+            file_external_id         VARCHAR(256) NOT NULL,
+            file_name                TEXT,
+            drive_id                 TEXT,
+            file_payload             JSONB NOT NULL,
+            attempt_count            INTEGER NOT NULL DEFAULT 0,
+            last_error               TEXT,
+            last_error_class         VARCHAR(32),
+            next_retry_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            status                   VARCHAR(16) NOT NULL DEFAULT 'PENDING',
+            rescued_snapshot_item_id UUID,
+            created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (snapshot_id, file_external_id)
+        )
+        """,
     ]
 
     index_statements = [
@@ -1087,6 +1155,27 @@ async def init_db() -> None:
         # Hot read path: hydrate a chat thread newest-first.
         "CREATE INDEX IF NOT EXISTS ix_chat_thread_messages_thread_time "
         "ON chat_thread_messages (chat_thread_id, created_date_time DESC)",
+        # Cross-user mail dedup — tenant-scoped fingerprint lookup is the
+        # hot upsert key. UNIQUE (tenant_id, fingerprint) is enforced
+        # at the DDL level; this index also covers the dedup-ratio
+        # rollup query (count by tenant_id).
+        "CREATE INDEX IF NOT EXISTS ix_mail_message_bodies_tenant_fp "
+        "ON mail_message_bodies (tenant_id, fingerprint)",
+        # Purge worker: find unreferenced bodies older than retention.
+        "CREATE INDEX IF NOT EXISTS ix_mail_message_bodies_purge "
+        "ON mail_message_bodies (last_referenced_at) "
+        "WHERE ref_count <= 0",
+        # OneDrive file-retry queue — consumer scans for PENDING rows
+        # whose next_retry_at has elapsed; partial index keeps the
+        # scan O(eligible) instead of O(table). Filtering on status
+        # in (PENDING, IN_PROGRESS) keeps the IN_PROGRESS reaper fast
+        # too (rescued/permanent terminal rows are not scanned).
+        "CREATE INDEX IF NOT EXISTS ix_onedrive_file_retries_ready "
+        "ON onedrive_file_retries (next_retry_at) "
+        "WHERE status IN ('PENDING', 'IN_PROGRESS')",
+        # Per-snapshot lookup for the finalizer's pending-retry count.
+        "CREATE INDEX IF NOT EXISTS ix_onedrive_file_retries_snapshot "
+        "ON onedrive_file_retries (snapshot_id, status)",
         # snapshot_partitions — finalizer + stale-sweep hot paths.
         # Finalizer: SELECT WHERE snapshot_id=... AND status=...
         # Sweep: oldest enqueued non-terminal first.
@@ -1140,6 +1229,25 @@ async def init_db() -> None:
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;",
         "ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;",
         "ALTER TABLE chat_thread_messages ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;",
+        # Item C — HC drain overlap (2026-05-17). Tracks whether a
+        # USER_CHATS snapshot's hostedContent download is still in
+        # flight. Restore paths must check this column before allowing
+        # a restore — see Snapshot.hc_drain_status doc in shared/models.
+        # Idempotent ADD COLUMN IF NOT EXISTS heals existing prod DBs
+        # on next boot without alembic. Default 'NOT_APPLICABLE' so
+        # every pre-existing row is restore-ready.
+        "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS "
+        "hc_drain_status VARCHAR(16) NOT NULL DEFAULT 'NOT_APPLICABLE';",
+        # Hot read path for the post-drain monitor that polls for
+        # PENDING snapshots and emits a warning if any are stuck.
+        "CREATE INDEX IF NOT EXISTS ix_snapshots_hc_pending "
+        "ON snapshots (hc_drain_status) "
+        "WHERE hc_drain_status = 'PENDING';",
+        # Drain-completeness baseline for the chat partial-drain gate
+        # (workers/backup-worker/main.py). NULL = "no baseline yet, skip gate".
+        # Idempotent ADD COLUMN IF NOT EXISTS so existing prod DBs heal on
+        # next service boot without an explicit alembic step.
+        "ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS last_drained_msg_count INTEGER;",
         # Chat export v1 — link CHAT_ATTACHMENT / CHAT_HOSTED_CONTENT rows to
         # their parent message without scanning the metadata JSONB.
         "ALTER TABLE snapshot_items ADD COLUMN IF NOT EXISTS parent_external_id VARCHAR;",

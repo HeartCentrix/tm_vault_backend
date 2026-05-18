@@ -444,14 +444,25 @@ class Settings:
         self.CHATS_PARTITION_ENABLED = os.getenv(
             "CHATS_PARTITION_ENABLED", "true",
         ).lower() in ("true", "1", "yes")
+        # 2026-05-17 prod tuning: lowered 100 → 25 so medium-chat users
+        # (e.g. 30-99 chats — the long tail of regular employees) also
+        # get the partition treatment. With the 8-light replica fleet this
+        # means ~4750 of 5K users fan out to 1-2 shards each, parallelising
+        # across the backup.chats_partition lane instead of crowding
+        # backup.high serially. Tiny users (<25 chats) still run inline
+        # to avoid the per-shard publish overhead.
         self.CHATS_PARTITION_MIN_CHATS = int(os.getenv(
-            "CHATS_PARTITION_MIN_CHATS", "100",
+            "CHATS_PARTITION_MIN_CHATS", "25",
         ))
         self.CHATS_PARTITION_TARGET_CHATS_PER_SHARD = int(os.getenv(
             "CHATS_PARTITION_TARGET_CHATS_PER_SHARD", "50",
         ))
+        # 2026-05-17 prod tuning: 4 → 6 so power users (executives with
+        # 500+ chats) drain ~33% faster. The 8-light × 12-prefetch =
+        # 96-shard cluster budget for backup.chats_partition still
+        # comfortably absorbs the new shard count.
         self.CHATS_PARTITION_MAX_SHARDS = int(os.getenv(
-            "CHATS_PARTITION_MAX_SHARDS", "4",
+            "CHATS_PARTITION_MAX_SHARDS", "6",
         ))
 
         # ── Phase 3.2: Mail partition (covers USER_MAIL / MAILBOX /
@@ -587,20 +598,30 @@ class Settings:
             "GRAPH_HARDENING_ENABLED", "true"
         ).lower() in ("true", "1", "yes")
         # Per-(app, tenant) sustained rate cap. Microsoft Graph's per-app
-        # per-tenant ceiling is ~200 req/s before throttling; 8 rps stays
-        # well clear of admin alerts AND leaves headroom for short bursts
-        # that the multi-app rotator can absorb. Old default 2.5 used
-        # only ~1% of the per-app budget — fine for a single tenant, but
-        # the multi-tenant + multi-resource scaling we built for is
-        # gated by this token-bucket. Override down for skittish tenant
-        # admins; up to 20-30 for trusted prod tenants where you've
-        # measured 429 rates and have headroom.
+        # per-tenant ceiling is ~200 req/s before throttling; 40 rps stays
+        # at 20% of that soft cap with plenty of headroom for the burst
+        # spikes the multi-app rotator can absorb.
+        #
+        # 2026-05-17 prod tuning: 8 → 40 to use the 20-app fleet
+        # efficiently. Cluster-wide budget: 20 apps × 40 RPS = 800 RPS.
+        # 12-replica fleet × ~67 RPS share = matches a 50-user manual
+        # burst peak (50 × ~10 RPS/user ≈ 500 RPS) with 60% headroom.
+        # Microsoft hard ceiling per app is 1000 RPS (10K req/10s window)
+        # so 40 RPS is 4% of the hard cap — practically zero risk of
+        # admin-visible alerts.
+        #
+        # Override down (to e.g. 20) for skittish tenant admins;
+        # override up (to 60-80) only after measuring 429 rates and
+        # confirming no compliance flag.
         self.GRAPH_APP_PACE_REQS_PER_SEC = float(
-            os.getenv("GRAPH_APP_PACE_REQS_PER_SEC", "8.0")
+            os.getenv("GRAPH_APP_PACE_REQS_PER_SEC", "40.0")
         )
         # Per-stream (= per concurrent backup) sustained rate cap.
+        # 1.0 → 2.0 so individual user backups can issue ~2 Graph calls/sec
+        # of sustained work. The per-app rate-limiter still caps the
+        # aggregate, so a single fat user can't monopolize an app.
         self.GRAPH_STREAM_PACE_REQS_PER_SEC = float(
-            os.getenv("GRAPH_STREAM_PACE_REQS_PER_SEC", "1.0")
+            os.getenv("GRAPH_STREAM_PACE_REQS_PER_SEC", "2.0")
         )
         # Priority scheduling on the Graph rate limiter. When true, HIGH/
         # URGENT callers (user-triggered restores, interactive UI ops)
@@ -615,9 +636,17 @@ class Settings:
         # Sequence walked when 429/503 arrives without a Retry-After header.
         # Loops back to the start on exhaustion; the real ceiling is the
         # cumulative-wait cap below.
+        #
+        # 2026-05-17 prod tuning: 60,120,240,480,600 → 10,30,60,180,300.
+        # With 20 apps and the c0c34ed app-migration-on-throttle code, a
+        # throttled call should rarely sit on its original app — the
+        # rotator migrates to a healthy app on next attempt. The backoff
+        # ladder is only the fallback when EVERY app is throttled. A 60s
+        # first-hop wait there was over-conservative and added minutes to
+        # tail latency on hot tenants.
         self.GRAPH_THROTTLE_BACKOFF_SECONDS = [
             int(x) for x in os.getenv(
-                "GRAPH_THROTTLE_BACKOFF_SECONDS", "60,120,240,480,600"
+                "GRAPH_THROTTLE_BACKOFF_SECONDS", "10,30,60,180,300"
             ).split(",") if x.strip()
         ]
         # Sequence for transient network errors (not throttle).
@@ -627,8 +656,13 @@ class Settings:
             ).split(",") if x.strip()
         ]
         self.GRAPH_JITTER_RATIO = float(os.getenv("GRAPH_JITTER_RATIO", "0.2"))
+        # 2026-05-17 prod tuning: 500 → 250. With 20 apps + migration,
+        # we don't need to brake the whole replica for half a second
+        # after one 429 — the next call rotates to a healthy app and
+        # only a 250ms safety margin is needed to avoid micro-burst
+        # contention.
         self.GRAPH_POST_THROTTLE_BRAKE_MS = int(
-            os.getenv("GRAPH_POST_THROTTLE_BRAKE_MS", "500")
+            os.getenv("GRAPH_POST_THROTTLE_BRAKE_MS", "250")
         )
         # Hard cap on total wait time per stream. After this, raise and let
         # RabbitMQ redeliver (resume from last checkpoint).

@@ -1,0 +1,6 @@
+# TMvault autoscaler — queue-depth-driven Railway replica adjuster.
+
+httpx==0.26.0
+
+# Observability — shared metrics module
+prometheus_client>=0.20.0

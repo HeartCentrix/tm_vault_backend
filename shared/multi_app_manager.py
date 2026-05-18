@@ -18,24 +18,41 @@ from shared.graph_ratelimit import AsyncTokenBucket
 # crossing the threshold escalates the ban instead of honoring just
 # Retry-After.
 _WINDOW_S = float(__import__("os").getenv("GRAPH_APP_429_WINDOW_S", "60"))
-_WINDOW_429_THRESHOLD = int(__import__("os").getenv("GRAPH_APP_429_THRESHOLD", "3"))
+# 2026-05-17 prod tuning: 3 → 5. With 20 apps the rotator absorbs
+# transient 429s by migrating to a healthy app on the next attempt —
+# we don't need to ban an app after just 3 hits in a 60s window, that's
+# over-aggressive and wastes ~5% of our app fleet during a normal burst.
+_WINDOW_429_THRESHOLD = int(__import__("os").getenv("GRAPH_APP_429_THRESHOLD", "5"))
 
 # Escalating ban ladder (seconds). Each consecutive triggering window
 # moves one step up. Resets after RECOVERY_SUCCESS_COUNT consecutive
 # successes — see mark_success.
+# 2026-05-17 prod tuning: 5,30,300,1800 → 10,60,300,900.
+#   - First step 5s → 10s so a brief ban is meaningful (5s could be
+#     consumed entirely by token-refresh).
+#   - Top step 1800s → 900s so a deeply-throttled app rejoins the
+#     fleet within 15min instead of half an hour — with 20 apps the
+#     fleet survives one bad apple, but rejoining faster helps when
+#     2-3 are simultaneously banned.
 _BAN_LADDER = [
     int(x) for x in
-    (__import__("os").getenv("GRAPH_APP_BAN_LADDER", "5,30,300,1800")).split(",")
+    (__import__("os").getenv("GRAPH_APP_BAN_LADDER", "10,60,300,900")).split(",")
 ]
 _PROBATION_OK_COUNT = int(__import__("os").getenv("GRAPH_APP_PROBATION_OK", "3"))
-_RECOVERY_SUCCESS_COUNT = int(__import__("os").getenv("GRAPH_APP_RESET_AFTER_OK", "50"))
+# 2026-05-17 prod tuning: 50 → 30. Faster reset means a recovered app
+# climbs back to full rate sooner — important for the 50-user manual
+# burst use case where one momentarily-banned app shouldn't sit at
+# probation rate for half a minute.
+_RECOVERY_SUCCESS_COUNT = int(__import__("os").getenv("GRAPH_APP_RESET_AFTER_OK", "30"))
 
 # Adaptive rate: multiplicative decrease on 429, additive increase on
 # sustained quiet. Floor prevents rate dropping to zero on persistent
 # throttling — at the floor we just lean on Retry-After delays.
 _RATE_DECREASE_FACTOR = float(__import__("os").getenv("GRAPH_APP_RATE_DEC", "0.5"))
 _RATE_INCREASE_FACTOR = float(__import__("os").getenv("GRAPH_APP_RATE_INC", "1.5"))
-_RATE_RECOVERY_QUIET_S = float(__import__("os").getenv("GRAPH_APP_RATE_RECOVER_S", "30"))
+# 2026-05-17 prod tuning: 30s → 15s quiet period before bumping rate
+# back up. Apps recover faster from transient throttle bursts.
+_RATE_RECOVERY_QUIET_S = float(__import__("os").getenv("GRAPH_APP_RATE_RECOVER_S", "15"))
 _RATE_FLOOR = float(__import__("os").getenv("GRAPH_APP_RATE_FLOOR", "0.25"))
 
 
@@ -140,7 +157,28 @@ class MultiAppManager:
         self.apps: List[AppRegistry] = [
             AppRegistry(app) for app in settings.GRAPH_APPS
         ]
-        self._current_index = 0
+        # 2026-05-17 prod tuning: stagger the rotation starting index
+        # across replicas so a cold-boot fleet of 12 doesn't synchronize
+        # on app #1. Without this, every replica's first 10-100 Graph
+        # calls land on the same app (until the round-robin lap completes
+        # to apps 2..N), spike-loading that app's token bucket and
+        # producing a 429 storm during the manual-burst use case. Hash
+        # the worker hostname/PID into the apps list length so different
+        # replicas pick different starting apps deterministically (same
+        # replica across restarts picks the same app — easier to debug).
+        import os as _os
+        seed = (
+            _os.environ.get("HOSTNAME", "")
+            or _os.environ.get("RAILWAY_REPLICA_ID", "")
+            or str(_os.getpid())
+        )
+        if self.apps:
+            self._current_index = (
+                int(hashlib.sha256(seed.encode()).hexdigest()[:8], 16)
+                % len(self.apps)
+            )
+        else:
+            self._current_index = 0
         self._lock = threading.Lock()
         self._app_map: Dict[str, AppRegistry] = {
             app.client_id: app for app in self.apps

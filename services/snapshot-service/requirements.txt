@@ -13,3 +13,6 @@ aiohttp>=3.9
 aioboto3>=15.5.0,<16
 aiobotocore>=2.25.0,<3
 boto3>=1.40.0,<2
+
+# Observability — Prometheus metrics scraped on CORE_METRICS_PORT (default 9103)
+prometheus_client>=0.20.0

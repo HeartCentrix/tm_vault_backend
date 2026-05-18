@@ -995,5 +995,7 @@ async def generate_report(request: GenerateReportRequest):
 
 @app.on_event("startup")
 async def startup():
+    from shared import core_metrics
+    core_metrics.init()
     await init_db()
     print("[REPORT] Report service started")

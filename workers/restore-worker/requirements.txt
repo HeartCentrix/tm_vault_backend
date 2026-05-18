@@ -1,5 +1,6 @@
 aio-pika>=9.4.0
 httpx>=0.27.0
+h2>=4.1.0,<5.0  # HTTP/2 client lib — required when GRAPHCLIENT_HTTP2=true
 azure-storage-blob>=12.19.0
 cryptography>=42.0.0
 sqlalchemy>=2.0.0
@@ -23,3 +24,6 @@ azure-keyvault-secrets>=4.7
 azure-identity>=1.15
 # Observability — Prometheus metrics scraped on PST_METRICS_PORT (default 9100)
 prometheus-client>=0.20.0
+
+# Alembic for prod-safe schema migrations
+alembic>=1.13.0,<2

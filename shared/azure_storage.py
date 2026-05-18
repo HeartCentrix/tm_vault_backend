@@ -829,15 +829,51 @@ class AzureStorageManager:
     
     def _router_facade(self, tenant_id: str, resource_id: str):
         """Return a _StoreFacade over the router's active backend, if loaded.
-        Returns None if the router isn't ready yet (service still booting,
-        or test contexts) so the caller falls back to direct shards."""
+
+        Returns None ONLY when the router truly hasn't loaded yet
+        (no ``active_backend_id`` set, e.g. service still booting or
+        running in a test context without storage_backends rows).
+
+        When the router IS loaded but raises — for example during a
+        Storage toggle ``transition_state`` window where writes are
+        rejected — we surface the error rather than silently falling
+        through to the raw Azure shard, because the legacy fallback
+        would silently route data to the WRONG backend. Operators
+        depend on the toggle to be honored end-to-end; a silent
+        fall-back was the root cause of the demo-time "Cannot connect
+        to stamitkmishr..." log noise where the active backend was
+        SeaweedFS but a stale chat-att task still hit Azure.
+
+        Knobs:
+          STORAGE_ROUTER_STRICT=true → always raise on facade errors
+            (recommended in prod once the toggle is healthy).
+          STORAGE_FACADE_LOG_FALLBACKS=true → log the reason at WARN
+            even when not strict, so silent fallbacks become visible.
+        """
+        import logging
+        log = logging.getLogger("tmvault.storage.facade")
         try:
             from shared.storage.router import router as _router
-            if not _router.active_backend_id():
-                return None
+        except Exception as exc:
+            if os.getenv("STORAGE_FACADE_LOG_FALLBACKS", "false").lower() == "true":
+                log.warning("[StorageFacade] router import failed: %s — using raw shard", exc)
+            return None
+        if not _router.active_backend_id():
+            # Router not loaded yet — legitimate boot-window case.
+            return None
+        try:
             store = _router.get_active_store().shard_for(tenant_id, resource_id)
             return _StoreFacade(store)
-        except Exception:
+        except Exception as exc:
+            strict = os.getenv("STORAGE_ROUTER_STRICT", "false").lower() == "true"
+            log.warning(
+                "[StorageFacade] active-store resolve failed for tenant=%s resource=%s: %s "
+                "(strict=%s; %s)",
+                tenant_id, resource_id, exc, strict,
+                "raising" if strict else "falling back to raw Azure shard",
+            )
+            if strict:
+                raise
             return None
 
     def get_shard_for_resource(self, resource_id: str, tenant_id: str):
@@ -1223,6 +1259,24 @@ async def read_encryption_scope_state(
         return {"error": str(e)}
 
 
+# ─── Key Vault: latest-version resolver with TTL cache + retry ────────
+# Cache key: (vault_uri, key_name). Value: (version, fetched_at_monotonic).
+# TTL is short (5 min) so a rotated key is picked up by the next
+# reconcile cadence without forcing every call to re-open KV.
+_KV_VERSION_CACHE: Dict[Tuple[str, str], Tuple[str, float]] = {}
+_KV_VERSION_CACHE_TTL_S = 300.0
+# Lazy-init so module import outside an event loop (alembic CLI,
+# test collection on older Python) doesn't warn / fail.
+_KV_VERSION_CACHE_LOCK: Optional[asyncio.Lock] = None
+
+
+def _kv_version_cache_lock() -> asyncio.Lock:
+    global _KV_VERSION_CACHE_LOCK
+    if _KV_VERSION_CACHE_LOCK is None:
+        _KV_VERSION_CACHE_LOCK = asyncio.Lock()
+    return _KV_VERSION_CACHE_LOCK
+
+
 async def resolve_key_vault_latest_version(
     key_vault_uri: str,
     key_name: str,
@@ -1234,12 +1288,28 @@ async def resolve_key_vault_latest_version(
     detect when the customer rotated the key in Key Vault and re-apply
     the encryption scope with the new version. Storage account managed
     identity needs `Get` permission on the key for this to succeed.
+
+    Caching: result is cached for ``_KV_VERSION_CACHE_TTL_S`` (5 min)
+    per (vault, key) so the SLA reconcile loop doesn't hammer KV. On
+    rotation the next cache miss picks up the new version.
+
+    Retry: transient KV errors (5xx / network) retry up to 3× with
+    exponential backoff before returning None. Permanent errors
+    (4xx, missing key, permission denied) return None immediately.
     """
     if not key_vault_uri or not key_name:
         return None
+
+    cache_key = (key_vault_uri, key_name)
+    now = time.monotonic() if hasattr(time, "monotonic") else 0.0
+    cached = _KV_VERSION_CACHE.get(cache_key)
+    if cached is not None and (now - cached[1]) < _KV_VERSION_CACHE_TTL_S:
+        return cached[0]
+
     try:
         from azure.keyvault.keys.aio import KeyClient
         from azure.identity.aio import ClientSecretCredential
+        from azure.core.exceptions import HttpResponseError, ServiceRequestError
         from shared.config import settings
     except Exception:
         return None
@@ -1250,17 +1320,61 @@ async def resolve_key_vault_latest_version(
     if not client_id or not client_secret:
         return None
 
-    credential = ClientSecretCredential(client_id=client_id, client_secret=client_secret, tenant_id=tenant_id)
-    try:
-        async with KeyClient(vault_url=key_vault_uri, credential=credential) as client:
-            key = await client.get_key(key_name)  # latest by default
-            # `key.id` is `https://vault/keys/<name>/<version>`
-            kid = getattr(key, "id", None) or ""
-            if "/" in kid:
-                return kid.rsplit("/", 1)[-1]
+    # Async credential MUST be closed to free the underlying HTTP session.
+    # Wrap it + the KeyClient in async-with so even a raise during get_key
+    # walks back through cleanup.
+    backoff_s = 1.0
+    for attempt in range(3):
+        try:
+            async with ClientSecretCredential(
+                client_id=client_id, client_secret=client_secret, tenant_id=tenant_id,
+            ) as credential:
+                async with KeyClient(vault_url=key_vault_uri, credential=credential) as client:
+                    key = await client.get_key(key_name)  # latest by default
+                    # `key.id` is `https://vault/keys/<name>/<version>`
+                    kid = getattr(key, "id", None) or ""
+                    if "/" not in kid:
+                        return None
+                    new_version = kid.rsplit("/", 1)[-1]
+                    # Log on rotation so operators can correlate SLA
+                    # re-applies to actual KV version bumps.
+                    if cached is not None and cached[0] != new_version:
+                        _lifecycle_logger.info(
+                            "[KV] key %s/%s rotation detected: %s → %s",
+                            key_vault_uri, key_name, cached[0], new_version,
+                        )
+                    async with _kv_version_cache_lock():
+                        _KV_VERSION_CACHE[cache_key] = (new_version, now)
+                    return new_version
+        except HttpResponseError as exc:
+            status = getattr(exc, "status_code", None) or 0
+            if 500 <= status < 600 and attempt < 2:
+                await asyncio.sleep(backoff_s)
+                backoff_s *= 2
+                continue
+            _lifecycle_logger.warning(
+                "[KV] resolve_key_vault_latest_version permanent error: %s/%s status=%s err=%s",
+                key_vault_uri, key_name, status, exc,
+            )
             return None
-    except Exception:
-        return None
+        except ServiceRequestError as exc:
+            # Network-layer transient — retry
+            if attempt < 2:
+                await asyncio.sleep(backoff_s)
+                backoff_s *= 2
+                continue
+            _lifecycle_logger.warning(
+                "[KV] resolve_key_vault_latest_version network error after retries: %s",
+                exc,
+            )
+            return None
+        except Exception as exc:
+            _lifecycle_logger.warning(
+                "[KV] resolve_key_vault_latest_version unexpected: %s/%s err=%s",
+                key_vault_uri, key_name, exc,
+            )
+            return None
+    return None
 
 
 async def apply_encryption_scope(
@@ -1326,57 +1440,61 @@ async def apply_encryption_scope(
     # the scope unique without needing the policy id at this layer.
     scope_name = f"tmv-cmk-{container_name}".replace("_", "-")[:63]
 
-    credential = ClientSecretCredential(
-        client_id=client_id, client_secret=client_secret, tenant_id=tenant_id,
-    )
+    # Wrap credential + management client in async-with so the
+    # underlying HTTP session is closed even if put/update raises.
+    # Without this the long-lived aio credential leaks a transport
+    # pool on every call (matters once the SLA reconciler fans out).
     try:
-        async with StorageManagementClient(credential) as mgmt:
-            key_uri_full = (
-                f"{key_vault_uri.rstrip('/')}/keys/{key_name}/{key_version}"
-                if key_version else
-                f"{key_vault_uri.rstrip('/')}/keys/{key_name}"
-            )
-            try:
-                await mgmt.encryption_scopes.put(
+        async with ClientSecretCredential(
+            client_id=client_id, client_secret=client_secret, tenant_id=tenant_id,
+        ) as credential:
+            async with StorageManagementClient(credential) as mgmt:
+                key_uri_full = (
+                    f"{key_vault_uri.rstrip('/')}/keys/{key_name}/{key_version}"
+                    if key_version else
+                    f"{key_vault_uri.rstrip('/')}/keys/{key_name}"
+                )
+                try:
+                    await mgmt.encryption_scopes.put(
+                        resource_group_name=rg_name,
+                        account_name=shard.account_name,
+                        encryption_scope_name=scope_name,
+                        encryption_scope={
+                            "properties": {
+                                "source": "Microsoft.KeyVault",
+                                "state": "Enabled",
+                                "keyVaultProperties": {"keyUri": key_uri_full},
+                                "requireInfrastructureEncryption": False,
+                            }
+                        },
+                    )
+                except Exception as scope_exc:
+                    msg = str(scope_exc)
+                    # Storage account managed identity lacks key permissions —
+                    # surface a specific status so the UI can prompt for
+                    # `az role assignment create --role "Key Vault Crypto User"`.
+                    if any(s in msg for s in ("Forbidden", "AccessDenied",
+                                              "AuthorizationFailed",
+                                              "KeyVaultAccessForbidden")):
+                        _lifecycle_logger.error(
+                            "[EncryptionScope] KEY_VAULT_ACCESS_DENIED — %s", msg)
+                        return {"success": False, "container": container_name,
+                                "status": "KEY_VAULT_ACCESS_DENIED",
+                                "error": msg, "scope": scope_name}
+                    raise
+
+                # Point the container at the new scope.
+                await mgmt.blob_containers.update(
                     resource_group_name=rg_name,
                     account_name=shard.account_name,
-                    encryption_scope_name=scope_name,
-                    encryption_scope={
-                        "properties": {
-                            "source": "Microsoft.KeyVault",
-                            "state": "Enabled",
-                            "keyVaultProperties": {"keyUri": key_uri_full},
-                            "requireInfrastructureEncryption": False,
-                        }
+                    container_name=container_name,
+                    blob_container={
+                        "default_encryption_scope": scope_name,
+                        "deny_encryption_scope_override": True,
                     },
                 )
-            except Exception as scope_exc:
-                msg = str(scope_exc)
-                # Storage account managed identity lacks key permissions —
-                # surface a specific status so the UI can prompt for
-                # `az role assignment create --role "Key Vault Crypto User"`.
-                if any(s in msg for s in ("Forbidden", "AccessDenied",
-                                          "AuthorizationFailed",
-                                          "KeyVaultAccessForbidden")):
-                    _lifecycle_logger.error(
-                        "[EncryptionScope] KEY_VAULT_ACCESS_DENIED — %s", msg)
-                    return {"success": False, "container": container_name,
-                            "status": "KEY_VAULT_ACCESS_DENIED",
-                            "error": msg, "scope": scope_name}
-                raise
-
-            # Point the container at the new scope.
-            await mgmt.blob_containers.update(
-                resource_group_name=rg_name,
-                account_name=shard.account_name,
-                container_name=container_name,
-                blob_container={
-                    "default_encryption_scope": scope_name,
-                    "deny_encryption_scope_override": True,
-                },
-            )
-            return {"success": True, "container": container_name,
-                    "scope": scope_name, "status": "OK"}
+                return {"success": True, "container": container_name,
+                        "scope": scope_name, "status": "OK"}
     except Exception as e:
         _lifecycle_logger.error(
             "[EncryptionScope] FAILED — container=%s: %s\n%s",

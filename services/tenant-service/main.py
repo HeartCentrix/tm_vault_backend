@@ -123,6 +123,8 @@ async def run_tenant_discovery(db: AsyncSession, tenant: Tenant) -> int:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Keep startup lightweight so worker boot does not block tenant reads.
+    from shared import core_metrics
+    core_metrics.init()
     async with engine.connect() as conn:
         await conn.execute(text("SELECT 1"))
     yield
@@ -237,6 +239,84 @@ async def update_tenant(tenant_id: str, request: dict, db: AsyncSession = Depend
         status=tenant.status.value,
         createdAt=tenant.created_at.isoformat(),
     )
+
+
+@app.patch("/api/v1/tenants/{tenant_id}/dr-config")
+async def set_dr_config(
+    tenant_id: str, request: dict, db: AsyncSession = Depends(get_db),
+):
+    """Toggle and configure cross-region DR replication for a tenant.
+
+    Request body fields (all optional):
+      enabled (bool)              — flip `dr_region_enabled`
+      region (str)                — Azure region for the secondary backup store
+      dr_storage_account_name (str)
+      dr_storage_account_key (str) — plaintext on the wire; encrypted at rest
+                                     via ``shared.security.encrypt_secret``.
+
+    DR worker (`dr_replication` Railway service) scans every 5 min for
+    snapshots with status COMPLETED + dr_replication_status='pending'
+    on tenants where this is enabled, and replicates them to the
+    secondary store. The worker is already deployed; this endpoint
+    flips the per-tenant switch + provisioning info.
+
+    SeaweedFS caveat: the current DR worker is Azure-Blob-specific
+    (uses StorageManagementClient + AzureStorageShard). For SeaweedFS-
+    backed tenants, DR requires a separate cross-region SeaweedFS
+    cluster + replication policy — outside this endpoint. The flag
+    is still honored (worker skips with INFO log) so toggling it for
+    a SeaweedFS tenant is non-destructive.
+    """
+    stmt = select(Tenant).where(Tenant.id == UUID(tenant_id))
+    result = await db.execute(stmt)
+    tenant = result.scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    if "enabled" in request:
+        tenant.dr_region_enabled = bool(request["enabled"])
+    if "region" in request:
+        tenant.dr_region = request["region"] or None
+    if "dr_storage_account_name" in request:
+        tenant.dr_storage_account_name = request["dr_storage_account_name"] or None
+    if "dr_storage_account_key" in request:
+        plaintext_key = request["dr_storage_account_key"]
+        if plaintext_key:
+            from shared.security import encrypt_secret
+            tenant.dr_storage_account_key_encrypted = encrypt_secret(plaintext_key)
+        else:
+            tenant.dr_storage_account_key_encrypted = None
+
+    tenant.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    await db.flush()
+    return {
+        "tenant_id": str(tenant.id),
+        "dr_region_enabled": bool(tenant.dr_region_enabled),
+        "dr_region": tenant.dr_region,
+        "dr_storage_account_name": tenant.dr_storage_account_name,
+        "dr_credentials_configured": tenant.dr_storage_account_key_encrypted is not None,
+    }
+
+
+@app.get("/api/v1/tenants/{tenant_id}/dr-config")
+async def get_dr_config(tenant_id: str, db: AsyncSession = Depends(get_db)):
+    """Return current DR configuration for a tenant (no secrets surfaced)."""
+    stmt = select(Tenant).where(Tenant.id == UUID(tenant_id))
+    result = await db.execute(stmt)
+    tenant = result.scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    return {
+        "tenant_id": str(tenant.id),
+        "dr_region_enabled": bool(tenant.dr_region_enabled),
+        "dr_region": tenant.dr_region,
+        "dr_storage_account_name": tenant.dr_storage_account_name,
+        "dr_credentials_configured": tenant.dr_storage_account_key_encrypted is not None,
+        "dr_last_replicated_at": (
+            tenant.dr_last_replicated_at.isoformat()
+            if tenant.dr_last_replicated_at else None
+        ),
+    }
 
 
 @app.delete("/api/v1/tenants/{tenant_id}", status_code=204)

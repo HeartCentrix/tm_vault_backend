@@ -2,6 +2,7 @@ fastapi==0.109.0
 sqlalchemy==2.0.25
 asyncpg==0.29.0
 httpx==0.26.0
+h2>=4.1.0,<5.0  # HTTP/2 client lib — required when GRAPHCLIENT_HTTP2=true
 pydantic-settings==2.1.0
 python-dotenv==1.0.0
 aio-pika==9.4.0
@@ -21,3 +22,9 @@ azure-mgmt-subscription>=3.1.0
 aioboto3>=15.5.0,<16
 aiobotocore>=2.25.0,<3
 boto3>=1.40.0,<2
+
+# Observability — Prometheus metrics scraped on CORE_METRICS_PORT (default 9103)
+prometheus_client>=0.20.0
+
+# Alembic for prod-safe schema migrations
+alembic>=1.13.0,<2

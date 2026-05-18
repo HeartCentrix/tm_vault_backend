@@ -17,3 +17,6 @@ aiobotocore>=2.25.0,<3
 boto3>=1.40.0,<2
 # Prometheus scrape endpoint exposed by shared/sla_metrics.py on :9101
 prometheus_client>=0.20.0
+
+# Alembic for prod-safe schema migrations
+alembic>=1.13.0,<2

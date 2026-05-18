@@ -101,17 +101,32 @@ class BatchClient:
         self, chunk: List[BatchRequest],
     ) -> Dict[str, BatchResponse]:
         from shared.config import settings as s
+        from shared.multi_app_manager import multi_app_manager
         pending = list(chunk)
         collected: Dict[str, BatchResponse] = {}
         attempts = 0
+        # Track which app's token is being used for this chunk's lifetime.
+        # On 429/503 we try to swap to a healthier app before sleeping —
+        # /$batch hits Graph's per-app throttle the same as single requests
+        # do, so 30s of Retry-After is pure waste when another app's
+        # bucket has full credit. Migration is tried up to N times per
+        # chunk (one per retry); if no healthy alt app exists we fall
+        # back to the original sleep behaviour.
+        current_token: Optional[str] = None
+        current_app_id: str = self._gc.client_id
         while pending and attempts < s.GRAPH_MAX_RETRIES + 1:
             attempts += 1
-            responses = await self._send_once(pending)
+            responses = await self._send_once(
+                pending, override_token=current_token,
+                override_app_id=current_app_id,
+            )
             failed: List[BatchRequest] = []
             max_retry_after = 0.0
             by_id = {r.id: r for r in pending}
+            any_throttle = False
             for resp in responses:
                 if resp.status in (429, 503):
+                    any_throttle = True
                     ra = parse_retry_after(resp.headers.get("Retry-After"))
                     if ra is not None:
                         max_retry_after = max(max_retry_after, ra)
@@ -120,7 +135,30 @@ class BatchClient:
                     collected[resp.id] = resp
             pending = failed
             if pending:
+                # Mark the current app throttled (per-app accounting)
+                # then attempt migration. The "any other healthy app"
+                # case is the common one with 20 apps registered.
+                multi_app_manager.mark_throttled(
+                    current_app_id, int(max(max_retry_after, 1.0)),
+                )
+                new_token, new_app = await self._gc._try_migrate_app(current_app_id)
+                if new_token and new_app:
+                    current_token = new_token
+                    current_app_id = new_app
+                    # No sleep — retry immediately on the new app's
+                    # token. Graph per-app caps are independent.
+                    continue
+                # Fallback: all other apps throttled too OR single-app
+                # deployment. Honor Retry-After.
                 await asyncio.sleep(max(max_retry_after, 1.0))
+            else:
+                if any_throttle is False and current_app_id != self._gc.client_id:
+                    # Migrated mid-chunk and the new app served clean —
+                    # credit it so adaptive recovery can lift its rate.
+                    try:
+                        multi_app_manager.mark_success(current_app_id, 0.0)
+                    except Exception:
+                        pass
         # Any still-failing requests: return as-is with their last 429 so
         # the caller can decide whether to surface or skip.
         for req in pending:
@@ -131,13 +169,24 @@ class BatchClient:
 
     async def _send_once(
         self, chunk: List[BatchRequest],
+        *,
+        override_token: Optional[str] = None,
+        override_app_id: Optional[str] = None,
     ) -> List[BatchResponse]:
+        """Send one /$batch POST.
+
+        ``override_token`` / ``override_app_id`` let the retry loop send
+        through a different app's token after migration. When unset
+        (the common first-attempt case), we use the parent GraphClient's
+        own credentials.
+        """
         policy = self._gc._policy
         await policy.stream_bucket.acquire()
         from shared.multi_app_manager import multi_app_manager
-        await multi_app_manager.acquire_app_token(self._gc.client_id)
+        effective_app = override_app_id or self._gc.client_id
+        await multi_app_manager.acquire_app_token(effective_app)
 
-        token = await self._gc._get_token()
+        token = override_token or await self._gc._get_token()
         payload = {
             "requests": [
                 {
@@ -148,11 +197,26 @@ class BatchClient:
                 for r in chunk
             ]
         }
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        # PERF (Item A): route /$batch through the SHARED httpx client so
+        # batch POSTs ride the same HTTP/2 connection as the per-sub-request
+        # GETs. The previous per-call httpx.AsyncClient() forced a fresh
+        # TCP+TLS handshake on every batch — adding 80-150ms per batch on
+        # WAN. With HTTP/2 the batch is just one more multiplexed stream.
+        try:
+            client = await self._gc._get_shared_http()
             resp = await client.post(
                 GRAPH_BATCH_URL, json=payload,
                 headers={"Authorization": f"Bearer {token}"},
+                timeout=60.0,
             )
+        except AttributeError:
+            # _gc didn't expose the shared http (unusual — only stubs in
+            # tests). Fall back to a fresh client so the batch still goes.
+            async with httpx.AsyncClient(timeout=60.0) as _fallback:
+                resp = await _fallback.post(
+                    GRAPH_BATCH_URL, json=payload,
+                    headers={"Authorization": f"Bearer {token}"},
+                )
         if resp.status_code != 200:
             # Outer batch itself rejected — e.g., whole app throttled.
             # Treat as 429 on every sub-request so the retry loop handles it.

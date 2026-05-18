@@ -547,6 +547,8 @@ async def _archived_purge_loop():
 @app.on_event("startup")
 async def startup():
     """Initialize message bus and start consumer on startup"""
+    from shared import core_metrics
+    core_metrics.init()
     await message_bus.connect()
     asyncio.create_task(consume_audit_events())
     asyncio.create_task(_refresh_running_jobs())

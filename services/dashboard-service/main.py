@@ -107,6 +107,8 @@ async def lifespan(app: FastAPI):
     # Dashboard is read-only and should not run heavyweight schema migration logic
     # during startup. That path can block on application traffic from other services
     # and leave the container stuck in "Waiting for application startup".
+    from shared import core_metrics
+    core_metrics.init()
     await _wait_for_db()
     yield
     await close_db()

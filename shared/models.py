@@ -1,6 +1,7 @@
 """Shared database models"""
 import uuid
 from datetime import datetime, timezone
+from typing import Tuple
 from sqlalchemy import (
     Column, String, DateTime, Boolean, Integer, BigInteger,
     Text, ForeignKey, Enum as SAEnum, JSON, ARRAY, func, LargeBinary,
@@ -555,6 +556,22 @@ class Snapshot(Base):
     lease_expires_at = Column(DateTime(timezone=True), nullable=True)
     lease_token = Column(BigInteger, nullable=False, default=0)
     requeue_count = Column(Integer, nullable=False, default=0)
+    # Item C: HC drain overlap (2026-05-17).
+    # USER_CHATS snapshots fire hostedContent (inline images) downloads
+    # as background tasks. Previously the handler waited at a barrier
+    # before returning — blocking the consumer slot until HC drained.
+    # With USER_CHATS_HC_BARRIER_DETACHED=true the handler returns
+    # immediately after persisting message bodies; HC drains in the
+    # background and flips this column to COMPLETE when done. Restore
+    # paths MUST refuse to restore a snapshot whose hc_drain_status is
+    # PENDING — the HC items haven't all written yet.
+    #
+    # Values:
+    #   "NOT_APPLICABLE" — non-chat snapshot, or HC interleave disabled
+    #   "PENDING"        — drain started, items still streaming in
+    #   "COMPLETE"       — every kicked task settled with no exception
+    #   "FAILED"         — at least one task raised; restore disallowed
+    hc_drain_status = Column(String(16), nullable=False, default="NOT_APPLICABLE")
     created_at = Column(DateTime, default=utcnow)
 
     __table_args__ = (
@@ -1236,9 +1253,76 @@ class ChatThread(Base):
     last_drained_at = Column(DateTime(timezone=True), nullable=True)   # when we last hit Graph
     drain_cursor = Column(Text, nullable=True)
     drain_failure_state = Column(JSONB, nullable=True)
+    # Count of messages persisted in chat_thread_messages after the most
+    # recent successful drain (across all users). Used by the post-drain
+    # completeness gate: if the next drain ends with significantly fewer
+    # messages than this baseline (and no purge/retention reason exists),
+    # we treat the drain as partial and DO NOT advance the cursor — see
+    # _CHAT_DRAIN_COMPLETENESS_DROP_PCT in backup-worker/main.py.
+    last_drained_msg_count = Column(Integer, nullable=True)
     archived_at = Column(DateTime(timezone=True), nullable=True)  # P2 soft delete
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
     updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
+class MailMessageBody(Base):
+    """Cross-user mail message body store (2026-05-17). Mirrors the
+    chat_thread_messages model: deduplicate the bytes of an email body
+    across all snapshots/users that reference it within one tenant.
+
+    Why this exists: in a typical enterprise mailbox the same email
+    thread is replicated across every recipient's mailbox AND every
+    sender's Sent folder. Today we serialize each copy's body into
+    snapshot_items.extra_data → 3-5× write amplification for big
+    distribution lists. This table caches the body once per
+    (tenant_id, fingerprint) and lets future reads JOIN here instead.
+
+    Dedup key: `fingerprint` = sha256(from + sentDateTime + subject +
+    body_size + body_first_64KB_hash). Not a hash collision risk in
+    practice — sentDateTime is microsecond-precise and the prefix
+    hash discriminates beyond what mailbox boundaries do.
+
+    Migration plan:
+      Phase 1 (this commit): write-only. Bodies live in BOTH
+        snapshot_items.extra_data AND mail_message_bodies. No restore
+        path changes — zero risk to existing reads.
+      Phase 2 (future): switch restore to JOIN this table; stop
+        writing body to snapshot_items.extra_data; reclaim disk.
+
+    Unique constraint: (tenant_id, fingerprint). ON CONFLICT DO
+    NOTHING makes the upsert idempotent under concurrent writers
+    from different users' drains.
+    """
+    __tablename__ = "mail_message_bodies"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="RESTRICT"), nullable=False, index=True)
+    fingerprint = Column(String(64), nullable=False)
+    # Provenance — the first user/snapshot to land this body. Useful for
+    # audit and for the "who got it first" tie-break in claim helpers.
+    first_user_id = Column(String(128), nullable=True)
+    first_snapshot_id = Column(UUID(as_uuid=True), nullable=True)
+    # Mail-specific fields lifted out of body so reads don't need JSON
+    # extraction. Identical role to ChatThreadMessage's from_*.
+    from_user_id = Column(String(128), nullable=True)
+    from_address = Column(String(256), nullable=True)
+    from_display_name = Column(String(256), nullable=True)
+    subject = Column(Text, nullable=True)
+    sent_date_time = Column(DateTime(timezone=True), nullable=True)
+    received_date_time = Column(DateTime(timezone=True), nullable=True)
+    body_content = Column(Text, nullable=True)
+    body_content_type = Column(String(16), nullable=True)
+    has_attachments = Column(Boolean, nullable=True)
+    # Full Graph payload — same shape backup-worker writes to
+    # snapshot_items.extra_data['raw'] today. Phase-2 reads JOIN here.
+    metadata_raw = Column(JSONB, nullable=True)
+    content_hash = Column(String(64), nullable=True)
+    content_size = Column(BigInteger, nullable=True)
+    # How many distinct snapshot_items rows currently point at this
+    # body. Bumped on every dedup hit. The post-retention purge walks
+    # bodies with ref_count=0 + last_referenced_at older than the cap.
+    ref_count = Column(Integer, nullable=False, default=1)
+    last_referenced_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
 
 
 class ChatThreadMessage(Base):
@@ -1267,3 +1351,56 @@ class ChatThreadMessage(Base):
     content_size = Column(BigInteger, nullable=True)
     archived_at = Column(DateTime(timezone=True), nullable=True)  # P2 soft delete
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+# OneDrive per-file retry queue (2026-05-17).
+# A file that exhausts its inline resume budget no longer blocks
+# snapshot completion. The main gather records a row here; a separate
+# consumer drains it at its own pace. On success the rescued bytes
+# are upserted into snapshot_items pointing at the ORIGINAL snapshot
+# (UPSERT on (snapshot_id, external_id, item_type) is idempotent —
+# the snapshot's rollup query re-derives counters from the table).
+class OneDriveFileRetry(Base):
+    __tablename__ = "onedrive_file_retries"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    resource_id = Column(UUID(as_uuid=True), ForeignKey("resources.id", ondelete="CASCADE"), nullable=False, index=True)
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey("snapshots.id", ondelete="CASCADE"), nullable=False, index=True)
+    file_external_id = Column(String(256), nullable=False)
+    file_name = Column(Text, nullable=True)
+    drive_id = Column(Text, nullable=True)
+    # The full Graph file dict — same shape backup_single_file expects.
+    file_payload = Column(JSONB, nullable=False)
+    attempt_count = Column(Integer, nullable=False, default=0)
+    last_error = Column(Text, nullable=True)
+    # "throttle" | "stream_drop" | "permanent" | "unknown"
+    last_error_class = Column(String(32), nullable=True)
+    next_retry_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    # PENDING | IN_PROGRESS | RESCUED | FAILED_PERMANENT
+    status = Column(String(16), nullable=False, default="PENDING")
+    rescued_snapshot_item_id = Column(UUID(as_uuid=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+    # UNIQUE(snapshot_id, file_external_id) enforced via the table
+    # DDL in shared/database.py; mirrored here is not necessary.
+
+
+def snapshot_is_restore_ready(snapshot: "Snapshot") -> Tuple[bool, str]:
+    """Return (is_ready, reason). Restore paths should call this and
+    refuse to proceed when is_ready is False.
+
+    Currently checks Item-C's hc_drain_status:
+      - NOT_APPLICABLE / COMPLETE → ready.
+      - PENDING → background HC drain still in flight; reject with a
+        retryable error so callers can poll-and-retry.
+      - FAILED → at least one HC task raised; restore is unsafe because
+        inline images may be missing. Caller should surface to the user.
+    """
+    status = getattr(snapshot, "hc_drain_status", "NOT_APPLICABLE") or "NOT_APPLICABLE"
+    if status in ("NOT_APPLICABLE", "COMPLETE"):
+        return True, ""
+    if status == "PENDING":
+        return False, "hc_drain_status=PENDING — hostedContent drain still in flight; retry later"
+    if status == "FAILED":
+        return False, "hc_drain_status=FAILED — at least one hostedContent task raised; restore unsafe"
+    return False, f"unknown hc_drain_status={status!r}"

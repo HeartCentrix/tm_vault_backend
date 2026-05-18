@@ -178,6 +178,69 @@ async def _create_batch_backup_jobs(
     if not resources_map:
         raise HTTPException(status_code=404, detail="No valid resources found")
 
+    # ── Batch-level debounce — protects against rapid duplicate triggers.
+    #
+    # The existing G1 dedup (further below) checks for IN_PROGRESS
+    # snapshots on the requested resource_ids. That misses the
+    # MANUAL_DATASOURCE_M365 case where the bulk request carries
+    # ENTRA_USER ids but the in-flight snapshots live on Tier-2 children
+    # (USER_CHATS, USER_MAIL, ...) — different resource_ids, so the snapshot
+    # check doesn't trip. Result observed 2026-05-17: two manual_bulk
+    # batches 43 seconds apart (88fd531b + 21d856e7) each dispatched a
+    # USER_CHATS job for Gajraj — one finished with 0 items (ghost
+    # snapshot), the other anchored against the ghost and stamped a bogus
+    # 64MB bytes_added.
+    #
+    # This guard runs BEFORE the batch INSERT. If a manual_bulk batch for
+    # the same tenant is IN_PROGRESS and was created in the last 30s,
+    # treat the new trigger as a duplicate and return a pointer to the
+    # existing batch instead of creating a parallel run.
+    if not tier2:
+        try:
+            sample_res = next(iter(resources_map.values()))
+            tenant_for_debounce = str(sample_res.tenant_id)
+            async with db.begin_nested():
+                existing = (await db.execute(
+                    text(
+                        """
+                        SELECT id::text AS bid, created_at
+                          FROM backup_batches
+                         WHERE tenant_id = cast(:tid AS uuid)
+                           AND source = 'manual_bulk'
+                           AND status = 'IN_PROGRESS'
+                           AND created_at > NOW() - INTERVAL '30 seconds'
+                           AND (cast(:bid AS uuid) IS NULL OR id <> cast(:bid AS uuid))
+                         ORDER BY created_at DESC
+                         LIMIT 1
+                        """
+                    ),
+                    {"tid": tenant_for_debounce, "bid": batch_id},
+                )).first()
+            if existing is not None:
+                existing_bid = str(existing[0])
+                print(
+                    f"[JOB_SERVICE] BATCH_DEBOUNCE: duplicate manual_bulk "
+                    f"trigger within 30s for tenant={tenant_for_debounce} — "
+                    f"returning existing batch {existing_bid} instead of "
+                    f"creating new batch {batch_id}"
+                )
+                return [{
+                    "jobId": None,
+                    "status": "RUNNING",
+                    "resourceId": "BATCH",
+                    "resourceCount": 0,
+                    "queue": "deduped_batch",
+                    "deduped": True,
+                    "duplicateBatchId": existing_bid,
+                    "message": (
+                        "Another bulk backup just started for this tenant; "
+                        "tracking the existing batch."
+                    ),
+                }]
+        except Exception as _debounce_exc:
+            # Never block a real trigger on a debounce-check failure.
+            print(f"[JOB_SERVICE] BATCH_DEBOUNCE check failed (non-fatal): {_debounce_exc}")
+
     # Ensure a backup_batches row exists for batch_id. Idempotent:
     # when tenant-service already inserted the row, ON CONFLICT keeps
     # its source/actor_email/bytes_expected. When the caller is the UI
@@ -192,7 +255,28 @@ async def _create_batch_backup_jobs(
         try:
             sample_res = next(iter(resources_map.values()))
             tenant_for_batch = sample_res.tenant_id
-            scope_ids = [r.id for r in resources_map.values()]
+            # scope_user_ids represents the OPERATOR'S intent — what the
+            # user/operator clicked. Tier-2 child rows (USER_MAIL /
+            # USER_CHATS / USER_ONEDRIVE / USER_CALENDAR / USER_CONTACTS)
+            # are discovered automatically as children of ENTRA_USER and
+            # MUST NOT appear in the scope: putting them in inflates
+            # array_length(scope_user_ids,1) so the UI Activity row says
+            # "54 users" when in reality 9 ENTRA_USER + 45 Tier-2 children
+            # are present. The batch finalizer gate-1 already expands
+            # ENTRA_USER scope entries into Tier-2 children at check
+            # time (shared/batch_rollup.py:_finalize_batch_if_complete),
+            # so excluding them here doesn't lose coverage.
+            _T2_EXCLUDE = {
+                ResourceType.USER_MAIL,
+                ResourceType.USER_CALENDAR,
+                ResourceType.USER_CONTACTS,
+                ResourceType.USER_ONEDRIVE,
+                ResourceType.USER_CHATS,
+            }
+            scope_ids = [
+                r.id for r in resources_map.values()
+                if r.type not in _T2_EXCLUDE
+            ]
             await db.execute(text("""
                 INSERT INTO backup_batches
                     (id, tenant_id, source, scope_user_ids, status, created_at)
@@ -536,6 +620,8 @@ async def _create_batch_backup_jobs(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from shared.storage.startup import startup_router, shutdown_router
+    from shared import core_metrics
+    core_metrics.init()
     async with engine.connect() as conn:
         await conn.execute(text("SELECT 1"))
     await message_bus.connect()
@@ -854,6 +940,16 @@ async def _revert_snapshot_storage(db: AsyncSession, snapshot) -> dict:
 async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
     """Cancel a job and fully revert any partial work.
 
+    Concurrency model: the UI fires Cancel POSTs for every sibling job
+    in a batch via Promise.all. Without serialization, three concurrent
+    cancels race for locks on the same backup_batches / jobs / snapshots
+    rows and deadlock (observed 2026-05-18). Take a Postgres advisory
+    lock keyed on batch_id at function entry — only one cancel per
+    batch can run at a time; the rest wait at most a few hundred ms
+    and proceed sequentially. Locks are transaction-scoped
+    (pg_advisory_xact_lock) so they release automatically on commit
+    /rollback / connection drop. Cheap (~100 ns) and Postgres-native.
+
     Cancel is a *revert*, not a soft-close — to keep backing storage
     consistent with the DB and to avoid ghost bytes piling up on
     SeaweedFS / Azure. See `_revert_snapshot_storage` for the per-
@@ -871,8 +967,137 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
     job = (await db.execute(select(Job).where(Job.id == _parse_uuid(job_id, "job_id")))).scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    # Take a transaction-scoped advisory lock keyed on batch_id so
+    # concurrent cancels for sibling jobs in the same batch serialize.
+    # hashtext() collapses the UUID string to a 32-bit int for
+    # pg_advisory_xact_lock; collisions across different batches are
+    # acceptable (worst case: cancels for unrelated batches wait a few
+    # ms for each other, instead of deadlocking the DB). Lock auto-
+    # releases on commit/rollback. If there is no batch_id (e.g. an
+    # ancient pre-batch-redesign job), we lock on the job id itself
+    # which still avoids self-races but doesn't serialize siblings —
+    # those legacy jobs predate the deadlock pattern anyway.
+    _lock_key = None
+    if isinstance(job.spec, dict):
+        _lock_key = job.spec.get("batch_id")
+    if not _lock_key:
+        _lock_key = str(job.id)
+    try:
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
+            {"k": str(_lock_key)},
+        )
+    except Exception as _le:
+        # Lock acquisition is best-effort — falling through without it
+        # is safer than 500-ing the cancel button.
+        print(f"[JOB_SERVICE] cancel advisory_xact_lock failed (continuing): {_le}")
+
     if job.status not in (JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.RETRYING):
-        # Already terminal — nothing to cascade.
+        # The targeted job is already terminal, but the batch it belonged
+        # to may still be IN_PROGRESS because sibling jobs / partition
+        # consumers are still draining. The user clicking Cancel a second
+        # time (or clicking on an already-finished resource) is signalling
+        # "stop the whole backup," so we still need to attempt the batch-
+        # level cascade. Without this, repeat clicks on the same Activity
+        # row never flip backup_batches.status → the row stays "In Progress"
+        # on reload even though the user clearly asked for it to stop.
+        try:
+            batch_id_t = None
+            if isinstance(job.spec, dict):
+                batch_id_t = job.spec.get("batch_id")
+            if batch_id_t:
+                # Cascade-cancel every still-running sibling job in the batch
+                # and force-flip the batch row. Idempotent (`status =
+                # 'IN_PROGRESS'` guards).
+                sib_rows = (await db.execute(
+                    text(
+                        "SELECT id FROM jobs "
+                        " WHERE COALESCE(spec::jsonb->>'batch_id','') = :bid "
+                        "   AND status IN ('QUEUED','RUNNING','RETRYING') "
+                    ),
+                    {"bid": str(batch_id_t)},
+                )).all()
+                sib_ids = [r.id for r in sib_rows]
+                if sib_ids:
+                    await db.execute(
+                        text(
+                            "UPDATE jobs SET status = 'CANCELLED', "
+                            "                completed_at = NOW() "
+                            " WHERE id = ANY(:ids)"
+                        ),
+                        {"ids": sib_ids},
+                    )
+                    await db.execute(
+                        text(
+                            "UPDATE snapshots SET "
+                            "  status = 'FAILED'::snapshotstatus, "
+                            "  completed_at = NOW(), "
+                            "  duration_secs = EXTRACT(EPOCH FROM "
+                            "                  (NOW() - started_at))::int, "
+                            "  extra_data = (COALESCE(extra_data::jsonb, '{}'::jsonb) "
+                            "               || jsonb_build_object( "
+                            "                   'cancelled_at', NOW(), "
+                            "                   'cancelled_by_batch_cascade', true, "
+                            "                   'cancel_phase', "
+                            "                   'flip_pending_sweep'))::json "
+                            " WHERE job_id = ANY(:ids) "
+                            "   AND status = 'IN_PROGRESS'"
+                        ),
+                        {"ids": sib_ids},
+                    )
+                    # Full-revert semantics: also mark sibling
+                    # COMPLETED/PARTIAL snapshots so the sweep at
+                    # backup-scheduler:1019 deletes blobs+items+rows for
+                    # work that finished in the race window between
+                    # "user clicked cancel" and "this UPDATE ran." Status
+                    # stays as-is (the data was genuinely walked); the
+                    # cancelled_at marker is enough for the sweep to
+                    # pick it up. Previous successful snapshots for the
+                    # same resource have a different job_id and are
+                    # untouched.
+                    await db.execute(
+                        text(
+                            "UPDATE snapshots SET "
+                            "  extra_data = (COALESCE(extra_data::jsonb, '{}'::jsonb) "
+                            "               || jsonb_build_object( "
+                            "                   'cancelled_at', NOW(), "
+                            "                   'cancelled_by_batch_cascade', true, "
+                            "                   'cancel_phase', "
+                            "                   'completed_before_cancel'))::json "
+                            " WHERE job_id = ANY(:ids) "
+                            "   AND status IN ('COMPLETED', 'PARTIAL') "
+                            "   AND (extra_data::jsonb ->> 'cancelled_at') IS NULL"
+                        ),
+                        {"ids": sib_ids},
+                    )
+                    print(
+                        f"[JOB_SERVICE] cancel-on-terminal cascaded to "
+                        f"{len(sib_ids)} sibling job(s) in batch "
+                        f"{batch_id_t}"
+                    )
+                await db.execute(
+                    text(
+                        "UPDATE backup_batches "
+                        "   SET status = 'CANCELLED', "
+                        "       completed_at = NOW() "
+                        " WHERE id = cast(:bid AS uuid) "
+                        "   AND status = 'IN_PROGRESS'"
+                    ),
+                    {"bid": str(batch_id_t)},
+                )
+                await db.commit()
+                print(
+                    f"[JOB_SERVICE] cancel-on-terminal force-flipped batch "
+                    f"{batch_id_t} -> CANCELLED (job {job.id} was already "
+                    f"{job.status.value if hasattr(job.status, 'value') else job.status})"
+                )
+        except Exception as _be:
+            print(
+                f"[JOB_SERVICE] cancel-on-terminal batch flip for "
+                f"job={job.id} failed (non-fatal): "
+                f"{type(_be).__name__}: {_be}"
+            )
         return
 
     job.status = JobStatus.CANCELLED
@@ -897,25 +1122,241 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
             text("UPDATE resources SET last_backup_status = 'CANCELLED', last_backup_job_id = :jid WHERE id = ANY(:ids)"),
             {"jid": job.id, "ids": resource_ids},
         )
-        # Fully revert every IN_PROGRESS snapshot this job owned:
-        # delete the blobs from storage, then the DB rows. This is how
-        # we stop partial-upload bytes from accumulating on SeaweedFS /
-        # Azure. The audit event below carries a summary of what went.
-        in_flight_snaps = (await db.execute(
-            select(Snapshot).where(
-                Snapshot.job_id == job.id,
-                Snapshot.status == SnapshotStatus.IN_PROGRESS,
-            )
-        )).scalars().all()
-        for snap in in_flight_snaps:
-            summary = await _revert_snapshot_storage(db, snap)
-            revert_totals["items_reverted"] += summary["items_reverted"]
-            revert_totals["bytes_reverted"] += summary["bytes_reverted"]
-            revert_totals["blobs_deleted"] += summary["blobs_deleted"]
-            revert_totals["blob_errors"] += summary["blob_errors"]
-        revert_totals["snapshots_reverted"] = len(in_flight_snaps)
+        # Atomic flip — was destructive delete, caused two real prod
+        # incidents:
+        #
+        #   1. ForeignKeyViolationError on `snapshot_items_snapshot_id_fkey`
+        #      when a backup_worker inserted a NEW snapshot_items row
+        #      BETWEEN this endpoint's "DELETE FROM snapshot_items" and
+        #      "DELETE FROM snapshots" — the second delete failed with
+        #      FK-violation → 500 to the UI cancel button.
+        #   2. DeadlockDetectedError when two concurrent cancels (or
+        #      cancel + worker insert) collide on the same snapshot row.
+        #
+        # New strategy: atomically flip every in-flight snapshot to
+        # FAILED with ``extra_data.cancelled_at`` set. No deletes here —
+        # FK violations are impossible because no row vanishes. Async
+        # blob + row teardown is owned by ``_sweep_cancelled_snapshots``
+        # in backup-scheduler (runs every 30s, idempotent).
+        #
+        # We still need the *summary* (item/byte counts) for the audit
+        # event below, so we snapshot the aggregate before the flip.
+        # Reads only — concurrent worker inserts after this point land
+        # in the post-cancel reaper's hands, not ours.
+        agg = (await db.execute(
+            text(
+                "SELECT count(s.id) AS n_snaps, "
+                "       COALESCE(SUM(si.n),  0)::bigint AS n_items, "
+                "       COALESCE(SUM(si.b),  0)::bigint AS n_bytes "
+                "  FROM snapshots s "
+                "  LEFT JOIN LATERAL ( "
+                "    SELECT count(*) AS n, "
+                "           COALESCE(SUM(content_size),0)::bigint AS b "
+                "      FROM snapshot_items "
+                "     WHERE snapshot_id = s.id "
+                "  ) si ON TRUE "
+                " WHERE s.job_id = :jid AND s.status = 'IN_PROGRESS'"
+            ),
+            {"jid": job.id},
+        )).first()
+        revert_totals["snapshots_reverted"] = int(agg.n_snaps or 0) if agg else 0
+        revert_totals["items_reverted"] = int(agg.n_items or 0) if agg else 0
+        revert_totals["bytes_reverted"] = int(agg.n_bytes or 0) if agg else 0
+        # The atomic flip itself — single UPDATE, no per-row Python.
+        # status=FAILED so the UI's IN_PROGRESS filter stops showing
+        # the row immediately. extra_data.cancelled_at is the durable
+        # marker the reaper keys on; extra_data.cancelled_by_job_id
+        # gives operators a clean trail back to the cancel event.
+        #
+        # Cast through ::jsonb so the `||` concat operator works even
+        # though the column is plain JSON in the model
+        # (shared/models.py:216). The trailing ::json coerces the
+        # jsonb result back to the column type so UPDATE doesn't trip
+        # an implicit-cast warning. Same idea is used by the reaper
+        # SQL in backup-scheduler.
+        # IN_PROGRESS branch — race-safe flip to FAILED + cancelled_at
+        # marker so the sweep at backup-scheduler:1019 reaps blobs + items
+        # + snapshot row. Worker self-flips on its next _is_job_cancelled
+        # check would also reach this state, but doing it here closes the
+        # window where the worker is still inside a Graph page.
+        await db.execute(
+            text(
+                "UPDATE snapshots SET "
+                "  status = 'FAILED'::snapshotstatus, "
+                "  completed_at = NOW(), "
+                "  duration_secs = EXTRACT(EPOCH FROM (NOW() - started_at))::int, "
+                "  extra_data = (COALESCE(extra_data::jsonb, '{}'::jsonb) "
+                "               || jsonb_build_object( "
+                "                   'cancelled_at', NOW(), "
+                "                   'cancelled_by_job_id', cast(:jid AS text), "
+                "                   'cancel_phase', 'flip_pending_sweep'))::json "
+                " WHERE job_id = cast(:jid AS uuid) AND status = 'IN_PROGRESS'"
+            ),
+            {"jid": str(job.id)},
+        )
+        # COMPLETED / PARTIAL branch — the snapshot already stamped a
+        # terminal state in the milliseconds before cancel landed (race
+        # observed 2026-05-17: Gajraj USER_CHATS 18:59:44 COMPLETED, then
+        # batch cancel at 19:04:47). Per operator requirement, a cancelled
+        # backup must leave NO durable artifacts — its blobs and rows
+        # must be purged so the next incremental anchors against the
+        # PREVIOUS successful snapshot, not the cancelled one. We keep
+        # snapshot.status here (don't downgrade COMPLETED to FAILED — it
+        # genuinely walked the data) but stamp the cancelled_at marker so
+        # the sweep picks it up. The sweep's WHERE-clause already accepts
+        # "cancelled_at IS NOT NULL" as sufficient for revert regardless
+        # of snapshot.status, so blob teardown + row delete will follow.
+        # Previous successful snapshots for the same resource have a
+        # different job_id and are untouched.
+        await db.execute(
+            text(
+                "UPDATE snapshots SET "
+                "  extra_data = (COALESCE(extra_data::jsonb, '{}'::jsonb) "
+                "               || jsonb_build_object( "
+                "                   'cancelled_at', NOW(), "
+                "                   'cancelled_by_job_id', cast(:jid AS text), "
+                "                   'cancel_phase', "
+                "                   'completed_before_cancel'))::json "
+                " WHERE job_id = cast(:jid AS uuid) "
+                "   AND status IN ('COMPLETED', 'PARTIAL') "
+                "   AND (extra_data::jsonb ->> 'cancelled_at') IS NULL"
+            ),
+            {"jid": str(job.id)},
+        )
 
     await db.flush()
+
+    # Bug fix (2026-05-17): cancel used to leave backup_batches.status
+    # stuck at IN_PROGRESS — the Activity feed reads that column directly
+    # (audit-service /api/v1/activity), so a user-cancelled batch kept
+    # showing "In Progress" on page reload. The previous code path only
+    # touched jobs + snapshots; nothing called the batch finalizer.
+    #
+    # Now: after the snapshot flip above, derive the batch_id from
+    # job.spec and call _finalize_batch_if_complete(). With every snapshot
+    # for this job already FAILED (gate-2 terminal), the finalizer will
+    # mark the batch terminal if and only if every other sibling job in
+    # the same batch is also terminal — which is the correct semantics
+    # for partial cancels in multi-job batches. Best-effort: an exception
+    # here must not 500 the cancel endpoint, the rest of the work (job
+    # flip, audit log, blob cleanup) already succeeded.
+    try:
+        batch_id = None
+        if isinstance(job.spec, dict):
+            batch_id = job.spec.get("batch_id")
+        if batch_id:
+            from shared.batch_rollup import _finalize_batch_if_complete
+            new_status = await _finalize_batch_if_complete(batch_id, db)
+            if new_status:
+                print(
+                    f"[JOB_SERVICE] cancel finalized batch {batch_id} "
+                    f"-> {new_status} (after job {job.id})"
+                )
+            else:
+                # Strict finalizer wouldn't flip because sibling jobs
+                # in the same batch are still IN_PROGRESS. But the user
+                # who clicked Cancel meant "stop this whole backup,"
+                # not "cancel one resource and let the rest run." A
+                # fanout-mass batch can have 30+ child jobs — the UI
+                # only exposes a single Cancel button, so a per-job
+                # cancel that leaves siblings running is observed by
+                # the user as "I clicked cancel, why is it still
+                # running?". Cascade-cancel every sibling job in the
+                # batch, then force-flip backup_batches.status to
+                # CANCELLED so the Activity feed reflects the user's
+                # intent on the next reload.
+                sib_rows = (await db.execute(
+                    text(
+                        "SELECT id FROM jobs "
+                        " WHERE COALESCE(spec::jsonb->>'batch_id','') = :bid "
+                        "   AND status IN ('QUEUED','RUNNING','RETRYING') "
+                        "   AND id <> :self_jid "
+                    ),
+                    {"bid": str(batch_id), "self_jid": job.id},
+                )).all()
+                sib_ids = [r.id for r in sib_rows]
+                if sib_ids:
+                    await db.execute(
+                        text(
+                            "UPDATE jobs "
+                            "   SET status = 'CANCELLED', "
+                            "       completed_at = NOW() "
+                            " WHERE id = ANY(:ids)"
+                        ),
+                        {"ids": sib_ids},
+                    )
+                    await db.execute(
+                        text(
+                            "UPDATE snapshots SET "
+                            "  status = 'FAILED'::snapshotstatus, "
+                            "  completed_at = NOW(), "
+                            "  duration_secs = EXTRACT(EPOCH FROM "
+                            "                  (NOW() - started_at))::int, "
+                            "  extra_data = (COALESCE(extra_data::jsonb, '{}'::jsonb) "
+                            "               || jsonb_build_object( "
+                            "                   'cancelled_at', NOW(), "
+                            "                   'cancelled_by_batch_cascade', true, "
+                            "                   'cancel_phase', "
+                            "                   'flip_pending_sweep'))::json "
+                            " WHERE job_id = ANY(:ids) "
+                            "   AND status = 'IN_PROGRESS'"
+                        ),
+                        {"ids": sib_ids},
+                    )
+                    # Full-revert semantics: also mark sibling
+                    # COMPLETED/PARTIAL snapshots so the sweep at
+                    # backup-scheduler:1019 deletes blobs+items+rows for
+                    # work that finished in the race window between
+                    # "user clicked cancel" and "this UPDATE ran." Status
+                    # stays as-is (the data was genuinely walked); the
+                    # cancelled_at marker is enough for the sweep to
+                    # pick it up. Previous successful snapshots for the
+                    # same resource have a different job_id and are
+                    # untouched.
+                    await db.execute(
+                        text(
+                            "UPDATE snapshots SET "
+                            "  extra_data = (COALESCE(extra_data::jsonb, '{}'::jsonb) "
+                            "               || jsonb_build_object( "
+                            "                   'cancelled_at', NOW(), "
+                            "                   'cancelled_by_batch_cascade', true, "
+                            "                   'cancel_phase', "
+                            "                   'completed_before_cancel'))::json "
+                            " WHERE job_id = ANY(:ids) "
+                            "   AND status IN ('COMPLETED', 'PARTIAL') "
+                            "   AND (extra_data::jsonb ->> 'cancelled_at') IS NULL"
+                        ),
+                        {"ids": sib_ids},
+                    )
+                    print(
+                        f"[JOB_SERVICE] cancel cascaded to "
+                        f"{len(sib_ids)} sibling job(s) in batch "
+                        f"{batch_id}"
+                    )
+                # Force-flip the batch row so the Activity feed
+                # reflects "Canceled" on the very next read. Idempotent
+                # (only flips if currently IN_PROGRESS, matching the
+                # _finalize_batch_if_complete safety semantics).
+                await db.execute(
+                    text(
+                        "UPDATE backup_batches "
+                        "   SET status = 'CANCELLED', "
+                        "       completed_at = NOW() "
+                        " WHERE id = cast(:bid AS uuid) "
+                        "   AND status = 'IN_PROGRESS'"
+                    ),
+                    {"bid": str(batch_id)},
+                )
+                await db.commit()
+                print(
+                    f"[JOB_SERVICE] cancel force-flipped batch "
+                    f"{batch_id} -> CANCELLED (user-initiated cascade)"
+                )
+    except Exception as _be:
+        print(
+            f"[JOB_SERVICE] cancel batch finalize for job={job.id} "
+            f"failed (non-fatal): {type(_be).__name__}: {_be}"
+        )
 
     # Audit trail — emit a CANCELLED event whose action mirrors the
     # job kind so the Audit feed groups restore vs backup correctly.

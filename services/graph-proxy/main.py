@@ -130,8 +130,10 @@ class AdaptiveThrottleManager:
 @app.on_event("startup")
 async def startup():
     """Initialize services"""
+    from shared import core_metrics
+    core_metrics.init()
     global redis_client, throttle_manager
-    
+
     # Initialize Redis if enabled
     if settings.REDIS_ENABLED:
         try:

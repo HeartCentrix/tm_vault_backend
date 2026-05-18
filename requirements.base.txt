@@ -12,6 +12,9 @@ python-multipart==0.0.6
 # --- Database ---
 sqlalchemy==2.0.25
 asyncpg==0.29.0
+# Alembic for schema migrations. Replaces Base.metadata.create_all
+# as the prod-safe schema-evolution path (see tm_backend/alembic/).
+alembic>=1.13.0,<2
 
 # --- HTTP client ---
 # httpx + h2 to enable HTTP/2 multiplexing on the persistent Graph client.
