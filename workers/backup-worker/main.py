@@ -22712,39 +22712,62 @@ class BackupWorker:
                         and prior.lease_expires_at > _now_aware
                         and _self_worker_uuid is not None
                         and prior.lease_owner_id != _self_worker_uuid):
-                    _now = datetime.utcnow()
-                    _sib_extra = dict(extra_data or {})
-                    _sib_extra["skipped_concurrent"] = True
-                    _sib_extra["concurrent_job_id"] = str(job_id)
-                    _sib_extra["concurrent_snapshot_id"] = str(prior.id)
-                    _sib_extra["skip_reason"] = "same_job_redelivery"
-                    sibling = Snapshot(
-                        id=uuid.uuid4(),
-                        resource_id=resource.id,
-                        job_id=job_id,
-                        type=snapshot_type,
-                        status=SnapshotStatus.COMPLETED,
-                        started_at=_now,
-                        completed_at=_now,
-                        duration_secs=0,
-                        item_count=0,
-                        bytes_added=0,
-                        bytes_total=0,
-                        snapshot_label=message.get(
-                            "snapshotLabel", "scheduled",
-                        ),
-                        extra_data=_sib_extra,
-                    )
-                    session.add(sibling)
-                    await session.commit()
+                    # IMPORTANT: do NOT persist a sentinel snapshot here.
+                    # Same-job means there is ALREADY a snapshot row
+                    # under (job_id, resource_id) — the owner worker's
+                    # IN_PROGRESS row. That row, once it reaches terminal,
+                    # satisfies the FANOUT/FINALIZE expected count for
+                    # this published message.
+                    #
+                    # Persisting a sibling COMPLETED row here would:
+                    #   (1) become the "latest" snapshot per
+                    #       (job_id, resource_id) under any read path
+                    #       that does `ORDER BY created_at DESC LIMIT 1`
+                    #       (e.g. the activity-panel per-resource view),
+                    #       and mask the owner's real item_count once
+                    #       it commits — observed 2026-05-18 as every
+                    #       Chats/Mail row showing 0/— after a fresh
+                    #       backup where slow handlers caused RMQ
+                    #       visibility-timeout redelivery.
+                    #   (2) double-count terminal snapshots for the
+                    #       job's expected_n, breaking the
+                    #       `c.terminal >= e.n` finalize trigger if a
+                    #       sentinel lands before the owner's row goes
+                    #       terminal.
+                    #
+                    # Return an unpersisted marker so the caller's
+                    # `(snapshot.extra_data or {}).get("skipped_concurrent")`
+                    # early-return still fires, but nothing hits the
+                    # snapshots table. The marker is a transient ORM
+                    # object — it is NOT session.add()'d, NOT committed,
+                    # and will be garbage-collected once the caller
+                    # bails. Cross-job redeliveries (handled later in
+                    # this function) still get a persisted sentinel
+                    # because each job needs its own terminal-marker.
                     print(
                         f"[{self.worker_id}] [SKIP_REDELIVERY] resource="
                         f"{resource.id} owned by worker="
                         f"{prior.lease_owner_id} with active lease "
-                        f"(snapshot={prior.id}); created skip-snapshot "
-                        f"{sibling.id} COMPLETED skipped_concurrent=true."
+                        f"(snapshot={prior.id}); skipping redelivered "
+                        f"message without persisting sibling."
                     )
-                    return sibling
+                    return Snapshot(
+                        id=prior.id,
+                        resource_id=resource.id,
+                        job_id=job_id,
+                        type=snapshot_type,
+                        status=SnapshotStatus.COMPLETED,
+                        item_count=0,
+                        bytes_added=0,
+                        bytes_total=0,
+                        extra_data={
+                            "skipped_concurrent": True,
+                            "skip_reason": "same_job_redelivery",
+                            "owner_worker": str(prior.lease_owner_id),
+                            "owner_snapshot_id": str(prior.id),
+                            "in_memory_only": True,
+                        },
+                    )
                 return prior
 
             # Cross-job concurrency guard (moved here from
