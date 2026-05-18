@@ -4167,6 +4167,35 @@ class BackupWorker:
                         folder_path_val = (
                             folder_tree.get(fid) if fid else ""
                         ) or ""
+                        # Fallback: when get_mail_folder_tree missed this
+                        # folder (typical cause: a parent's childFolders
+                        # call hit 403/404 and got swallowed at
+                        # graph_client.py:4972-4974, so the subtree
+                        # didn't make it into folder_tree), walk up via
+                        # /mailFolders/{id} once. Cached on the
+                        # GraphClient by (user_id, folder_id) so this is
+                        # ONE Graph call per unresolvable folder per
+                        # backup, not per message. Without this, every
+                        # message in the missing folder would get
+                        # folder_path="" → snapshot-service startup
+                        # backfill stamps in 'folder:<12-char id>'
+                        # placeholder, which is what produces buckets
+                        # like 'folder:AAMkADRhZTM1' in the UI.
+                        if not folder_path_val and fid:
+                            try:
+                                folder_path_val = (
+                                    await graph_client.resolve_mail_folder_path(
+                                        user_id, fid,
+                                    )
+                                ) or ""
+                            except Exception as _rfe:
+                                print(
+                                    f"[{self.worker_id}] [USER_MAIL] "
+                                    f"folder-path resolver failed for "
+                                    f"{fid[:8] if fid else '?'}: "
+                                    f"{type(_rfe).__name__}: {_rfe}"
+                                )
+                                folder_path_val = ""
                         persist_tasks: List[asyncio.Task] = []
                         try:
                             async with mail_sem:
@@ -4180,8 +4209,31 @@ class BackupWorker:
                                                 m.get("parentFolderId"),
                                             )
                                             or (folder_tree.get(fid) if fid else None)
+                                            or folder_path_val
                                             or ""
                                         )
+                                        # Per-message resolver fallback —
+                                        # covers messages whose
+                                        # parentFolderId is a subfolder
+                                        # that didn't make it into
+                                        # folder_tree even though `fid`
+                                        # (the iterating folder) did.
+                                        # GraphClient caches per (user,
+                                        # folder_id) so distinct
+                                        # subfolders cost one Graph
+                                        # call each, regardless of how
+                                        # many messages reference them.
+                                        if not path:
+                                            _pfid = m.get("parentFolderId")
+                                            if _pfid:
+                                                try:
+                                                    path = (
+                                                        await graph_client.resolve_mail_folder_path(
+                                                            user_id, _pfid,
+                                                        )
+                                                    ) or ""
+                                                except Exception:
+                                                    path = ""
                                         local_out.append((
                                             "EMAIL",
                                             m.get("subject") or "(no subject)",
