@@ -993,7 +993,7 @@ async def _list_activities_batch_v2(
             ids = list(r.scope_user_ids or [])
             if len(ids) == 1:
                 name_row = (await session.execute(text("""
-                    SELECT COALESCE(display_name, name) AS dn
+                    SELECT display_name AS dn
                       FROM resources WHERE id = cast(:rid AS uuid) LIMIT 1
                 """), {"rid": str(ids[0])})).first()
                 object_label = (name_row.dn if name_row and name_row.dn else str(ids[0]))
