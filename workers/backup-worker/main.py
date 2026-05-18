@@ -3025,88 +3025,33 @@ class BackupWorker:
                 )
                 return
 
-            # ── Cross-job concurrency guard ────────────────────────────────
-            # The same-job IN_PROGRESS check above only catches dupes within
-            # one job. A fresh job (e.g. instant-run started while a
-            # scheduled job is still walking the resource graph) can
-            # publish a task for a resource that another job is actively
-            # processing — its snapshot row passes the partial unique
-            # index ix_snapshots_job_resource_inprogress because job_id
-            # differs, but both handlers race on the same Graph cursor
-            # and per-folder deltaLink. Observed 2026-05-18 as Narendra
-            # Calendar 806 phantom items, Rashmi mail 3-worker race.
-            #
-            # Treat a recent IN_PROGRESS row from ANOTHER job (lease not
-            # expired, OR started under 25 min ago — the stale-sweep
-            # threshold) as evidence the resource is already being
-            # processed. We still need this job's FANOUT/FINALIZE counter
-            # (c.terminal >= e.n) incremented, so we record `other_active`
-            # here and below create + immediately COMPLETED-mark a
-            # skipped_concurrent snapshot.
-            other_active = None
-            if os.getenv("BACKUP_SKIP_CONCURRENT_JOBS", "true").lower() in ("1", "true", "yes"):
-                other_active = (await session.execute(
-                    select(Snapshot.id, Snapshot.job_id, Snapshot.started_at).where(
-                        Snapshot.resource_id == resource.id,
-                        Snapshot.job_id != job_id,
-                        Snapshot.status == SnapshotStatus.IN_PROGRESS,
-                        or_(
-                            # lease_expires_at is tz-aware (DateTime(timezone=True));
-                            # started_at is naive — compare each against the right kind
-                            # of "now" to avoid offset-naive vs offset-aware TypeError.
-                            Snapshot.lease_expires_at > datetime.now(timezone.utc),
-                            and_(
-                                Snapshot.lease_expires_at == None,  # noqa: E711
-                                Snapshot.started_at > datetime.utcnow() - timedelta(minutes=25),
-                            ),
-                        ),
-                    ).limit(1)
-                )).first()
+            # Cross-job concurrency guard is now atomic inside
+            # create_snapshot (resource-level advisory lock + cross-job
+            # SELECT + INSERT all in one transaction). The TOCTOU
+            # window that used to let N workers race past this check
+            # and each insert their own snapshot is closed. See
+            # create_snapshot for the full mechanism.
 
             # Detach so we can use these objects after the session closes.
             session.expunge_all()
         # Connection released to pool here.
 
-        if other_active is not None:
-            other_id, other_job, other_started = other_active
-            # Create the snapshot row so this job's FANOUT/FINALIZE math
-            # balances (consumer count must equal the bulk_fanout_seen
-            # expectation), then immediately mark it COMPLETED with
-            # skipped_concurrent so operators can see why no items were
-            # ingested for this (job, resource) pair.
-            snapshot = await self.create_snapshot(resource, message, job_id)
-            try:
-                async with async_session_factory() as _skip_s:
-                    _live = await _skip_s.get(Snapshot, snapshot.id)
-                    if _live and _live.status == SnapshotStatus.IN_PROGRESS:
-                        _live.status = SnapshotStatus.COMPLETED
-                        _live.completed_at = datetime.utcnow()
-                        _live.duration_secs = 0
-                        _live.item_count = 0
-                        _live.bytes_added = 0
-                        _live.bytes_total = 0
-                        _ed = dict(_live.extra_data or {})
-                        _ed["skipped_concurrent"] = True
-                        _ed["concurrent_job_id"] = str(other_job)
-                        _ed["concurrent_snapshot_id"] = str(other_id)
-                        _live.extra_data = _ed
-                        await _skip_s.commit()
-            except Exception as _skip_exc:
-                print(
-                    f"[{self.worker_id}] [SKIP_CONCURRENT] couldn't mark "
-                    f"skip-snapshot COMPLETED for resource={resource.id}: "
-                    f"{_skip_exc}"
-                )
-            print(
-                f"[{self.worker_id}] [SKIP_CONCURRENT] resource={resource.id} "
-                f"active in job={other_job} since {other_started} "
-                f"(this job={job_id}); created skip-snapshot {snapshot.id} "
-                f"COMPLETED skipped_concurrent=true."
-            )
-            return
-
         # ── Step 2: network work without a pinned session ─────────────────
         resource_type = resource.type.value if hasattr(resource.type, 'value') else str(resource.type)
+
+        # create_snapshot opens + closes its own short-lived session.
+        # It internally serializes (resource-id advisory lock) so a
+        # cross-job race yields a `skipped_concurrent` sentinel snapshot
+        # rather than a real IN_PROGRESS one. Detect and bail BEFORE
+        # we acquire a Graph client + spend any quota.
+        snapshot = await self.create_snapshot(resource, message, job_id)
+        if (snapshot.extra_data or {}).get("skipped_concurrent"):
+            # Snapshot is already COMPLETED with skipped_concurrent=true,
+            # FANOUT/FINALIZE math is satisfied (1 terminal row per
+            # message). Nothing more to do — bail before graph_client
+            # acquisition / handler dispatch.
+            return
+
         # Per-resource-type handler_key gives each Tier 2 handler its own
         # Graph app from the round-robin pool, so 6 concurrent handlers on
         # the same tenant don't all queue behind one app's RPS budget.
@@ -3115,9 +3060,6 @@ class BackupWorker:
             print(f"[{self.worker_id}] Graph client not available for resource {resource_id}, skipping")
             return
         print(f"[{self.worker_id}] Processing backup for {resource_id} (type={resource_type}, tenant={tenant.id})")
-
-        # create_snapshot opens + closes its own short-lived session.
-        snapshot = await self.create_snapshot(resource, message, job_id)
         # Live-progress tick — snapshot row now exists, handler about to run.
         await _update_job_pct(job_id, 15)
 
@@ -8002,6 +7944,17 @@ class BackupWorker:
                 await _raise_if_job_cancelled(job_id)
                 snapshot = await self.create_snapshot(resource, message, job_id)
                 _snap_by_resource[str(resource.id)] = str(snapshot.id)
+                # Skip-concurrent sentinel from create_snapshot: another
+                # job is actively backing up this resource. Snapshot is
+                # already COMPLETED with skipped_concurrent=true; FANOUT/
+                # FINALIZE accounting is balanced. Bail without graph work.
+                if (snapshot.extra_data or {}).get("skipped_concurrent"):
+                    return {
+                        "resource_id": str(resource.id),
+                        "snapshot_id": str(snapshot.id),
+                        "status": "skipped_concurrent",
+                        "items": 0,
+                    }
                 # Audit: BACKUP_STARTED is emitted ONCE at the outermost
                 # entry point (_process_single_backup for individual /
                 # fanout-mass paths, _finalize_partitioned_snapshot for
@@ -14684,6 +14637,16 @@ class BackupWorker:
                 snapshot = None
                 try:
                     snapshot = await self.create_snapshot(resource, message, job_id)
+                    # Skip-concurrent sentinel from create_snapshot: another
+                    # job is actively backing up this resource. The
+                    # snapshot is already COMPLETED with skipped_concurrent;
+                    # bail before Graph delta fetch.
+                    if (snapshot.extra_data or {}).get("skipped_concurrent"):
+                        return {
+                            "resource_id": str(resource.id),
+                            "snapshot_id": str(snapshot.id),
+                            "status": "skipped_concurrent",
+                        }
                     # BACKUP_STARTED emitted once at the outer entry
                     # (_process_single_backup); see comment in
                     # _backup_user_content_parallel for the rationale.
@@ -16079,6 +16042,13 @@ class BackupWorker:
                 user_label = resource.display_name or resource.external_id
                 try:
                     snapshot = await self.create_snapshot(resource, message, job_id)
+                    if (snapshot.extra_data or {}).get("skipped_concurrent"):
+                        return {
+                            "resource_id": str(resource.id),
+                            "snapshot_id": str(snapshot.id),
+                            "status": "skipped_concurrent",
+                            "user": user_label,
+                        }
                     # BACKUP_STARTED emitted once at the outer entry
                     # (_process_single_backup); inner emission removed
                     # to prevent 4–6× duplicate audit rows per attempt.
@@ -16625,6 +16595,12 @@ class BackupWorker:
                 snapshot = None
                 try:
                     snapshot = await self.create_snapshot(resource, message, job_id)
+                    if (snapshot.extra_data or {}).get("skipped_concurrent"):
+                        return {
+                            "resource_id": str(resource.id),
+                            "snapshot_id": str(snapshot.id),
+                            "status": "skipped_concurrent",
+                        }
                     # BACKUP_STARTED emitted once at the outer entry
                     # (_process_single_backup); inner emission removed
                     # to prevent duplicate audit rows per attempt.
@@ -22670,18 +22646,27 @@ class BackupWorker:
         """
         from sqlalchemy.exc import IntegrityError as _IntegrityError
         async with async_session_factory() as session:
-            # Serialize SELECT+INSERT against the same (job, resource)
-            # so concurrent partition consumers / per-resource handlers
-            # can't both find no prior and both INSERT. The partial
-            # unique index would normally block the second INSERT, but
-            # the 2026-05-16 Vinay incident produced two IN_PROGRESS
-            # snapshots for the same (job, resource) anyway — the only
-            # remaining explanation is the SELECT+INSERT race racing
-            # AROUND the index on different sessions with overlapping
-            # MVCC snapshots. xact-scoped advisory lock keyed on the
-            # (job_id, resource_id) hash makes the check-and-insert
-            # atomic per-pair without serialising the whole table.
-            _lock_key = hash((str(job_id), str(resource.id))) & 0x7fffffffffffffff
+            # Serialize SELECT+INSERT against the RESOURCE (not the
+            # (job, resource) pair). Pre-fix this lock keyed on
+            # (job_id, resource_id), which only protected against
+            # same-job redelivery races — different jobs publishing
+            # tasks for the SAME resource each held a different lock
+            # key and didn't serialize, so all of them passed the
+            # cross-job IN_PROGRESS check in _process_single_backup
+            # (TOCTOU: SELECT happens before any INSERT lands) and
+            # all of them INSERTed under their own job_id, satisfying
+            # the partial unique index ix_snapshots_job_resource_inprogress
+            # because that index keys on (job_id, resource_id). Result
+            # observed 2026-05-18: 4 workers running USER_CHATS for
+            # the same user simultaneously.
+            #
+            # Resource-only key means at most one snapshot CREATION
+            # for a given resource happens at a time across the whole
+            # cluster, no matter how many jobs target it. The lock is
+            # released on commit, so it only blocks the brief
+            # check-and-insert window (~10s of ms), never the actual
+            # handler work.
+            _lock_key = hash(("backup-resource", str(resource.id))) & 0x7fffffffffffffff
             await session.execute(
                 text("SELECT pg_advisory_xact_lock(:k)"),
                 {"k": _lock_key},
@@ -22701,6 +22686,38 @@ class BackupWorker:
             if prior is not None:
                 return prior
 
+            # Cross-job concurrency guard (moved here from
+            # _process_single_backup so it runs INSIDE the same
+            # transaction as the snapshot INSERT — closes the TOCTOU
+            # window). If another active job already owns an
+            # IN_PROGRESS snapshot for this resource (lease not
+            # expired OR started < 25 min ago), we INSERT a sentinel
+            # snapshot for THIS job in status COMPLETED with
+            # skipped_concurrent=true so the fan-out accounting
+            # balances, then return it. Callers detect the sentinel
+            # via extra_data['skipped_concurrent'] and bail before
+            # spending any Graph quota.
+            _cross_skip = None
+            if os.getenv(
+                "BACKUP_SKIP_CONCURRENT_JOBS", "true",
+            ).lower() in ("1", "true", "yes"):
+                _cross_skip = (await session.execute(
+                    select(
+                        Snapshot.id, Snapshot.job_id, Snapshot.started_at,
+                    ).where(
+                        Snapshot.resource_id == resource.id,
+                        Snapshot.job_id != job_id,
+                        Snapshot.status == SnapshotStatus.IN_PROGRESS,
+                        or_(
+                            Snapshot.lease_expires_at > datetime.now(timezone.utc),
+                            and_(
+                                Snapshot.lease_expires_at == None,  # noqa: E711
+                                Snapshot.started_at > datetime.utcnow() - timedelta(minutes=25),
+                            ),
+                        ),
+                    ).limit(1)
+                )).first()
+
             # Stamp the reconciliation lease at creation time. The
             # worker_uuid mirrors the heartbeat row; the sweeper joins
             # on that to decide whether the lease belongs to a live
@@ -22710,6 +22727,37 @@ class BackupWorker:
             _now = datetime.utcnow()
             _lease_owner = getattr(getattr(self, "_heartbeat", None), "worker_uuid", None)
             _lease_expires = _now + timedelta(seconds=int(os.getenv("LEASE_TTL_S", "60")))
+            if _cross_skip is not None:
+                _skip_other_id, _skip_other_job, _skip_other_started = _cross_skip
+                _skip_extra = dict(extra_data or {})
+                _skip_extra["skipped_concurrent"] = True
+                _skip_extra["concurrent_job_id"] = str(_skip_other_job)
+                _skip_extra["concurrent_snapshot_id"] = str(_skip_other_id)
+                snapshot = Snapshot(
+                    id=uuid.uuid4(),
+                    resource_id=resource.id,
+                    job_id=job_id,
+                    type=snapshot_type,
+                    status=SnapshotStatus.COMPLETED,
+                    started_at=_now,
+                    completed_at=_now,
+                    duration_secs=0,
+                    item_count=0,
+                    bytes_added=0,
+                    bytes_total=0,
+                    snapshot_label=message.get("snapshotLabel", "scheduled"),
+                    extra_data=_skip_extra,
+                )
+                session.add(snapshot)
+                await session.commit()
+                print(
+                    f"[{self.worker_id}] [SKIP_CONCURRENT] resource="
+                    f"{resource.id} active in job={_skip_other_job} "
+                    f"since {_skip_other_started} (this job={job_id}); "
+                    f"created skip-snapshot {snapshot.id} COMPLETED "
+                    f"skipped_concurrent=true."
+                )
+                return snapshot
             snapshot = Snapshot(
                 id=uuid.uuid4(),
                 resource_id=resource.id,
