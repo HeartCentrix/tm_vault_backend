@@ -1,4 +1,5 @@
 import asyncio
+import hashlib as _hashlib
 import re as _re
 import base64 as _b64
 import io as _io
@@ -118,42 +119,85 @@ async def _backfill_chat_topic_fallbacks():
             print(f"[SNAPSHOT] chat_topic backfill skipped: {e}")
 
 
+_CHAT_NAME_MAX_LEN = 200
+
+
 def _compose_chat_name(
     chat_id: str,
     topic: Optional[str],
     chat_type: Optional[str],
     member_names: Optional[list],
+    self_display_name: Optional[str] = None,
+    self_user_id: Optional[str] = None,
+    member_user_ids: Optional[list] = None,
 ) -> str:
     """Read-time chat display name. Never persisted.
 
+    MUST stay aligned with the write-side helper in backup-worker
+    (`_compose_chat_name_local`) so /folders and /chats/groups agree
+    on the same name.
+
     Resolution order:
-      1. Real Graph topic (when chat_threads.chat_topic is set).
-      2. Composed from chat_threads.member_names_json — picks the right
-         shape for 1:1 vs group.
-      3. "Untitled chat #abcdef" / "Untitled group #abcdef" — natural-
-         reading fallback with a short ref suffix derived from chat_id
-         (alphanumeric-only, last 6 chars). Must match the write-side
-         fallback in backup-worker exactly so /folders and /chats/groups
-         agree on the displayed name.
+      1. Topic — matches Teams' own rename UX.
+      2. Others (filter self out by AAD object id when available, else by
+         displayName match against `self_display_name`).
+      3. 1:1 → the other person's display name.
+         Group / meeting → comma-joined names of others, smart-truncated
+         past 200 chars with a trailing "+N more".
+      4. Fallback: "Untitled chat/group #<sha1[:8]>" — unique per chat_id
+         so unnamed chats never collapse into a shared folder.
     """
     if isinstance(topic, str) and topic.strip():
         return topic.strip()
-    names: List[str] = []
+    raw_names: List[str] = []
     if isinstance(member_names, list):
-        names = [
+        raw_names = [
             str(n).strip()
             for n in member_names
             if isinstance(n, str) and n.strip()
         ]
+    raw_uids: List[str] = []
+    if isinstance(member_user_ids, list):
+        raw_uids = [
+            str(u).strip()
+            for u in member_user_ids
+            if u
+        ]
+    self_uid_norm = (self_user_id or "").strip().lower()
+    self_dn_norm = (self_display_name or "").strip().lower()
+    others: List[str] = []
+    if raw_uids and raw_names and len(raw_uids) == len(raw_names):
+        for _u, _n in zip(raw_uids, raw_names):
+            if _u and _u.strip().lower() == self_uid_norm:
+                continue
+            others.append(_n)
+    else:
+        for _n in raw_names:
+            if self_dn_norm and _n.lower() == self_dn_norm:
+                continue
+            others.append(_n)
     ct = (chat_type or "").lower()
-    if names:
-        if ct == "oneonone":
-            return " | ".join(names[:2])
-        if len(names) <= 3:
-            return ", ".join(names)
-        return ", ".join(names[:3]) + f" +{len(names) - 3} more"
-    cid_clean = "".join(c for c in chat_id if c.isalnum()) or chat_id
-    suffix = cid_clean[-6:]
+    if ct == "oneonone":
+        if others:
+            return others[0]
+    elif others:
+        joined = ", ".join(others)
+        if len(joined) <= _CHAT_NAME_MAX_LEN:
+            return joined
+        picked: List[str] = []
+        used = 0
+        for _n in others:
+            sep_len = 2 if picked else 0
+            tail_len = 10  # room for ' +N more'
+            if used + sep_len + len(_n) + tail_len > _CHAT_NAME_MAX_LEN:
+                break
+            picked.append(_n)
+            used += sep_len + len(_n)
+        remaining = len(others) - len(picked)
+        if remaining > 0:
+            return f"{', '.join(picked)} +{remaining} more"
+        return ", ".join(picked)
+    suffix = _hashlib.sha1(chat_id.encode("utf-8")).hexdigest()[:8]
     if ct == "oneonone":
         return f"Untitled chat #{suffix}"
     return f"Untitled group #{suffix}"
