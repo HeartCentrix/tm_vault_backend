@@ -2456,6 +2456,43 @@ class BackupWorker:
         except Exception as audit_err:
             print(f"[{self.worker_id}] [AuditLogger] lifecycle emit failed: {audit_err}")
 
+    async def _delta_token_is_usable(
+        self, snapshot: "Snapshot", resource_id: uuid.UUID,
+    ) -> bool:
+        """Single decision point for "should we honor a stored delta_token
+        on this resource for THIS snapshot?"
+
+        Returns True only when both hold:
+          1) snapshot.type != FULL (FULL must always do a clean sweep so
+             scheduled fulls heal partials and force-fulls work)
+          2) there exists at least one prior COMPLETED snapshot for the
+             same resource (other than this snapshot itself)
+
+        Why (2): post-DB-wipe (or after retention pruning, or first run
+        ever) the resource row's extra_data can still carry a delta_token
+        from a now-deleted snapshot. Using it makes Graph return only
+        recent changes — the worker then writes a COMPLETED snapshot with
+        a fraction of the mailbox/chat history, and the activity panel
+        falsely shows ✓ with partial counts (observed 2026-05-18: Rohit
+        Chats 3,927 vs 30k+ real; Vinay Mail 576 vs 7k real). Requiring a
+        prior COMPLETED snapshot as a baseline anchors delta sync to a
+        real backup that exists in this vault, not a ghost.
+        """
+        try:
+            if snapshot.type == SnapshotType.FULL:
+                return False
+        except Exception:
+            return False
+        async with async_session_factory() as _sess:
+            row = (await _sess.execute(
+                select(Snapshot.id).where(
+                    Snapshot.resource_id == resource_id,
+                    Snapshot.status == SnapshotStatus.COMPLETED,
+                    Snapshot.id != snapshot.id,
+                ).limit(1)
+            )).first()
+        return row is not None
+
     async def _load_mail_folder_deltas(
         self, resource_id: uuid.UUID,
     ) -> Dict[str, str]:
@@ -3845,17 +3882,31 @@ class BackupWorker:
                     # tokens). Until prod is fully migrated, fall back
                     # to the legacy dict per folder_id that hasn't
                     # been re-baselined yet. New wins on conflict.
-                    _new_table_tokens = await self._load_mail_folder_deltas(
-                        resource.id,
-                    )
-                    _legacy_tokens = dict(
-                        (resource.extra_data or {}).get(
-                            "mail_delta_tokens_by_folder", {},
-                        ) or {},
-                    )
-                    mail_existing_tokens: Dict[str, str] = {
-                        **_legacy_tokens, **_new_table_tokens,
-                    }
+                    if await self._delta_token_is_usable(snapshot, resource.id):
+                        _new_table_tokens = await self._load_mail_folder_deltas(
+                            resource.id,
+                        )
+                        _legacy_tokens = dict(
+                            (resource.extra_data or {}).get(
+                                "mail_delta_tokens_by_folder", {},
+                            ) or {},
+                        )
+                        mail_existing_tokens: Dict[str, str] = {
+                            **_legacy_tokens, **_new_table_tokens,
+                        }
+                    else:
+                        # FULL snapshot or no prior COMPLETED snapshot for
+                        # this resource — discard any stored per-folder
+                        # delta tokens so Graph returns the full inventory
+                        # for every folder. Without this, a wipe-then-full
+                        # silently runs as a delta and short-completes
+                        # (Vinay Mail 576 vs 7k, 2026-05-18 incident).
+                        mail_existing_tokens = {}
+                        print(
+                            f"[{self.worker_id}] [FULL_RESEED] USER_MAIL "
+                            f"resource={resource.id}: discarded per-folder "
+                            f"delta tokens (FULL or no prior baseline)"
+                        )
                     mail_new_tokens: Dict[str, str] = {}
                     out: List = []
                     mail_select = (
@@ -4727,8 +4778,16 @@ class BackupWorker:
                     win_start = (now_utc - _td(days=365 * 2)).strftime("%Y-%m-%dT%H:%M:%SZ")
                     win_end   = (now_utc + _td(days=365)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-                    # Current delta-token map (per calendar).
-                    cal_delta_map: Dict[str, str] = dict((resource.extra_data or {}).get("calendar_delta_tokens") or {})
+                    # Current delta-token map (per calendar). Discarded
+                    # on FULL snapshot or when no prior COMPLETED
+                    # baseline exists for this resource (post-wipe) —
+                    # otherwise a stale token would cause Graph to
+                    # return only recent events and the snapshot would
+                    # short-complete (see _delta_token_is_usable).
+                    if await self._delta_token_is_usable(snapshot, resource.id):
+                        cal_delta_map: Dict[str, str] = dict((resource.extra_data or {}).get("calendar_delta_tokens") or {})
+                    else:
+                        cal_delta_map = {}
                     new_delta_map: Dict[str, str] = {}
 
                     # Sub-calendar throttle map (per calendar id → last
@@ -14650,7 +14709,15 @@ class BackupWorker:
                     # BACKUP_STARTED emitted once at the outer entry
                     # (_process_single_backup); see comment in
                     # _backup_user_content_parallel for the rationale.
-                    delta_token = (resource.extra_data or {}).get("delta_token")
+                    if await self._delta_token_is_usable(snapshot, resource.id):
+                        delta_token = (resource.extra_data or {}).get("delta_token")
+                    else:
+                        delta_token = None
+                        print(
+                            f"[{self.worker_id}] [FULL_RESEED] {resource_type} "
+                            f"resource={resource.id}: ignoring stored delta_token "
+                            f"(FULL snapshot or no prior COMPLETED baseline)"
+                        )
 
                     if resource_type == "ONEDRIVE":
                         files = await graph_client.get_drive_items_delta(resource.external_id, delta_token)
@@ -16079,25 +16146,36 @@ class BackupWorker:
                     # above. New mail_folder_delta table is the
                     # authoritative read source; fall back to legacy
                     # extra_data dict per folder_id not yet baselined.
-                    _new_table_tokens = await self._load_mail_folder_deltas(
-                        resource.id,
-                    )
-                    _legacy_tokens = dict(
-                        (resource.extra_data or {}).get(
-                            "mail_delta_tokens_by_folder", {},
-                        ) or {},
-                    )
-                    existing_tokens: Dict[str, str] = {
-                        **_legacy_tokens, **_new_table_tokens,
-                    }
+                    if await self._delta_token_is_usable(snapshot, resource.id):
+                        _new_table_tokens = await self._load_mail_folder_deltas(
+                            resource.id,
+                        )
+                        _legacy_tokens = dict(
+                            (resource.extra_data or {}).get(
+                                "mail_delta_tokens_by_folder", {},
+                            ) or {},
+                        )
+                        existing_tokens: Dict[str, str] = {
+                            **_legacy_tokens, **_new_table_tokens,
+                        }
+                        # Backwards-compat: an older deploy may have written
+                        # a single `mail_delta_token` for the whole mailbox.
+                        # Seed that into the "__all__" slot so we don't lose
+                        # the resume point on the first run after upgrade.
+                        legacy_tok = (resource.extra_data or {}).get("mail_delta_token")
+                        if legacy_tok and "__all__" not in existing_tokens:
+                            existing_tokens["__all__"] = legacy_tok
+                    else:
+                        # FULL snapshot or no prior COMPLETED baseline —
+                        # discard stored per-folder tokens and force a
+                        # complete folder sweep (see USER_MAIL path).
+                        existing_tokens = {}
+                        print(
+                            f"[{self.worker_id}] [FULL_RESEED] MAILBOX "
+                            f"resource={resource.id}: discarded per-folder "
+                            f"delta tokens (FULL or no prior baseline)"
+                        )
                     new_tokens: Dict[str, str] = {}
-                    # Backwards-compat: an older deploy may have written
-                    # a single `mail_delta_token` for the whole mailbox.
-                    # Seed that into the "__all__" slot so we don't lose
-                    # the resume point on the first run after upgrade.
-                    legacy_tok = (resource.extra_data or {}).get("mail_delta_token")
-                    if legacy_tok and "__all__" not in existing_tokens:
-                        existing_tokens["__all__"] = legacy_tok
 
                     folder_ids = list(folder_tree.keys()) or [None]
 
@@ -17745,8 +17823,12 @@ class BackupWorker:
         # Keyed by user_id because the delta is scoped to a Graph user, not a
         # chat — different chats that share a participant can legitimately
         # persist different anchors (each reflects that chat's last sync).
-        existing_tokens = ((resource.extra_data or {}).get("chat_delta_tokens") or {})
-        delta_token = existing_tokens.get(user_id)
+        # Discard the anchor on FULL or post-wipe to force a full reseed.
+        if await self._delta_token_is_usable(snapshot, resource.id):
+            existing_tokens = ((resource.extra_data or {}).get("chat_delta_tokens") or {})
+            delta_token = existing_tokens.get(user_id)
+        else:
+            delta_token = None
 
         sync_mode = "delta" if delta_token else "full"
         print(
@@ -17831,7 +17913,10 @@ class BackupWorker:
         user_id = resource.external_id
         user_label = resource.display_name or user_id
 
-        delta_token = (resource.extra_data or {}).get("delta_token")
+        if await self._delta_token_is_usable(snapshot, resource.id):
+            delta_token = (resource.extra_data or {}).get("delta_token")
+        else:
+            delta_token = None
         sync_mode = "delta" if delta_token else "full"
         print(
             f"[{self.worker_id}] [CHAT_EXPORT START] {user_label} "
@@ -20427,8 +20512,11 @@ class BackupWorker:
         """Backup a single OneDrive with parallel file downloads"""
         print(f"[{self.worker_id}] [ONEDRIVE START] {resource.display_name} (drive: {resource.external_id})")
 
-        delta_token = (resource.extra_data or {}).get("delta_token")
-        print(f"[{self.worker_id}]   [FILES] Fetching drive items (paginated, delta)...")
+        if await self._delta_token_is_usable(snapshot, resource.id):
+            delta_token = (resource.extra_data or {}).get("delta_token")
+        else:
+            delta_token = None
+        print(f"[{self.worker_id}]   [FILES] Fetching drive items (paginated, delta={'yes' if delta_token else 'no/full-reseed'})...")
         try:
             files = await graph_client.get_drive_items_delta(resource.external_id, delta_token)
         except httpx.HTTPStatusError as e:
@@ -20606,8 +20694,13 @@ class BackupWorker:
         """
         print(f"[{self.worker_id}] [SHAREPOINT START] {resource.display_name} (site: {resource.external_id})")
 
-        delta_token = (resource.extra_data or {}).get("delta_token")
-        subsite_delta_tokens = ((resource.extra_data or {}).get("subsite_delta_tokens") or {}).copy()
+        _delta_usable = await self._delta_token_is_usable(snapshot, resource.id)
+        if _delta_usable:
+            delta_token = (resource.extra_data or {}).get("delta_token")
+            subsite_delta_tokens = ((resource.extra_data or {}).get("subsite_delta_tokens") or {}).copy()
+        else:
+            delta_token = None
+            subsite_delta_tokens = {}
         # Per-drive resume tokens. Needed because a single SharePoint
         # site routinely has several document libraries; using the
         # singleton `/drive` endpoint (the legacy path) only captures

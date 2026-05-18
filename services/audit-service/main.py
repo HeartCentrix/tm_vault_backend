@@ -1807,6 +1807,20 @@ async def get_batch_children(batch_id: str):
         #                  (handy for "how much have we backed up so
         #                  far for this user" context — UI surfaces
         #                  alongside bytesAdded)
+        # Sentinel-aware ranking: when a batch fans out across sibling
+        # jobs (scheduler tick + manual trigger overlap, or RMQ
+        # redelivery rescheduling), one job picks up the real work
+        # while later siblings write COMPLETED "skipped_concurrent"
+        # sentinel snapshots (extra_data.skipped_concurrent=true,
+        # item_count=0, bytes_added=0). With plain ORDER BY created_at
+        # DESC, the *later* sentinel wins the DISTINCT ON pick and the
+        # activity panel shows "✓ 0 —" for every resource even though
+        # the real data was persisted by an earlier sibling. The CASE
+        # makes non-sentinels rank ahead of sentinels regardless of
+        # which was written last; if ONLY sentinels exist (no sibling
+        # job did the real work in this batch), we still return one
+        # and surface `skipped=true` so the frontend can render
+        # "Skipped (duplicate)" instead of a false ✓.
         snaps_q = await db.execute(text("""
             SELECT DISTINCT ON (s.resource_id)
                    s.id,
@@ -1814,23 +1828,21 @@ async def get_batch_children(batch_id: str):
                    s.status::text                                AS status,
                    -- Delta-first display so the per-resource grid shows
                    -- "what THIS backup added", not the cumulative
-                   -- inventory. Previously this used NULLIF(new_item_count, 0)
-                   -- which collapsed a real 0-delta back to s.item_count
-                   -- (29 k cached chats) — making a clean no-op
-                   -- incremental look identical to a full re-fetch and
-                   -- driving the "why is dedup not working" reports
-                   -- (2026-05-15 incident). Fallback only when
-                   -- new_item_count is genuinely NULL (handler never
-                   -- ran the settle path).
+                   -- inventory.
                    COALESCE(s.new_item_count, s.item_count)      AS item_count,
                    COALESCE(s.item_count, 0)                     AS item_count_total,
                    s.bytes_added                                 AS bytes_added,
-                   s.bytes_total                                 AS bytes_total
+                   s.bytes_total                                 AS bytes_total,
+                   COALESCE(s.extra_data->>'skipped_concurrent','false')='true'
+                                                                 AS is_sentinel
               FROM snapshots s
               JOIN jobs j ON j.id = s.job_id
              WHERE s.resource_id = ANY(CAST(:rids AS UUID[]))
                AND COALESCE(j.spec::jsonb->>'batch_id', j.id::text) = :bid
-          ORDER BY s.resource_id, s.created_at DESC
+          ORDER BY s.resource_id,
+                   CASE WHEN COALESCE(s.extra_data->>'skipped_concurrent','false')='true'
+                        THEN 1 ELSE 0 END ASC,
+                   s.created_at DESC
         """), {"rids": all_rid_strs, "bid": batch_id})
         snap_by_rid: Dict[Any, Dict[str, Any]] = {}
         for sr in snaps_q.all():
