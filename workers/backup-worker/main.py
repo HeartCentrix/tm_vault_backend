@@ -22683,7 +22683,68 @@ class BackupWorker:
                 ).order_by(desc(Snapshot.created_at)).limit(1),
             )
             prior = existing.scalar_one_or_none()
+            _self_worker_uuid = getattr(
+                getattr(self, "_heartbeat", None), "worker_uuid", None,
+            )
             if prior is not None:
+                # Same-job RMQ redelivery guard. If the existing
+                # IN_PROGRESS row belongs to ANOTHER live worker (lease
+                # not yet expired AND owner != self), this call is a
+                # redelivered queue message racing the owner — fan-out
+                # publish, prefetch oversubscription, or a slow ack.
+                # Both workers were entering the chat/mail handler
+                # against the SAME snapshot, doubling Graph quota +
+                # DB work for zero added inventory. Emit a sentinel
+                # COMPLETED+skipped_concurrent snapshot for accounting
+                # so FANOUT/FINALIZE balances, and bail.
+                #
+                # Legitimate resume paths still pass through:
+                #   * COMPLETED / PARTIAL prior (terminal resume) →
+                #     status filter below.
+                #   * Expired lease (original worker crashed) →
+                #     lease_expires_at comparison fails, fall through.
+                #   * Same worker re-entering (rare partition path) →
+                #     lease_owner_id == self.uuid, fall through.
+                _now_aware = datetime.now(timezone.utc)
+                if (prior.status == SnapshotStatus.IN_PROGRESS
+                        and prior.lease_owner_id is not None
+                        and prior.lease_expires_at is not None
+                        and prior.lease_expires_at > _now_aware
+                        and _self_worker_uuid is not None
+                        and prior.lease_owner_id != _self_worker_uuid):
+                    _now = datetime.utcnow()
+                    _sib_extra = dict(extra_data or {})
+                    _sib_extra["skipped_concurrent"] = True
+                    _sib_extra["concurrent_job_id"] = str(job_id)
+                    _sib_extra["concurrent_snapshot_id"] = str(prior.id)
+                    _sib_extra["skip_reason"] = "same_job_redelivery"
+                    sibling = Snapshot(
+                        id=uuid.uuid4(),
+                        resource_id=resource.id,
+                        job_id=job_id,
+                        type=snapshot_type,
+                        status=SnapshotStatus.COMPLETED,
+                        started_at=_now,
+                        completed_at=_now,
+                        duration_secs=0,
+                        item_count=0,
+                        bytes_added=0,
+                        bytes_total=0,
+                        snapshot_label=message.get(
+                            "snapshotLabel", "scheduled",
+                        ),
+                        extra_data=_sib_extra,
+                    )
+                    session.add(sibling)
+                    await session.commit()
+                    print(
+                        f"[{self.worker_id}] [SKIP_REDELIVERY] resource="
+                        f"{resource.id} owned by worker="
+                        f"{prior.lease_owner_id} with active lease "
+                        f"(snapshot={prior.id}); created skip-snapshot "
+                        f"{sibling.id} COMPLETED skipped_concurrent=true."
+                    )
+                    return sibling
                 return prior
 
             # Cross-job concurrency guard (moved here from
