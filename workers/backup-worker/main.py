@@ -5244,15 +5244,140 @@ class BackupWorker:
                             f"({len(unique_uids)} unique user IDs)"
                         )
 
+                    # Unified naming helper. Used for both fresh and reused
+                    # chats so legacy collision-bucket cache entries (old
+                    # "Untitled chat #spaces" everywhere) self-heal once a
+                    # backup runs with this code.
+                    #
+                    # Resolution order:
+                    #   1. Topic — matches Teams' own rename UX.
+                    #   2. Other members (self filtered out by AAD object id
+                    #      when available, else by displayName match against
+                    #      the resource's own display_name).
+                    #   3. 1:1 → just the other person.
+                    #      Group / meeting → comma-joined names, smart-
+                    #      truncated past 200 chars with " +N more".
+                    #   4. Final fallback: "Untitled chat/group #<sha1[:8]>"
+                    #      — unique per cid so unnamed chats never collapse
+                    #      into a shared folder.
+                    #
+                    # MUST stay aligned with snapshot-service
+                    # `_compose_chat_name` so write-time folder_path and
+                    # read-time chat-thread fallback names agree.
+                    _CHAT_NAME_MAX_LEN = 200
+                    _LEGACY_FALLBACK_PREFIXES = (
+                        "Untitled chat #",
+                        "Untitled group #",
+                        "1-on-1 Chat (19:",
+                        "Group Chat (19:",
+                        "Chat ",
+                    )
+                    _self_uid_norm = (str(user_id) or "").strip().lower()
+                    _self_dn_norm = (
+                        (resource.display_name or "").strip().lower()
+                    )
+
+                    def _compose_chat_name_local(
+                        cid_in: str,
+                        chat_type_in: Optional[str],
+                        topic_in: Optional[str],
+                        member_user_ids_in: List[str],
+                        member_names_in: List[str],
+                    ) -> str:
+                        if (isinstance(topic_in, str)
+                                and topic_in.strip()):
+                            return topic_in.strip()
+                        uids = list(member_user_ids_in or [])
+                        ns = [
+                            n.strip() for n in (member_names_in or [])
+                            if isinstance(n, str) and n.strip()
+                        ]
+                        others: List[str] = []
+                        if uids and ns and len(uids) == len(ns):
+                            for _u, _n in zip(uids, ns):
+                                if _u and _u.strip().lower() == _self_uid_norm:
+                                    continue
+                                others.append(_n)
+                        else:
+                            # Arrays not aligned (Graph responses filter
+                            # missing fields independently) — drop self by
+                            # display-name match instead.
+                            for _n in ns:
+                                if (_self_dn_norm
+                                        and _n.lower() == _self_dn_norm):
+                                    continue
+                                others.append(_n)
+                        ct = (chat_type_in or "").lower()
+                        if ct == "oneonone":
+                            if others:
+                                return others[0]
+                        elif others:
+                            joined = ", ".join(others)
+                            if len(joined) <= _CHAT_NAME_MAX_LEN:
+                                return joined
+                            picked: List[str] = []
+                            used = 0
+                            for _n in others:
+                                sep_len = 2 if picked else 0
+                                tail_len = 10  # room for ' +N more'
+                                if (used + sep_len + len(_n) + tail_len
+                                        > _CHAT_NAME_MAX_LEN):
+                                    break
+                                picked.append(_n)
+                                used += sep_len + len(_n)
+                            remaining = len(others) - len(picked)
+                            if remaining > 0:
+                                return (
+                                    f"{', '.join(picked)} "
+                                    f"+{remaining} more"
+                                )
+                            return ", ".join(picked)
+                        # Hash suffix — unique per cid. Old behaviour
+                        # (_cid_clean[-6:]) always returned 'spaces' for
+                        # 1:1 chats (every @unq.gbl.spaces id) and
+                        # 'readv2' for groups (every @thread.v2 id), so
+                        # every unnamed chat collapsed into the same
+                        # folder. 8 hex chars of sha1 give ~2^32 unique
+                        # buckets per tenant.
+                        suffix = hashlib.sha1(
+                            cid_in.encode("utf-8"),
+                        ).hexdigest()[:8]
+                        if ct == "oneonone":
+                            return f"Untitled chat #{suffix}"
+                        return f"Untitled group #{suffix}"
+
+                    def _is_legacy_fallback(_dn: str) -> bool:
+                        return any(
+                            _dn.startswith(p)
+                            for p in _LEGACY_FALLBACK_PREFIXES
+                        )
+
                     # Replay cached metadata for reused chats — no member
-                    # fetch needed, just rehydrate the existing entry into
-                    # chat_meta so the rest of the drain loop sees a uniform
-                    # map shape.
+                    # fetch needed. If the cached displayName is a legacy
+                    # fallback, re-run the unified algorithm with the
+                    # cached memberNames so old collision-bucket entries
+                    # heal in place on next backup.
                     for ch in reuse_chats:
                         cid = ch.get("id")
                         cached = _cached_chat_meta.get(cid)
                         if cid and cached:
-                            chat_meta[cid] = dict(cached)
+                            cached_dn = (cached.get("displayName") or "")
+                            if _is_legacy_fallback(cached_dn):
+                                new_dn = _compose_chat_name_local(
+                                    cid_in=cid,
+                                    chat_type_in=cached.get("chatType"),
+                                    topic_in=cached.get("topic"),
+                                    member_user_ids_in=[],
+                                    member_names_in=(
+                                        cached.get("memberNames") or []
+                                    ),
+                                )
+                                chat_meta[cid] = {
+                                    **cached,
+                                    "displayName": new_dn,
+                                }
+                            else:
+                                chat_meta[cid] = dict(cached)
 
                     for ch in fresh_chats:
                         cid = ch.get("id")
@@ -5261,43 +5386,14 @@ class BackupWorker:
                         ctype = ch.get("chatType", "unknown")
                         topic = ch.get("topic")
                         emails, names = member_lookup.get(cid, ([], []))
-                        # Display-name ladder. Fallback reads like a natural
-                        # label, not a technical chat-id dump. We strip the
-                        # "19:" Graph prefix and take a short reference
-                        # suffix (last 6 alphanumeric chars of the chat id)
-                        # so each unresolved chat keeps a unique, stable
-                        # path — required for the Recovery left-rail click-
-                        # through to filter the right messages — but the
-                        # user sees "Untitled chat #abc123" instead of
-                        # "Chat 19abcde7" or "Group Chat (19:abc123)".
-                        #
-                        # MUST match snapshot-service `_compose_chat_name`
-                        # final fallback exactly. Keeping write-time and
-                        # read-time formats identical is what makes this
-                        # durable: no migration ever needed when Graph
-                        # later resolves real members/topic — the post-
-                        # drain folder_path normalizer at line ~5476 picks
-                        # up the improvement and rewrites in place.
-                        _cid_clean = "".join(
-                            c for c in cid if c.isalnum()
-                        ) or cid
-                        _cid_suffix = _cid_clean[-6:]
-                        if ctype == "oneOnOne":
-                            if topic:
-                                display_name = topic
-                            elif names:
-                                display_name = " | ".join(names)
-                            else:
-                                display_name = f"Untitled chat #{_cid_suffix}"
-                        else:
-                            if topic:
-                                display_name = topic
-                            elif names:
-                                display_name = f"Group: {', '.join(names[:3])}"
-                                if len(names) > 3:
-                                    display_name += f" +{len(names) - 3} more"
-                            else:
-                                display_name = f"Untitled group #{_cid_suffix}"
+                        uids = chat_user_ids.get(cid) or []
+                        display_name = _compose_chat_name_local(
+                            cid_in=cid,
+                            chat_type_in=ctype,
+                            topic_in=topic,
+                            member_user_ids_in=uids,
+                            member_names_in=names,
+                        )
                         chat_meta[cid] = {
                             "displayName": display_name,
                             "chatType": ctype,
@@ -5319,6 +5415,87 @@ class BackupWorker:
                             "memberNames": [],
                             "memberEmails": [],
                         })
+
+                    # ─── Discovery diagnostic (USER_CHATS_DEBUG_USER) ───
+                    # Env-gated one-shot dump for a single user. Set
+                    # USER_CHATS_DEBUG_USER to a Graph user id OR a
+                    # resource id to print the full discovery picture
+                    # before drain: chats_raw count, chatType breakdown,
+                    # cross-tenant drops, unresolved member-name chats,
+                    # and whether named users (semicolon-list in
+                    # USER_CHATS_DEBUG_MEMBERS) appear in any chat's
+                    # memberEmails / memberNames. Unset → zero cost.
+                    _debug_user = os.getenv("USER_CHATS_DEBUG_USER", "").strip().lower()
+                    if _debug_user and _debug_user in (
+                        str(user_id).strip().lower(),
+                        str(resource.id).strip().lower(),
+                    ):
+                        try:
+                            _ctype_counts: Dict[str, int] = {}
+                            _unresolved_cids: List[str] = []
+                            for _cid_dbg, _info_dbg in chat_meta.items():
+                                _ct_dbg = (_info_dbg.get("chatType") or "unknown")
+                                _ctype_counts[_ct_dbg] = (
+                                    _ctype_counts.get(_ct_dbg, 0) + 1
+                                )
+                                _dn_dbg = _info_dbg.get("displayName") or ""
+                                if _is_legacy_fallback(_dn_dbg):
+                                    _unresolved_cids.append(_cid_dbg)
+                            _needle_raw = os.getenv(
+                                "USER_CHATS_DEBUG_MEMBERS", "",
+                            ).strip()
+                            _needles = [
+                                n.strip().lower()
+                                for n in _needle_raw.split(";")
+                                if n.strip()
+                            ]
+                            _needle_hits: Dict[str, List[str]] = {
+                                n: [] for n in _needles
+                            }
+                            for _cid_dbg, _info_dbg in chat_meta.items():
+                                _emails_dbg = [
+                                    str(e).lower()
+                                    for e in (_info_dbg.get("memberEmails") or [])
+                                ]
+                                _names_dbg = [
+                                    str(n).lower()
+                                    for n in (_info_dbg.get("memberNames") or [])
+                                ]
+                                for n in _needles:
+                                    if (n in _emails_dbg
+                                            or any(n in nm for nm in _names_dbg)):
+                                        _needle_hits[n].append(_cid_dbg)
+                            print(
+                                f"[{self.worker_id}] [USER_CHATS] [DEBUG] "
+                                f"discovery dump for {resource.display_name} "
+                                f"({user_id}):"
+                            )
+                            print(
+                                f"[{self.worker_id}] [USER_CHATS] [DEBUG]   "
+                                f"chats_raw_count={len(chats_raw)} "
+                                f"chat_meta_count={len(chat_meta)} "
+                                f"chatTypes={_ctype_counts}"
+                            )
+                            print(
+                                f"[{self.worker_id}] [USER_CHATS] [DEBUG]   "
+                                f"unresolved_name_count="
+                                f"{len(_unresolved_cids)} "
+                                f"(first 10: "
+                                f"{[c[:48] for c in _unresolved_cids[:10]]})"
+                            )
+                            for n, hits in _needle_hits.items():
+                                print(
+                                    f"[{self.worker_id}] [USER_CHATS] "
+                                    f"[DEBUG]   member_search '{n}': "
+                                    f"{len(hits)} chat(s); first 5: "
+                                    f"{[c[:48] for c in hits[:5]]}"
+                                )
+                        except Exception as _de:
+                            print(
+                                f"[{self.worker_id}] [USER_CHATS] [DEBUG] "
+                                f"diagnostic dump failed: "
+                                f"{type(_de).__name__}: {_de}"
+                            )
 
                     out: List = []
                     # Log label for this stream — resource.display_name like
@@ -7145,6 +7322,125 @@ class BackupWorker:
                             f"{type(_re).__name__}: {_re}"
                         )
 
+                    # ─── Final-resort: parse chat_id for 1:1 chats ───
+                    # When neither the members API nor the message-author
+                    # scan resolved a 1:1 chat's other party (typical
+                    # cause: chat has 0 drained messages this run because
+                    # Graph chat-delta is still in its 30s–15min indexing
+                    # lag window, or the only drained messages are
+                    # authored by self), we can still recover by parsing
+                    # the chat ID itself. Microsoft encodes 1:1 chat IDs
+                    # as `19:<oidA>_<oidB>@unq.gbl.spaces` where oidA
+                    # and oidB are the two participants' AAD object IDs.
+                    # Extract the OTHER oid, call /users/{oid} to fetch
+                    # the displayName, write it into chat_meta. Group
+                    # chats (@thread.v2) don't encode participants in
+                    # the id, so this path skips them — they rely on
+                    # the message-author fallback already run above.
+                    try:
+                        _CID_1ON1 = re.compile(
+                            r"^19:([0-9a-fA-F-]+)_([0-9a-fA-F-]+)"
+                            r"@unq\.gbl\.spaces$"
+                        )
+                        _cid_parse_lookup: Dict[str, str] = {}  # other_uid → cid
+                        for _cid_loc, _info_loc in chat_meta.items():
+                            _dn_loc = (_info_loc or {}).get("displayName") or ""
+                            if not (_dn_loc.startswith("Untitled chat #")
+                                    or _dn_loc.startswith("1-on-1 Chat (19:")):
+                                continue
+                            if (_info_loc or {}).get("chatType") != "oneOnOne":
+                                continue
+                            _m = _CID_1ON1.match(_cid_loc)
+                            if not _m:
+                                continue
+                            _a = _m.group(1).lower()
+                            _b = _m.group(2).lower()
+                            _self = str(user_id).strip().lower()
+                            _other = None
+                            if _a != _self and _a:
+                                _other = _a
+                            elif _b != _self and _b:
+                                _other = _b
+                            if _other and _other not in _cid_parse_lookup:
+                                _cid_parse_lookup[_other] = _cid_loc
+                        if _cid_parse_lookup:
+                            from shared.graph_batch import BatchRequest
+                            _USER_BATCH = 20
+                            _parsed_meta: Dict[str, Dict[str, str]] = {}
+                            _uids_list = list(_cid_parse_lookup.keys())
+                            for _i in range(0, len(_uids_list), _USER_BATCH):
+                                _sub = _uids_list[_i:_i + _USER_BATCH]
+                                _reqs = [
+                                    BatchRequest(
+                                        id=_uid, method="GET",
+                                        url=(
+                                            f"/users/{_uid}"
+                                            f"?$select=displayName,mail"
+                                        ),
+                                    )
+                                    for _uid in _sub
+                                ]
+                                try:
+                                    _u_result = await graph_client.batch(_reqs)
+                                except Exception as _be:
+                                    print(
+                                        f"[{self.worker_id}] [USER_CHATS] "
+                                        f"chat-id parse /users batch failed: "
+                                        f"{type(_be).__name__}: {_be}"
+                                    )
+                                    _u_result = {}
+                                for _uid, _r in _u_result.items():
+                                    if (_r.status == 200
+                                            and isinstance(_r.body, dict)):
+                                        _parsed_meta[_uid] = {
+                                            "displayName": (
+                                                _r.body.get("displayName") or ""
+                                            ),
+                                            "mail": _r.body.get("mail") or "",
+                                        }
+                            _resolved_parse = 0
+                            for _other_uid, _cid_loc in _cid_parse_lookup.items():
+                                _um = _parsed_meta.get(_other_uid) or {}
+                                _new_dn = _um.get("displayName")
+                                if not _new_dn:
+                                    continue
+                                _info_loc = chat_meta.get(_cid_loc) or {}
+                                _existing_names = list(
+                                    _info_loc.get("memberNames") or []
+                                )
+                                _existing_emails = list(
+                                    _info_loc.get("memberEmails") or []
+                                )
+                                if _new_dn not in _existing_names:
+                                    _existing_names.append(_new_dn)
+                                if (_um.get("mail")
+                                        and _um["mail"] not in _existing_emails):
+                                    _existing_emails.append(_um["mail"])
+                                chat_meta[_cid_loc] = {
+                                    **_info_loc,
+                                    "displayName": _new_dn,
+                                    "memberNames": _existing_names,
+                                    "memberEmails": _existing_emails,
+                                    "memberCount": max(
+                                        int(_info_loc.get("memberCount") or 0),
+                                        1,
+                                    ),
+                                }
+                                _resolved_parse += 1
+                            if _resolved_parse:
+                                print(
+                                    f"[{self.worker_id}] [USER_CHATS] "
+                                    f"resolved {_resolved_parse} 1:1 chat "
+                                    f"name(s) by parsing chat_id "
+                                    f"(final-resort)"
+                                )
+                    except Exception as _ce:
+                        print(
+                            f"[{self.worker_id}] [USER_CHATS] chat-id parse "
+                            f"fallback failed: "
+                            f"{type(_ce).__name__}: {_ce}"
+                        )
+
                     # Per-chat drain cursors + failure state now live in
                     # chat_threads (tenant-singleton). Each _drain_one_chat
                     # call already wrote its own row via
@@ -7175,30 +7471,36 @@ class BackupWorker:
                     except Exception as _e:
                         print(f"[{self.worker_id}] [USER_CHATS] meta persist failed: {_e}")
 
-                    # Folder-path normalization: rewrite stale folder_path /
-                    # chatTopic for any historical items whose chat's display
-                    # name has improved since they were written. Without this
-                    # step, items written when membership was unresolvable
-                    # remain stuck in "chats/Group Chat (19:xxxxx)" forever
-                    # — even after /users backfill resolves a real name.
-                    # Runs ~O(chats), idempotent (WHERE folder_path != target
-                    # makes already-good rows a no-op).
+                    # Folder-path normalization. Two passes, designed so a
+                    # regression in this run can never clobber a good name
+                    # that was already persisted.
+                    #
+                    # Pass 1 — rewrite when chat_meta currently has a REAL
+                    # (non-fallback) name. Same behaviour as before.
+                    # Pass 2 — migration. When chat_meta currently has a
+                    # NEW-style hash fallback ("Untitled chat #<sha8>"),
+                    # rewrite ONLY items whose stored folder_path matches a
+                    # legacy collision pattern (Untitled chat #spaces /
+                    # Untitled group #readv2 / "1-on-1 Chat (19:..)" /
+                    # "Group Chat (19:..)" / "Chat ..."). This splits the
+                    # legacy lump-bucket into per-chat folders without
+                    # touching any rows that already had a resolved name.
                     try:
-                        cids: List[str] = []
-                        names: List[str] = []
+                        real_cids: List[str] = []
+                        real_names: List[str] = []
+                        migrate_cids: List[str] = []
+                        migrate_names: List[str] = []
                         for cid, info in chat_meta.items():
                             dn = (info or {}).get("displayName")
-                            # Skip fallback names — no point overwriting one
-                            # bad name with another, and skip empties.
-                            if not dn or dn.startswith("Untitled chat #") \
-                                    or dn.startswith("Untitled group #") \
-                                    or dn.startswith("1-on-1 Chat (19:") \
-                                    or dn.startswith("Group Chat (19:") \
-                                    or dn.startswith("Chat "):
+                            if not dn:
                                 continue
-                            cids.append(cid)
-                            names.append(dn)
-                        if cids:
+                            if _is_legacy_fallback(dn):
+                                migrate_cids.append(cid)
+                                migrate_names.append(dn)
+                            else:
+                                real_cids.append(cid)
+                                real_names.append(dn)
+                        if real_cids:
                             async with async_session_factory() as _s2:
                                 _res = await _s2.execute(
                                     text("""
@@ -7215,7 +7517,7 @@ class BackupWorker:
                                           AND (si.metadata::jsonb->>'chatId') = nm.cid
                                           AND si.folder_path != 'chats/' || nm.dn
                                     """),
-                                    {"cids": cids, "names": names, "rid": str(resource.id)},
+                                    {"cids": real_cids, "names": real_names, "rid": str(resource.id)},
                                 )
                                 await _s2.commit()
                                 rc = _res.rowcount or 0
@@ -7223,6 +7525,40 @@ class BackupWorker:
                                     print(
                                         f"[{self.worker_id}] [USER_CHATS] "
                                         f"normalized folder_path on {rc} stale row(s)"
+                                    )
+                        if migrate_cids:
+                            async with async_session_factory() as _s3:
+                                _res2 = await _s3.execute(
+                                    text("""
+                                        UPDATE snapshot_items si
+                                        SET folder_path = 'chats/' || nm.dn,
+                                            metadata = (si.metadata::jsonb
+                                                        || jsonb_build_object('chatTopic', nm.dn))::json
+                                        FROM (
+                                          SELECT unnest(CAST(:cids AS text[])) AS cid,
+                                                 unnest(CAST(:names AS text[])) AS dn
+                                        ) nm, snapshots s
+                                        WHERE s.id = si.snapshot_id
+                                          AND s.resource_id = :rid
+                                          AND (si.metadata::jsonb->>'chatId') = nm.cid
+                                          AND si.folder_path != 'chats/' || nm.dn
+                                          AND (
+                                            si.folder_path LIKE 'chats/Untitled chat #%'
+                                            OR si.folder_path LIKE 'chats/Untitled group #%'
+                                            OR si.folder_path LIKE 'chats/1-on-1 Chat (19:%'
+                                            OR si.folder_path LIKE 'chats/Group Chat (19:%'
+                                            OR si.folder_path LIKE 'chats/Chat %'
+                                          )
+                                    """),
+                                    {"cids": migrate_cids, "names": migrate_names, "rid": str(resource.id)},
+                                )
+                                await _s3.commit()
+                                rc2 = _res2.rowcount or 0
+                                if rc2:
+                                    print(
+                                        f"[{self.worker_id}] [USER_CHATS] "
+                                        f"migrated {rc2} legacy-fallback row(s) "
+                                        f"to per-chat hash folders"
                                     )
                     except Exception as _e:
                         print(f"[{self.worker_id}] [USER_CHATS] folder_path normalize failed: {_e}")
