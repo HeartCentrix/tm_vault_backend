@@ -7112,24 +7112,92 @@ class BackupWorker:
                         (_interleave_hc and _hc_tasks)
                         or (_interleave_att and _att_tasks)
                     ):
-                        # Mark snapshot as HC-pending so restore paths
-                        # refuse it until the background drain settles.
+                        # Atomic CAS claim — exactly-once HC drain per
+                        # snapshot. When the cross-job dupe guard at the
+                        # snapshot-insert layer misfires (RMQ redelivery,
+                        # competing fan-out, manual re-dispatch), the same
+                        # snapshot can land at multiple workers and each
+                        # one would otherwise re-download every hosted
+                        # content + attachment, race the fold-back UPDATE
+                        # and over-count bytes_total / item_count.
+                        #
+                        # Postgres serializes UPDATE ... WHERE within the
+                        # row lock, so exactly one worker's transition
+                        # NOT_APPLICABLE/FAILED → PENDING returns a row.
+                        # That worker owns the drain; everyone else
+                        # cancels their in-flight HC/att tasks and skips
+                        # both the detached and attached barriers.
+                        #
+                        # Observed cost without this guard (2026-05-18):
+                        # snap=2f444491 hit by 3 workers totaling +2,282
+                        # items / ~1.16 GB of duplicate Graph traffic.
+                        _won_hc_claim = False
                         try:
                             async with async_session_factory() as _hc_sess:
-                                from sqlalchemy import update as _sa_update
-                                await _hc_sess.execute(
-                                    _sa_update(Snapshot)
-                                    .where(Snapshot.id == snapshot.id)
-                                    .values(hc_drain_status="PENDING")
+                                _claim_res = await _hc_sess.execute(
+                                    text(
+                                        "UPDATE snapshots "
+                                        "SET hc_drain_status = 'PENDING' "
+                                        "WHERE id = :sid "
+                                        "AND hc_drain_status IN "
+                                        "('NOT_APPLICABLE', 'FAILED') "
+                                        "RETURNING id"
+                                    ),
+                                    {"sid": str(snapshot.id)},
+                                )
+                                _won_hc_claim = (
+                                    _claim_res.first() is not None
                                 )
                                 await _hc_sess.commit()
                         except Exception as _e:
                             print(
-                                f"[{self.worker_id}] [USER_CHATS] failed to "
-                                f"mark hc_drain_status=PENDING (continuing "
-                                f"with attached barrier): {_e}"
+                                f"[{self.worker_id}] [USER_CHATS] hc_drain "
+                                f"claim errored ({type(_e).__name__}: "
+                                f"{_e}); falling back to attached barrier "
+                                f"for snap={snapshot.id}"
                             )
+                            _won_hc_claim = False
                             _hc_detached = False
+
+                        if _hc_detached and not _won_hc_claim:
+                            # Lost the claim. Another worker already owns
+                            # this snapshot's HC/att drain. Cancel our
+                            # in-flight tasks so we don't keep burning
+                            # Graph API quota on contents the owner is
+                            # already persisting, then drain the cancelled
+                            # coroutines so they unwind cleanly. Persist
+                            # layer is ON CONFLICT DO NOTHING-safe, so any
+                            # partial work we'd already committed before
+                            # cancellation is harmless.
+                            _cancelled_n = 0
+                            for _t in list(_hc_tasks) + list(_att_tasks):
+                                if not _t.done():
+                                    _t.cancel()
+                                    _cancelled_n += 1
+                            try:
+                                if _hc_tasks:
+                                    await asyncio.gather(
+                                        *_hc_tasks, return_exceptions=True,
+                                    )
+                                if _att_tasks:
+                                    await asyncio.gather(
+                                        *_att_tasks, return_exceptions=True,
+                                    )
+                            except Exception:
+                                pass
+                            print(
+                                f"[{self.worker_id}] [HC_FINALIZER] "
+                                f"snap={snapshot.id} already claimed by "
+                                f"another worker; cancelled "
+                                f"{_cancelled_n} pending hc/att tasks; "
+                                f"skipping duplicate drain"
+                            )
+                            # Disable both the detached-spawn block and
+                            # the attached-barrier block below. Both
+                            # gate on these list truthiness checks.
+                            _hc_detached = False
+                            _hc_tasks = []
+                            _att_tasks = []
 
                     if _hc_detached and (
                         (_interleave_hc and _hc_tasks)
@@ -7646,6 +7714,72 @@ class BackupWorker:
                     except Exception as _e:
                         print(f"[{self.worker_id}] [USER_CHATS] meta persist failed: {_e}")
 
+                    # Push resolved member_names back to chat_threads so the
+                    # snapshot-service's read-time _compose_chat_name (which
+                    # joins on chat_threads.member_names_json) sees the same
+                    # names the worker's fallback ladder resolved here. Pre-
+                    # fix: members API returned empty → chat_threads row was
+                    # inserted with NULL member_names_json → msg-author /
+                    # chat-id-parse / DB-historical fallbacks updated only
+                    # the in-memory chat_meta → snapshot-service read NULL
+                    # and recomputed the hash fallback → response showed
+                    # `chats/Untitled chat #<sha8>` for 1:1 chats where the
+                    # other party's name was perfectly recoverable. We only
+                    # write when we have non-empty resolved names AND the
+                    # chat_threads row currently holds an empty/NULL list
+                    # (COALESCE-protected so a real list from another user
+                    # snapshot the same chat isn't clobbered with our
+                    # smaller view).
+                    try:
+                        _ctw_rows: List[Dict[str, Any]] = []
+                        for _cid_w, _info_w in chat_meta.items():
+                            _names_w = list(
+                                (_info_w or {}).get("memberNames") or [],
+                            )
+                            _names_w = [
+                                n for n in _names_w
+                                if isinstance(n, str) and n.strip()
+                            ]
+                            if not _names_w:
+                                continue
+                            _ctw_rows.append({
+                                "tid": str(tenant.id),
+                                "cid": _cid_w,
+                                "mn": json.dumps(_names_w),
+                            })
+                        if _ctw_rows:
+                            async with async_session_factory() as _s_ctw:
+                                _ctw_res = await _s_ctw.execute(
+                                    text(
+                                        "UPDATE chat_threads "
+                                        "   SET member_names_json = "
+                                        "        CAST(:mn AS JSONB), "
+                                        "       updated_at = NOW() "
+                                        " WHERE tenant_id = :tid "
+                                        "   AND chat_id = :cid "
+                                        "   AND ( member_names_json IS NULL "
+                                        "        OR jsonb_array_length("
+                                        "             member_names_json"
+                                        "           ) = 0 ) "
+                                    ),
+                                    _ctw_rows,
+                                )
+                                await _s_ctw.commit()
+                                _ctw_rc = _ctw_res.rowcount or 0
+                                if _ctw_rc:
+                                    print(
+                                        f"[{self.worker_id}] [USER_CHATS] "
+                                        f"backfilled member_names_json on "
+                                        f"{_ctw_rc} chat_threads row(s) "
+                                        f"so read-time chat-topic agrees"
+                                    )
+                    except Exception as _e:
+                        print(
+                            f"[{self.worker_id}] [USER_CHATS] "
+                            f"chat_threads member_names backfill failed: "
+                            f"{type(_e).__name__}: {_e}"
+                        )
+
                     # Folder-path normalization. Two passes, designed so a
                     # regression in this run can never clobber a good name
                     # that was already persisted.
@@ -7675,21 +7809,37 @@ class BackupWorker:
                             else:
                                 real_cids.append(cid)
                                 real_names.append(dn)
+                        # IMPORTANT: streaming persist (_shape_chat_rows) stores
+                        # extra_data={} on chat rows — full body lives in
+                        # chat_thread_messages.metadata_raw and is hydrated at
+                        # read time. That means `metadata::jsonb->>'chatId'` is
+                        # NULL for every streaming-persisted row, so the old
+                        # `metadata->>'chatId' = nm.cid` predicate matched 0
+                        # rows and the chat never got renamed.
+                        # parent_external_id IS set to chat_id (indexed) on
+                        # every chat row — streaming AND legacy paths — so we
+                        # key off that. The `item_type` filter keeps this
+                        # safe against any non-chat row that happened to use
+                        # a chat-shaped parent_external_id.
                         if real_cids:
                             async with async_session_factory() as _s2:
                                 _res = await _s2.execute(
                                     text("""
                                         UPDATE snapshot_items si
                                         SET folder_path = 'chats/' || nm.dn,
-                                            metadata = (si.metadata::jsonb
-                                                        || jsonb_build_object('chatTopic', nm.dn))::json
+                                            metadata = (
+                                              COALESCE(NULLIF(si.metadata::text, '')::jsonb,
+                                                       '{}'::jsonb)
+                                              || jsonb_build_object('chatTopic', nm.dn)
+                                            )::json
                                         FROM (
                                           SELECT unnest(CAST(:cids AS text[])) AS cid,
                                                  unnest(CAST(:names AS text[])) AS dn
                                         ) nm, snapshots s
                                         WHERE s.id = si.snapshot_id
                                           AND s.resource_id = :rid
-                                          AND (si.metadata::jsonb->>'chatId') = nm.cid
+                                          AND si.item_type = 'TEAMS_CHAT_MESSAGE'
+                                          AND si.parent_external_id = nm.cid
                                           AND si.folder_path != 'chats/' || nm.dn
                                     """),
                                     {"cids": real_cids, "names": real_names, "rid": str(resource.id)},
@@ -7707,15 +7857,19 @@ class BackupWorker:
                                     text("""
                                         UPDATE snapshot_items si
                                         SET folder_path = 'chats/' || nm.dn,
-                                            metadata = (si.metadata::jsonb
-                                                        || jsonb_build_object('chatTopic', nm.dn))::json
+                                            metadata = (
+                                              COALESCE(NULLIF(si.metadata::text, '')::jsonb,
+                                                       '{}'::jsonb)
+                                              || jsonb_build_object('chatTopic', nm.dn)
+                                            )::json
                                         FROM (
                                           SELECT unnest(CAST(:cids AS text[])) AS cid,
                                                  unnest(CAST(:names AS text[])) AS dn
                                         ) nm, snapshots s
                                         WHERE s.id = si.snapshot_id
                                           AND s.resource_id = :rid
-                                          AND (si.metadata::jsonb->>'chatId') = nm.cid
+                                          AND si.item_type = 'TEAMS_CHAT_MESSAGE'
+                                          AND si.parent_external_id = nm.cid
                                           AND si.folder_path != 'chats/' || nm.dn
                                           AND (
                                             si.folder_path LIKE 'chats/Untitled chat #%'
