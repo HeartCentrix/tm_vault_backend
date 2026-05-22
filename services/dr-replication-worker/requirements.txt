@@ -14,7 +14,7 @@ six>=1.16.0
 # (do not exist on PyPI). Pinned to the real latest stable trio that
 # share a known-good compatibility matrix. See Dep-C2/Dep-C5.
 aioboto3==13.1.1
-aiobotocore==2.15.2
+aiobotocore==2.13.1  # exact pin required by aioboto3 13.1.1
 boto3==1.34.131
 
 # Observability — Prometheus metrics scraped on CORE_METRICS_PORT (default 9103)

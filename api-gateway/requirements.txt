@@ -18,7 +18,7 @@ azure-mgmt-storage==21.0.0
 # (do not exist on PyPI). Pinned to the real latest stable trio that
 # share a known-good compatibility matrix. See Dep-C3/Dep-C6.
 aioboto3==13.1.1
-aiobotocore==2.15.2
+aiobotocore==2.13.1  # exact pin required by aioboto3 13.1.1
 boto3==1.34.131
 # SSE stream for live toggle-phase updates
 sse-starlette==1.8.2

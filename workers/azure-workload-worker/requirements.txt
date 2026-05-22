@@ -23,7 +23,7 @@ pytsk3>=20250312
 # On-prem storage backend (SeaweedFS) — pulled in by shared.storage.
 # Phantom upstream versions; pinned to real PyPI releases. See requirements.base.txt.
 aioboto3==13.1.1
-aiobotocore==2.15.2
+aiobotocore==2.13.1  # exact pin required by aioboto3 13.1.1
 boto3==1.34.131
 
 # Observability — Prometheus metrics scraped on CORE_METRICS_PORT (default 9103)
