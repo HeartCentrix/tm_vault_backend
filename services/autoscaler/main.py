@@ -25,8 +25,10 @@ Environment
 -----------
   RABBITMQ_MGMT_URL          # e.g. http://rabbitmq:15672 (used to read
                              # queue length via /api/queues/{vhost}/{name})
-  RABBITMQ_MGMT_USER         # default 'guest'
-  RABBITMQ_MGMT_PASSWORD     # default 'guest'
+  RABBITMQ_MGMT_USER         # required — autoscaler refuses to start
+                             # if unset or equal to 'guest'
+  RABBITMQ_MGMT_PASSWORD     # required — autoscaler refuses to start
+                             # if unset or equal to 'guest'
 
   RAILWAY_API_TOKEN          # required for replica writes; without this
                              # the autoscaler is read-only and logs the
@@ -253,10 +255,33 @@ async def main() -> None:
     mgmt_url = os.environ.get(
         "RABBITMQ_MGMT_URL", "http://rabbitmq:15672"
     )
-    mgmt_auth = (
-        os.environ.get("RABBITMQ_MGMT_USER", "guest"),
-        os.environ.get("RABBITMQ_MGMT_PASSWORD", "guest"),
-    )
+    # Refuse to start with the stock guest:guest credential. The RabbitMQ
+    # management API on :15672 lets any caller read queue contents,
+    # publish to arbitrary exchanges (including storage.toggle, which
+    # triggers azure↔onprem migrations in storage_toggle_worker), delete
+    # queues, and create vhosts. Defaulting to 'guest' here re-introduces
+    # the exact attack vector that storage_toggle_worker explicitly
+    # guards against (see api-gateway/routes/admin_storage.py:_rmq_url).
+    mgmt_user = os.environ.get("RABBITMQ_MGMT_USER")
+    mgmt_password = os.environ.get("RABBITMQ_MGMT_PASSWORD")
+    missing = [name for name, val in (
+        ("RABBITMQ_MGMT_USER", mgmt_user),
+        ("RABBITMQ_MGMT_PASSWORD", mgmt_password),
+    ) if not val]
+    if missing:
+        raise RuntimeError(
+            "Missing required RabbitMQ management env vars: "
+            + ", ".join(missing)
+            + ". Provision a dedicated user for the autoscaler — never "
+            "fall back to the default guest:guest credential."
+        )
+    if mgmt_user == "guest" and mgmt_password == "guest":
+        raise RuntimeError(
+            "Refusing to connect to the RabbitMQ management API with the "
+            "default guest:guest credential. Provision a dedicated user "
+            "for the autoscaler."
+        )
+    mgmt_auth = (mgmt_user, mgmt_password)
     railway_token = os.environ.get("RAILWAY_API_TOKEN")
     project_id = os.environ.get("RAILWAY_PROJECT_ID")
     env_id = os.environ.get("RAILWAY_ENVIRONMENT_ID")

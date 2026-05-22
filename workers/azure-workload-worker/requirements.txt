@@ -4,7 +4,7 @@ azure-mgmt-network>=25.0.0
 azure-mgmt-sql>=3.0.1
 azure-mgmt-rdbms>=10.1.1
 azure-mgmt-resource>=23.1.0
-azure-mgmt-storage>=21.2.0
+azure-mgmt-storage==21.1.0  # 21.2.0 is a phantom version on PyPI — pin to real latest
 azure-storage-blob>=12.22.0
 aio-pika>=9.4.0
 sqlalchemy[asyncio]>=2.0.0
@@ -20,10 +20,11 @@ pyodbc>=5.1.0
 # the file-level index during VM backup. See handlers/vm_file_index.py.
 pytsk3>=20250312
 
-# On-prem storage backend (SeaweedFS) — pulled in by shared.storage
-aioboto3>=15.5.0,<16
-aiobotocore>=2.25.0,<3
-boto3>=1.40.0,<2
+# On-prem storage backend (SeaweedFS) — pulled in by shared.storage.
+# Phantom upstream versions; pinned to real PyPI releases. See requirements.base.txt.
+aioboto3==13.1.1
+aiobotocore==2.15.2
+boto3==1.34.131
 
 # Observability — Prometheus metrics scraped on CORE_METRICS_PORT (default 9103)
 prometheus_client>=0.20.0

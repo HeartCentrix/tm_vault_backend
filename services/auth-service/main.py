@@ -1205,13 +1205,12 @@ async def refresh_token(
     if token_data is None:
         raise HTTPException(status_code=401, detail="User no longer exists")
 
-    access_token = create_access_token(token_data)
-    new_refresh_token = create_refresh_token(token_data)
-    expires_in = settings.JWT_EXPIRATION_HOURS * 3600
-
-    # Refresh-token rotation: revoke the just-used jti so the same token
-    # can't be used twice. TTL = remaining lifetime of the old token, so the
-    # denylist entry expires naturally and Redis doesn't grow unbounded.
+    # Atomically claim the old jti BEFORE minting new tokens. SET NX in
+    # revoke_refresh_token is the compare-and-swap: if two concurrent
+    # /auth/refresh calls present the same refresh token, exactly one
+    # wins. The loser must be rejected — otherwise both callers would
+    # walk away with a fresh token pair derived from the same parent,
+    # which is the textbook refresh-token replay path.
     if old_jti:
         old_exp = payload.get("exp")
         if isinstance(old_exp, (int, float)):
@@ -1219,7 +1218,13 @@ async def refresh_token(
             remaining = max(1, int(old_exp) - now_ts)
         else:
             remaining = settings.JWT_REFRESH_EXPIRATION_DAYS * 86400
-        await revoke_refresh_token(old_jti, remaining)
+        claimed = await revoke_refresh_token(old_jti, remaining)
+        if not claimed:
+            raise HTTPException(status_code=401, detail="Refresh token already used")
+
+    access_token = create_access_token(token_data)
+    new_refresh_token = create_refresh_token(token_data)
+    expires_in = settings.JWT_EXPIRATION_HOURS * 3600
 
     _set_auth_cookies(response, access_token, new_refresh_token)
 
@@ -1244,7 +1249,15 @@ async def logout(response: Response, http_request: Request):
                     remaining = max(1, int(exp) - now_ts)
                 else:
                     remaining = settings.JWT_REFRESH_EXPIRATION_DAYS * 86400
-                await revoke_refresh_token(jti, remaining)
+                try:
+                    await revoke_refresh_token(jti, remaining)
+                except HTTPException:
+                    # Revocation backend down: we still want to clear the
+                    # browser cookies so the user transitions to signed-out
+                    # in the UI. The token remains valid until natural
+                    # expiry — that's an availability/security tradeoff
+                    # we accept on logout (the user *intended* to leave).
+                    pass
         except HTTPException:
             # Already-expired or tampered token — nothing to revoke.
             pass

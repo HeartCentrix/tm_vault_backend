@@ -1,6 +1,10 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    # Pinned by digest (D-H1). Floating `16-alpine` tag can be moved by
+    # upstream between `docker compose pull` runs; the digest commits
+    # the build to a specific bit-for-bit image. Refresh with:
+    #   docker buildx imagetools inspect postgres:16-alpine --format '{{.Manifest.Digest}}'
+    image: postgres:16-alpine@sha256:16bc17c64a573ef34162af9298258d1aec548232985b33ed7b1eac33ba35c229
     container_name: tm_vault_db
     env_file: .env
     environment:
@@ -22,17 +26,29 @@ services:
       - tm-network
 
   rabbitmq:
-    image: rabbitmq:3-management-alpine
+    # Pinned by digest (D-H1). Refresh with:
+    #   docker buildx imagetools inspect rabbitmq:3-management-alpine --format '{{.Manifest.Digest}}'
+    image: rabbitmq:3-management-alpine@sha256:606d8c0d6b3c18d1da9afc53bc7cdb2a8d5486df91b5a9830e9e07626c9ae281
     container_name: tm_vault_rabbitmq
     environment:
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+      # No :- fallback. If RABBITMQ_USER/RABBITMQ_PASSWORD are missing the
+      # compose stack must refuse to start rather than silently boot the
+      # broker with the well-known guest:guest credential.
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?RABBITMQ_USER must be set — do not fall back to the default guest account}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set — do not fall back to the default guest account}
     # Config mounted from host - if mount fails, comment out and use defaults:
     # volumes:
     #   - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
     ports:
-      - "5672:5672"
-      - "15672:15672"
+      # AMQP and management UI are bound to loopback only. Other services
+      # in the compose network reach RabbitMQ via the service DNS name
+      # (`rabbitmq:5672`) on the internal bridge — they do not need the
+      # host port forwarded. Exposing 0.0.0.0:15672 lets any host on the
+      # LAN/internet hit the management UI and (with default creds) take
+      # over the broker — see D-C3. For remote admin access, tunnel via
+      # SSH or VPN.
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 10s
@@ -43,15 +59,34 @@ services:
       - tm-network
 
   redis:
-    image: redis:7-alpine
+    # Pinned by digest (D-H1). Refresh with:
+    #   docker buildx imagetools inspect redis:7-alpine --format '{{.Manifest.Digest}}'
+    image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
     container_name: tm_vault_redis
-    command: redis-server --appendonly yes
+    # `--requirepass` makes auth mandatory on every connection — without
+    # this any pod on the same network could read/write the revocation
+    # denylist and rate-limit buckets unauthenticated. `${REDIS_PASSWORD:?…}`
+    # forces the compose stack to fail-fast if the operator forgot to
+    # provision a password in .env, matching the RabbitMQ pattern above.
+    command: >-
+      redis-server --appendonly yes
+      --requirepass "${REDIS_PASSWORD:?REDIS_PASSWORD must be set — Redis must not run unauthenticated}"
+    environment:
+      # Pass the password through so the in-container healthcheck below
+      # can authenticate. (Compose interpolates ${…} at file-parse time
+      # before any container exists.)
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set — Redis must not run unauthenticated}
     ports:
-      - "6379:6379"
+      # Bind to loopback only (D-C3). Other compose services reach Redis
+      # via the service DNS name `redis:6379` on the internal bridge —
+      # they do not need the host port forwarded, and exposing 0.0.0.0
+      # is a fast way to ship an unauthenticated key/value store to any
+      # host on the LAN/internet.
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep PONG"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -65,6 +100,13 @@ services:
   # One op (stage_block_from_url) is not implemented by Azurite 3.29.0 — the
   # corresponding test is skipped when the connection string points to Azurite.
   azurite:
+    # TODO(D-H1): pin by digest. MCR's manifest endpoint returns the v1
+    # schema (no inline digest); fetch via the Docker CLI on a host with
+    # network access:
+    #   docker pull mcr.microsoft.com/azure-storage/azurite:3.29.0
+    #   docker inspect --format='{{index .RepoDigests 0}}' mcr.microsoft.com/azure-storage/azurite:3.29.0
+    # Test-only profile, so the supply-chain blast radius is smaller than
+    # the other services — but still worth pinning.
     image: mcr.microsoft.com/azure-storage/azurite:3.29.0
     container_name: tm_vault_azurite
     command: "azurite-blob --blobHost 0.0.0.0 --loose --skipApiVersionCheck"
@@ -81,8 +123,20 @@ services:
   # ${SEAWEEDFS_DATA_DIR:-D:/tm_vault_data/seaweedfs} so it survives
   # `docker compose down`. Credentials come from deploy/local/seaweedfs-s3.json.
   seaweedfs:
-    image: chrislusf/seaweedfs:3.71
+    # Pinned by digest (D-C1 / D-H1). Refresh with:
+    #   docker buildx imagetools inspect chrislusf/seaweedfs:3.71 --format '{{.Manifest.Digest}}'
+    # A floating tag can be force-pushed by the upstream maintainer;
+    # only a digest commits the build to a specific bit-for-bit image.
+    image: chrislusf/seaweedfs:3.71@sha256:c47aadbe7b6f78ff52e03bd0a27c6f61c2b27640cba3cf1215cbcafd9045122f
     container_name: tm_vault_seaweedfs
+    # Drop privileges (D-C2). SeaweedFS does not need root; binding to
+    # high ports (8333/9333) and writing to /data works fine as UID 10001.
+    # On Linux hosts you must pre-chown the bind-mount target so the
+    # container can write to it:
+    #   chown -R 10001:10001 ${SEAWEEDFS_DATA_DIR:-/var/tm_vault_data/seaweedfs}
+    # On Docker Desktop (Windows/macOS) the bind-mount file-sharing layer
+    # already presents the host directory as writable to any UID.
+    user: "10001:10001"
     command:
       - "server"
       - "-dir=/data"
@@ -97,9 +151,15 @@ services:
     volumes:
       - ./deploy/local/seaweedfs-s3.json:/config/s3.json:ro
       - ${SEAWEEDFS_DATA_DIR:-D:/tm_vault_data/seaweedfs}:/data
+    # D-M1: bind to loopback only. Backup/restore/snapshot/etc reach
+    # SeaweedFS via the compose-network DNS name `seaweedfs:8333` — they
+    # do NOT need the host port forwarded. Publishing on 0.0.0.0 lets
+    # any host on the LAN/internet hit the S3 API directly with the
+    # credentials in seaweedfs-s3.json (read or delete every backup
+    # object). 9333 is the master API and is even more privileged.
     ports:
-      - "8333:8333"
-      - "9333:9333"
+      - "127.0.0.1:8333:8333"
+      - "127.0.0.1:9333:9333"
     restart: unless-stopped
     networks:
       - tm-network
@@ -119,6 +179,16 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    # D-H3: HTTP liveness probe so dependent services' `condition:
+    # service_healthy` actually waits for an answering process, not just
+    # a started container. urllib instead of curl because the python:alpine
+    # base image doesn't ship curl.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
     networks:
       - tm-network
@@ -142,6 +212,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
     networks:
       - tm-network
@@ -165,6 +241,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
     networks:
       - tm-network
@@ -180,6 +262,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/health', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
     networks:
       - tm-network
@@ -195,13 +283,19 @@ services:
       RABBITMQ_ENABLED: "true"
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
-      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      RABBITMQ_USER: ${RABBITMQ_USER:?RABBITMQ_USER must be set — do not fall back to the default guest account}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set — do not fall back to the default guest account}
     depends_on:
       postgres:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8004/health', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
     networks:
       - tm-network
@@ -217,6 +311,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8005/health', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
     networks:
       - tm-network
@@ -232,6 +332,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8006/health', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
     networks:
       - tm-network
@@ -247,6 +353,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8007/health', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
     networks:
       - tm-network
@@ -262,8 +374,8 @@ services:
       RABBITMQ_ENABLED: ${RABBITMQ_ENABLED:-false}
       RABBITMQ_HOST: ${RABBITMQ_HOST:-rabbitmq}
       RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
-      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      RABBITMQ_USER: ${RABBITMQ_USER:?RABBITMQ_USER must be set — do not fall back to the default guest account}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set — do not fall back to the default guest account}
       # SharePoint admin API requires a cert-signed JWT. Same setup as
       # backup-worker — see secrets/sharepoint_auth.pem.
       # Cert shipped via SHAREPOINT_CERT_PEM_B64 env var (graph_client
@@ -275,6 +387,10 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    # TODO(D-H3): discovery-worker is a pure RabbitMQ consumer with no
+    # HTTP server. Add a /health endpoint to its main loop (mirror
+    # chat-export-worker.health_server) so a deadlocked consumer is
+    # actually detectable instead of just "container is up".
     restart: unless-stopped
     networks:
       - tm-network
@@ -292,13 +408,18 @@ services:
       RABBITMQ_ENABLED: "true"
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
-      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      RABBITMQ_USER: ${RABBITMQ_USER:?RABBITMQ_USER must be set — do not fall back to the default guest account}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set — do not fall back to the default guest account}
       REDIS_ENABLED: "true"
       REDIS_HOST: redis
       REDIS_PORT: 6379
+    # D-M2: scheduler is invoked by other services through the compose
+    # network DNS name (`backup-scheduler:8008`), never directly by
+    # external callers. Bind to loopback so the trigger/cancel/inspect
+    # endpoints aren't reachable from the LAN — those calls would
+    # otherwise bypass api-gateway's auth middleware entirely.
     ports:
-      - "8008:8008"
+      - "127.0.0.1:8008:8008"
     depends_on:
       postgres:
         condition: service_healthy
@@ -306,6 +427,12 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8008/health', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
     networks:
       - tm-network
@@ -323,6 +450,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8014/health', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
     networks:
       - tm-network
@@ -338,8 +471,8 @@ services:
       RABBITMQ_ENABLED: "true"
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
-      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      RABBITMQ_USER: ${RABBITMQ_USER:?RABBITMQ_USER must be set — do not fall back to the default guest account}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set — do not fall back to the default guest account}
       REDIS_ENABLED: "true"
       REDIS_HOST: redis
       REDIS_PORT: 6379
@@ -412,8 +545,8 @@ services:
       RABBITMQ_ENABLED: "true"
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
-      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      RABBITMQ_USER: ${RABBITMQ_USER:?RABBITMQ_USER must be set — do not fall back to the default guest account}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set — do not fall back to the default guest account}
       REDIS_ENABLED: "true"
       REDIS_HOST: redis
       REDIS_PORT: 6379
@@ -474,8 +607,8 @@ services:
       RABBITMQ_ENABLED: "true"
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
-      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      RABBITMQ_USER: ${RABBITMQ_USER:?RABBITMQ_USER must be set — do not fall back to the default guest account}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set — do not fall back to the default guest account}
       REDIS_ENABLED: "true"
       REDIS_HOST: redis
       REDIS_PORT: 6379
@@ -488,6 +621,15 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    # chat-export-worker exposes its health server on 8081 (see main.py
+    # `health_server`). Adds a probe so a stuck consumer doesn't hide
+    # behind "container is running" indefinitely.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/health', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
     networks:
       - tm-network
@@ -521,13 +663,19 @@ services:
       RABBITMQ_ENABLED: "true"
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
-      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      RABBITMQ_USER: ${RABBITMQ_USER:?RABBITMQ_USER must be set — do not fall back to the default guest account}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set — do not fall back to the default guest account}
     ports:
       - "8011:8011"
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8011/health', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
     networks:
       - tm-network
@@ -545,6 +693,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8012/health', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
     networks:
       - tm-network
@@ -561,8 +715,8 @@ services:
       RABBITMQ_ENABLED: "true"
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
-      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      RABBITMQ_USER: ${RABBITMQ_USER:?RABBITMQ_USER must be set — do not fall back to the default guest account}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set — do not fall back to the default guest account}
       AZURE_STORAGE_ACCOUNT_NAME: ${AZURE_STORAGE_ACCOUNT_NAME}
       AZURE_STORAGE_ACCOUNT_KEY: ${AZURE_STORAGE_ACCOUNT_KEY}
       # Multi-app registration
@@ -636,8 +790,8 @@ services:
       RABBITMQ_ENABLED: "true"
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
-      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      RABBITMQ_USER: ${RABBITMQ_USER:?RABBITMQ_USER must be set — do not fall back to the default guest account}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set — do not fall back to the default guest account}
       AZURE_STORAGE_ACCOUNT_NAME: ${AZURE_STORAGE_ACCOUNT_NAME}
       AZURE_STORAGE_ACCOUNT_KEY: ${AZURE_STORAGE_ACCOUNT_KEY}
       # Multi-app registration
@@ -720,8 +874,8 @@ services:
       RABBITMQ_ENABLED: "true"
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
-      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      RABBITMQ_USER: ${RABBITMQ_USER:?RABBITMQ_USER must be set — do not fall back to the default guest account}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set — do not fall back to the default guest account}
       AZURE_STORAGE_ACCOUNT_NAME: ${AZURE_STORAGE_ACCOUNT_NAME}
       AZURE_STORAGE_ACCOUNT_KEY: ${AZURE_STORAGE_ACCOUNT_KEY}
       # Azure ARM credentials for VM/SQL/PostgreSQL backup

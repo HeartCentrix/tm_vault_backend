@@ -34,8 +34,19 @@ def _dsn() -> str:
     host = os.getenv("DB_HOST", "localhost")
     port = os.getenv("DB_PORT", "5432")
     user = os.getenv("DB_USERNAME", "postgres")
-    pw = os.getenv("DB_PASSWORD", "")
+    pw = os.getenv("DB_PASSWORD")
     db = os.getenv("DB_NAME", "postgres")
+    # Fail closed (B-L1). An empty DB_PASSWORD silently produces a DSN
+    # like `postgresql://postgres:@host:5432/postgres`; depending on the
+    # server's pg_hba.conf this can succeed unauthenticated. This worker
+    # toggles the storage backend for the entire deployment — refuse to
+    # start without an explicit password. Set DATABASE_URL or DB_PASSWORD.
+    if not pw:
+        raise RuntimeError(
+            "DB_PASSWORD must be set for storage-toggle-worker (or pass a "
+            "full DATABASE_URL with credentials baked in). Refusing to "
+            "build a passwordless Postgres DSN."
+        )
     return f"postgresql://{user}:{pw}@{host}:{port}/{db}"
 
 

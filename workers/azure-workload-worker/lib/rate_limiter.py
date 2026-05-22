@@ -20,6 +20,7 @@ a Lua script so the read-then-write is atomic across the cluster.
 """
 import asyncio
 import logging
+import os
 import time
 import uuid
 from collections import deque
@@ -103,13 +104,50 @@ class AzureApiRateLimiter:
         # O(n) list comprehension the previous implementation ran on every
         # acquire (which built GC pressure and stalled under sustained load).
         self._fallback_windows: Dict[str, Deque[float]] = {}
+        # B-M1: track last-write per key so we can evict stale keys whose
+        # subscription stopped calling. Without this the dict grows
+        # unboundedly — one entry per unique subscription_id × limit-type
+        # ever observed — and bleeds memory in long-running workers.
+        self._fallback_last_active: Dict[str, float] = {}
+        self._fallback_acquire_count = 0
+        # Sweep stale keys every N successful in-process acquires. The
+        # work per sweep is O(len(dict)); N=128 amortises that to ~1%
+        # overhead even if every acquire used the fallback path.
+        self._fallback_evict_every = 128
         self._fallback_lock = asyncio.Lock()
+
+    @staticmethod
+    def _is_production() -> bool:
+        """True when the worker is running in a non-dev environment.
+
+        Checks ENVIRONMENT (canonical) and RAILWAY_ENVIRONMENT_NAME (the
+        var Railway sets automatically on the production environment).
+        Both must explicitly say so — absence is treated as dev.
+        """
+        env = os.environ.get("ENVIRONMENT", "").strip().lower()
+        if env in ("production", "prod"):
+            return True
+        railway_env = os.environ.get("RAILWAY_ENVIRONMENT_NAME", "").strip().lower()
+        return railway_env == "production"
 
     async def _get_redis(self) -> Optional[Redis]:
         """Lazy-init the Redis client. Returns None when Redis isn't configured."""
         if self._redis is not None:
             return self._redis
         if Redis is None or not settings.REDIS_ENABLED:
+            # B-M1: in production the in-process fallback would cause
+            # every replica to track its own counters, which collectively
+            # blast through Azure's per-subscription API ceiling and
+            # trigger subscription-wide throttling. Fail fast instead.
+            if self._is_production():
+                raise RuntimeError(
+                    "AzureApiRateLimiter requires Redis in production "
+                    "(REDIS_ENABLED=true, reachable Redis). The in-process "
+                    "fallback is NOT safe across multiple worker replicas "
+                    "and will exceed Azure's per-subscription API limits. "
+                    "Set ENVIRONMENT=dev / RAILWAY_ENVIRONMENT_NAME=dev "
+                    "for explicit local-development opt-out."
+                )
             if not self._redis_warned:
                 logger.warning(
                     "[RateLimiter] Redis disabled — falling back to in-process "
@@ -175,8 +213,28 @@ class AzureApiRateLimiter:
             while entries and entries[0] <= cutoff:
                 entries.popleft()
             if len(entries) >= limit:
+                # Rejected → still record that the key saw activity so
+                # the sweep doesn't evict it under contention.
+                self._fallback_last_active[key] = now
                 return len(entries)
             entries.append(now)
+            self._fallback_last_active[key] = now
+
+            # B-M1: opportunistic eviction. Every N acquires, drop keys
+            # whose deques are empty AND haven't been touched in two
+            # full windows. Bounds memory at O(active subscriptions ×
+            # limit_types) instead of unbounded growth across the
+            # worker's lifetime.
+            self._fallback_acquire_count += 1
+            if self._fallback_acquire_count % self._fallback_evict_every == 0:
+                stale_cutoff = now - 2 * window_seconds
+                stale_keys = [
+                    k for k, ts in self._fallback_last_active.items()
+                    if ts < stale_cutoff and not self._fallback_windows.get(k)
+                ]
+                for k in stale_keys:
+                    self._fallback_windows.pop(k, None)
+                    self._fallback_last_active.pop(k, None)
             return -1
 
     async def _acquire(

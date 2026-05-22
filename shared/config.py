@@ -71,6 +71,38 @@ class Settings:
         # the type-claim check in decode_token is the primary defense.
         self.ACCESS_TOKEN_SECRET = os.getenv("ACCESS_TOKEN_SECRET", "") or self.JWT_SECRET
         self.REFRESH_TOKEN_SECRET = os.getenv("REFRESH_TOKEN_SECRET", "") or self.JWT_SECRET
+
+        # D-H4: refuse to launch with any of the placeholder strings that
+        # ship in .env.example, or with an empty secret. The old
+        # placeholder `your-secret-key-change-in-production` was public
+        # in the repo — any service that booted with it was signing
+        # every JWT with a known string, full account takeover across
+        # all tenants. ACCESS_TOKEN_SECRET / REFRESH_TOKEN_SECRET fall
+        # back to JWT_SECRET above, so this check catches all three.
+        # Set ALLOW_DEV_JWT_SECRETS=true only for ephemeral test runs
+        # that never see real user data.
+        _placeholder_jwt_secrets = {
+            "",
+            "your-secret-key-change-in-production",
+            "REPLACE_WITH_python_-c_secrets_token_hex_32",
+            "change-me",
+            "changeme",
+            "secret",
+        }
+        if os.environ.get("ALLOW_DEV_JWT_SECRETS", "").lower() not in ("true", "1", "yes"):
+            for _name, _value in (
+                ("JWT_SECRET", self.JWT_SECRET),
+                ("ACCESS_TOKEN_SECRET", self.ACCESS_TOKEN_SECRET),
+                ("REFRESH_TOKEN_SECRET", self.REFRESH_TOKEN_SECRET),
+            ):
+                if _value in _placeholder_jwt_secrets:
+                    raise RuntimeError(
+                        f"{_name} is empty or matches a known placeholder. "
+                        "Generate a real secret with "
+                        "`python -c \"import secrets; print(secrets.token_hex(32))\"` "
+                        "and set it in the environment. Set ALLOW_DEV_JWT_SECRETS=true "
+                        "only for ephemeral test runs that never see real user data."
+                    )
         # Shared secret for service-to-service calls on internal-only services
         # (delta-token, etc.). Callers send it as the X-Internal-Api-Key header.
         # Must be set in every environment — empty disables the affected
@@ -742,7 +774,35 @@ class Settings:
         self.ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200")
         self.ELASTICSEARCH_ENABLED = False
         origins = os.getenv("CORS_ORIGINS") or os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:4200,http://localhost:3000,http://localhost:5173")
-        self.CORS_ORIGINS = [o.strip() for o in origins.split(",")]
+        self.CORS_ORIGINS = [o.strip() for o in origins.split(",") if o.strip()]
+
+        # D-M3: in production, refuse to start if any CORS_ORIGINS entry
+        # is a localhost/loopback origin. The .env.example used to ship
+        # `["http://localhost:4200", "http://localhost:3000"]`; if that
+        # value leaked into a prod deployment (CI misconfig, copy-paste
+        # of dev env), any page served from the user's local machine
+        # could mount credentialed cross-origin requests against the
+        # prod API and exfiltrate JWT-backed session state. Dev is
+        # untouched — the check only fires when ENVIRONMENT or
+        # RAILWAY_ENVIRONMENT_NAME is explicitly set to production.
+        _env = os.environ.get("ENVIRONMENT", "").strip().lower()
+        _railway_env = os.environ.get("RAILWAY_ENVIRONMENT_NAME", "").strip().lower()
+        _is_prod = _env in ("production", "prod") or _railway_env == "production"
+        if _is_prod:
+            _bad_origins = [
+                o for o in self.CORS_ORIGINS
+                if any(needle in o.lower() for needle in (
+                    "localhost", "127.0.0.1", "0.0.0.0", "[::1]",
+                ))
+            ]
+            if _bad_origins:
+                raise RuntimeError(
+                    "CORS_ORIGINS contains localhost/loopback entries in a "
+                    f"production environment: {_bad_origins!r}. Set CORS_ORIGINS "
+                    "to the real SPA origin(s) (comma-separated). To run this "
+                    "check off intentionally, unset ENVIRONMENT and "
+                    "RAILWAY_ENVIRONMENT_NAME."
+                )
 
         # Frontend URL for OAuth redirects
         self.FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:4200").rstrip("/")

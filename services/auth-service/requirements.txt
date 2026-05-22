@@ -7,7 +7,12 @@ python-jose[cryptography]==3.3.0
 httpx==0.26.0
 redis==5.0.1
 aio-pika==9.4.0
-cryptography==42.0.2
+# CVE-2024-12797 (raw-public-key client-auth bypass in OpenSSL) is fixed
+# in cryptography 43.0.3. The auth-service uses this transitively via
+# python-jose for JWT signing/verification, so the bump matters here in
+# particular. Pin a floor, not an exact, so we still pick up future
+# 43.x security patches automatically.
+cryptography>=43.0.3,<44
 pydantic==2.5.3
 pydantic-settings==2.1.0
 python-dotenv==1.0.0
