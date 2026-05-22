@@ -774,7 +774,35 @@ class Settings:
         self.ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200")
         self.ELASTICSEARCH_ENABLED = False
         origins = os.getenv("CORS_ORIGINS") or os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:4200,http://localhost:3000,http://localhost:5173")
-        self.CORS_ORIGINS = [o.strip() for o in origins.split(",")]
+        self.CORS_ORIGINS = [o.strip() for o in origins.split(",") if o.strip()]
+
+        # D-M3: in production, refuse to start if any CORS_ORIGINS entry
+        # is a localhost/loopback origin. The .env.example used to ship
+        # `["http://localhost:4200", "http://localhost:3000"]`; if that
+        # value leaked into a prod deployment (CI misconfig, copy-paste
+        # of dev env), any page served from the user's local machine
+        # could mount credentialed cross-origin requests against the
+        # prod API and exfiltrate JWT-backed session state. Dev is
+        # untouched — the check only fires when ENVIRONMENT or
+        # RAILWAY_ENVIRONMENT_NAME is explicitly set to production.
+        _env = os.environ.get("ENVIRONMENT", "").strip().lower()
+        _railway_env = os.environ.get("RAILWAY_ENVIRONMENT_NAME", "").strip().lower()
+        _is_prod = _env in ("production", "prod") or _railway_env == "production"
+        if _is_prod:
+            _bad_origins = [
+                o for o in self.CORS_ORIGINS
+                if any(needle in o.lower() for needle in (
+                    "localhost", "127.0.0.1", "0.0.0.0", "[::1]",
+                ))
+            ]
+            if _bad_origins:
+                raise RuntimeError(
+                    "CORS_ORIGINS contains localhost/loopback entries in a "
+                    f"production environment: {_bad_origins!r}. Set CORS_ORIGINS "
+                    "to the real SPA origin(s) (comma-separated). To run this "
+                    "check off intentionally, unset ENVIRONMENT and "
+                    "RAILWAY_ENVIRONMENT_NAME."
+                )
 
         # Frontend URL for OAuth redirects
         self.FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:4200").rstrip("/")

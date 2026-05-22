@@ -151,9 +151,15 @@ services:
     volumes:
       - ./deploy/local/seaweedfs-s3.json:/config/s3.json:ro
       - ${SEAWEEDFS_DATA_DIR:-D:/tm_vault_data/seaweedfs}:/data
+    # D-M1: bind to loopback only. Backup/restore/snapshot/etc reach
+    # SeaweedFS via the compose-network DNS name `seaweedfs:8333` — they
+    # do NOT need the host port forwarded. Publishing on 0.0.0.0 lets
+    # any host on the LAN/internet hit the S3 API directly with the
+    # credentials in seaweedfs-s3.json (read or delete every backup
+    # object). 9333 is the master API and is even more privileged.
     ports:
-      - "8333:8333"
-      - "9333:9333"
+      - "127.0.0.1:8333:8333"
+      - "127.0.0.1:9333:9333"
     restart: unless-stopped
     networks:
       - tm-network
@@ -407,8 +413,13 @@ services:
       REDIS_ENABLED: "true"
       REDIS_HOST: redis
       REDIS_PORT: 6379
+    # D-M2: scheduler is invoked by other services through the compose
+    # network DNS name (`backup-scheduler:8008`), never directly by
+    # external callers. Bind to loopback so the trigger/cancel/inspect
+    # endpoints aren't reachable from the LAN — those calls would
+    # otherwise bypass api-gateway's auth middleware entirely.
     ports:
-      - "8008:8008"
+      - "127.0.0.1:8008:8008"
     depends_on:
       postgres:
         condition: service_healthy
