@@ -25,14 +25,24 @@ services:
     image: rabbitmq:3-management-alpine
     container_name: tm_vault_rabbitmq
     environment:
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+      # No :- fallback. If RABBITMQ_USER/RABBITMQ_PASSWORD are missing the
+      # compose stack must refuse to start rather than silently boot the
+      # broker with the well-known guest:guest credential.
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?RABBITMQ_USER must be set — do not fall back to the default guest account}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set — do not fall back to the default guest account}
     # Config mounted from host - if mount fails, comment out and use defaults:
     # volumes:
     #   - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
     ports:
-      - "5672:5672"
-      - "15672:15672"
+      # AMQP and management UI are bound to loopback only. Other services
+      # in the compose network reach RabbitMQ via the service DNS name
+      # (`rabbitmq:5672`) on the internal bridge — they do not need the
+      # host port forwarded. Exposing 0.0.0.0:15672 lets any host on the
+      # LAN/internet hit the management UI and (with default creds) take
+      # over the broker — see D-C3. For remote admin access, tunnel via
+      # SSH or VPN.
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 10s
@@ -195,8 +205,8 @@ services:
       RABBITMQ_ENABLED: "true"
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
-      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      RABBITMQ_USER: ${RABBITMQ_USER:?RABBITMQ_USER must be set — do not fall back to the default guest account}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set — do not fall back to the default guest account}
     depends_on:
       postgres:
         condition: service_healthy
@@ -262,8 +272,8 @@ services:
       RABBITMQ_ENABLED: ${RABBITMQ_ENABLED:-false}
       RABBITMQ_HOST: ${RABBITMQ_HOST:-rabbitmq}
       RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
-      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      RABBITMQ_USER: ${RABBITMQ_USER:?RABBITMQ_USER must be set — do not fall back to the default guest account}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set — do not fall back to the default guest account}
       # SharePoint admin API requires a cert-signed JWT. Same setup as
       # backup-worker — see secrets/sharepoint_auth.pem.
       # Cert shipped via SHAREPOINT_CERT_PEM_B64 env var (graph_client
@@ -292,8 +302,8 @@ services:
       RABBITMQ_ENABLED: "true"
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
-      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      RABBITMQ_USER: ${RABBITMQ_USER:?RABBITMQ_USER must be set — do not fall back to the default guest account}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set — do not fall back to the default guest account}
       REDIS_ENABLED: "true"
       REDIS_HOST: redis
       REDIS_PORT: 6379
@@ -338,8 +348,8 @@ services:
       RABBITMQ_ENABLED: "true"
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
-      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      RABBITMQ_USER: ${RABBITMQ_USER:?RABBITMQ_USER must be set — do not fall back to the default guest account}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set — do not fall back to the default guest account}
       REDIS_ENABLED: "true"
       REDIS_HOST: redis
       REDIS_PORT: 6379
@@ -412,8 +422,8 @@ services:
       RABBITMQ_ENABLED: "true"
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
-      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      RABBITMQ_USER: ${RABBITMQ_USER:?RABBITMQ_USER must be set — do not fall back to the default guest account}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set — do not fall back to the default guest account}
       REDIS_ENABLED: "true"
       REDIS_HOST: redis
       REDIS_PORT: 6379
@@ -474,8 +484,8 @@ services:
       RABBITMQ_ENABLED: "true"
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
-      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      RABBITMQ_USER: ${RABBITMQ_USER:?RABBITMQ_USER must be set — do not fall back to the default guest account}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set — do not fall back to the default guest account}
       REDIS_ENABLED: "true"
       REDIS_HOST: redis
       REDIS_PORT: 6379
@@ -521,8 +531,8 @@ services:
       RABBITMQ_ENABLED: "true"
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
-      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      RABBITMQ_USER: ${RABBITMQ_USER:?RABBITMQ_USER must be set — do not fall back to the default guest account}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set — do not fall back to the default guest account}
     ports:
       - "8011:8011"
     depends_on:
@@ -561,8 +571,8 @@ services:
       RABBITMQ_ENABLED: "true"
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
-      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      RABBITMQ_USER: ${RABBITMQ_USER:?RABBITMQ_USER must be set — do not fall back to the default guest account}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set — do not fall back to the default guest account}
       AZURE_STORAGE_ACCOUNT_NAME: ${AZURE_STORAGE_ACCOUNT_NAME}
       AZURE_STORAGE_ACCOUNT_KEY: ${AZURE_STORAGE_ACCOUNT_KEY}
       # Multi-app registration
@@ -636,8 +646,8 @@ services:
       RABBITMQ_ENABLED: "true"
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
-      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      RABBITMQ_USER: ${RABBITMQ_USER:?RABBITMQ_USER must be set — do not fall back to the default guest account}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set — do not fall back to the default guest account}
       AZURE_STORAGE_ACCOUNT_NAME: ${AZURE_STORAGE_ACCOUNT_NAME}
       AZURE_STORAGE_ACCOUNT_KEY: ${AZURE_STORAGE_ACCOUNT_KEY}
       # Multi-app registration
@@ -720,8 +730,8 @@ services:
       RABBITMQ_ENABLED: "true"
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
-      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      RABBITMQ_USER: ${RABBITMQ_USER:?RABBITMQ_USER must be set — do not fall back to the default guest account}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set — do not fall back to the default guest account}
       AZURE_STORAGE_ACCOUNT_NAME: ${AZURE_STORAGE_ACCOUNT_NAME}
       AZURE_STORAGE_ACCOUNT_KEY: ${AZURE_STORAGE_ACCOUNT_KEY}
       # Azure ARM credentials for VM/SQL/PostgreSQL backup

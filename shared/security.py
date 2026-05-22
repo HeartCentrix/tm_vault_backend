@@ -148,33 +148,80 @@ async def _get_revocation_redis():
         return None
 
 
-async def revoke_refresh_token(jti: str, ttl_seconds: int) -> None:
-    """Add a refresh-token jti to the denylist for the rest of its lifetime."""
+async def revoke_refresh_token(jti: str, ttl_seconds: int) -> bool:
+    """Atomically claim a refresh-token jti on the denylist.
+
+    Returns True when this caller wrote the denylist entry (i.e. won the
+    rotation race). Returns False when the key already existed — another
+    concurrent /auth/refresh has already burned this jti and the caller
+    must reject the request to prevent refresh-token replay (B-C2).
+
+    Fails closed on Redis errors: if we cannot prove we wrote the entry,
+    we cannot safely issue a new refresh token, so we raise 503 rather
+    than letting a stolen token roll forward (B-C1 companion).
+    """
     if not jti:
-        return
+        return False
     client = await _get_revocation_redis()
     if client is None:
-        return
+        # Revocation is a security-critical control. If Redis is disabled
+        # or unreachable at startup we refuse the operation rather than
+        # silently letting the same refresh token be replayed.
+        if HTTPException is None or status is None:
+            raise RuntimeError("Refresh-token revocation requires Redis")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Token revocation service unavailable",
+        )
     try:
-        await client.setex(f"{_REVOCATION_KEY_PREFIX}{jti}", max(1, ttl_seconds), "1")
+        # SET NX is the compare-and-swap that makes rotation atomic: the
+        # first concurrent caller wins (result truthy), every other caller
+        # for the same jti gets None and is rejected by the auth-service.
+        result = await client.set(
+            f"{_REVOCATION_KEY_PREFIX}{jti}",
+            "1",
+            nx=True,
+            ex=max(1, ttl_seconds),
+        )
+        return result is not None
     except Exception:
-        # Best-effort: if Redis is down we can't add to the denylist. Log via
-        # the FastAPI runtime if the caller wants — return None either way so
-        # logout/refresh don't 500 on a transient Redis hiccup.
-        return
+        # Fail-closed: we cannot confirm the denylist write, so we must
+        # not let the caller proceed to mint a new token pair.
+        if HTTPException is None or status is None:
+            raise RuntimeError("Refresh-token revocation backend unreachable")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Token revocation service unavailable",
+        )
 
 
 async def is_refresh_token_revoked(jti: str) -> bool:
-    """Return True when the jti has been revoked. Fail-open on Redis errors."""
+    """Return True when the jti has been revoked.
+
+    Fails closed: on Redis error we raise 503 rather than treating the
+    token as valid. A network partition or Redis OOM at the moment of a
+    /auth/refresh call would otherwise let a previously revoked token
+    replay indefinitely (B-C1).
+    """
     if not jti:
         return False
     client = await _get_revocation_redis()
     if client is None:
-        return False
+        if HTTPException is None or status is None:
+            raise RuntimeError("Refresh-token revocation requires Redis")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Token validation service unavailable",
+        )
     try:
         return bool(await client.exists(f"{_REVOCATION_KEY_PREFIX}{jti}"))
     except Exception:
-        return False
+        if HTTPException is None or status is None:
+            raise RuntimeError("Refresh-token revocation backend unreachable")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Token validation service unavailable",
+        )
 
 
 def _unauthorized(detail: str):
