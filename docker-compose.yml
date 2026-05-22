@@ -55,13 +55,30 @@ services:
   redis:
     image: redis:7-alpine
     container_name: tm_vault_redis
-    command: redis-server --appendonly yes
+    # `--requirepass` makes auth mandatory on every connection — without
+    # this any pod on the same network could read/write the revocation
+    # denylist and rate-limit buckets unauthenticated. `${REDIS_PASSWORD:?…}`
+    # forces the compose stack to fail-fast if the operator forgot to
+    # provision a password in .env, matching the RabbitMQ pattern above.
+    command: >-
+      redis-server --appendonly yes
+      --requirepass "${REDIS_PASSWORD:?REDIS_PASSWORD must be set — Redis must not run unauthenticated}"
+    environment:
+      # Pass the password through so the in-container healthcheck below
+      # can authenticate. (Compose interpolates ${…} at file-parse time
+      # before any container exists.)
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set — Redis must not run unauthenticated}
     ports:
-      - "6379:6379"
+      # Bind to loopback only (D-C3). Other compose services reach Redis
+      # via the service DNS name `redis:6379` on the internal bridge —
+      # they do not need the host port forwarded, and exposing 0.0.0.0
+      # is a fast way to ship an unauthenticated key/value store to any
+      # host on the LAN/internet.
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep PONG"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -91,8 +108,23 @@ services:
   # ${SEAWEEDFS_DATA_DIR:-D:/tm_vault_data/seaweedfs} so it survives
   # `docker compose down`. Credentials come from deploy/local/seaweedfs-s3.json.
   seaweedfs:
+    # TODO(supply-chain, D-C1): pin by digest, e.g.
+    #   image: chrislusf/seaweedfs:3.71@sha256:<digest>
+    # Obtain the current digest with:
+    #   docker buildx imagetools inspect chrislusf/seaweedfs:3.71 \
+    #     --format '{{.Manifest.Digest}}'
+    # A floating tag can be force-pushed by the upstream maintainer; only
+    # a digest commits the build to a specific bit-for-bit image.
     image: chrislusf/seaweedfs:3.71
     container_name: tm_vault_seaweedfs
+    # Drop privileges (D-C2). SeaweedFS does not need root; binding to
+    # high ports (8333/9333) and writing to /data works fine as UID 10001.
+    # On Linux hosts you must pre-chown the bind-mount target so the
+    # container can write to it:
+    #   chown -R 10001:10001 ${SEAWEEDFS_DATA_DIR:-/var/tm_vault_data/seaweedfs}
+    # On Docker Desktop (Windows/macOS) the bind-mount file-sharing layer
+    # already presents the host directory as writable to any UID.
+    user: "10001:10001"
     command:
       - "server"
       - "-dir=/data"

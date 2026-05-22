@@ -135,10 +135,16 @@ async def _get_revocation_redis():
         return None
     try:
         from redis.asyncio import Redis
+        # Pass REDIS_PASSWORD when configured. Production Redis runs with
+        # `--requirepass` (see D-C3); without this kwarg every revocation
+        # check would NOAUTH-error and the denylist would be unreachable
+        # — which combined with the fail-closed behaviour above would 503
+        # the entire auth-service.
         _revocation_redis = Redis(
             host=settings.REDIS_HOST,
             port=settings.REDIS_PORT,
             db=settings.REDIS_DB,
+            password=settings.REDIS_PASSWORD or None,
             decode_responses=True,
             socket_timeout=2,
             socket_connect_timeout=2,

@@ -27,10 +27,11 @@ orjson>=3.10
 # (cross-snapshot dedup index target) stays sha256 so existing indexed
 # rows continue to match.
 blake3>=1.0
-# On-prem storage backend (SeaweedFS) — pulled in by shared.storage
-aioboto3>=15.5.0,<16
-aiobotocore>=2.25.0,<3
-boto3>=1.40.0,<2
+# On-prem storage backend (SeaweedFS) — pulled in by shared.storage.
+# Phantom upstream versions; pinned to real PyPI releases. See requirements.base.txt.
+aioboto3==13.1.1
+aiobotocore==2.15.2
+boto3==1.34.131
 
 # Observability — Prometheus metrics scraped on CORE_METRICS_PORT (default 9103)
 prometheus_client>=0.20.0
