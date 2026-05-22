@@ -1,6 +1,6 @@
 aio-pika>=9.4.0
 aiohttp>=3.9
-cryptography>=42.0.0
+cryptography>=43.0.3,<44  # CVE-2024-12797 fixed in 43.0.3
 python-jose>=3.3.0
 azure-storage-blob>=12.19
 azure-mgmt-storage>=21.0

@@ -5,7 +5,7 @@ asyncpg==0.29.0
 apscheduler==3.10.4
 aio-pika==9.4.0
 httpx==0.26.0
-cryptography>=42.0.0
+cryptography>=43.0.3,<44  # CVE-2024-12797 fixed in 43.0.3
 # R3.2 — backup verification cron downloads blobs to checksum-verify them.
 azure-storage-blob>=12.19
 aiohttp>=3.9

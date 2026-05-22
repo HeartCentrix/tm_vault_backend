@@ -32,7 +32,9 @@ pydantic==2.5.3
 pydantic-settings==2.1.0
 
 # --- Auth / cryptography (needs gcc + libffi on ARM64) ---
-cryptography==42.0.2
+# CVE-2024-12797 (raw-public-key client-auth bypass) is fixed in 43.0.3.
+# Pin a floor instead of an exact so future 43.x security patches roll in.
+cryptography>=43.0.3,<44
 python-jose[cryptography]==3.3.0
 
 # --- Cache ---

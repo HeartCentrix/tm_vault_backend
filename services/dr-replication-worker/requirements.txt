@@ -1,6 +1,6 @@
 azure-identity>=1.17.0
 azure-storage-blob>=12.22.0
-azure-mgmt-storage>=21.2.0
+azure-mgmt-storage==21.1.0  # 21.2.0 is a phantom version on PyPI — pin to real latest
 aio-pika>=9.4.0
 sqlalchemy[asyncio]>=2.0.0
 asyncpg>=0.29.0

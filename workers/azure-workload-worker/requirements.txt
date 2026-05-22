@@ -4,7 +4,7 @@ azure-mgmt-network>=25.0.0
 azure-mgmt-sql>=3.0.1
 azure-mgmt-rdbms>=10.1.1
 azure-mgmt-resource>=23.1.0
-azure-mgmt-storage>=21.2.0
+azure-mgmt-storage==21.1.0  # 21.2.0 is a phantom version on PyPI — pin to real latest
 azure-storage-blob>=12.22.0
 aio-pika>=9.4.0
 sqlalchemy[asyncio]>=2.0.0
