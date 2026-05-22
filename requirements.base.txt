@@ -55,7 +55,7 @@ azure-mgmt-storage==21.0.0
 # package installed everywhere). Pinned to the real latest stable trio
 # that share a known-good compatibility matrix.
 aioboto3==13.1.1
-aiobotocore==2.15.2
+aiobotocore==2.13.1  # exact pin required by aioboto3 13.1.1
 boto3==1.34.131
 
 # --- Server-Sent Events (admin storage toggle stream) ---
