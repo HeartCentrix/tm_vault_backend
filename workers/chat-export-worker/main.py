@@ -26,16 +26,35 @@ async def _reclaim_orphan_jobs() -> None:
     and the UI polls forever. There is exactly one chat-export-worker per
     deployment, so on startup any RUNNING chat-export job has no live owner
     and should be failed so the client sees a terminal state.
+
+    B-M2: the SELECT and UPDATE used to be unsynchronised, leaving a TOCTOU
+    window during rolling deploys where a sibling worker could have advanced
+    a job between the two queries — we'd then incorrectly mark a job
+    FAILED while another replica was actively processing it. Closing the
+    window with two compounding guards:
+
+      1. `SELECT … FOR UPDATE SKIP LOCKED` so any row another worker is
+         already operating on (i.e. holding a row lock inside its own
+         consumer transaction) is invisible to this reclaim scan.
+      2. Re-check the status set in the UPDATE's WHERE clause so a row
+         that legitimately transitioned out of RUNNING/PENDING/QUEUED
+         between SELECT and UPDATE — possibly via a code path that
+         doesn't take row locks — is also skipped.
     """
-    from sqlalchemy import and_, or_, select, update as sa_update
+    from sqlalchemy import and_, select, update as sa_update
     from shared.database import async_session_factory
     from shared.models import Job, JobStatus, JobType
+    in_flight_states = [JobStatus.RUNNING, JobStatus.PENDING, JobStatus.QUEUED]
     async with async_session_factory() as sess:
-        q = select(Job.id, Job.spec).where(
-            and_(
-                Job.type == JobType.EXPORT,
-                Job.status.in_([JobStatus.RUNNING, JobStatus.PENDING, JobStatus.QUEUED]),
+        q = (
+            select(Job.id, Job.spec)
+            .where(
+                and_(
+                    Job.type == JobType.EXPORT,
+                    Job.status.in_(in_flight_states),
+                )
             )
+            .with_for_update(skip_locked=True)
         )
         rows = (await sess.execute(q)).all()
         ids_to_fail: list = []
@@ -43,10 +62,20 @@ async def _reclaim_orphan_jobs() -> None:
             if isinstance(spec, dict) and spec.get("kind") == "chat_export_thread":
                 ids_to_fail.append(jid)
         if not ids_to_fail:
+            await sess.commit()  # release the locks SKIP LOCKED grabbed
             return
-        await sess.execute(
+        result = await sess.execute(
             sa_update(Job)
-            .where(Job.id.in_(ids_to_fail))
+            .where(
+                and_(
+                    Job.id.in_(ids_to_fail),
+                    # Re-assert the in-flight states. Belt-and-suspenders
+                    # alongside the SELECT FOR UPDATE — if a non-locking
+                    # write path (e.g. an admin SQL fix) advanced the row
+                    # since the SELECT, don't clobber it.
+                    Job.status.in_(in_flight_states),
+                )
+            )
             .values(
                 status=JobStatus.FAILED,
                 result={"error": {"code": "worker_restart",
@@ -54,7 +83,10 @@ async def _reclaim_orphan_jobs() -> None:
             )
         )
         await sess.commit()
-        log.info("reclaimed %d orphan chat-export job(s)", len(ids_to_fail))
+        log.info(
+            "reclaimed %d orphan chat-export job(s) (rows touched: %d)",
+            len(ids_to_fail), result.rowcount or 0,
+        )
 
 
 async def health_server() -> None:

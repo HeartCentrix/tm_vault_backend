@@ -13,14 +13,14 @@
 # start to render /tmp/s3.json — credentials are NEVER baked into the
 # image layer (see D-C4).
 #
-# TODO(supply-chain, D-C5): pin by digest, e.g.
-#     FROM chrislusf/seaweedfs:3.71@sha256:<digest>
-# Obtain the current digest with:
+# Pinned by digest (D-C5 / D-H2). Refresh with:
 #     docker buildx imagetools inspect chrislusf/seaweedfs:3.71 \
 #       --format '{{.Manifest.Digest}}'
 # A floating tag can be force-pushed by the upstream maintainer; only a
-# digest commits the build to a specific bit-for-bit image.
-FROM chrislusf/seaweedfs:3.71
+# digest commits the build to a specific bit-for-bit image. This image
+# guards the 250 TiB customer backup store — supply-chain integrity is
+# load-bearing.
+FROM chrislusf/seaweedfs:3.71@sha256:c47aadbe7b6f78ff52e03bd0a27c6f61c2b27640cba3cf1215cbcafd9045122f
 
 # Drop privileges (D-C5). SeaweedFS does not need root — it binds to
 # high ports (8333/9333) and writes only to /data (the runtime-mounted

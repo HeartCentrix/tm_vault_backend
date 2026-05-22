@@ -1,16 +1,82 @@
 """Alert Service - Manages alerts, notifications, and access groups"""
+import ipaddress
+import socket
 from contextlib import asynccontextmanager
 from typing import List, Optional
+from urllib.parse import urlparse
 from uuid import UUID, uuid4
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, Depends, HTTPException, Query
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, HttpUrl, field_validator
 from sqlalchemy import select, func
 
 from shared.database import get_db, init_db, close_db, AsyncSession
 from shared.models import Alert, AccessGroup
 from shared.security import get_current_user_from_token
+
+
+# ============ Webhook URL SSRF guard ============
+#
+# Registered webhooks are eventually fired by the alert-service from
+# inside the cluster. A naive `requests.post(webhook.url, ...)` against
+# an attacker-controlled URL grants them an outbound HTTP probe through
+# the service's network identity — every internal-only DNS name, the
+# cloud-metadata endpoint (169.254.169.254 / fd00:ec2::254), the Docker
+# bridge, RFC-1918 ranges, and loopback all become reachable.
+#
+# We block these at *registration* time. The consumer that actually
+# fires the webhook MUST also re-resolve and re-check the host right
+# before connecting — DNS rebinding can change the resolved IP after
+# this validation passes.
+
+_BLOCKED_WEBHOOK_HOSTNAMES = frozenset({
+    "localhost",
+    "metadata",
+    "metadata.google.internal",
+    "instance-data",  # AWS legacy
+    "metadata.azure.com",
+})
+_BLOCKED_WEBHOOK_TLDS = (".local", ".internal", ".cluster.local", ".localdomain")
+
+
+def _validate_webhook_url(value: str) -> str:
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("Webhook URL must use http or https")
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        raise ValueError("Webhook URL must include a host")
+    if host in _BLOCKED_WEBHOOK_HOSTNAMES or host.endswith(_BLOCKED_WEBHOOK_TLDS):
+        raise ValueError(f"Webhook URL host {host!r} is not allowed")
+    try:
+        candidates = [ipaddress.ip_address(host)]
+    except ValueError:
+        try:
+            infos = socket.getaddrinfo(host, None)
+        except socket.gaierror as exc:
+            raise ValueError(f"Webhook URL host {host!r} could not be resolved: {exc}")
+        candidates = []
+        for info in infos:
+            try:
+                candidates.append(ipaddress.ip_address(info[4][0]))
+            except (TypeError, ValueError):
+                continue
+        if not candidates:
+            raise ValueError(f"Webhook URL host {host!r} resolved to no usable IPs")
+    for ip in candidates:
+        if (
+            ip.is_loopback
+            or ip.is_private
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise ValueError(
+                f"Webhook URL host resolves to a non-routable address ({ip})"
+            )
+    return value
 
 
 @asynccontextmanager
@@ -117,7 +183,16 @@ class AddMemberRequest(BaseModel):
 class WebhookCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str
-    url: str
+    # HttpUrl gives us scheme + structural validation for free; the
+    # field_validator below adds the SSRF guard (private/loopback IPs,
+    # cloud-metadata hostnames, link-local). See B-H3.
+    url: HttpUrl
+
+    @field_validator("url")
+    @classmethod
+    def _no_ssrf(cls, value: HttpUrl) -> HttpUrl:
+        _validate_webhook_url(str(value))
+        return value
 
 
 # ============ Alerts ============
@@ -230,7 +305,7 @@ async def create_webhook(
     webhook: WebhookCreate,
     current_user: dict = Depends(get_current_user_from_token),
 ):
-    return {"id": str(uuid4()), "name": webhook.name, "url": webhook.url, "enabled": True, "createdAt": datetime.now(timezone.utc).isoformat()}
+    return {"id": str(uuid4()), "name": webhook.name, "url": str(webhook.url), "enabled": True, "createdAt": datetime.now(timezone.utc).isoformat()}
 
 
 @app.delete("/api/v1/alerts/webhooks/{webhook_id}", status_code=204)

@@ -71,6 +71,38 @@ class Settings:
         # the type-claim check in decode_token is the primary defense.
         self.ACCESS_TOKEN_SECRET = os.getenv("ACCESS_TOKEN_SECRET", "") or self.JWT_SECRET
         self.REFRESH_TOKEN_SECRET = os.getenv("REFRESH_TOKEN_SECRET", "") or self.JWT_SECRET
+
+        # D-H4: refuse to launch with any of the placeholder strings that
+        # ship in .env.example, or with an empty secret. The old
+        # placeholder `your-secret-key-change-in-production` was public
+        # in the repo — any service that booted with it was signing
+        # every JWT with a known string, full account takeover across
+        # all tenants. ACCESS_TOKEN_SECRET / REFRESH_TOKEN_SECRET fall
+        # back to JWT_SECRET above, so this check catches all three.
+        # Set ALLOW_DEV_JWT_SECRETS=true only for ephemeral test runs
+        # that never see real user data.
+        _placeholder_jwt_secrets = {
+            "",
+            "your-secret-key-change-in-production",
+            "REPLACE_WITH_python_-c_secrets_token_hex_32",
+            "change-me",
+            "changeme",
+            "secret",
+        }
+        if os.environ.get("ALLOW_DEV_JWT_SECRETS", "").lower() not in ("true", "1", "yes"):
+            for _name, _value in (
+                ("JWT_SECRET", self.JWT_SECRET),
+                ("ACCESS_TOKEN_SECRET", self.ACCESS_TOKEN_SECRET),
+                ("REFRESH_TOKEN_SECRET", self.REFRESH_TOKEN_SECRET),
+            ):
+                if _value in _placeholder_jwt_secrets:
+                    raise RuntimeError(
+                        f"{_name} is empty or matches a known placeholder. "
+                        "Generate a real secret with "
+                        "`python -c \"import secrets; print(secrets.token_hex(32))\"` "
+                        "and set it in the environment. Set ALLOW_DEV_JWT_SECRETS=true "
+                        "only for ephemeral test runs that never see real user data."
+                    )
         # Shared secret for service-to-service calls on internal-only services
         # (delta-token, etc.). Callers send it as the X-Internal-Api-Key header.
         # Must be set in every environment — empty disables the affected
