@@ -2623,6 +2623,42 @@ class BackupWorker:
             return int(size_bytes or 0) >= int(min_bytes)
         return (int(size_bytes or 0) - int(prev_size_bytes or 0)) >= int(jump_bytes)
 
+    @staticmethod
+    def _chat_sparse_skip_writes(enabled: bool, has_prior_snapshot: bool) -> bool:
+        """Return True if an UNCHANGED chat should write ZERO pointer rows
+        (sparse) and rely on the sibling-snapshot union to reconstruct it.
+
+        Only safe when a prior COMPLETED snapshot exists for the resource —
+        that's what the union (created_at<=picked, newest-wins) reads from.
+        With no prior, we must write the full inventory (first backup)."""
+        return bool(enabled) and bool(has_prior_snapshot)
+
+    async def _chat_resource_has_completed_snapshot(
+        self, resource_id: uuid.UUID,
+    ) -> bool:
+        """True if this USER_CHATS resource already has a COMPLETED snapshot
+        (the current run's snapshot is still IN_PROGRESS, so it's excluded).
+        Gate for sparse chat incrementals: the sibling-union can only
+        reconstruct an unchanged chat if an earlier completed snapshot holds
+        its rows. Fails CLOSED (False → write full) on any error."""
+        try:
+            async with async_session_factory() as session:
+                row = (await session.execute(
+                    text(
+                        "SELECT EXISTS(SELECT 1 FROM snapshots "
+                        "WHERE resource_id = :rid AND status = 'COMPLETED')"
+                    ),
+                    {"rid": str(resource_id)},
+                )).scalar()
+            return bool(row)
+        except Exception as e:
+            print(
+                f"[{self.worker_id}] [USER_CHATS] prior-snapshot check "
+                f"failed for {resource_id}: {type(e).__name__}: {e} "
+                f"— writing full inventory (safe)"
+            )
+            return False
+
     async def _load_mail_folder_fingerprints(
         self, resource_id: uuid.UUID,
     ) -> Dict[str, Dict[str, Any]]:
@@ -5781,6 +5817,15 @@ class BackupWorker:
                     # lastUpdatedDateTime IS reliable, so we use it to
                     # short-circuit drain for chats that haven't been
                     # touched since the last successful run.
+                    # Sparse-incremental gate: only skip writing an unchanged
+                    # chat's pointer inventory if a prior COMPLETED snapshot
+                    # exists for this resource (so the sibling-union can
+                    # reconstruct it). Computed once per user.
+                    _chat_has_prior_snap = (
+                        await self._chat_resource_has_completed_snapshot(
+                            resource.id,
+                        )
+                    )
                     chat_last_updated_map: Dict[str, str] = {}
                     for c in chats_raw:
                         _cid = c.get("id")
@@ -6652,32 +6697,39 @@ class BackupWorker:
                         ):
                             chat_lu = chat_last_updated_map.get(cid)
                             if chat_lu and chat_lu <= saved_cursor:
-                                # The chat genuinely had no activity since the
-                                # cursor — but we still need to write pointer
-                                # rows for THIS snapshot (the cross-user skip
-                                # path is separate; here we won the claim and
-                                # owe a per-snapshot inventory). Reuse the
-                                # messages already persisted in chat_thread_
-                                # messages.
-                                try:
-                                    _pts = await _load_chat_thread_messages_for_pointer(
-                                        thread_id=thread_id,
-                                    )
-                                    if _pts:
-                                        _rows, _bytes = _build_chat_pointer_rows(
-                                            cid, _pts, full_messages=False,
+                                # The chat had no activity since the cursor.
+                                # SPARSE path (default): write ZERO pointer rows
+                                # and let the sibling-snapshot union reconstruct
+                                # this chat from the prior COMPLETED snapshot —
+                                # exactly how mail incrementals already work
+                                # (verified on live data: excluding a chat
+                                # snapshot's whole inventory recovers the
+                                # identical message set). Only safe with a prior
+                                # snapshot; otherwise fall back to writing the
+                                # full inventory (first backup / kill-switch off).
+                                if not self._chat_sparse_skip_writes(
+                                    settings.CHAT_SPARSE_INCREMENTAL_ENABLED,
+                                    _chat_has_prior_snap,
+                                ):
+                                    try:
+                                        _pts = await _load_chat_thread_messages_for_pointer(
+                                            thread_id=thread_id,
                                         )
-                                        async with async_session_factory() as _ps:
-                                            await _bulk_upsert_snapshot_items(_ps, _rows)
-                                        _persisted_total += len(_rows)
-                                        _persisted_bytes += _bytes
-                                except Exception as _pe:
-                                    print(
-                                        f"[{self.worker_id}] [USER_CHATS] "
-                                        f"chat {cid[:8]} skip-by-activity "
-                                        f"pointer-write failed: "
-                                        f"{type(_pe).__name__}: {_pe}"
-                                    )
+                                        if _pts:
+                                            _rows, _bytes = _build_chat_pointer_rows(
+                                                cid, _pts, full_messages=False,
+                                            )
+                                            async with async_session_factory() as _ps:
+                                                await _bulk_upsert_snapshot_items(_ps, _rows)
+                                            _persisted_total += len(_rows)
+                                            _persisted_bytes += _bytes
+                                    except Exception as _pe:
+                                        print(
+                                            f"[{self.worker_id}] [USER_CHATS] "
+                                            f"chat {cid[:8]} skip-by-activity "
+                                            f"pointer-write failed: "
+                                            f"{type(_pe).__name__}: {_pe}"
+                                        )
                                 # Bump last_drained_at to renew freshness for
                                 # other concurrent backups.
                                 await _mark_chat_thread_drained(

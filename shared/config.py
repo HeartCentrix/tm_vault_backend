@@ -476,6 +476,19 @@ class Settings:
         self.CHATS_PARTITION_ENABLED = os.getenv(
             "CHATS_PARTITION_ENABLED", "true",
         ).lower() in ("true", "1", "yes")
+        # Sparse chat incrementals (2026-06-05). Chats historically re-emit
+        # the FULL per-message pointer inventory every snapshot (~187k rows /
+        # ~123s on an empty incremental). Mail is sparse and restore + the
+        # Recovery UI already reconstruct via the sibling-snapshot union
+        # (created_at<=picked, DISTINCT external_id newest-wins). Verified on
+        # live data: excluding a chat snapshot's entire inventory recovers the
+        # IDENTICAL message set from prior siblings. So for an UNCHANGED chat
+        # with a prior COMPLETED snapshot, write ZERO rows (sparse) instead of
+        # re-emitting — the union recovers them. Kill-switch:
+        # CHAT_SPARSE_INCREMENTAL_ENABLED=false.
+        self.CHAT_SPARSE_INCREMENTAL_ENABLED = os.getenv(
+            "CHAT_SPARSE_INCREMENTAL_ENABLED", "true",
+        ).lower() in ("true", "1", "yes")
         # 2026-05-17 prod tuning: lowered 100 → 25 so medium-chat users
         # (e.g. 30-99 chats — the long tail of regular employees) also
         # get the partition treatment. With the 8-light replica fleet this
