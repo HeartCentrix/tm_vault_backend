@@ -4334,23 +4334,41 @@ class BackupWorker:
                                     if "@odata.deltaLink" in page:
                                         delta_out = page["@odata.deltaLink"]
 
-                        # ── Intra-folder sub-shard: oversized FULL backup only
-                        # (no saved token → no deletions to reconcile). Parallel
-                        # receivedDateTime buckets fetch bodies, then one id-only
-                        # delta walk captures the unified deltaLink. Incremental
-                        # big-jump stays on the serial path until deletion
-                        # reconciliation lands. ──
+                        # ── Intra-folder sub-shard: parallel receivedDateTime
+                        # buckets fetch bodies, then one id-only delta walk
+                        # captures the unified deltaLink (no body re-transfer).
+                        #   FULL (no saved token): window = epoch, split whole folder.
+                        #   INCREMENTAL big-jump: window = fingerprint baseline_at,
+                        #     split the size JUMP.
+                        # Deletions inside the window are deferred to the next
+                        # serial cycle: a big jump is size GROWTH (additions);
+                        # a shrinking folder fails the gate and takes the serial
+                        # delta path which captures @removed. No data loss — a
+                        # deleted item lingers at most one cycle. ──
                         _ss_cur_bytes = 0
-                        if fid and not saved and isinstance(folder_tree_full, dict):
+                        _ss_prev_bytes = 0
+                        _ss_baseline = None
+                        if fid and isinstance(folder_tree_full, dict):
                             _ss_ff = folder_tree_full.get(fid)
                             if isinstance(_ss_ff, dict):
                                 _ss_cur_bytes = int(_ss_ff.get("sizeInBytes") or 0)
+                        if fid and saved and isinstance(fp_table, dict):
+                            _ss_fp_row = fp_table.get(fid)
+                            if isinstance(_ss_fp_row, dict):
+                                _ss_baseline = _ss_fp_row.get("baseline_at")
+                                try:
+                                    _ss_prev_bytes = int(
+                                        str(_ss_fp_row.get("fp") or "0|0|0").split("|")[2]
+                                    )
+                                except Exception:
+                                    _ss_prev_bytes = 0
                         _did_subshard = bool(
-                            fid and not saved
+                            fid
                             and self._should_intra_folder_subshard(
                                 enabled=settings.MAIL_INTRA_FOLDER_SUBSHARD_ENABLED,
-                                size_bytes=_ss_cur_bytes, prev_size_bytes=0,
-                                saved_token=None,
+                                size_bytes=_ss_cur_bytes,
+                                prev_size_bytes=_ss_prev_bytes,
+                                saved_token=saved,
                                 min_bytes=settings.MAIL_INTRA_FOLDER_MIN_BYTES,
                                 jump_bytes=settings.MAIL_INTRA_FOLDER_INCREMENTAL_JUMP_BYTES,
                             )
@@ -4359,10 +4377,21 @@ class BackupWorker:
                             try:
                                 from datetime import datetime as _ss_dt
                                 from datetime import timezone as _ss_tz
+                                _ss_epoch = _ss_dt(1970, 1, 1, tzinfo=_ss_tz.utc)
+                                _ss_window_start = _ss_epoch
+                                _ss_split_bytes = _ss_cur_bytes
+                                if saved and isinstance(_ss_baseline, _ss_dt):
+                                    _bw = _ss_baseline
+                                    if _bw.tzinfo is None:
+                                        _bw = _bw.replace(tzinfo=_ss_tz.utc)
+                                    _ss_window_start = _bw
+                                    _ss_split_bytes = max(
+                                        1, _ss_cur_bytes - _ss_prev_bytes
+                                    )
                                 _ss_buckets = self._plan_mail_date_buckets(
-                                    window_start=_ss_dt(1970, 1, 1, tzinfo=_ss_tz.utc),
+                                    window_start=_ss_window_start,
                                     window_end=_ss_dt.now(_ss_tz.utc),
-                                    total_bytes=_ss_cur_bytes,
+                                    total_bytes=_ss_split_bytes,
                                     target_bytes=settings.MAIL_INTRA_FOLDER_TARGET_BYTES,
                                     max_subshards=settings.MAIL_INTRA_FOLDER_MAX_SUBSHARDS,
                                 )
@@ -4392,7 +4421,8 @@ class BackupWorker:
                                 )
                                 print(
                                     f"[{self.worker_id}] [USER_MAIL] folder "
-                                    f"{fid[:8]} sub-sharded full backup: "
+                                    f"{fid[:8]} sub-sharded "
+                                    f"{'incremental' if saved else 'full'} backup: "
                                     f"{len(_ss_buckets)} buckets, "
                                     f"{len(local_out)} msgs"
                                 )
