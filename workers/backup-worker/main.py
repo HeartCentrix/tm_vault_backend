@@ -2604,6 +2604,25 @@ class BackupWorker:
             out.append((s, e))
         return out
 
+    @staticmethod
+    def _should_intra_folder_subshard(
+        *, enabled, size_bytes, prev_size_bytes, saved_token,
+        min_bytes, jump_bytes,
+    ) -> bool:
+        """Decide whether to parallelize one folder's drain.
+
+        Full backup (no saved_token): sub-shard if the folder is >= min_bytes.
+        Incremental (saved_token present): sub-shard only when the per-folder
+        size jump since the last baseline is >= jump_bytes (a 'big jump').
+        Small incrementals take the cheap serial delta walk. Disabled flag
+        short-circuits to the legacy path (byte-identical behavior).
+        """
+        if not enabled:
+            return False
+        if not saved_token:
+            return int(size_bytes or 0) >= int(min_bytes)
+        return (int(size_bytes or 0) - int(prev_size_bytes or 0)) >= int(jump_bytes)
+
     async def _load_mail_folder_fingerprints(
         self, resource_id: uuid.UUID,
     ) -> Dict[str, Dict[str, Any]]:

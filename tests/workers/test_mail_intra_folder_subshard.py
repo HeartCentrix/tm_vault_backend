@@ -95,3 +95,36 @@ def test_zero_bytes_is_single_bucket():
     b = _plan(window_start=T0, window_end=T1, total_bytes=0,
               target_bytes=64 * MB, max_subshards=8, overlap_seconds=1)
     assert len(b) == 1
+
+
+# ─── Task 4: sub-shard decision gate ─────────────────────────────────────
+
+def _dec(**k):
+    return _bw.BackupWorker._should_intra_folder_subshard(**k)
+
+
+def test_gate_disabled_never_subshards():
+    assert _dec(enabled=False, size_bytes=999 * MB, prev_size_bytes=0,
+                saved_token=None, min_bytes=128 * MB, jump_bytes=128 * MB) is False
+
+
+def test_gate_full_big_folder_subshards():
+    assert _dec(enabled=True, size_bytes=200 * MB, prev_size_bytes=0,
+                saved_token=None, min_bytes=128 * MB, jump_bytes=128 * MB) is True
+
+
+def test_gate_full_small_folder_no_subshard():
+    assert _dec(enabled=True, size_bytes=50 * MB, prev_size_bytes=0,
+                saved_token=None, min_bytes=128 * MB, jump_bytes=128 * MB) is False
+
+
+def test_gate_incremental_small_jump_no_subshard():
+    assert _dec(enabled=True, size_bytes=210 * MB, prev_size_bytes=200 * MB,
+                saved_token="https://delta", min_bytes=128 * MB,
+                jump_bytes=128 * MB) is False
+
+
+def test_gate_incremental_big_jump_subshards():
+    assert _dec(enabled=True, size_bytes=400 * MB, prev_size_bytes=200 * MB,
+                saved_token="https://delta", min_bytes=128 * MB,
+                jump_bytes=128 * MB) is True
