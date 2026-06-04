@@ -4273,10 +4273,17 @@ class BackupWorker:
                             folder_tree.get(fid) if fid else ""
                         ) or ""
                         persist_tasks: List[asyncio.Task] = []
-                        try:
+
+                        async def _drain_pages_persist(p_url, p_params):
+                            """Page p_url; append messages to local_out, fire
+                            pipelined body-persist tasks, and capture the
+                            deltaLink. Used by the normal path and by each
+                            sub-shard date-range bucket (bodies are inline in
+                            mail_select)."""
+                            nonlocal delta_out
                             async with mail_sem:
                                 async for page in graph_client._iter_pages(
-                                    url, params=params,
+                                    p_url, params=p_params,
                                 ):
                                     page_raw_msgs: List[Dict[str, Any]] = []
                                     for m in page.get("value", []) or []:
@@ -4312,14 +4319,102 @@ class BackupWorker:
                                                 )
                                             )
                                         )
-                        except Exception as e:
-                            fid_disp = fid[:8] if fid else "__all__"
-                            print(
-                                f"[{self.worker_id}] [USER_MAIL] folder "
-                                f"{fid_disp} drain failed: "
-                                f"{type(e).__name__}: {e} "
-                                f"(kept {len(local_out)})"
+
+                        async def _finalize_deltalink_idonly(d_url):
+                            """After a parallel sub-shard backfill, walk
+                            /messages/delta with $select=id ONLY to capture the
+                            unified @odata.deltaLink WITHOUT re-transferring the
+                            bodies the buckets already persisted. Tiny pages →
+                            fast."""
+                            nonlocal delta_out
+                            async with mail_sem:
+                                async for page in graph_client._iter_pages(
+                                    d_url, params={"$top": "999", "$select": "id"},
+                                ):
+                                    if "@odata.deltaLink" in page:
+                                        delta_out = page["@odata.deltaLink"]
+
+                        # ── Intra-folder sub-shard: oversized FULL backup only
+                        # (no saved token → no deletions to reconcile). Parallel
+                        # receivedDateTime buckets fetch bodies, then one id-only
+                        # delta walk captures the unified deltaLink. Incremental
+                        # big-jump stays on the serial path until deletion
+                        # reconciliation lands. ──
+                        _ss_cur_bytes = 0
+                        if fid and not saved and isinstance(folder_tree_full, dict):
+                            _ss_ff = folder_tree_full.get(fid)
+                            if isinstance(_ss_ff, dict):
+                                _ss_cur_bytes = int(_ss_ff.get("sizeInBytes") or 0)
+                        _did_subshard = bool(
+                            fid and not saved
+                            and self._should_intra_folder_subshard(
+                                enabled=settings.MAIL_INTRA_FOLDER_SUBSHARD_ENABLED,
+                                size_bytes=_ss_cur_bytes, prev_size_bytes=0,
+                                saved_token=None,
+                                min_bytes=settings.MAIL_INTRA_FOLDER_MIN_BYTES,
+                                jump_bytes=settings.MAIL_INTRA_FOLDER_INCREMENTAL_JUMP_BYTES,
                             )
+                        )
+                        if _did_subshard:
+                            try:
+                                from datetime import datetime as _ss_dt
+                                from datetime import timezone as _ss_tz
+                                _ss_buckets = self._plan_mail_date_buckets(
+                                    window_start=_ss_dt(1970, 1, 1, tzinfo=_ss_tz.utc),
+                                    window_end=_ss_dt.now(_ss_tz.utc),
+                                    total_bytes=_ss_cur_bytes,
+                                    target_bytes=settings.MAIL_INTRA_FOLDER_TARGET_BYTES,
+                                    max_subshards=settings.MAIL_INTRA_FOLDER_MAX_SUBSHARDS,
+                                )
+
+                                def _ss_q(_s, _e):
+                                    return (
+                                        f"{graph_client.GRAPH_URL}/users/{user_id}"
+                                        f"/mailFolders/{fid}/messages"
+                                    ), {
+                                        "$top": "999", "$select": mail_select,
+                                        "$filter": (
+                                            "receivedDateTime ge "
+                                            f"{_s.strftime('%Y-%m-%dT%H:%M:%SZ')} "
+                                            "and receivedDateTime lt "
+                                            f"{_e.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+                                        ),
+                                    }
+                                # Invariant #2: gather raises if ANY bucket
+                                # fails → we return [] below, token NOT advanced.
+                                await asyncio.gather(*[
+                                    _drain_pages_persist(*_ss_q(_s, _e))
+                                    for _s, _e in _ss_buckets
+                                ])
+                                await _finalize_deltalink_idonly(
+                                    f"{graph_client.GRAPH_URL}/users/{user_id}"
+                                    f"/mailFolders/{fid}/messages/delta"
+                                )
+                                print(
+                                    f"[{self.worker_id}] [USER_MAIL] folder "
+                                    f"{fid[:8]} sub-sharded full backup: "
+                                    f"{len(_ss_buckets)} buckets, "
+                                    f"{len(local_out)} msgs"
+                                )
+                            except Exception as _ss_e:
+                                print(
+                                    f"[{self.worker_id}] [USER_MAIL] folder "
+                                    f"{fid[:8] if fid else '__all__'} sub-shard "
+                                    f"failed: {type(_ss_e).__name__}: {_ss_e} — "
+                                    f"folder retries next run (token not advanced)"
+                                )
+                                return []  # invariant #2: do not advance token
+                        else:
+                            try:
+                                await _drain_pages_persist(url, params)
+                            except Exception as e:
+                                fid_disp = fid[:8] if fid else "__all__"
+                                print(
+                                    f"[{self.worker_id}] [USER_MAIL] folder "
+                                    f"{fid_disp} drain failed: "
+                                    f"{type(e).__name__}: {e} "
+                                    f"(kept {len(local_out)})"
+                                )
                         if delta_out:
                             mail_new_tokens[fid or "__all__"] = delta_out
 
