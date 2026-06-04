@@ -655,9 +655,14 @@ class Settings:
         # different app, multiplying per-mailbox concurrency (Microsoft's
         # 4-concurrent limit is per-APP, so N apps ≈ N×4 concurrent against
         # one mailbox). Risk: harder per-mailbox hammering → more 429s.
-        # Branch: experiment/mail-throughput. Measure before enabling in prod.
+        # Branch: experiment/mail-throughput. Enabled by default 2026-06-05
+        # after an incremental run confirmed delta-resume stayed correct with
+        # rotation on (mail new_items=0, deltas intact). Spreads one mailbox's
+        # concurrent folder streams across the app pool (per-app 4-concurrent
+        # cap). Kill-switch: GRAPH_ITER_APP_ROTATION=false. Canary must verify
+        # a known-change incremental is captured (see mail-subshard spec).
         self.GRAPH_ITER_APP_ROTATION = os.getenv(
-            "GRAPH_ITER_APP_ROTATION", "false"
+            "GRAPH_ITER_APP_ROTATION", "true"
         ).lower() in ("true", "1", "yes")
         # Priority scheduling on the Graph rate limiter. When true, HIGH/
         # URGENT callers (user-triggered restores, interactive UI ops)
