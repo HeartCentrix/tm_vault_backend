@@ -29,11 +29,18 @@ FROM chrislusf/seaweedfs:3.71@sha256:c47aadbe7b6f78ff52e03bd0a27c6f61c2b27640cba
 # yield root on the host data volume — which on prod is the 250 TiB
 # customer backup store.
 #
-# Operational note: on Railway, the attached volume at /data must be
-# owned by UID 10001 (the `seaweed` user created below). If you see
-# permission-denied writing to /data after this change, chown the
-# mount from a one-shot debug container: `chown -R 10001:10001 /data`.
-RUN addgroup -S seaweed \
+# Railway mounts the attached /data volume ROOT-OWNED at runtime, which
+# shadows the build-time chown below and previously crash-looped the
+# non-root process ("mkdir /data/m9333: permission denied"). Rather than a
+# manual one-shot `chown -R 10001 /data`, the entrypoint now starts as root,
+# chowns the mount POINT (non-recursive — O(1), safe for the 250 TiB store),
+# then drops to UID 10001 via su-exec. So we deliberately do NOT set
+# `USER 10001` here — the entrypoint owns the privilege drop.
+# su-exec lets the entrypoint start as root (to chown the runtime-mounted
+# /data volume), then drop to the unprivileged seaweed user before exec'ing
+# the long-lived weed process — D-C5 hardening is preserved.
+RUN apk add --no-cache su-exec \
+    && addgroup -S seaweed \
     && adduser -S -G seaweed -u 10001 seaweed \
     && mkdir -p /data \
     && chown -R seaweed:seaweed /data
@@ -44,7 +51,10 @@ COPY --chown=seaweed:seaweed deploy/railway/seaweedfs/entrypoint.sh /usr/local/b
 RUN sed -i 's/\r$//' /usr/local/bin/tmvault-entrypoint.sh \
     && chmod 0755 /usr/local/bin/tmvault-entrypoint.sh
 
-USER 10001
+# NOTE: no `USER 10001` — see the note above. The container starts as root
+# so the entrypoint can chown the runtime-mounted /data volume; it then
+# drops to the seaweed user via su-exec before exec'ing weed. The
+# long-lived process never runs as root.
 
 EXPOSE 8333 9333
 
