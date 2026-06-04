@@ -777,12 +777,22 @@ class GraphClient:
         """
         from shared.config import settings as s
         from shared.multi_app_manager import multi_app_manager
+        from shared.graph_rate_limiter import graph_rate_limiter
         policy = self._policy
         original_app = self.client_id
         current_app = original_app
         pages_on_failover = 0
         next_url: Optional[str] = url
         token = await self._get_token()
+        # EXPERIMENTAL (GRAPH_ITER_APP_ROTATION): start this stream on a
+        # rotated healthy app instead of always self.client_id, so the many
+        # concurrent per-folder mail streams of one mailbox spread across the
+        # app pool (Microsoft's 4-concurrent cap is per-app). Default off.
+        if s.GRAPH_ITER_APP_ROTATION and multi_app_manager.app_count > 1:
+            rot_token, rot_app = await self._try_migrate_app(original_app)
+            if rot_token and rot_app:
+                token = rot_token
+                current_app = rot_app
         self._last_delta_link: Optional[str] = None
 
         async with self._http_session() as client:
@@ -798,6 +808,11 @@ class GraphClient:
                 else:
                     headers = {"Authorization": f"Bearer {token}"}
                 try:
+                    # Per-tenant global limiter (was missing on the paging
+                    # path — present on _get_hardened). Prevents many parallel
+                    # mailbox streams from collectively blowing past the
+                    # tenant-wide RPS ceiling and triggering 429 storms.
+                    await graph_rate_limiter.acquire(reason="graph_iter_pages")
                     resp = await client.get(
                         next_url, headers=headers,
                         params=params if not next_url.startswith("http") else None,

@@ -2528,6 +2528,45 @@ class BackupWorker:
                 f"{type(e).__name__}: {e}"
             )
 
+    @staticmethod
+    def _should_clear_mail_deltas(full_backup: bool) -> bool:
+        """A forced full must re-enumerate; clear saved per-folder deltas
+        first so the drain does not resume from an old deltaLink."""
+        return bool(full_backup)
+
+    async def _clear_mail_folder_deltas(self, resource_id: uuid.UUID) -> int:
+        """Delete all `mail_folder_delta` rows for a resource and strip the
+        legacy `extra_data['mail_delta_tokens_by_folder']` mirror, so a
+        forced full backup truly re-enumerates every folder. Idempotent;
+        returns the number of delta rows removed. Fails open (returns 0)
+        rather than aborting the snapshot."""
+        try:
+            async with async_session_factory() as session:
+                res = await session.execute(
+                    text(
+                        "DELETE FROM mail_folder_delta WHERE resource_id = :rid"
+                    ),
+                    {"rid": str(resource_id)},
+                )
+                # JSONB minus-key drops the legacy mirror if present.
+                await session.execute(
+                    text(
+                        "UPDATE resources "
+                        "SET extra_data = extra_data - 'mail_delta_tokens_by_folder' "
+                        "WHERE id = :rid "
+                        "  AND extra_data ? 'mail_delta_tokens_by_folder'"
+                    ),
+                    {"rid": str(resource_id)},
+                )
+                await session.commit()
+                return int(res.rowcount or 0)
+        except Exception as e:
+            print(
+                f"[{self.worker_id}] [mail_delta] clear failed for "
+                f"resource={resource_id}: {type(e).__name__}: {e}"
+            )
+            return 0
+
     async def _load_mail_folder_fingerprints(
         self, resource_id: uuid.UUID,
     ) -> Dict[str, Dict[str, Any]]:
@@ -3903,6 +3942,16 @@ class BackupWorker:
                     # tokens). Until prod is fully migrated, fall back
                     # to the legacy dict per folder_id that hasn't
                     # been re-baselined yet. New wins on conflict.
+                    if self._should_clear_mail_deltas(bool(
+                        message.get("forceFullBackup")
+                        or message.get("type") == "FULL"
+                    )):
+                        _cleared = await self._clear_mail_folder_deltas(resource.id)
+                        if _cleared:
+                            print(
+                                f"[{self.worker_id}] [USER_MAIL] forceFullBackup "
+                                f"→ cleared {_cleared} folder deltas for {resource.id}"
+                            )
                     _new_table_tokens = await self._load_mail_folder_deltas(
                         resource.id,
                     )
@@ -15780,6 +15829,16 @@ class BackupWorker:
                     # above. New mail_folder_delta table is the
                     # authoritative read source; fall back to legacy
                     # extra_data dict per folder_id not yet baselined.
+                    if self._should_clear_mail_deltas(bool(
+                        message.get("forceFullBackup")
+                        or message.get("type") == "FULL"
+                    )):
+                        _cleared = await self._clear_mail_folder_deltas(resource.id)
+                        if _cleared:
+                            print(
+                                f"[{self.worker_id}] [USER_MAIL] forceFullBackup "
+                                f"→ cleared {_cleared} folder deltas for {resource.id}"
+                            )
                     _new_table_tokens = await self._load_mail_folder_deltas(
                         resource.id,
                     )

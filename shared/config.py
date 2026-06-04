@@ -523,6 +523,31 @@ class Settings:
             "MAIL_PARTITION_TARGET_BYTES_PER_SHARD",
             str(2 * 1024 * 1024 * 1024),
         ))
+        # ── Intra-folder sub-sharding (2026-06-05 design) ──
+        # One oversized folder is otherwise a single atomic shard. Split
+        # its initial/full enumeration by receivedDateTime ranges fetched
+        # in parallel, then capture ONE folder deltaLink (incremental-safe).
+        self.MAIL_INTRA_FOLDER_SUBSHARD_ENABLED = os.getenv(
+            "MAIL_INTRA_FOLDER_SUBSHARD_ENABLED", "true",
+        ).lower() in ("true", "1", "yes")
+        # Folders at/above this size are sub-sharded on full backup.
+        self.MAIL_INTRA_FOLDER_MIN_BYTES = int(os.getenv(
+            "MAIL_INTRA_FOLDER_MIN_BYTES", str(128 * 1024 * 1024),
+        ))
+        # Target bytes per date-range bucket.
+        self.MAIL_INTRA_FOLDER_TARGET_BYTES = int(os.getenv(
+            "MAIL_INTRA_FOLDER_TARGET_BYTES", str(64 * 1024 * 1024),
+        ))
+        # Hard cap on parallel buckets per folder.
+        self.MAIL_INTRA_FOLDER_MAX_SUBSHARDS = int(os.getenv(
+            "MAIL_INTRA_FOLDER_MAX_SUBSHARDS", "8",
+        ))
+        # An incremental whose per-folder size grows by >= this since the
+        # last baseline triggers the parallel catch-up instead of a serial
+        # delta walk.
+        self.MAIL_INTRA_FOLDER_INCREMENTAL_JUMP_BYTES = int(os.getenv(
+            "MAIL_INTRA_FOLDER_INCREMENTAL_JUMP_BYTES", str(128 * 1024 * 1024),
+        ))
 
         # ── Phase 3.3: SharePoint site partition (by drive list) ──
         self.SP_PARTITION_ENABLED = os.getenv(
@@ -655,6 +680,17 @@ class Settings:
         self.GRAPH_STREAM_PACE_REQS_PER_SEC = float(
             os.getenv("GRAPH_STREAM_PACE_REQS_PER_SEC", "2.0")
         )
+        # EXPERIMENTAL (default off): spread a single stream's page fetches
+        # across the multi-app pool from the FIRST page instead of pinning
+        # to self.client_id until a 429 forces migration. When many folders
+        # of one mailbox page concurrently, this lets each land on a
+        # different app, multiplying per-mailbox concurrency (Microsoft's
+        # 4-concurrent limit is per-APP, so N apps ≈ N×4 concurrent against
+        # one mailbox). Risk: harder per-mailbox hammering → more 429s.
+        # Branch: experiment/mail-throughput. Measure before enabling in prod.
+        self.GRAPH_ITER_APP_ROTATION = os.getenv(
+            "GRAPH_ITER_APP_ROTATION", "false"
+        ).lower() in ("true", "1", "yes")
         # Priority scheduling on the Graph rate limiter. When true, HIGH/
         # URGENT callers (user-triggered restores, interactive UI ops)
         # jump the per-app token-bucket queue ahead of NORMAL (scheduled
