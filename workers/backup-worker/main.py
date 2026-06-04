@@ -2567,6 +2567,43 @@ class BackupWorker:
             )
             return 0
 
+    @staticmethod
+    def _plan_mail_date_buckets(
+        *, window_start, window_end, total_bytes, target_bytes,
+        max_subshards, overlap_seconds: int = 1,
+    ):
+        """Split [window_start, window_end] into N receivedDateTime ranges
+        for parallel intra-folder backfill.
+
+        N = clamp(ceil(total_bytes / target_bytes), 1, max_subshards).
+        Buckets tile the window edge-to-edge; every bucket after the first
+        is widened *backwards* by overlap_seconds so adjacent buckets
+        OVERLAP and never leave a gap (invariant #3 — combined with the
+        idempotent message upsert, overlap is a harmless dedupe while a gap
+        would lose mail). Degenerate windows / zero bytes → a single bucket
+        spanning the whole window. Returns [(start, end), ...] ascending.
+        """
+        import math
+        from datetime import timedelta
+        if window_end <= window_start or total_bytes <= 0:
+            return [(window_start, window_end)]
+        n = max(1, min(
+            int(max_subshards),
+            math.ceil(total_bytes / max(int(target_bytes), 1)),
+        ))
+        if n == 1:
+            return [(window_start, window_end)]
+        span = (window_end - window_start) / n
+        eps = timedelta(seconds=overlap_seconds)
+        out = []
+        for i in range(n):
+            s = window_start + span * i
+            e = window_end if i == n - 1 else window_start + span * (i + 1)
+            if i > 0:
+                s = s - eps  # widen back → overlap, never gap
+            out.append((s, e))
+        return out
+
     async def _load_mail_folder_fingerprints(
         self, resource_id: uuid.UUID,
     ) -> Dict[str, Dict[str, Any]]:

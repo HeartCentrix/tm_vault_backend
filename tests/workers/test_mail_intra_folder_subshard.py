@@ -44,3 +44,54 @@ def test_force_full_clears_deltas():
 
 def test_incremental_keeps_deltas():
     assert _bw.BackupWorker._should_clear_mail_deltas(False) is False
+
+
+# ─── Task 3: date-bucket planner (invariant #3) ──────────────────────────
+
+def _plan(**k):
+    return _bw.BackupWorker._plan_mail_date_buckets(**k)
+
+
+T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+T1 = datetime(2026, 6, 1, tzinfo=timezone.utc)
+
+
+def test_below_target_is_single_bucket():
+    b = _plan(window_start=T0, window_end=T1, total_bytes=10 * MB,
+              target_bytes=64 * MB, max_subshards=8, overlap_seconds=1)
+    assert len(b) == 1 and b[0][0] == T0 and b[0][1] == T1
+
+
+def test_count_scales_with_size_capped():
+    # ceil(2GB/64MB)=32, capped at max_subshards=8
+    b = _plan(window_start=T0, window_end=T1, total_bytes=2048 * MB,
+              target_bytes=64 * MB, max_subshards=8, overlap_seconds=1)
+    assert len(b) == 8
+
+
+def test_buckets_cover_window_with_no_gap():
+    b = _plan(window_start=T0, window_end=T1, total_bytes=512 * MB,
+              target_bytes=64 * MB, max_subshards=8, overlap_seconds=1)
+    assert b[0][0] == T0 and b[-1][1] == T1
+    for i in range(1, len(b)):
+        # next bucket starts at-or-before previous end → overlap, never gap
+        assert b[i][0] <= b[i - 1][1]
+
+
+def test_overlap_epsilon_applied():
+    b = _plan(window_start=T0, window_end=T1, total_bytes=512 * MB,
+              target_bytes=64 * MB, max_subshards=8, overlap_seconds=2)
+    assert len(b) > 1
+    assert (b[0][1] - b[1][0]).total_seconds() >= 2
+
+
+def test_zero_or_negative_window_is_single_bucket():
+    b = _plan(window_start=T1, window_end=T0, total_bytes=10 ** 12,
+              target_bytes=64 * MB, max_subshards=8, overlap_seconds=1)
+    assert len(b) == 1
+
+
+def test_zero_bytes_is_single_bucket():
+    b = _plan(window_start=T0, window_end=T1, total_bytes=0,
+              target_bytes=64 * MB, max_subshards=8, overlap_seconds=1)
+    assert len(b) == 1
