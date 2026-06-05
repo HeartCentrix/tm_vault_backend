@@ -16,7 +16,25 @@ from datetime import datetime
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 import aioboto3
+from botocore.config import Config as _BotoConfig
 from botocore.exceptions import ClientError
+
+# Fail-fast S3 client config. Without explicit timeouts, a down/restarting
+# SeaweedFS (observed on Railway under heavy write load) makes an upload HANG
+# indefinitely — which wedges the OneDrive drain coroutine, holds the partition
+# lease alive (the LeaseExtender keeps renewing while the process lives), so the
+# stale-sweep never reclaims it and the snapshot never finalizes. A bounded
+# connect/read timeout turns a seaweed blip into a fast failure → the per-file
+# retry queue handles it → the shard completes. max_pool_connections is raised
+# well above the default 10 so high file-concurrency doesn't queue/stall waiting
+# for a connection.
+_SEAWEED_BOTO_CONFIG = _BotoConfig(
+    connect_timeout=int(os.getenv("ONPREM_S3_CONNECT_TIMEOUT_S", "10")),
+    read_timeout=int(os.getenv("ONPREM_S3_READ_TIMEOUT_S", "120")),
+    retries={"max_attempts": int(os.getenv("ONPREM_S3_MAX_ATTEMPTS", "3")),
+             "mode": "standard"},
+    max_pool_connections=int(os.getenv("ONPREM_S3_MAX_POOL", "256")),
+)
 
 from shared.storage.base import BlobInfo, BlobProps
 from shared.storage.errors import BackendUnreachableError, ImmutableBlobError
@@ -124,6 +142,7 @@ class SeaweedStore:
             aws_secret_access_key=self._secret,
             region_name=self._region,
             verify=self._verify,
+            config=_SEAWEED_BOTO_CONFIG,
         )
 
     def _bucket(self, container: str) -> str:

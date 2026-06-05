@@ -2236,12 +2236,21 @@ class GraphClient:
             }
 
         # Chats — chat IDs for this user (1:1 + group).
+        # $top=50 is Graph's HARD max for /chats; $top>50 returns 400, which the
+        # shared pager's $top-preserve turned into a "permanent" probe failure ->
+        # USER_CHATS marked license_missing -> excluded from the Tier-2 backup
+        # fan-out (the bug that silently dropped Amit's 50 chats). Paginate so the
+        # chat_count stays accurate past the first 50.
         async def _chats():
-            chats = await self._get(
-                f"{self.GRAPH_URL}/users/{user_external_id}/chats",
-                params={"$top": "999", "$select": "id,chatType,topic,lastUpdatedDateTime"},
+            _chats_url = (
+                f"{self.GRAPH_URL}/users/{user_external_id}/chats"
+                "?$top=50&$select=id,chatType,topic,lastUpdatedDateTime"
             )
-            chat_list = chats.get("value", []) or []
+            chat_list: List[Dict[str, Any]] = []
+            while _chats_url:
+                chats = await self._get(_chats_url)
+                chat_list.extend(chats.get("value", []) or [])
+                _chats_url = chats.get("@odata.nextLink")
             return {
                 "external_id": f"{user_external_id}:chats",
                 "display_name": f"Chats — {display}",
@@ -3194,7 +3203,10 @@ class GraphClient:
         Get channels in a Teams team.
         Graph API: GET /teams/{team-id}/channels
         """
-        result = await self._get(f"{self.GRAPH_URL}/teams/{team_id}/channels", params={"$top": "999"})
+        # $top=50: Teams channel/message collections cap at 50 — $top>50 returns
+        # 400 (the shared pager's $top-preserve turned that into a hard failure).
+        # Pagination below fetches the rest.
+        result = await self._get(f"{self.GRAPH_URL}/teams/{team_id}/channels", params={"$top": "50"})
         all_value = result.get("value", [])
 
         # Follow pagination
@@ -3214,7 +3226,8 @@ class GraphClient:
         base = f"{self.GRAPH_URL}/teams/{team_id}/channels/{channel_id}/messages/delta"
         url = delta_token or base
 
-        params = {"$top": "999"}
+        # $top=50 is Graph's max for channel messages — $top>50 returns 400.
+        params = {"$top": "50"}
         try:
             result = await self._get(url, params=params)
         except httpx.HTTPStatusError as e:

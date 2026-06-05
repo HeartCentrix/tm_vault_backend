@@ -5252,24 +5252,26 @@ class BackupWorker:
                     # without it and fall back to the $batch path.
                     chat_members_inline: bool = False
                     try:
-                        list_page = await graph_client._get(
-                            f"{graph_client.GRAPH_URL}/users/{user_id}/chats",
-                            params={
-                                "$top": "200",
-                                # tenantId included so we can pre-filter
-                                # cross-tenant meeting chats (19:meeting_…
-                                # @thread.v2 invitations from other tenants)
-                                # before calling /messages — Graph returns
-                                # 403 AclCheckFailed on those with no path
-                                # to read; our app's app-only Chat.Read.All
-                                # doesn't cross tenant boundaries. Without
-                                # the pre-filter each external chat burns
-                                # ~5 retry attempts in _iter_pages.
-                                "$select": "id,topic,chatType,lastUpdatedDateTime,tenantId",
-                                "$expand": "members",
-                            },
+                        # $top=50 is Graph's HARD max for /chats — $top>50
+                        # returns 400 (and the shared pager's $top-preserve
+                        # turned that latent bug into a hard failure: 0 chats
+                        # enumerated, silent data loss). Embed the whole query
+                        # in the URL (P1) so $select/$expand survive the pager,
+                        # and follow @odata.nextLink to page past 50 chats.
+                        # tenantId is selected so we can pre-filter cross-tenant
+                        # meeting chats (19:meeting_…@thread.v2) that our app-
+                        # only Chat.Read.All can't read (403 AclCheckFailed).
+                        _chat_list_url = (
+                            f"{graph_client.GRAPH_URL}/users/{user_id}/chats"
+                            "?$top=50"
+                            "&$select=id,topic,chatType,lastUpdatedDateTime,tenantId"
+                            "&$expand=members"
                         )
-                        chats_raw = (list_page or {}).get("value", []) or []
+                        chats_raw = []
+                        while _chat_list_url:
+                            list_page = await graph_client._get(_chat_list_url)
+                            chats_raw.extend((list_page or {}).get("value", []) or [])
+                            _chat_list_url = (list_page or {}).get("@odata.nextLink")
                         chat_members_inline = True
                     except Exception as e_expand:
                         # Retry without $expand. Distinguish a Graph 400
@@ -5281,17 +5283,16 @@ class BackupWorker:
                             f"{type(e_expand).__name__}: {e_expand}"
                         )
                         try:
-                            list_page = await graph_client._get(
-                                f"{graph_client.GRAPH_URL}/users/{user_id}/chats",
-                                params={
-                                    "$top": "200",
-                                    "$select": (
-                                        "id,topic,chatType,"
-                                        "lastUpdatedDateTime,tenantId"
-                                    ),
-                                },
+                            _chat_list_url = (
+                                f"{graph_client.GRAPH_URL}/users/{user_id}/chats"
+                                "?$top=50"
+                                "&$select=id,topic,chatType,lastUpdatedDateTime,tenantId"
                             )
-                            chats_raw = (list_page or {}).get("value", []) or []
+                            chats_raw = []
+                            while _chat_list_url:
+                                list_page = await graph_client._get(_chat_list_url)
+                                chats_raw.extend((list_page or {}).get("value", []) or [])
+                                _chat_list_url = (list_page or {}).get("@odata.nextLink")
                         except Exception as e:
                             print(f"[{self.worker_id}] [USER_CHATS] chats list failed for {user_id}: {e}")
                             chats_raw = []
