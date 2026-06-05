@@ -94,6 +94,32 @@ class GraphClient:
     GRAPH_URL = "https://graph.microsoft.com/v1.0"
     TOKEN_URL = "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
 
+    @staticmethod
+    def _safe_first_page_params(next_url: str, params: Optional[Dict]) -> Optional[Dict]:
+        """Decide which query params to actually send on a request.
+
+        The pager historically passed ``params`` only when the URL was NOT
+        absolute (``not next_url.startswith("http")``) — but EVERY Graph URL is
+        absolute, so the whole ``params`` dict (``$top``/``$select``/``$filter``/
+        ``$expand``) was silently dropped on the first request. The big silent
+        cost was ``$top``: Graph fell back to its default ~10-item pages, so a
+        1458-message folder took ~146 round-trips instead of 2 — across mailbox,
+        Teams, SharePoint, contacts, calendar and group handlers.
+
+        We now preserve ONLY ``$top`` on absolute URLs — it is pure page-size
+        (pure perf, no result/field/behavior change). ``$select``/``$filter``/
+        ``$expand`` are deliberately STILL dropped here: applying them globally
+        would shrink stored objects ($select) or change which items come back
+        ($filter/$expand) for every caller. Handlers that need those embed them
+        directly in the URL (e.g. the mail sub-shard and chat incremental
+        paths). Relative URLs (defensive; not produced today) keep full params.
+        """
+        if not next_url.startswith("http"):
+            return params
+        if params and "$top" in params:
+            return {"$top": params["$top"]}
+        return None
+
     SCOPES = [
         "https://graph.microsoft.com/.default"
     ]
@@ -458,7 +484,7 @@ class GraphClient:
                     else:
                         headers = {"Authorization": f"Bearer {token}"}
                     await graph_rate_limiter.acquire(reason="graph_get_legacy")
-                    resp = await client.get(next_url, headers=headers, params=params if not next_url.startswith("http") else None)
+                    resp = await client.get(next_url, headers=headers, params=self._safe_first_page_params(next_url, params))
 
                     # Handle 429 throttling
                     if resp.status_code == 429:
@@ -571,7 +597,7 @@ class GraphClient:
                     await graph_rate_limiter.acquire(reason="graph_get_hardened")
                     resp = await client.get(
                         next_url, headers=headers,
-                        params=params if not next_url.startswith("http") else None,
+                        params=self._safe_first_page_params(next_url, params),
                     )
                 except (httpx.ReadTimeout, httpx.ConnectTimeout,
                         httpx.RemoteProtocolError) as exc:
@@ -702,7 +728,7 @@ class GraphClient:
                         headers = {"Authorization": f"Bearer {token}"}
                     resp = await client.get(
                         next_url, headers=headers,
-                        params=params if not next_url.startswith("http") else None,
+                        params=self._safe_first_page_params(next_url, params),
                     )
                     if resp.status_code == 429:
                         retry_after = int(resp.headers.get("Retry-After", "30"))
@@ -815,7 +841,7 @@ class GraphClient:
                     await graph_rate_limiter.acquire(reason="graph_iter_pages")
                     resp = await client.get(
                         next_url, headers=headers,
-                        params=params if not next_url.startswith("http") else None,
+                        params=self._safe_first_page_params(next_url, params),
                     )
                 except (httpx.ReadTimeout, httpx.ConnectTimeout,
                         httpx.RemoteProtocolError) as exc:

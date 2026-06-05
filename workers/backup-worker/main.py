@@ -21825,9 +21825,25 @@ class BackupWorker:
         now = datetime.utcnow()
         snapshot.completed_at = now
         snapshot.item_count = result.get("item_count", 0)
-        snapshot.new_item_count = result.get("item_count", 0)
-        snapshot.bytes_added = result.get("bytes_added", 0)
         snapshot.bytes_total = result.get("bytes_added", 0)
+        # Route new_item_count / bytes_added through the SAME set-difference
+        # delta the Tier-2 finalize paths use, instead of copying item_count
+        # verbatim. Standalone Tier-1 full-relist types (SharePoint, Teams,
+        # Entra, Planner, Todo, OneNote, metadata) re-list the full inventory
+        # every run, so the old verbatim copy reported the WHOLE inventory as
+        # "new" on every re-backup. The set-diff counts only rows whose
+        # (external_id,item_type) are absent from the prior snapshot — the true
+        # per-run delta. For streaming/sparse types (mailbox) where item_count
+        # is already the per-run delta, it yields the same number. Partitioned
+        # snapshots returned early above, so this only affects the
+        # non-partitioned terminal write.
+        _new_items, _new_bytes = await self._compute_snapshot_delta_from_prior(
+            session, snapshot.id, snapshot.resource_id,
+            result.get("item_count", 0), result.get("bytes_added", 0),
+            current_job_id=snapshot.job_id,
+        )
+        snapshot.new_item_count = _new_items
+        snapshot.bytes_added = _new_bytes
         snapshot.delta_token = result.get("new_delta_token")
 
         # Drain pending FILE_VERSION rows before flipping status (see the
