@@ -14,7 +14,12 @@ set -eu
 : "${ONPREM_S3_SECRET_KEY:?ONPREM_S3_SECRET_KEY must be set — do not bake S3 credentials into the image}"
 : "${ONPREM_S3_IDENTITY_NAME:=tmvault}"
 
-CONFIG_PATH="${ONPREM_S3_CONFIG_PATH:-/tmp/s3.json}"
+# Render the S3 config onto the PERSISTENT, seaweed-owned /data volume — NOT
+# ephemeral /tmp. On Railway /tmp is not reliably writable by the runtime
+# user across restarts, which crash-looped the container ("can't create
+# /tmp/s3.json: Permission denied"). /data is chowned to the seaweed user
+# below, so it stays writable on every restart.
+CONFIG_PATH="${ONPREM_S3_CONFIG_PATH:-/data/s3.json}"
 
 # Refuse to run with the legacy demo credentials. These strings appeared
 # in the old committed s3.json; if they ever reach prod via a stale

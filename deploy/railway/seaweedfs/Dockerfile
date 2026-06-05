@@ -58,6 +58,14 @@ RUN sed -i 's/\r$//' /usr/local/bin/tmvault-entrypoint.sh \
 
 EXPOSE 8333 9333
 
+# Force a root start so the entrypoint can chown the runtime-mounted /data
+# volume and render /data/s3.json on EVERY restart (Railway has been observed
+# to start this container non-root on restarts, which crash-looped it on
+# "/tmp/s3.json: Permission denied"). The entrypoint immediately drops to the
+# unprivileged seaweed user via su-exec, so the long-lived weed process still
+# never runs as root — D-C5 hardening preserved.
+USER root
+
 ENTRYPOINT ["/usr/local/bin/tmvault-entrypoint.sh"]
 CMD ["-logtostderr=true", \
      "-stderrthreshold=WARNING", \
@@ -65,7 +73,7 @@ CMD ["-logtostderr=true", \
      "-dir=/data", \
      "-ip=0.0.0.0", \
      "-s3", \
-     "-s3.config=/tmp/s3.json", \
+     "-s3.config=/data/s3.json", \
      "-filer", \
      "-master.volumeSizeLimitMB=5120", \
      "-volume.max=24", \
