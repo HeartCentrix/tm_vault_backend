@@ -3208,12 +3208,24 @@ class GraphClient:
         Get messages from a Teams channel using delta API.
         Graph API: GET /teams/{team-id}/channels/{channel-id}/messages/delta
         """
-        url = f"{self.GRAPH_URL}/teams/{team_id}/channels/{channel_id}/messages/delta"
-        if delta_token:
-            url = delta_token
+        base = f"{self.GRAPH_URL}/teams/{team_id}/channels/{channel_id}/messages/delta"
+        url = delta_token or base
 
         params = {"$top": "999"}
-        result = await self._get(url, params=params)
+        try:
+            result = await self._get(url, params=params)
+        except httpx.HTTPStatusError as e:
+            # Expired/invalid delta token → Graph returns 410 (or 400 per the
+            # _PERMANENT_STATUSES note). Conservative FULL resync from the base
+            # delta URL so a stale token can never loop the channel forever.
+            if delta_token and getattr(e.response, "status_code", None) in (410, 400):
+                print(
+                    f"[GraphClient] channel delta token expired "
+                    f"({e.response.status_code}) — full resync {channel_id[:12]}"
+                )
+                result = await self._get(base, params=params)
+            else:
+                raise
         all_value = result.get("value", [])
 
         # Follow pagination

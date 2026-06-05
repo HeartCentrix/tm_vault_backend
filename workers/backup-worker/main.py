@@ -17258,6 +17258,15 @@ class BackupWorker:
 
         team_id = resource.external_id
 
+        # Per-channel delta tokens from the prior run. The handler already
+        # PERSISTS these (channel_delta_tokens, below) but never RESUMED from
+        # them — so every incremental re-pulled the full channel history. Load
+        # + pass them so incrementals fetch only NEW messages. A stale token
+        # (410/400) self-heals to a full resync inside get_channel_messages.
+        _saved_channel_tokens = (
+            (resource.extra_data or {}).get("channel_delta_tokens", {}) or {}
+        )
+
         # Partition filter — set when this call is a partition consumer.
         _gp_filter = (message or {}).get("partitionFilter") or {}
         _gp_allowed_channel_ids: Optional[Set[str]] = (
@@ -17321,7 +17330,10 @@ class BackupWorker:
                 ch_id = ch.get("id")
                 ch_name = ch.get("displayName", ch_id)
                 print(f"[{self.worker_id}]   [CHANNEL_MSG] {ch_name} — fetching messages...")
-                msgs = await graph_client.get_channel_messages(team_id, ch_id)
+                msgs = await graph_client.get_channel_messages(
+                    team_id, ch_id,
+                    delta_token=_saved_channel_tokens.get(ch_id),
+                )
                 msg_list = msgs.get("value", [])
                 print(f"[{self.worker_id}]   [CHANNEL_MSG] {ch_name} — {len(msg_list)} messages")
 
