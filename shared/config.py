@@ -502,6 +502,21 @@ class Settings:
         self.CHAT_INCREMENTAL_FILTER_ENABLED = os.getenv(
             "CHAT_INCREMENTAL_FILTER_ENABLED", "false",
         ).lower() in ("true", "1", "yes")
+        # User-level chat activity gate (2026-06-05). On an incremental, if
+        # EVERY chat for a user is unchanged since we last drained it
+        # (lastUpdatedDateTime <= its saved drain_cursor — the same trusted
+        # signal the per-chat activity-skip uses) AND a prior COMPLETED
+        # snapshot exists, skip the ENTIRE per-chat loop. The new snapshot
+        # keeps zero chat rows; the sibling-snapshot union reconstructs them.
+        # This is the 2k-scale win: most users have no chat activity in an 8h
+        # window, so we skip their whole drain instead of re-checking every
+        # chat (~60s/shard). Conservative + fails CLOSED (any new/changed
+        # chat, missing/deltalink cursor, no prior snapshot, or error → full
+        # drain). DEFAULT OFF — needs a no-missed-message validation run
+        # (add a chat message → incremental → confirm captured) before enabling.
+        self.CHAT_USER_LEVEL_SKIP_ENABLED = os.getenv(
+            "CHAT_USER_LEVEL_SKIP_ENABLED", "false",
+        ).lower() in ("true", "1", "yes")
         # 2026-05-17 prod tuning: lowered 100 → 25 so medium-chat users
         # (e.g. 30-99 chats — the long tail of regular employees) also
         # get the partition treatment. With the 8-light replica fleet this

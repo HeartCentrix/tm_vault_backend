@@ -2659,6 +2659,49 @@ class BackupWorker:
             )
             return False
 
+    async def _chat_user_all_unchanged(
+        self, tenant_id: str, chat_last_updated_map: Dict[str, str],
+        chat_ids: List[str],
+    ) -> bool:
+        """True iff EVERY chat in `chat_ids` is unchanged since we last
+        drained it — the SAME signal the per-chat activity-skip trusts
+        (chat.lastUpdatedDateTime <= its saved drain_cursor), evaluated
+        up-front for the whole user so we can skip the entire per-chat loop.
+
+        Fails CLOSED (returns False → normal full drain) on ANY of: a chat
+        with no saved cursor (never drained / brand-new), a deltaLink-style
+        (http) cursor we can't string-compare, a missing lastUpdatedDateTime,
+        a chat whose lastUpdatedDateTime is AFTER its cursor (real activity),
+        or any error. So a new message anywhere → full drain → never missed."""
+        if not chat_ids:
+            return False
+        try:
+            from sqlalchemy import bindparam
+            stmt = text(
+                "SELECT chat_id, drain_cursor FROM chat_threads "
+                "WHERE tenant_id = :tid AND chat_id IN :cids"
+            ).bindparams(bindparam("cids", expanding=True))
+            async with async_session_factory() as session:
+                rows = (await session.execute(
+                    stmt, {"tid": tenant_id, "cids": list(chat_ids)},
+                )).all()
+            cursors = {r[0]: r[1] for r in rows}
+            for cid in chat_ids:
+                cur = cursors.get(cid)
+                if not cur or str(cur).startswith("http"):
+                    return False  # never drained / deltalink → can't prove unchanged
+                lu = chat_last_updated_map.get(cid)
+                if not lu or str(lu) > str(cur):
+                    return False  # new activity (or unknown) → changed
+            return True
+        except Exception as e:
+            print(
+                f"[{self.worker_id}] [USER_CHATS] user-level skip check "
+                f"failed (tenant={tenant_id}): {type(e).__name__}: {e} "
+                f"— full drain (safe)"
+            )
+            return False
+
     async def _load_mail_folder_fingerprints(
         self, resource_id: uuid.UUID,
     ) -> Dict[str, Dict[str, Any]]:
@@ -5856,6 +5899,35 @@ class BackupWorker:
                     chat_ids_to_drain = [
                         cid for cid in chat_meta.keys() if cid
                     ]
+
+                    # ── USER-LEVEL ACTIVITY GATE (coordinator only) ──
+                    # If EVERY chat is unchanged since we last drained it AND a
+                    # prior COMPLETED snapshot exists, empty the drain list:
+                    # the per-chat loop then does nothing, the new snapshot
+                    # keeps zero chat rows, and the sibling-union reconstructs
+                    # them (proven). Skips the ~60s/shard re-check entirely —
+                    # the 2k-scale win. Only at the coordinator (no partition
+                    # filter); fails closed in _chat_user_all_unchanged.
+                    if (
+                        settings.CHAT_USER_LEVEL_SKIP_ENABLED
+                        and not (
+                            (message or {}).get("partitionFilter") or {}
+                        ).get("chatIds")
+                        and chat_ids_to_drain
+                        and _chat_has_prior_snap
+                        and await self._chat_user_all_unchanged(
+                            tenant_id=str(tenant.id),
+                            chat_last_updated_map=chat_last_updated_map,
+                            chat_ids=chat_ids_to_drain,
+                        )
+                    ):
+                        print(
+                            f"[{self.worker_id}] [USER_CHATS] {user_label}: "
+                            f"user-level skip — all {len(chat_ids_to_drain)} "
+                            f"chats unchanged since prior snapshot "
+                            f"(sparse; sibling-union reconstructs)"
+                        )
+                        chat_ids_to_drain = []
 
                     # ── Cross-replica partition split (Phase 2.3b) ──
                     # Two roles for this branch:
