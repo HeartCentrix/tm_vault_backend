@@ -4277,24 +4277,28 @@ class BackupWorker:
                             url = saved  # resume from deltaLink verbatim
                             params = None
                         elif fid:
+                            # $top=999 EMBEDDED IN THE URL — the hardened pager
+                            # drops the `params` arg for absolute URLs
+                            # (graph_client.py:818), so a params["$top"] is
+                            # silently ignored and Graph falls back to its
+                            # default ~10-item pages (a 1458-msg folder → ~146
+                            # round-trips instead of 2). $select stays in params
+                            # (intentionally dropped → all fields preserved, as
+                            # today). nextLinks carry $top forward automatically.
                             url = (
                                 f"{graph_client.GRAPH_URL}/users/{user_id}"
-                                f"/mailFolders/{fid}/messages/delta"
+                                f"/mailFolders/{fid}/messages/delta?$top=999"
                             )
-                            # $top=999 is Graph's maximum for messages.
-                            # No-op at sub-1k mailboxes (every folder fits
-                            # in one page either way), but at 10k+ folders
-                            # the page count drops ~20× and saves minutes
-                            # of round-trip time on first sync.
-                            params = {"$top": "999", "$select": mail_select}
+                            params = {"$select": mail_select}
                         else:
                             # Folder enumeration failed — do a best-effort
                             # non-delta scan of all messages (no incremental).
+                            # $top embedded in the URL for the same reason.
                             url = (
                                 f"{graph_client.GRAPH_URL}/users/{user_id}"
-                                f"/messages"
+                                f"/messages?$top=999"
                             )
-                            params = {"$top": "999", "$select": mail_select}
+                            params = {"$select": mail_select}
 
                         local_out: List = []
                         delta_out: Optional[str] = None
@@ -6797,7 +6801,28 @@ class BackupWorker:
                         if saved_cursor and saved_cursor.startswith("http"):
                             url = saved_cursor
                             params = None  # type: ignore[assignment]
+                        elif saved_cursor and settings.CHAT_INCREMENTAL_FILTER_ENABLED:
+                            # EMBED $filter/$orderby IN THE URL — the hardened
+                            # pager drops the params arg for absolute URLs, so a
+                            # params["$filter"] never reaches Graph (this is why
+                            # incrementals re-pulled the whole history). Verified
+                            # live: Graph honors lastModifiedDateTime on chat
+                            # messages. $top/$expand stay in params (unchanged):
+                            # the poisoned-page retry below strips $expand from
+                            # params, so it must remain there. DEFAULT-OFF flag
+                            # (CHAT_INCREMENTAL_FILTER_ENABLED) — needs a
+                            # chat-incremental validation run before enabling.
+                            from urllib.parse import quote as _q_cf
+                            _cf = f"lastModifiedDateTime gt {saved_cursor}"
+                            url = (
+                                f"{url}?$filter={_q_cf(_cf, safe='')}"
+                                f"&$orderby={_q_cf('lastModifiedDateTime asc', safe='')}"
+                            )
                         elif saved_cursor:
+                            # Legacy behavior (flag off): params $filter is
+                            # dropped by the pager → re-pulls full history,
+                            # deduped on persist. Kept until the URL-embedded
+                            # path is validated.
                             params["$filter"] = (
                                 f"lastModifiedDateTime gt {saved_cursor}"
                             )

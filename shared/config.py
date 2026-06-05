@@ -489,6 +489,19 @@ class Settings:
         self.CHAT_SPARSE_INCREMENTAL_ENABLED = os.getenv(
             "CHAT_SPARSE_INCREMENTAL_ENABLED", "true",
         ).lower() in ("true", "1", "yes")
+        # Chat incremental server-side $filter (2026-06-05). On an incremental,
+        # the chat drain fetches ONLY messages with lastModifiedDateTime gt the
+        # saved cursor instead of re-pulling the whole chat history every run
+        # (observed: 3 runs × 19,331 msgs). The $filter was historically
+        # believed "ignored by Graph", but that was the hardened pager DROPPING
+        # the params arg for absolute URLs — verified live that Graph DOES honor
+        # lastModifiedDateTime on /chats/{id}/messages. We embed it in the URL
+        # (survives the param-drop). DEFAULT OFF: changes incremental behavior +
+        # interacts with the cursor/$expand-retry logic, so it must pass a
+        # chat-incremental validation run (no missed messages) before enabling.
+        self.CHAT_INCREMENTAL_FILTER_ENABLED = os.getenv(
+            "CHAT_INCREMENTAL_FILTER_ENABLED", "false",
+        ).lower() in ("true", "1", "yes")
         # 2026-05-17 prod tuning: lowered 100 → 25 so medium-chat users
         # (e.g. 30-99 chats — the long tail of regular employees) also
         # get the partition treatment. With the 8-light replica fleet this
