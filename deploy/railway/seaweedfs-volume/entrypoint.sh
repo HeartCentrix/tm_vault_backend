@@ -18,6 +18,7 @@ set -- volume \
   -mserver="${SEAWEED_MASTER}" \
   -dir="${DATA_DIR}" \
   -ip="${ADVERTISE}" \
+  -ip.bind=0.0.0.0 \
   -port="${PORT}" \
   -max="${VMAX}" \
   -index=leveldb2 \
