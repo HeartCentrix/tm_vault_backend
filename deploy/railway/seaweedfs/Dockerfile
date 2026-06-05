@@ -56,27 +56,16 @@ RUN sed -i 's/\r$//' /usr/local/bin/tmvault-entrypoint.sh \
 # drops to the seaweed user via su-exec before exec'ing weed. The
 # long-lived process never runs as root.
 
-EXPOSE 8333 9333
+EXPOSE 8333 9333 8888
 
 # Force a root start so the entrypoint can chown the runtime-mounted /data
-# volume and render /data/s3.json on EVERY restart (Railway has been observed
-# to start this container non-root on restarts, which crash-looped it on
-# "/tmp/s3.json: Permission denied"). The entrypoint immediately drops to the
-# unprivileged seaweed user via su-exec, so the long-lived weed process still
-# never runs as root — D-C5 hardening preserved.
+# volume and render /data/s3.json on EVERY restart. The entrypoint drops to the
+# unprivileged seaweed user via su-exec, so the long-lived weed processes never
+# run as root — D-C5 hardening preserved.
 USER root
 
+# COORDINATOR mode (sharding Phase 2): the entrypoint launches master + filer
+# + s3 itself (NO local volume server) — blob storage lives on the external
+# seaweedfs-vol-* services. No CMD args needed; the entrypoint owns the cluster
+# launch.
 ENTRYPOINT ["/usr/local/bin/tmvault-entrypoint.sh"]
-CMD ["-logtostderr=true", \
-     "-stderrthreshold=WARNING", \
-     "server", \
-     "-dir=/data", \
-     "-ip=0.0.0.0", \
-     "-s3", \
-     "-s3.config=/data/s3.json", \
-     "-filer", \
-     "-master.volumeSizeLimitMB=30000", \
-     "-volume.max=200", \
-     "-volume.index=leveldb2", \
-     "-volume.preStopSeconds=1", \
-     "-master.volumePreallocate=false"]

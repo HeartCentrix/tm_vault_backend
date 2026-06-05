@@ -1,41 +1,32 @@
 #!/bin/sh
-# SeaweedFS entrypoint — renders the S3 identity config from env vars at
-# container start instead of baking credentials into the image layer.
+# SeaweedFS COORDINATOR entrypoint (sharding Phase 2).
 #
-# Rationale (see audit D-C4): anyone with pull access to the registry
-# image can `docker save | tar -x` and extract any file COPY'd at build
-# time, so secrets must never live inside an image layer. Railway (and
-# any reasonable orchestrator) injects ONPREM_S3_ACCESS_KEY /
-# ONPREM_S3_SECRET_KEY at runtime; this script writes them to a
-# tmpfs-style path that exists only for the life of the container.
+# Runs master + filer + s3 ONLY — NO local volume server. With no local
+# volume to prefer, the master is forced to place every write on the external
+# seaweedfs-vol-* services (each its own Railway service + volume). That gives
+# real write distribution (no single-instance dirty-page OOM) and lets the
+# blob store scale ~linearly with volume-server count.
+#
+# The all-in-one prior version kept a local volume server with huge capacity,
+# so the master never used the external servers (they sat at 0 volumes). This
+# split fixes that.
 set -eu
 
 : "${ONPREM_S3_ACCESS_KEY:?ONPREM_S3_ACCESS_KEY must be set — do not bake S3 credentials into the image}"
 : "${ONPREM_S3_SECRET_KEY:?ONPREM_S3_SECRET_KEY must be set — do not bake S3 credentials into the image}"
 : "${ONPREM_S3_IDENTITY_NAME:=tmvault}"
 
-# Render the S3 config onto the PERSISTENT, seaweed-owned /data volume — NOT
-# ephemeral /tmp. On Railway /tmp is not reliably writable by the runtime
-# user across restarts, which crash-looped the container ("can't create
-# /tmp/s3.json: Permission denied"). /data is chowned to the seaweed user
-# below, so it stays writable on every restart.
 CONFIG_PATH="${ONPREM_S3_CONFIG_PATH:-/data/s3.json}"
+VOL_SIZE_MB="${SEAWEED_VOLUME_SIZE_LIMIT_MB:-30000}"
+# Railway injects the service's own internal hostname here; the master/filer
+# advertise it so the volume servers + s3 can reach them. Bind 0.0.0.0.
+ADV="${RAILWAY_PRIVATE_DOMAIN:-0.0.0.0}"
 
-# Refuse to run with the legacy demo credentials. These strings appeared
-# in the old committed s3.json; if they ever reach prod via a stale
-# secret reference, fail fast.
+# Refuse known-weak/demo credentials (D-C4).
 case "${ONPREM_S3_ACCESS_KEY}" in
-  tmvault-local-access|admin|guest|"")
-    echo "ONPREM_S3_ACCESS_KEY is a known-weak/demo value; refusing to start." >&2
-    exit 1
-    ;;
-esac
+  tmvault-local-access|admin|guest|"") echo "ONPREM_S3_ACCESS_KEY is weak/demo; refusing." >&2; exit 1;; esac
 case "${ONPREM_S3_SECRET_KEY}" in
-  tmvault-local-secret|admin|guest|"")
-    echo "ONPREM_S3_SECRET_KEY is a known-weak/demo value; refusing to start." >&2
-    exit 1
-    ;;
-esac
+  tmvault-local-secret|admin|guest|"") echo "ONPREM_S3_SECRET_KEY is weak/demo; refusing." >&2; exit 1;; esac
 
 umask 077
 cat > "${CONFIG_PATH}" <<EOF
@@ -53,24 +44,39 @@ cat > "${CONFIG_PATH}" <<EOF
 }
 EOF
 
-# Railway mounts the persistent volume at /data ROOT-OWNED at runtime,
-# which shadows the build-time `chown seaweed:seaweed /data`. The non-root
-# seaweed user (UID 10001) then crash-loops on
-# "mkdir /data/m9333: permission denied" (see Dockerfile note + issue #717).
-#
-# Fix without giving up the non-root hardening (D-C5): when the container
-# starts as root, take ownership of the mount POINT only — NON-recursive,
-# so it is O(1) regardless of volume size and safe for the 250 TiB prod
-# store (weed creates and owns its own subdirectories as 10001 from here).
-# Hand the rendered S3 config to seaweed too, then drop privileges and run
-# the long-lived process as the unprivileged seaweed user via su-exec.
+# Filer metadata store -> persistent leveldb2 on /data (NOT in-memory, or S3
+# objects become unfindable after a restart). The filer reads filer.toml from
+# /etc/seaweedfs.
+mkdir -p /data/master /data/filerdb /etc/seaweedfs
+cat > /etc/seaweedfs/filer.toml <<TOML
+[leveldb2]
+enabled = true
+dir = "/data/filerdb"
+TOML
+
+start_cluster() {
+  # master (background) — coordinates volume placement across the external
+  # volume servers; volumeSizeLimitMB controls per-volume rollover.
+  /usr/bin/weed master -ip="${ADV}" -ip.bind=0.0.0.0 -port=9333 -mdir=/data/master \
+      -volumeSizeLimitMB="${VOL_SIZE_MB}" -volumePreallocate=false &
+  sleep 5
+  # filer (background) — talks to the local master; persistent leveldb2 store.
+  /usr/bin/weed filer -master=127.0.0.1:9333 -ip="${ADV}" -ip.bind=0.0.0.0 -port=8888 &
+  sleep 5
+  # s3 (foreground / PID 1 after exec) — the endpoint the workers hit.
+  exec /usr/bin/weed s3 -filer=127.0.0.1:8888 -ip.bind=0.0.0.0 -port=8333 -config="${CONFIG_PATH}"
+}
+
+# Start as root to chown the runtime-mounted /data (Railway mounts it root-
+# owned), then drop to the unprivileged seaweed user via su-exec. The
+# coordinator's /data now holds only metadata (master + filerdb), so the
+# recursive chown is cheap.
 DATA_DIR="${SEAWEED_DATA_DIR:-/data}"
 if [ "$(id -u)" = "0" ]; then
-  chown seaweed:seaweed "${DATA_DIR}" 2>/dev/null || true
+  chown -R seaweed:seaweed "${DATA_DIR}" /etc/seaweedfs 2>/dev/null || true
   chmod u+rwx "${DATA_DIR}" 2>/dev/null || true
-  chown seaweed:seaweed "${CONFIG_PATH}" 2>/dev/null || true
-  exec su-exec seaweed /usr/bin/weed "$@"
+  # re-exec this script as seaweed so the 3 children all run unprivileged
+  exec su-exec seaweed "$0" "$@"
 fi
 
-# Already unprivileged (e.g. local run with a pre-chowned volume).
-exec /usr/bin/weed "$@"
+start_cluster
