@@ -21525,19 +21525,44 @@ class BackupWorker:
         if current_job_id is not None:
             filters.append(Snapshot.job_id != current_job_id)
         prior = (await session.execute(
-            select(Snapshot.item_count, Snapshot.bytes_total)
+            select(Snapshot.id, Snapshot.item_count, Snapshot.bytes_total)
             .where(*filters)
             .order_by(desc(Snapshot.completed_at))
             .limit(1)
         )).first()
         if prior is None:
             return current_item_count, current_bytes_total
-        prior_items = int(prior[0] or 0)
-        prior_bytes = int(prior[1] or 0)
-        return (
-            max(0, current_item_count - prior_items),
-            max(0, current_bytes_total - prior_bytes),
-        )
+        prior_id = prior[0]
+        # SET-DIFFERENCE, not count-subtraction. Incremental snapshots are
+        # SPARSE — each holds only that run's delta, not the full inventory —
+        # so `current_item_count - prior_item_count` wrongly yields 0 whenever
+        # this run's delta is smaller than the prior run's, even though every
+        # row written this run is genuinely new/changed (the data IS captured;
+        # only the Activity "items backed up" number was wrong — observed
+        # 2026-06-05: a 2-item incremental after a 3-item one showed "0 new"
+        # though both items were new test mails). Count the rows in THIS
+        # snapshot whose (external_id, item_type) are ABSENT from the prior
+        # snapshot. Correct for sparse (all delta rows are new vs prior) AND
+        # full-inventory reuse snapshots (only the grown rows are absent).
+        # Matches item_count's CHILD_ITEM_TYPES exclusion for the count;
+        # bytes sums all types like bytes_total.
+        row = (await session.execute(
+            text(
+                "SELECT "
+                "  count(*) FILTER (WHERE cur.item_type NOT IN "
+                "    ('CHAT_ATTACHMENT','EMAIL_ATTACHMENT','CHAT_HOSTED_CONTENT')), "
+                "  COALESCE(SUM(cur.content_size), 0) "
+                "FROM snapshot_items cur "
+                "WHERE cur.snapshot_id = :cur "
+                "  AND NOT EXISTS ("
+                "    SELECT 1 FROM snapshot_items pri "
+                "    WHERE pri.snapshot_id = :pri "
+                "      AND pri.external_id = cur.external_id "
+                "      AND pri.item_type = cur.item_type)"
+            ),
+            {"cur": str(snapshot_id), "pri": str(prior_id)},
+        )).first()
+        return int(row[0] or 0), int(row[1] or 0)
 
     async def update_resource_backup_info(self, session: AsyncSession, resource: Resource,
                                           job_id: uuid.UUID, snapshot_id: uuid.UUID,
