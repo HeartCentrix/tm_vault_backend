@@ -6572,9 +6572,25 @@ class BackupWorker:
                             # Another backup just drained this chat. Reuse
                             # the messages they persisted and write thin
                             # pointer rows for THIS snapshot only.
+                            # SPARSE path: unchanged chat + a prior COMPLETED
+                            # snapshot → skip writing this chat's pointer
+                            # inventory; the sibling-snapshot union reconstructs
+                            # it (verified on live data). This claim-skip is the
+                            # path that fires on an incremental right after a
+                            # full backup (every chat freshly drained → not
+                            # claimed), so gating it HERE — not just the
+                            # activity-skip below — is what makes empty
+                            # incrementals cheap. Conservative: no prior snapshot
+                            # / flag off → write the full inventory.
+                            _sparse_skip = self._chat_sparse_skip_writes(
+                                settings.CHAT_SPARSE_INCREMENTAL_ENABLED,
+                                _chat_has_prior_snap,
+                            )
                             try:
-                                _pointers = await _load_chat_thread_messages_for_pointer(
-                                    thread_id=thread_id,
+                                _pointers = None if _sparse_skip else (
+                                    await _load_chat_thread_messages_for_pointer(
+                                        thread_id=thread_id,
+                                    )
                                 )
                                 if _pointers:
                                     _rows, _bytes = _build_chat_pointer_rows(
@@ -6593,7 +6609,7 @@ class BackupWorker:
                                 # we just need a snapshot-owned row pointing
                                 # at it. Idempotent — NOT EXISTS guard.
                                 try:
-                                    _att_copied = await _copy_chat_attachment_rows_to_snapshot(
+                                    _att_copied = 0 if _sparse_skip else await _copy_chat_attachment_rows_to_snapshot(
                                         tenant_id=str(tenant.id),
                                         target_snapshot_id=str(snapshot.id),
                                         chat_id=cid,
