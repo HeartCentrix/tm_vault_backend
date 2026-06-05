@@ -75,8 +75,8 @@ CMD ["-logtostderr=true", \
      "-s3", \
      "-s3.config=/data/s3.json", \
      "-filer", \
-     "-master.volumeSizeLimitMB=5120", \
-     "-volume.max=24", \
+     "-master.volumeSizeLimitMB=30000", \
+     "-volume.max=200", \
      "-volume.index=leveldb2", \
      "-volume.preStopSeconds=1", \
      "-master.volumePreallocate=false"]
