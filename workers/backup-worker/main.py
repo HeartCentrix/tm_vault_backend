@@ -4361,11 +4361,18 @@ class BackupWorker:
                             /messages/delta with $select=id ONLY to capture the
                             unified @odata.deltaLink WITHOUT re-transferring the
                             bodies the buckets already persisted. Tiny pages →
-                            fast."""
+                            fast.
+
+                            NOTE: _iter_pages_hardened drops the `params` arg for
+                            full (http-prefixed) URLs, so $top/$select MUST be
+                            embedded in the URL query string or they're ignored
+                            (which would make this walk re-pull full bodies)."""
                             nonlocal delta_out
+                            _sep = "&" if "?" in d_url else "?"
+                            d_url = f"{d_url}{_sep}$top=999&$select=id"
                             async with mail_sem:
                                 async for page in graph_client._iter_pages(
-                                    d_url, params={"$top": "999", "$select": "id"},
+                                    d_url, params=None,
                                 ):
                                     if "@odata.deltaLink" in page:
                                         delta_out = page["@odata.deltaLink"]
@@ -4433,18 +4440,27 @@ class BackupWorker:
                                 )
 
                                 def _ss_q(_s, _e):
+                                    from urllib.parse import quote
+                                    _flt = (
+                                        "receivedDateTime ge "
+                                        f"{_s.strftime('%Y-%m-%dT%H:%M:%SZ')} "
+                                        "and receivedDateTime lt "
+                                        f"{_e.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+                                    )
+                                    # Embed the query IN THE URL: the hardened
+                                    # pager drops the `params` arg for full
+                                    # (http-prefixed) URLs, so a separate $filter
+                                    # is silently ignored — each bucket would then
+                                    # re-fetch the WHOLE folder (N× over-fetch).
+                                    _qs = (
+                                        "$top=999"
+                                        f"&$select={quote(mail_select, safe='')}"
+                                        f"&$filter={quote(_flt, safe='')}"
+                                    )
                                     return (
                                         f"{graph_client.GRAPH_URL}/users/{user_id}"
-                                        f"/mailFolders/{fid}/messages"
-                                    ), {
-                                        "$top": "999", "$select": mail_select,
-                                        "$filter": (
-                                            "receivedDateTime ge "
-                                            f"{_s.strftime('%Y-%m-%dT%H:%M:%SZ')} "
-                                            "and receivedDateTime lt "
-                                            f"{_e.strftime('%Y-%m-%dT%H:%M:%SZ')}"
-                                        ),
-                                    }
+                                        f"/mailFolders/{fid}/messages?{_qs}"
+                                    ), None
                                 # Invariant #2: gather raises if ANY bucket
                                 # fails → we return [] below, token NOT advanced.
                                 await asyncio.gather(*[
