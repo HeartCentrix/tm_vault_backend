@@ -116,7 +116,10 @@ class GraphClient:
         """
         if not next_url.startswith("http"):
             return params
-        if params and "$top" in params:
+        # Only when the URL has no query of its own — otherwise a deltaLink /
+        # URL-embedded query already carries everything (and httpx would
+        # otherwise APPEND a duplicate $top to it).
+        if params and "$top" in params and "?" not in next_url:
             return {"$top": params["$top"]}
         return None
 
