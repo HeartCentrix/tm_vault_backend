@@ -1710,12 +1710,25 @@ async def list_snapshot_messages(
     params_page["limit"] = size
     params_page["offset"] = offset
 
+    # Pagination must slice by message DATE, not by external_id. PG's
+    # DISTINCT ON requires its leading sort column to be the dedup key
+    # (external_id) — which means a single-statement query paginated with
+    # LIMIT/OFFSET on that statement slices rows in external_id order, not
+    # chronological. The result: page 1 is "50 messages whose external_ids
+    # happen to sort first lexicographically", not "50 newest messages".
+    # Symptom: November messages appearing before December (or any random
+    # date scatter) as the user paginates.
+    #
+    # Fix: dedup in a subquery, then sort + paginate the deduped set by
+    # message timestamp DESC. The in-process re-sort below is now redundant
+    # but kept as a safety net for NULL timestamps.
     sql_page = (
-        "SELECT DISTINCT ON (si.external_id) "
-        "  si.id, si.snapshot_id, si.external_id, si.parent_external_id, "
-        "  si.tenant_id AS si_tenant_id, "
-        "  si.item_type, si.folder_path, si.content_size, si.is_deleted, "
-        "  si.created_at AS si_created_at, "
+        "SELECT * FROM ("
+        "  SELECT DISTINCT ON (si.external_id) "
+        "    si.id, si.snapshot_id, si.external_id, si.parent_external_id, "
+        "    si.tenant_id AS si_tenant_id, "
+        "    si.item_type, si.folder_path, si.content_size, si.is_deleted, "
+        "    si.created_at AS si_created_at, "
         # si.metadata holds the full Graph payload for chat messages
         # written via the newer TEAMS_CHAT_EXPORT path
         # (workers/backup-worker/main.py:14341-14376). When the LEFT
@@ -1723,20 +1736,23 @@ async def list_snapshot_messages(
         # for the entire snapshot when the chat-export-worker pipeline
         # didn't populate that table — we hydrate body / sender /
         # raw from si.metadata.raw instead.
-        "  si.metadata AS si_metadata, "
-        "  ct.chat_topic, ct.chat_type, ct.member_names_json, "
-        "  ctm.body_content, ctm.body_content_type, "
-        "  ctm.from_user_id, ctm.from_display_name, "
-        "  ctm.created_date_time, ctm.last_modified_date_time, "
-        "  ctm.deleted_date_time, ctm.metadata_raw "
+        "    si.metadata AS si_metadata, "
+        "    ct.chat_topic, ct.chat_type, ct.member_names_json, "
+        "    ctm.body_content, ctm.body_content_type, "
+        "    ctm.from_user_id, ctm.from_display_name, "
+        "    ctm.created_date_time, ctm.last_modified_date_time, "
+        "    ctm.deleted_date_time, ctm.metadata_raw "
         + base_sql +
-        " ORDER BY si.external_id, ctm.created_date_time DESC NULLS LAST, "
-        "          si.created_at DESC "
+        "  ORDER BY si.external_id, ctm.created_date_time DESC NULLS LAST, "
+        "           si.created_at DESC "
+        ") sub "
+        " ORDER BY sub.created_date_time DESC NULLS LAST, "
+        "          sub.si_created_at DESC "
         " LIMIT :limit OFFSET :offset"
     )
-    # PG requires the outer ORDER BY for pagination to match the DISTINCT ON
-    # leading column. Re-sort the page in-process by message timestamp.
     rows = (await db.execute(text(sql_page), params_page)).all()
+    # Defensive in-process re-sort: identical to the subquery's outer
+    # ORDER BY, but handles any oddball NULL combinations consistently.
     rows = sorted(
         rows,
         key=lambda r: (r.created_date_time or r.si_created_at, ""),
