@@ -50,6 +50,7 @@ _sys_ab.modules["audit_service_activity_backup"] = _ab_mod
 _ab_spec.loader.exec_module(_ab_mod)
 shape_activity_row = _ab_mod.shape_activity_row
 merge_backup_batch_rows = _ab_mod.merge_backup_batch_rows
+prune_unrun_terminal_children = _ab_mod.prune_unrun_terminal_children
 
 app = FastAPI(title="Audit Log Service", version="1.0.0")
 
@@ -1736,34 +1737,40 @@ async def get_batch_children(batch_id: str):
         await db.execute(text("SET LOCAL TRANSACTION READ ONLY"))
 
         res_ids: Set[Any] = set()
+        batch_status: Optional[str] = None
 
         # backup_batches first-class scope (flag on). Operator click intent
         # lives here; jobs-reconstruction is fallback for legacy rows.
         if settings.BATCH_ROW_REDESIGN_ENABLED:
             try:
                 bb_row = (await db.execute(text("""
-                    SELECT scope_user_ids
+                    SELECT scope_user_ids, status
                       FROM backup_batches
                      WHERE id = cast(:bid AS uuid)
                 """), {"bid": batch_id})).first()
             except Exception:
                 bb_row = None
             if bb_row and bb_row.scope_user_ids:
+                batch_status = bb_row.status
                 for rid in bb_row.scope_user_ids:
                     res_ids.add(rid)
 
         if not res_ids:
             jobs_q = await db.execute(text("""
-                SELECT id, batch_resource_ids
+                SELECT id, batch_resource_ids, status::text AS status
                 FROM jobs
                 WHERE COALESCE(spec->>'batch_id', id::text) = :bid
             """), {"bid": batch_id})
             jrows = jobs_q.all()
             if not jrows:
                 raise HTTPException(status_code=404, detail="batch not found")
-            for _, rids in jrows:
+            job_statuses = []
+            for _, rids, status in jrows:
+                job_statuses.append(str(status or "").upper())
                 for rid in (rids or []):
                     res_ids.add(rid)
+            if job_statuses and all(s in {"COMPLETED", "FAILED", "CANCELLED"} for s in job_statuses):
+                batch_status = "COMPLETED"
 
         if not res_ids:
             return {"batchId": batch_id, "resources": []}
@@ -1912,6 +1919,7 @@ async def get_batch_children(batch_id: str):
             t["children"] = children_by_parent.get(
                 uuid.UUID(t["resourceId"]), []
             )
+        tier1 = prune_unrun_terminal_children(tier1, batch_status)
 
     return {"batchId": batch_id, "resources": tier1}
 

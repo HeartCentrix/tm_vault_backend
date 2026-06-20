@@ -177,3 +177,36 @@ def merge_backup_batch_rows(
         merged.append(row)
 
     return merged
+
+
+_TERMINAL_BATCH_STATUSES = {"COMPLETED", "PARTIAL", "FAILED", "CANCELLED"}
+
+
+def prune_unrun_terminal_children(
+    resources: list[Dict[str, Any]],
+    batch_status: str | None,
+) -> list[Dict[str, Any]]:
+    """Hide child workloads that did not participate in a terminal batch.
+
+    The drilldown endpoint expands an ENTRA_USER to every discovered Tier-2
+    child. That is useful while a batch is live because not-yet-created
+    snapshots should appear as pending work. Once the batch is terminal,
+    no-snapshot children mean "not part of this run" (for example a Mail-only
+    SLA), not "still backing up".
+    """
+    if (batch_status or "").upper() not in _TERMINAL_BATCH_STATUSES:
+        return resources
+
+    pruned: list[Dict[str, Any]] = []
+    for parent in resources:
+        entry = dict(parent)
+        children = entry.get("children")
+        if isinstance(children, list):
+            entry["children"] = [
+                dict(child)
+                for child in children
+                if child.get("snapshotId")
+            ]
+        pruned.append(entry)
+
+    return pruned

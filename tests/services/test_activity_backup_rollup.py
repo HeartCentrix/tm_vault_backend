@@ -41,6 +41,7 @@ except Exception as exc:
 
 shape_activity_row = _mod.shape_activity_row
 merge_backup_batch_rows = _mod.merge_backup_batch_rows
+prune_unrun_terminal_children = _mod.prune_unrun_terminal_children
 
 
 def _row(**kw):
@@ -175,3 +176,64 @@ def test_v2_batch_rows_replace_matching_legacy_rows():
     )
 
     assert [row["object"] for row in out] == ["v2", "Discovery"]
+
+
+def test_terminal_batch_drilldown_hides_unrun_child_workloads():
+    resources = [{
+        "resourceId": "user-1",
+        "displayName": "Akshat Verma",
+        "type": "ENTRA_USER",
+        "tier": 1,
+        "status": "COMPLETED",
+        "children": [
+            {
+                "resourceId": "mail-1",
+                "displayName": "Akshat Verma",
+                "type": "USER_MAIL",
+                "tier": 2,
+                "snapshotId": "snap-mail-1",
+                "status": "COMPLETED",
+                "itemCount": 12,
+                "bytesAdded": 2048,
+            },
+            {
+                "resourceId": "chat-1",
+                "displayName": "Akshat Verma",
+                "type": "USER_CHATS",
+                "tier": 2,
+            },
+        ],
+    }]
+
+    out = prune_unrun_terminal_children(resources, "COMPLETED")
+
+    assert [child["type"] for child in out[0]["children"]] == ["USER_MAIL"]
+
+
+def test_in_progress_batch_drilldown_keeps_pending_child_workloads():
+    resources = [{
+        "resourceId": "user-1",
+        "displayName": "Akshat Verma",
+        "type": "ENTRA_USER",
+        "tier": 1,
+        "children": [
+            {
+                "resourceId": "mail-1",
+                "displayName": "Akshat Verma",
+                "type": "USER_MAIL",
+                "tier": 2,
+                "snapshotId": "snap-mail-1",
+                "status": "IN_PROGRESS",
+            },
+            {
+                "resourceId": "chat-1",
+                "displayName": "Akshat Verma",
+                "type": "USER_CHATS",
+                "tier": 2,
+            },
+        ],
+    }]
+
+    out = prune_unrun_terminal_children(resources, "IN_PROGRESS")
+
+    assert [child["type"] for child in out[0]["children"]] == ["USER_MAIL", "USER_CHATS"]
