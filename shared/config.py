@@ -314,6 +314,17 @@ class Settings:
         self.DISCOVERY_DEADLINE_MIN = int(
             os.getenv("DISCOVERY_DEADLINE_MIN", "60"),
         )
+        # Tier-2 per-user discovery fan-out. Defaults are sized for large
+        # tenants (~4k users): 25-user messages create 160 queue units, enough
+        # for discovery-worker replicas to share work, while 4 users per worker
+        # means up to 20 workload probes per replica (5 probes/user) before the
+        # shared Graph rate limiter applies backpressure.
+        self.TIER2_DISCOVERY_MESSAGE_CHUNK_SIZE = int(
+            os.getenv("TIER2_DISCOVERY_MESSAGE_CHUNK_SIZE", "25"),
+        )
+        self.TIER2_DISCOVERY_USER_CONCURRENCY = int(
+            os.getenv("TIER2_DISCOVERY_USER_CONCURRENCY", "4"),
+        )
         # backup-scheduler resilience. APScheduler jobs are intentionally
         # in-memory, so the service runs periodic DB-backed sweeps that
         # rebuild policy jobs and catch up a recently missed fire after

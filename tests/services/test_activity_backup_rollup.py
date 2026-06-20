@@ -163,6 +163,61 @@ def test_v2_batch_rows_inherit_legacy_progress_without_losing_scope_label():
     assert out[0]["counts"]["done"] == 23
 
 
+def test_running_v2_batch_rows_use_higher_live_rollup_progress():
+    batch_id = str(uuid.uuid4())
+    v2 = [{
+        "id": batch_id,
+        "batchId": batch_id,
+        "operation": "BACKUP",
+        "object": "11 users",
+        "status": "In Progress",
+        "details": "In progress",
+        "progressPct": 0,
+        "bytesDone": 0,
+        "bytesExpected": 1000,
+    }]
+    legacy = [{
+        "id": batch_id,
+        "batchId": batch_id,
+        "operation": "BACKUP",
+        "object": "55 resources",
+        "status": "In Progress",
+        "details": "Progress: 42%",
+        "progress_pct": 42,
+    }]
+
+    out = merge_backup_batch_rows(legacy, v2)
+
+    assert out[0]["progressPct"] == 42
+    assert out[0]["progress_pct"] == 42
+    assert out[0]["object"] == "11 users"
+
+
+def test_terminal_v2_batch_rows_keep_terminal_progress_over_legacy_rollup():
+    batch_id = str(uuid.uuid4())
+    v2 = [{
+        "id": batch_id,
+        "batchId": batch_id,
+        "operation": "BACKUP",
+        "object": "11 users",
+        "status": "Done",
+        "progressPct": 100,
+    }]
+    legacy = [{
+        "id": batch_id,
+        "batchId": batch_id,
+        "operation": "BACKUP",
+        "object": "55 resources",
+        "status": "In Progress",
+        "progress_pct": 42,
+    }]
+
+    out = merge_backup_batch_rows(legacy, v2)
+
+    assert out[0]["progressPct"] == 100
+    assert out[0].get("progress_pct") is None
+
+
 def test_v2_batch_rows_replace_matching_legacy_rows():
     batch_id = str(uuid.uuid4())
     out = merge_backup_batch_rows(

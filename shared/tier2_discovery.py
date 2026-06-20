@@ -17,13 +17,18 @@ out across them without a second SELECT.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+import asyncio
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, TypeVar
 from uuid import uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.models import Resource, ResourceStatus, ResourceType
+
+
+_T = TypeVar("_T")
+_R = TypeVar("_R")
 
 
 TIER2_CHILD_TYPES: tuple[ResourceType, ...] = (
@@ -45,6 +50,35 @@ _TIER2_TYPE_MAP: Dict[str, ResourceType] = {
     "USER_CALENDAR": ResourceType.USER_CALENDAR,
     "USER_CHATS": ResourceType.USER_CHATS,
 }
+
+
+def chunk_user_ids(user_ids: Iterable[Any], chunk_size: int) -> List[List[str]]:
+    """Split user IDs into queue-friendly chunks.
+
+    RabbitMQ distributes messages across discovery-worker replicas, so small
+    bounded chunks make replica scaling useful without querying cloud-specific
+    replica counts.
+    """
+    size = max(1, int(chunk_size or 1))
+    ids = [str(user_id) for user_id in user_ids]
+    return [ids[i:i + size] for i in range(0, len(ids), size)]
+
+
+async def run_bounded_user_tasks(
+    user_ids: Iterable[_T],
+    *,
+    concurrency: int,
+    worker: Callable[[_T], Awaitable[_R]],
+) -> List[_R]:
+    """Run per-user discovery work concurrently with a hard local cap."""
+    limit = max(1, int(concurrency or 1))
+    semaphore = asyncio.Semaphore(limit)
+
+    async def _run_one(user_id: _T) -> _R:
+        async with semaphore:
+            return await worker(user_id)
+
+    return await asyncio.gather(*(_run_one(user_id) for user_id in user_ids))
 
 
 async def has_complete_tier2(db: AsyncSession, user_resource_id) -> bool:

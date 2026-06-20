@@ -21,6 +21,7 @@ from shared.message_bus import message_bus, create_backup_message, create_restor
 from shared.batch_pending import classify_scope, BatchPendingState
 from shared.audit import emit_backup_triggered
 from shared.sla_workloads import filter_resource_map_by_policy_flags
+from shared.tier2_discovery import chunk_user_ids
 
 
 def _parse_uuid(value: Optional[str], field_name: str) -> Optional[UUID]:
@@ -370,13 +371,15 @@ async def _create_batch_backup_jobs(
                     by_tenant.setdefault(str(res.tenant_id), []).append(str(uid))
                 for tid, uids in by_tenant.items():
                     try:
-                        await message_bus.publish("discovery.tier2", {
-                            "tenantId": tid,
-                            "userResourceIds": uids,
-                            "source": "BULK_TRIGGER",
-                            "thenBackup": True,
-                            "batchId": batch_id,
-                        }, priority=5)
+                        chunks = chunk_user_ids(uids, settings.TIER2_DISCOVERY_MESSAGE_CHUNK_SIZE)
+                        for chunk in chunks:
+                            await message_bus.publish("discovery.tier2", {
+                                "tenantId": tid,
+                                "userResourceIds": chunk,
+                                "source": "BULK_TRIGGER",
+                                "thenBackup": True,
+                                "batchId": batch_id,
+                            }, priority=5)
                     except Exception as _pub_err:
                         # Non-fatal: scheduler watchdog flips the
                         # pending rows to DISCOVERY_FAILED after

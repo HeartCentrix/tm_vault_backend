@@ -1259,7 +1259,7 @@ async def startup():
 
     async def _sweep_tier2_gaps():
         try:
-            from shared.tier2_discovery import find_users_missing_tier2
+            from shared.tier2_discovery import chunk_user_ids, find_users_missing_tier2
             from shared.message_bus import message_bus as _mb
             async with async_session_factory() as session:
                 missing = await find_users_missing_tier2(session, require_sla=True)
@@ -1272,16 +1272,17 @@ async def startup():
             for u in missing:
                 by_tenant.setdefault(str(u.tenant_id), []).append(str(u.id))
             for tid, user_ids in by_tenant.items():
-                await _mb.publish(
-                    "discovery.tier2",
-                    {
-                        "tenantId": tid,
-                        "userResourceIds": user_ids,
-                        "source": "SCHEDULER_BACKSTOP",
-                        "thenBackup": False,
-                    },
-                    priority=4,
-                )
+                for chunk in chunk_user_ids(user_ids, settings.TIER2_DISCOVERY_MESSAGE_CHUNK_SIZE):
+                    await _mb.publish(
+                        "discovery.tier2",
+                        {
+                            "tenantId": tid,
+                            "userResourceIds": chunk,
+                            "source": "SCHEDULER_BACKSTOP",
+                            "thenBackup": False,
+                        },
+                        priority=4,
+                    )
             print(
                 f"[backup-scheduler] tier2_backstop: enqueued discovery for "
                 f"{len(missing)} user(s) across {len(by_tenant)} tenant(s)",

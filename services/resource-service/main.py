@@ -27,6 +27,7 @@ from shared.schemas import (
     GroupPolicyAssignmentRequest,
 )
 from shared.message_bus import message_bus
+from shared.tier2_discovery import chunk_user_ids
 from shared.sla_validation import (
     gate_immutability_lock as _gate_immutability_lock,
     validate_policy_payload as _validate_policy_payload,
@@ -88,19 +89,21 @@ async def _enqueue_tier2_for_entra_users(resources: Iterable[Resource]) -> None:
         by_tenant.setdefault(str(r.tenant_id), []).append(str(r.id))
     for tid, user_ids in by_tenant.items():
         try:
-            await message_bus.publish(
-                "discovery.tier2",
-                {
-                    "tenantId": tid,
-                    "userResourceIds": user_ids,
-                    "source": "SLA_ASSIGNED",
-                    "thenBackup": False,
-                },
-                priority=5,
-            )
+            chunks = chunk_user_ids(user_ids, settings.TIER2_DISCOVERY_MESSAGE_CHUNK_SIZE)
+            for chunk in chunks:
+                await message_bus.publish(
+                    "discovery.tier2",
+                    {
+                        "tenantId": tid,
+                        "userResourceIds": chunk,
+                        "source": "SLA_ASSIGNED",
+                        "thenBackup": False,
+                    },
+                    priority=5,
+                )
             print(
                 f"[resource-service] Tier-2 prep enqueued for {len(user_ids)} user(s) "
-                f"under tenant {tid}",
+                f"under tenant {tid} across {len(chunks)} chunk(s)",
             )
         except Exception as e:
             # Best-effort. Backstop sweep + bulk-trigger fallback both cover

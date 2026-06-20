@@ -148,10 +148,28 @@ def merge_backup_batch_rows(
             legacy_progress = fallback.get("progress_pct")
             if legacy_progress is None:
                 legacy_progress = fallback.get("progressPct")
-            if row.get("progressPct") is None and legacy_progress is not None:
-                row["progressPct"] = legacy_progress
-            if row.get("progress_pct") is None and legacy_progress is not None:
-                row["progress_pct"] = legacy_progress
+            if legacy_progress is not None:
+                status = str(row.get("status") or "").lower()
+                row_progress = row.get("progressPct")
+                if row_progress is None:
+                    row_progress = row.get("progress_pct")
+
+                if status == "in progress":
+                    try:
+                        live_progress = int(legacy_progress)
+                        current_progress = int(row_progress) if row_progress is not None else -1
+                    except (TypeError, ValueError):
+                        live_progress = legacy_progress
+                        current_progress = None
+                    if current_progress is None or int(live_progress) > current_progress:
+                        row["progressPct"] = live_progress
+                        row["progress_pct"] = live_progress
+                    elif row_progress is not None:
+                        row["progressPct"] = row_progress
+                        row["progress_pct"] = row_progress
+                elif row_progress is None:
+                    row["progressPct"] = legacy_progress
+                    row["progress_pct"] = legacy_progress
 
             if not row.get("details") and fallback.get("details"):
                 row["details"] = fallback["details"]
