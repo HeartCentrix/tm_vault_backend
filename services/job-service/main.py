@@ -20,6 +20,7 @@ from shared.schemas import (
 from shared.message_bus import message_bus, create_backup_message, create_restore_message
 from shared.batch_pending import classify_scope, BatchPendingState
 from shared.audit import emit_backup_triggered
+from shared.sla_workloads import filter_resource_map_by_policy_flags
 
 
 def _parse_uuid(value: Optional[str], field_name: str) -> Optional[UUID]:
@@ -251,6 +252,7 @@ async def _create_batch_backup_jobs(
     # tenant-service's pre-insert already used 'manual_user' so its row
     # is untouched. Tier-2 fanout (tier2=True) does NOT insert — those
     # waves inherit an existing batch_id from their parent click.
+    deferred_discovery_count = 0
     if batch_id and not tier2:
         try:
             sample_res = next(iter(resources_map.values()))
@@ -323,6 +325,7 @@ async def _create_batch_backup_jobs(
             tier2_owners = {row[0] for row in tier2_rows if row[0] is not None}
 
             ready, deferred = classify_scope(scope_ids, tier2_owners)
+            deferred_discovery_count = len(deferred)
 
             if deferred:
                 from datetime import datetime as _dt, timedelta as _td
@@ -419,6 +422,74 @@ async def _create_batch_backup_jobs(
             status_code=400,
             detail=f"Resources must have SLA policies assigned. {len(resources_without_sla)} resource(s) missing policy: {', '.join(resources_without_sla[:5])}"
         )
+
+    policy_ids = list({res.sla_policy_id for res in resources_map.values() if res.sla_policy_id})
+    policies = []
+    if policy_ids:
+        policies = (await db.execute(
+            select(SlaPolicy).where(SlaPolicy.id.in_(policy_ids))
+        )).scalars().all()
+    resources_map, sla_skipped = filter_resource_map_by_policy_flags(
+        resources_map,
+        {policy.id: policy for policy in policies},
+    )
+    if sla_skipped:
+        skipped_summary: dict[str, int] = {}
+        for item in sla_skipped:
+            skipped_summary[item.resource_type] = skipped_summary.get(item.resource_type, 0) + 1
+        print(
+            f"[JOB_SERVICE] SLA workload filter skipped {len(sla_skipped)} "
+            f"resources disabled by policy flags: {skipped_summary}"
+        )
+
+    if not resources_map:
+        if deferred_discovery_count > 0:
+            return [{
+                "jobId": None,
+                "status": "RUNNING",
+                "resourceId": "BATCH",
+                "resourceCount": 0,
+                "queue": "discovery_tier2",
+                "slaFiltered": True,
+                "skippedCount": len(sla_skipped),
+                "pendingDiscoveryCount": deferred_discovery_count,
+                "message": (
+                    "Tier-2 discovery is running for the selected users; "
+                    "enabled workload backups will be queued when discovery completes."
+                ),
+            }]
+        if batch_id and not tier2:
+            try:
+                await db.execute(text("""
+                    UPDATE backup_batches
+                       SET status = 'COMPLETED',
+                           completed_at = NOW()
+                     WHERE id = cast(:bid AS uuid)
+                       AND status = 'IN_PROGRESS'
+                """), {"bid": batch_id})
+                await db.commit()
+            except Exception as _batch_complete_exc:
+                print(
+                    f"[JOB_SERVICE] SLA workload filter could not complete "
+                    f"empty batch {batch_id}: {_batch_complete_exc}"
+                )
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
+        return [{
+            "jobId": None,
+            "status": "SKIPPED",
+            "resourceId": "BATCH",
+            "resourceCount": 0,
+            "queue": "sla_filtered",
+            "slaFiltered": True,
+            "skippedCount": len(sla_skipped),
+            "message": (
+                "No backup jobs were queued because the requested resources "
+                "are disabled by their assigned SLA workload selection."
+            ),
+        }]
 
     # G1 — cross-bulk per-resource dedup. If the operator clicks "Backup
     # all M365 now" three times in quick succession, we DO NOT want

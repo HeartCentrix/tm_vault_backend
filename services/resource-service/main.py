@@ -1425,7 +1425,11 @@ async def list_policies(
     return {"items": items, "total": total, "limit": limit, "offset": offset}
 
 
-@app.get("/api/v1/policies/{policy_id}", response_model=SlaPolicyResponse)
+@app.get(
+    "/api/v1/policies/{policy_id}",
+    response_model=SlaPolicyResponse,
+    response_model_by_alias=False,
+)
 async def get_policy(policy_id: str, db: AsyncSession = Depends(get_db)):
     stmt = select(SlaPolicy).where(SlaPolicy.id == UUID(policy_id))
     result = await db.execute(stmt)
@@ -1485,7 +1489,7 @@ async def create_policy(
         backup_onedrive=get_val("backupOneDrive", "backup_onedrive", service_type == "m365"),
         backup_sharepoint=get_val("backupSharepoint", "backup_sharepoint", service_type == "m365"),
         backup_teams=get_val("backupTeams", "backup_teams", service_type == "m365"),
-        backup_teams_chats=get_val("backupTeamsChats", "backup_teams_chats", False),
+        backup_teams_chats=get_val("backupTeamsChats", "backup_teams_chats", service_type == "m365"),
         backup_entra_id=get_val("backupEntraId", "backup_entra_id", service_type == "m365"),
         backup_power_platform=get_val("backupPowerPlatform", "backup_power_platform", False),
         backup_copilot=get_val("backupCopilot", "backup_copilot", False),
@@ -1567,7 +1571,11 @@ async def create_policy(
     return response
 
 
-@app.put("/api/v1/policies/{policy_id}", response_model=SlaPolicyResponse)
+@app.put(
+    "/api/v1/policies/{policy_id}",
+    response_model=SlaPolicyResponse,
+    response_model_by_alias=False,
+)
 async def update_policy(
     policy_id: str,
     request: dict,

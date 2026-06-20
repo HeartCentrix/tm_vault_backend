@@ -861,7 +861,6 @@ async def list_resources_with_backups(
     resources_stmt = (
         select(Resource)
         .where(Resource.tenant_id == UUID(tenantId))
-        .where(Resource.type.notin_(_HIDDEN_RECOVERY_TYPES))
         .order_by(Resource.display_name)
     )
     resources_result = await db.execute(resources_stmt)
@@ -892,12 +891,22 @@ async def list_resources_with_backups(
     for s in stats_result.fetchall():
         raw_stats[str(s[0])] = {"snapshot_count": int(s[1] or 0), "total_items": int(s[2] or 0)}
 
+    def _type_name(resource: Resource) -> str:
+        return resource.type.value if hasattr(resource.type, 'value') else str(resource.type)
+
+    visible_resource_ids = {
+        str(r.id) for r in all_resources
+        if _type_name(r) not in _HIDDEN_RECOVERY_TYPES
+    }
+
     # Roll children up under their parent. Stats keyed by the parent's ID.
     stats: Dict[str, Dict[str, int]] = {}
     for r in all_resources:
         # Tier 2 children never get their own row — they accumulate onto the
         # parent's stats below.
         if r.parent_resource_id is not None:
+            continue
+        if str(r.id) not in visible_resource_ids:
             continue
         own = raw_stats.get(str(r.id), {"snapshot_count": 0, "total_items": 0})
         stats[str(r.id)] = dict(own)
@@ -907,8 +916,8 @@ async def list_resources_with_backups(
             continue
         parent_key = str(r.parent_resource_id)
         if parent_key not in stats:
-            # Parent missing (shouldn't happen) — promote child standalone.
-            stats[parent_key] = {"snapshot_count": 0, "total_items": 0}
+            # Parent is missing or hidden, so the child remains hidden too.
+            continue
         child_stats = raw_stats.get(str(r.id))
         if not child_stats:
             continue
@@ -937,7 +946,7 @@ async def list_resources_with_backups(
         if not r:
             continue
         s = stats[rid]
-        type_name = r.type.value if hasattr(r.type, 'value') else str(r.type)
+        type_name = _type_name(r)
         items.append({
             "id": str(r.id),
             "tenant_id": str(r.tenant_id),

@@ -14,6 +14,8 @@ build/
 macbook_down.sh
 macbook_up.sh
 macbook_wipe.sh
+deploy/local/seaweedfs/
+.local/
 build-docker/
 *.whl
 *.pyc

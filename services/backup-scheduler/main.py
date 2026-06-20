@@ -36,57 +36,12 @@ from shared.message_bus import (
 from shared.config import settings
 from shared.power_bi_client import PowerBIClient
 from shared.audit import emit_backup_triggered
+from shared.sla_workloads import RESOURCE_TYPE_TO_SLA_FLAG, resource_type_enabled
 
 app = FastAPI(title="Backup Scheduler Service", version="3.0.0")
 
 # APScheduler for dynamic SLA policy scheduling
 scheduler = AsyncIOScheduler()
-
-# Resource type to SLA flag mapping — determines which workloads a policy backs up
-RESOURCE_TYPE_TO_SLA_FLAG: Dict[str, str] = {
-    "MAILBOX": "backup_exchange",
-    "SHARED_MAILBOX": "backup_exchange",
-    "ROOM_MAILBOX": "backup_exchange",
-    "ONEDRIVE": "backup_onedrive",
-    "SHAREPOINT_SITE": "backup_sharepoint",
-    "TEAMS_CHANNEL": "backup_teams",
-    # TEAMS_CHAT rows stay in the catalog as the user-facing entity (UI,
-    # restore-by-chat), but are excluded from job dispatch — see
-    # SCHEDULER_IGNORED_TYPES below. Actual chat backup runs against the
-    # per-user TEAMS_CHAT_EXPORT shard emitted by discovery.
-    "TEAMS_CHAT": "backup_teams_chats",
-    "TEAMS_CHAT_EXPORT": "backup_teams_chats",
-    # Tier 2 per-user shards emitted by discovery — one row per user per
-    # workload (see graph_client.discover_user_resources). Without these
-    # mappings the scheduler can't resolve them to an SLA flag and skips
-    # every shard, even when the matching workload toggle is on.
-    "USER_MAIL": "backup_exchange",
-    "USER_ONEDRIVE": "backup_onedrive",
-    "USER_CONTACTS": "contacts",
-    "USER_CALENDAR": "calendars",
-    "USER_CHATS": "backup_teams_chats",
-    "ENTRA_USER": "backup_entra_id",
-    "ENTRA_GROUP": "backup_entra_id",
-    "ENTRA_APP": "backup_entra_id",
-    "ENTRA_SERVICE_PRINCIPAL": "backup_entra_id",
-    "ENTRA_DEVICE": "backup_entra_id",
-    "ENTRA_ROLE": "backup_entra_id",
-    "ENTRA_ADMIN_UNIT": "backup_entra_id",
-    "ENTRA_AUDIT_LOG": "backup_entra_id",
-    "INTUNE_MANAGED_DEVICE": "backup_entra_id",
-    "POWER_BI": "backup_power_platform",
-    "POWER_APPS": "backup_power_platform",
-    "POWER_AUTOMATE": "backup_power_platform",
-    "POWER_DLP": "backup_power_platform",
-    "COPILOT": "backup_copilot",
-    "PLANNER": "planner",
-    "TODO": "tasks",
-    "ONENOTE": "backup_onedrive",
-    "AZURE_VM": "backup_azure_vm",
-    "AZURE_SQL_DB": "backup_azure_sql",
-    "AZURE_POSTGRESQL": "backup_azure_postgresql",
-    "AZURE_POSTGRESQL_SINGLE": "backup_azure_postgresql",
-}
 
 RESOURCE_TYPE_DISPLAY_NAMES: Dict[str, str] = {
     "MAILBOX": "Exchange mailboxes",
@@ -233,38 +188,6 @@ def frequency_to_cron_params(
 
     # DAILY (and any legacy / unrecognized value)
     return {"trigger": "cron", "hour": (base_hour + hour_carry) % 24, "minute": final_minute, **dow_clause}
-
-
-# Resource types intentionally excluded from dispatch even when an SLA policy
-# would otherwise cover them. TEAMS_CHAT is here because actual chat-message
-# backup runs through TEAMS_CHAT_EXPORT (one delta pull per user, not per chat);
-# the TEAMS_CHAT rows remain as the user-facing catalog entity for restore.
-SCHEDULER_IGNORED_TYPES: set[str] = {"TEAMS_CHAT"}
-
-
-def resource_type_enabled(resource_type: str, policy: SlaPolicy) -> bool:
-    """Check if a resource type is enabled in the SLA policy's backup flags."""
-    if resource_type in SCHEDULER_IGNORED_TYPES:
-        return False
-
-    if resource_type == "ENTRA_USER":
-        return bool(
-            getattr(policy, "backup_entra_id", False)
-            or getattr(policy, "contacts", False)
-            or getattr(policy, "calendars", False)
-        )
-
-    if resource_type in {"ENTRA_GROUP", "DYNAMIC_GROUP"}:
-        return bool(
-            getattr(policy, "backup_entra_id", False)
-            or getattr(policy, "group_mailbox", False)
-        )
-
-    flag_name = RESOURCE_TYPE_TO_SLA_FLAG.get(resource_type)
-    if not flag_name:
-        # Unknown or unsupported resource types should not be scheduled automatically.
-        return False
-    return getattr(policy, flag_name, True)
 
 
 def build_sla_skip_message(resource_type: str, policy: SlaPolicy) -> tuple[str, str | None, str | None]:

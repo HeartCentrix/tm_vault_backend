@@ -297,7 +297,7 @@ class SlaPolicy(Base):
     backup_onedrive = Column(Boolean, default=True)
     backup_sharepoint = Column(Boolean, default=True)
     backup_teams = Column(Boolean, default=True)
-    backup_teams_chats = Column(Boolean, default=False)
+    backup_teams_chats = Column(Boolean, default=True)
     backup_entra_id = Column(Boolean, default=True)
     backup_power_platform = Column(Boolean, default=False)
     backup_copilot = Column(Boolean, default=False)

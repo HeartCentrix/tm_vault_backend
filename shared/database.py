@@ -398,7 +398,7 @@ async def init_db() -> None:
             backup_onedrive BOOLEAN DEFAULT TRUE,
             backup_sharepoint BOOLEAN DEFAULT TRUE,
             backup_teams BOOLEAN DEFAULT TRUE,
-            backup_teams_chats BOOLEAN DEFAULT FALSE,
+            backup_teams_chats BOOLEAN DEFAULT TRUE,
             backup_entra_id BOOLEAN DEFAULT TRUE,
             backup_power_platform BOOLEAN DEFAULT FALSE,
             backup_copilot BOOLEAN DEFAULT FALSE,
