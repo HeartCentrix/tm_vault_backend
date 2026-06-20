@@ -40,6 +40,7 @@ except Exception as exc:
     )
 
 shape_activity_row = _mod.shape_activity_row
+merge_backup_batch_rows = _mod.merge_backup_batch_rows
 
 
 def _row(**kw):
@@ -123,3 +124,54 @@ def test_failed_status_label():
 def test_operation_constant():
     out = shape_activity_row(_row())
     assert out["operation"] == "BACKUP"
+
+
+def test_v2_batch_rows_inherit_legacy_progress_without_losing_scope_label():
+    batch_id = str(uuid.uuid4())
+    v2 = [{
+        "id": batch_id,
+        "batchId": batch_id,
+        "operation": "BACKUP",
+        "object": "11 users",
+        "status": "In Progress",
+        "details": "",
+        "progressPct": None,
+        "bytesDone": 1024,
+        "bytesExpected": None,
+    }]
+    legacy = [{
+        "id": batch_id,
+        "batchId": batch_id,
+        "operation": "BACKUP",
+        "object": "55 resources",
+        "status": "In Progress",
+        "details": "1.0 KiB so far",
+        "progress_pct": 42,
+        "phase": "in_progress",
+        "counts": {"total": 55, "done": 23, "partial": 0, "failed": 0, "in_progress": 32, "queued": 0},
+        "cancellable": True,
+    }]
+
+    out = merge_backup_batch_rows(legacy, v2)
+
+    assert len(out) == 1
+    assert out[0]["object"] == "11 users"
+    assert out[0]["progressPct"] == 42
+    assert out[0]["progress_pct"] == 42
+    assert out[0]["details"] == "1.0 KiB so far"
+    assert out[0]["counts"]["done"] == 23
+
+
+def test_v2_batch_rows_replace_matching_legacy_rows():
+    batch_id = str(uuid.uuid4())
+    out = merge_backup_batch_rows(
+        legacy_items=[
+            {"id": batch_id, "batchId": batch_id, "operation": "BACKUP", "object": "legacy"},
+            {"id": "discovery-1", "operation": "DISCOVERY", "object": "Discovery"},
+        ],
+        v2_rows=[
+            {"id": batch_id, "batchId": batch_id, "operation": "BACKUP", "object": "v2"},
+        ],
+    )
+
+    assert [row["object"] for row in out] == ["v2", "Discovery"]

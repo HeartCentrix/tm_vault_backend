@@ -314,6 +314,22 @@ class Settings:
         self.DISCOVERY_DEADLINE_MIN = int(
             os.getenv("DISCOVERY_DEADLINE_MIN", "60"),
         )
+        # backup-scheduler resilience. APScheduler jobs are intentionally
+        # in-memory, so the service runs periodic DB-backed sweeps that
+        # rebuild policy jobs and catch up a recently missed fire after
+        # process/cloud restarts.
+        self.SCHEDULER_RESCHEDULE_INTERVAL_SECONDS = int(
+            os.getenv("SCHEDULER_RESCHEDULE_INTERVAL_SECONDS", "300"),
+        )
+        self.SCHEDULER_CATCHUP_INTERVAL_SECONDS = int(
+            os.getenv("SCHEDULER_CATCHUP_INTERVAL_SECONDS", "300"),
+        )
+        self.SCHEDULER_CATCHUP_LOOKBACK_MINUTES = int(
+            os.getenv("SCHEDULER_CATCHUP_LOOKBACK_MINUTES", "1440"),
+        )
+        self.SCHEDULER_MISFIRE_GRACE_SECONDS = int(
+            os.getenv("SCHEDULER_MISFIRE_GRACE_SECONDS", "21600"),
+        )
         # Per-worker global cap on concurrent mail-restore tasks across all
         # in-flight jobs. Keeps Graph traffic bounded even if many jobs run at once.
         self.MAIL_RESTORE_GLOBAL_POOL = int(os.getenv("MAIL_RESTORE_GLOBAL_POOL", "32"))

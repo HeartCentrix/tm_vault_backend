@@ -190,6 +190,53 @@ def frequency_to_cron_params(
     return {"trigger": "cron", "hour": (base_hour + hour_carry) % 24, "minute": final_minute, **dow_clause}
 
 
+def _utc_naive(value: datetime) -> datetime:
+    """Normalize datetimes for comparisons with the DB's UTC-naive columns."""
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _policy_fire_times_between(policy: SlaPolicy, start: datetime, end: datetime) -> List[datetime]:
+    """Reconstruct scheduled SLA fire times without relying on APScheduler memory."""
+    start = _utc_naive(start)
+    end = _utc_naive(end)
+    if end < start:
+        return []
+
+    cron_params = frequency_to_cron_params(
+        getattr(policy, "frequency", "DAILY"),
+        getattr(policy, "backup_days", None),
+        getattr(policy, "backup_window_start", None),
+        policy_id=str(getattr(policy, "id", "")) if getattr(policy, "id", None) else None,
+    )
+    if cron_params is None:
+        return []
+
+    raw_hours = str(cron_params["hour"]).split(",")
+    hours = [int(hour) for hour in raw_hours if str(hour).strip() != ""]
+    minute = int(cron_params["minute"])
+    allowed_days = {
+        day.strip().lower()
+        for day in str(cron_params.get("day_of_week", "")).split(",")
+        if day.strip()
+    }
+
+    fires: List[datetime] = []
+    current_day = datetime(start.year, start.month, start.day)
+    last_day = datetime(end.year, end.month, end.day)
+    while current_day <= last_day:
+        day_name = current_day.strftime("%a").lower()[:3]
+        if not allowed_days or day_name in allowed_days:
+            for hour in hours:
+                fire = current_day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if start <= fire <= end:
+                    fires.append(fire)
+        current_day += timedelta(days=1)
+
+    return sorted(fires)
+
+
 def build_sla_skip_message(resource_type: str, policy: SlaPolicy) -> tuple[str, str | None, str | None]:
     workload_name = RESOURCE_TYPE_DISPLAY_NAMES.get(resource_type, resource_type.replace("_", " ").title())
     flag_name = RESOURCE_TYPE_TO_SLA_FLAG.get(resource_type)
@@ -301,6 +348,28 @@ async def startup():
 
     # Dynamically schedule backup jobs for each active SLA policy
     await schedule_all_policies()
+
+    # Durable backstops for in-memory APScheduler state. Startup rebuilds
+    # policies from the DB, this sweep catches later policy/assignment changes
+    # if the on-save HTTP nudge is dropped during a deploy or network blip.
+    scheduler.add_job(
+        schedule_all_policies,
+        "interval",
+        seconds=max(60, settings.SCHEDULER_RESCHEDULE_INTERVAL_SECONDS),
+        id="sla_policy_reschedule_sweep",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        catch_up_missed_policy_runs,
+        "interval",
+        seconds=max(60, settings.SCHEDULER_CATCHUP_INTERVAL_SECONDS),
+        id="sla_policy_catchup_sweep",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
 
     # Schedule SLA violation check every 30 minutes
     scheduler.add_job(check_sla_violations, "interval", minutes=30)
@@ -1474,6 +1543,100 @@ async def schedule_all_policies():
     print(f"[SCHEDULER] Scheduled backup jobs for {scheduled_count} SLA policies")
 
 
+async def catch_up_missed_policy_runs():
+    """Dispatch the latest missed scheduled run after scheduler downtime.
+
+    APScheduler jobs are in-memory. Startup and the reschedule sweep rebuild
+    future timers from the DB, but they cannot fire a cron event that happened
+    while the process/cloud instance was down. This DB-backed pass reconstructs
+    policy fire times over a bounded lookback and creates one scheduled run when
+    no matching scheduled Job exists.
+    """
+    now = datetime.utcnow()
+    lookback_minutes = max(60, settings.SCHEDULER_CATCHUP_LOOKBACK_MINUTES)
+    window_start = now - timedelta(minutes=lookback_minutes)
+    to_dispatch: List[Tuple[str, str, datetime, int]] = []
+
+    async with async_session_factory() as session:
+        policies_result = await session.execute(
+            select(SlaPolicy).where(
+                and_(
+                    SlaPolicy.enabled == True,
+                    SlaPolicy.frequency != "MANUAL",
+                )
+            )
+        )
+        policies = policies_result.scalars().all()
+
+        for policy in policies:
+            try:
+                active_since = _utc_naive(policy.created_at) if policy.created_at else window_start
+                fire_start = max(window_start, active_since)
+                fires = _policy_fire_times_between(policy, fire_start, now)
+                if not fires:
+                    continue
+                last_fire = fires[-1]
+
+                resources_result = await session.execute(
+                    select(Resource).where(
+                        and_(
+                            Resource.sla_policy_id == policy.id,
+                            Resource.status.in_([ResourceStatus.DISCOVERED, ResourceStatus.ACTIVE]),
+                        )
+                    )
+                )
+                active_resources = resources_result.scalars().all()
+                enabled_count = 0
+                for resource in active_resources:
+                    resource_type = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
+                    if resource_type_enabled(resource_type, policy):
+                        enabled_count += 1
+
+                if enabled_count <= 0:
+                    continue
+
+                in_flight = (await session.execute(
+                    select(func.count(Job.id)).where(
+                        and_(
+                            Job.type == JobType.BACKUP,
+                            Job.spec["sla_policy_id"].astext == str(policy.id),
+                            Job.spec["triggered_by"].astext == "SCHEDULED",
+                            Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]),
+                        )
+                    )
+                )).scalar() or 0
+                if in_flight:
+                    continue
+
+                recent_scheduled = (await session.execute(
+                    select(func.count(Job.id)).where(
+                        and_(
+                            Job.type == JobType.BACKUP,
+                            Job.spec["sla_policy_id"].astext == str(policy.id),
+                            Job.spec["triggered_by"].astext == "SCHEDULED",
+                            Job.created_at >= last_fire - timedelta(minutes=5),
+                        )
+                    )
+                )).scalar() or 0
+                if recent_scheduled:
+                    continue
+
+                to_dispatch.append((str(policy.id), policy.name, last_fire, enabled_count))
+            except Exception as exc:
+                print(f"[SCHEDULER] Catch-up scan failed for policy {policy.name} ({policy.id}): {exc}")
+
+    for policy_id, policy_name, last_fire, enabled_count in to_dispatch:
+        print(
+            f"[SCHEDULER] Catching up missed scheduled fire for policy "
+            f"'{policy_name}' at {last_fire.isoformat()}Z "
+            f"({enabled_count} eligible resources)"
+        )
+        try:
+            await dispatch_policy_backups(policy_id)
+        except Exception as exc:
+            print(f"[SCHEDULER] Catch-up dispatch failed for policy {policy_name} ({policy_id}): {exc}")
+
+
 async def schedule_policy_job(policy: SlaPolicy):
     """Schedule or reschedule a backup job for a specific SLA policy.
 
@@ -1500,6 +1663,9 @@ async def schedule_policy_job(policy: SlaPolicy):
         name=f"Backup: {policy.name}",
         replace_existing=True,
         timezone="UTC",
+        misfire_grace_time=max(60, settings.SCHEDULER_MISFIRE_GRACE_SECONDS),
+        coalesce=True,
+        max_instances=1,
         **cron_params,
     )
 

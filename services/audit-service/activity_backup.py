@@ -115,3 +115,65 @@ def shape_activity_row(row) -> Dict[str, Any]:
         "bytesDone": bytes_done,
         "bytesExpected": bytes_expected,
     }
+
+
+def merge_backup_batch_rows(
+    legacy_items: list[Dict[str, Any]],
+    v2_rows: list[Dict[str, Any]],
+) -> list[Dict[str, Any]]:
+    """Overlay backup_batches rows onto legacy rollup rows.
+
+    ``backup_batches`` owns operator intent (the clicked scope: "11 users",
+    one user name, source, etc.). The legacy rollup owns live progress derived
+    from Jobs/Snapshots/Partitions. Merge the two by batchId so v2 rows keep
+    the correct scope label without losing progress/details while
+    ``bytes_expected`` is unknown on first-ever backups.
+    """
+    legacy_by_batch = {
+        str(row.get("batchId")): row
+        for row in legacy_items
+        if row.get("operation") == "BACKUP" and row.get("batchId")
+    }
+
+    merged: list[Dict[str, Any]] = []
+    v2_batch_ids: set[str] = set()
+    for source in v2_rows:
+        row = dict(source)
+        batch_id = row.get("batchId")
+        if batch_id:
+            v2_batch_ids.add(str(batch_id))
+        fallback = legacy_by_batch.get(str(batch_id)) if batch_id else None
+
+        if fallback:
+            legacy_progress = fallback.get("progress_pct")
+            if legacy_progress is None:
+                legacy_progress = fallback.get("progressPct")
+            if row.get("progressPct") is None and legacy_progress is not None:
+                row["progressPct"] = legacy_progress
+            if row.get("progress_pct") is None and legacy_progress is not None:
+                row["progress_pct"] = legacy_progress
+
+            if not row.get("details") and fallback.get("details"):
+                row["details"] = fallback["details"]
+            if not row.get("finish_time") and fallback.get("finish_time"):
+                row["finish_time"] = fallback["finish_time"]
+
+            for key in (
+                "phase",
+                "counts",
+                "warnings",
+                "cancellable",
+                "data_backed_up",
+                "total_data",
+            ):
+                if row.get(key) is None and fallback.get(key) is not None:
+                    row[key] = fallback[key]
+
+        merged.append(row)
+
+    for row in legacy_items:
+        if row.get("operation") == "BACKUP" and str(row.get("batchId")) in v2_batch_ids:
+            continue
+        merged.append(row)
+
+    return merged

@@ -56,8 +56,9 @@ def format_bytes(bytes_val: int) -> str:
 async def notify_scheduler_reschedule():
     """Notify the backup Scheduler to reschedule all SLA policy jobs"""
     try:
+        base_url = settings.BACKUP_SCHEDULER_URL.rstrip("/")
         async with httpx.AsyncClient(timeout=5.0) as client:
-            await client.post("http://backup-scheduler:8008/scheduler/reschedule-all")
+            await client.post(f"{base_url}/scheduler/reschedule-all")
     except Exception as e:
         print(f"[resource-service] Failed to notify scheduler: {e}")
 
@@ -113,8 +114,9 @@ async def notify_lifecycle_reconcile():
     for the daily 24h cron tick. Best-effort — failure logged, not raised.
     """
     try:
+        base_url = settings.BACKUP_SCHEDULER_URL.rstrip("/")
         async with httpx.AsyncClient(timeout=5.0) as client:
-            await client.post("http://backup-scheduler:8008/scheduler/reconcile-lifecycle")
+            await client.post(f"{base_url}/scheduler/reconcile-lifecycle")
     except Exception as e:
         print(f"[resource-service] Lifecycle reconcile notification failed: {e}")
 
@@ -1167,6 +1169,7 @@ async def assign_policy(resource_id: str, request: AssignPolicyRequest, db: Asyn
         target.status = ResourceStatus.ACTIVE
     await db.commit()
     await _enqueue_tier2_for_entra_users(resources)
+    await notify_scheduler_reschedule()
 
 
 @app.post("/api/v1/resources/{resource_id}/unassign-policy", status_code=204)
@@ -1180,6 +1183,7 @@ async def unassign_policy(resource_id: str, db: AsyncSession = Depends(get_db)):
     for target in resources:
         target.sla_policy_id = None
     await db.commit()
+    await notify_scheduler_reschedule()
 
 
 @app.post("/api/v1/resources/{resource_id}/archive", status_code=204)
@@ -1254,6 +1258,7 @@ async def bulk_assign_policy(request: BulkAssignRequest, db: AsyncSession = Depe
         for resource in expanded_resources:
             resource.sla_policy_id = None
         await db.commit()
+        await notify_scheduler_reschedule()
 
         return {
             "assigned": 0,
@@ -1303,6 +1308,7 @@ async def bulk_assign_policy(request: BulkAssignRequest, db: AsyncSession = Depe
 
     await db.commit()
     await _enqueue_tier2_for_entra_users(expanded_resources)
+    await notify_scheduler_reschedule()
 
     return {
         "assigned": updated_count,
@@ -1340,6 +1346,7 @@ async def bulk_unassign_policy(request: BulkUnassignRequest, db: AsyncSession = 
         resource.sla_policy_id = None
     
     await db.commit()
+    await notify_scheduler_reschedule()
     
     return {
         "unassigned": len(expanded_resources),

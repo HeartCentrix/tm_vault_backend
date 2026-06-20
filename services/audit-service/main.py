@@ -49,6 +49,7 @@ _ab_mod = _ilu_ab.module_from_spec(_ab_spec)
 _sys_ab.modules["audit_service_activity_backup"] = _ab_mod
 _ab_spec.loader.exec_module(_ab_mod)
 shape_activity_row = _ab_mod.shape_activity_row
+merge_backup_batch_rows = _ab_mod.merge_backup_batch_rows
 
 app = FastAPI(title="Audit Log Service", version="1.0.0")
 
@@ -1067,13 +1068,8 @@ async def list_activities(
             operation=operation, status=status,
             limit=max(size, page * size),
         )
-        v2_batch_ids = {row["batchId"] for row in v2_rows if row.get("batchId")}
         legacy_items = legacy.get("items", []) if isinstance(legacy, dict) else []
-        merged: List[Dict[str, Any]] = list(v2_rows)
-        for it in legacy_items:
-            if it.get("operation") == "BACKUP" and it.get("batchId") in v2_batch_ids:
-                continue
-            merged.append(it)
+        merged: List[Dict[str, Any]] = merge_backup_batch_rows(legacy_items, v2_rows)
         merged.sort(key=lambda r: r.get("start_time") or "", reverse=True)
         total = len(merged)
         start_idx = (page - 1) * size
