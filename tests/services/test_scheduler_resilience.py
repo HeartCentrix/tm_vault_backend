@@ -64,3 +64,11 @@ def test_policy_jobs_have_misfire_and_single_instance_guards():
     assert "misfire_grace_time" in source
     assert "coalesce=True" in source
     assert "max_instances=1" in source
+
+
+def test_scheduler_json_filters_use_json_extract_path_text():
+    source = _SCHEDULER_MAIN.read_text()
+
+    assert ".astext" not in source
+    assert 'func.json_extract_path_text(Job.spec, "sla_policy_id")' in source
+    assert 'func.json_extract_path_text(Job.spec, "triggered_by")' in source

@@ -1600,8 +1600,8 @@ async def catch_up_missed_policy_runs():
                     select(func.count(Job.id)).where(
                         and_(
                             Job.type == JobType.BACKUP,
-                            Job.spec["sla_policy_id"].astext == str(policy.id),
-                            Job.spec["triggered_by"].astext == "SCHEDULED",
+                            func.json_extract_path_text(Job.spec, "sla_policy_id") == str(policy.id),
+                            func.json_extract_path_text(Job.spec, "triggered_by") == "SCHEDULED",
                             Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]),
                         )
                     )
@@ -1613,8 +1613,8 @@ async def catch_up_missed_policy_runs():
                     select(func.count(Job.id)).where(
                         and_(
                             Job.type == JobType.BACKUP,
-                            Job.spec["sla_policy_id"].astext == str(policy.id),
-                            Job.spec["triggered_by"].astext == "SCHEDULED",
+                            func.json_extract_path_text(Job.spec, "sla_policy_id") == str(policy.id),
+                            func.json_extract_path_text(Job.spec, "triggered_by") == "SCHEDULED",
                             Job.created_at >= last_fire - timedelta(minutes=5),
                         )
                     )
@@ -1835,7 +1835,7 @@ async def dispatch_policy_backups(policy_id: str):
         if max_concurrent > 0:
             inflight_stmt = (
                 select(func.count(Job.id)).where(and_(
-                    Job.spec["sla_policy_id"].astext == str(policy.id),
+                    func.json_extract_path_text(Job.spec, "sla_policy_id") == str(policy.id),
                     Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]),
                 ))
             )
