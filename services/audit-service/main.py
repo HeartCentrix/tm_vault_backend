@@ -1756,10 +1756,32 @@ async def get_batch_children(batch_id: str):
                     res_ids.add(rid)
 
         if not res_ids:
+            # No backup_batches row → addressed by a job_id (scheduled / SLA /
+            # legacy fire). A scheduled fire fans out into one Job per resource
+            # type, all sharing (tenant, triggered_by, second-precision
+            # created_at) — the SAME key _group_batch_jobs collapses into a
+            # single Activity row whose id is just ONE of those job_ids.
+            # Resolve the clicked job AND its fire-siblings so the drilldown
+            # expands to EVERY user/resource in the fire (validated on prod:
+            # one type-group job_id -> 6 sibling jobs / 50 resources), not just
+            # the one type-group whose job_id happens to be the row id. Batch
+            # rows still resolve by their shared spec.batch_id.
             jobs_q = await db.execute(text("""
-                SELECT id, batch_resource_ids, status::text AS status
-                FROM jobs
-                WHERE COALESCE(spec->>'batch_id', id::text) = :bid
+                WITH seed AS (
+                    SELECT tenant_id,
+                           COALESCE(spec->>'batch_id', '')     AS bid,
+                           COALESCE(spec->>'triggered_by', '') AS trig,
+                           date_trunc('second', created_at)    AS sec
+                      FROM jobs
+                     WHERE COALESCE(spec->>'batch_id', id::text) = :bid
+                     LIMIT 1
+                )
+                SELECT j.id, j.batch_resource_ids, j.status::text AS status
+                  FROM jobs j, seed
+                 WHERE (seed.bid <> '' AND COALESCE(j.spec->>'batch_id', '') = seed.bid)
+                    OR (seed.bid = ''  AND j.tenant_id = seed.tenant_id
+                                      AND COALESCE(j.spec->>'triggered_by', '') = seed.trig
+                                      AND date_trunc('second', j.created_at) = seed.sec)
             """), {"bid": batch_id})
             jrows = jobs_q.all()
             if not jrows:
