@@ -938,51 +938,71 @@ async def _carry_forward_prior_chat_snapshot_items(
     """
     if not tenant_id or not resource_id or not target_snapshot_id:
         return 0
+    from sqlalchemy.exc import IntegrityError as _IntegrityError
     async with async_session_factory() as s:
-        result = await s.execute(
-            text(
-                "INSERT INTO snapshot_items ("
-                "  id, snapshot_id, tenant_id, item_type, external_id, "
-                "  parent_external_id, name, folder_path, content_hash, "
-                "  content_checksum, content_size, blob_path, "
-                "  encryption_key_id, backup_version, metadata, is_deleted, "
-                "  indexed_at, backend_id, created_at"
-                ") "
-                "SELECT gen_random_uuid(), :tsid, src.tenant_id, src.item_type, "
-                "       src.external_id, src.parent_external_id, src.name, "
-                "       src.folder_path, src.content_hash, src.content_checksum, "
-                "       src.content_size, src.blob_path, src.encryption_key_id, "
-                "       COALESCE(src.backup_version, 1), src.metadata, "
-                "       COALESCE(src.is_deleted, false), src.indexed_at, "
-                "       src.backend_id, NOW() "
-                "  FROM snapshot_items src "
-                "  JOIN snapshots ps ON ps.id = src.snapshot_id "
-                " WHERE ps.resource_id = :rid "
-                "   AND ps.id <> :tsid "
-                "   AND ps.status IN ('COMPLETED', 'PARTIAL') "
-                "   AND src.item_type IN ("
-                "         'CHAT_MESSAGE', 'CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT'"
-                "       ) "
-                "   AND ps.id = ("
-                "         SELECT s2.id FROM snapshots s2 "
-                "          WHERE s2.resource_id = :rid "
-                "            AND s2.id <> :tsid "
-                "            AND s2.status IN ('COMPLETED', 'PARTIAL') "
-                "          ORDER BY s2.created_at DESC "
-                "          LIMIT 1"
-                "       ) "
-                "   AND NOT EXISTS ("
-                "         SELECT 1 FROM snapshot_items dst "
-                "          WHERE dst.snapshot_id = :tsid "
-                "            AND dst.external_id = src.external_id "
-                "            AND dst.item_type = src.item_type"
-                "       )"
-            ),
-            {
-                "tsid": target_snapshot_id,
-                "rid": resource_id,
-            },
-        )
+        try:
+            result = await s.execute(
+                text(
+                    "INSERT INTO snapshot_items ("
+                    "  id, snapshot_id, tenant_id, item_type, external_id, "
+                    "  parent_external_id, name, folder_path, content_hash, "
+                    "  content_checksum, content_size, blob_path, "
+                    "  encryption_key_id, backup_version, metadata, is_deleted, "
+                    "  indexed_at, backend_id, created_at"
+                    ") "
+                    "SELECT gen_random_uuid(), :tsid, src.tenant_id, src.item_type, "
+                    "       src.external_id, src.parent_external_id, src.name, "
+                    "       src.folder_path, src.content_hash, src.content_checksum, "
+                    "       src.content_size, src.blob_path, src.encryption_key_id, "
+                    "       COALESCE(src.backup_version, 1), src.metadata, "
+                    "       COALESCE(src.is_deleted, false), src.indexed_at, "
+                    "       src.backend_id, NOW() "
+                    "  FROM snapshot_items src "
+                    "  JOIN snapshots ps ON ps.id = src.snapshot_id "
+                    " WHERE ps.resource_id = :rid "
+                    "   AND ps.id <> :tsid "
+                    "   AND ps.status IN ('COMPLETED', 'PARTIAL') "
+                    "   AND src.item_type IN ("
+                    "         'CHAT_MESSAGE', 'CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT'"
+                    "       ) "
+                    "   AND ps.id = ("
+                    "         SELECT s2.id FROM snapshots s2 "
+                    "          WHERE s2.resource_id = :rid "
+                    "            AND s2.id <> :tsid "
+                    "            AND s2.status IN ('COMPLETED', 'PARTIAL') "
+                    "          ORDER BY s2.created_at DESC "
+                    "          LIMIT 1"
+                    "       ) "
+                    "   AND NOT EXISTS ("
+                    "         SELECT 1 FROM snapshot_items dst "
+                    "          WHERE dst.snapshot_id = :tsid "
+                    "            AND dst.external_id = src.external_id "
+                    "            AND dst.item_type = src.item_type"
+                    "       )"
+                ),
+                {
+                    "tsid": target_snapshot_id,
+                    "rid": resource_id,
+                },
+            )
+        except _IntegrityError as e:
+            # Target snapshot was deleted out from under us mid-carry-forward
+            # (stale-snapshot GC / cancel-revert / a superseding concurrent
+            # drain of the same resource). Mirror _bulk_upsert_snapshot_items:
+            # surface the snapshot_items_snapshot_id_fkey violation as
+            # SnapshotVanishedError so the caller aborts cleanly instead of
+            # logging a raw ForeignKeyViolationError. No data loss — the prior
+            # (source) snapshot still holds the full history; carrying rows
+            # into a snapshot that no longer exists is a no-op by definition.
+            # Match the FK constraint name, not message text, for robustness
+            # across asyncpg / driver wording.
+            if "snapshot_items_snapshot_id_fkey" in str(e):
+                await s.rollback()
+                raise SnapshotVanishedError(
+                    f"snapshot {target_snapshot_id} no longer exists; "
+                    f"aborting chat carry-forward"
+                ) from e
+            raise
         await s.commit()
         return result.rowcount or 0
 
@@ -8585,6 +8605,17 @@ class BackupWorker:
                                 f"carried forward {_cf} pointer rows from "
                                 f"prior snapshot"
                             )
+                    except SnapshotVanishedError as _snap_gone:
+                        # Target snapshot was cleaned up (stale-snapshot GC /
+                        # cancel-revert / a superseding concurrent drain of the
+                        # same user) before carry-forward ran. Clean abort, not
+                        # an error: the prior snapshot retains the full history
+                        # and the surviving snapshot owns this run.
+                        print(
+                            f"[{self.worker_id}] [USER_CHATS] "
+                            f"{resource.display_name or resource.id}: "
+                            f"carry-forward skipped — {_snap_gone}"
+                        )
                     except Exception as _cf_err:
                         print(
                             f"[{self.worker_id}] [USER_CHATS] "
