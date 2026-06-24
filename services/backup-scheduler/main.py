@@ -2124,6 +2124,17 @@ async def dispatch_policy_backups(policy_id: str):
                         # Shared per-fire/per-tenant id so the Activity rollup
                         # renders ONE row for the whole fire (see _fire_batch_ids).
                         "batch_id": _batch_id,
+                        # Exclude scheduled jobs from the rollup's Tier-1
+                        # (ENTRA_USER) scope. A scheduled INCREMENTAL only backs
+                        # up DUE resources, so the manual-bulk Tier-2 expected-
+                        # coverage gate (missing_t2 in shared/batch_rollup) would
+                        # otherwise never reach 100% and the row would show a
+                        # false "In Progress N%". Only tier1_scope reads
+                        # spec.tier2 (verified — the worker ignores it, so backup
+                        # behavior is unchanged); status becomes job/snapshot-
+                        # derived (Done when every dispatched resource has a
+                        # terminal snapshot).
+                        "tier2": True,
                     }
                 )
                 session.add(job)
