@@ -1638,23 +1638,47 @@ async def catch_up_missed_policy_runs():
             print(f"[SCHEDULER] Catch-up dispatch failed for policy {policy_name} ({policy_id}): {exc}")
 
 
+# Records the effective cron fingerprint last registered for each policy job
+# so the 5-min reschedule sweep can skip unchanged policies instead of
+# churning their APScheduler timers (see schedule_policy_job).
+_POLICY_JOB_FINGERPRINTS: dict[str, tuple] = {}
+
+
 async def schedule_policy_job(policy: SlaPolicy):
     """Schedule or reschedule a backup job for a specific SLA policy.
 
     MANUAL policies are intentionally never scheduled — they only run when
-    explicitly triggered via the /trigger endpoint. afi behaves identically."""
-    job_id = f"policy_backup_{policy.id}"
+    explicitly triggered via the /trigger endpoint. afi behaves identically.
 
-    # Remove existing job if it exists (covers reschedule + frequency change to MANUAL)
-    if scheduler.get_job(job_id):
-        scheduler.remove_job(job_id)
+    Idempotent: the durability sweep (sla_policy_reschedule_sweep) re-invokes
+    this for every policy every SCHEDULER_RESCHEDULE_INTERVAL_SECONDS. Removing
+    and re-adding an *unchanged* cron job resets its next_run_time and races the
+    fire window — repeatedly doing so dropped scheduled Gold fires (observed
+    1-2x/day instead of 3x, with 12.5h-vs-8h SLA violations). We therefore only
+    (re)register when the effective schedule actually changed."""
+    job_id = f"policy_backup_{policy.id}"
 
     cron_params = frequency_to_cron_params(
         policy.frequency, policy.backup_days, policy.backup_window_start,
         policy_id=str(policy.id),
     )
+
+    # MANUAL / unschedulable: tear down any live job and forget its fingerprint.
     if cron_params is None:
+        if scheduler.get_job(job_id):
+            scheduler.remove_job(job_id)
+        _POLICY_JOB_FINGERPRINTS.pop(job_id, None)
         print(f"[SCHEDULER] Skipping '{policy.name}' (MANUAL policy — admin-triggered only)")
+        return
+
+    # Skip the no-op reschedule: same effective cron AND the live timer still
+    # exists. add_job(replace_existing=True) below handles genuine changes
+    # atomically, so the explicit remove_job is no longer needed.
+    fingerprint = tuple(sorted(cron_params.items()))
+    if (
+        scheduler.get_job(job_id) is not None
+        and _POLICY_JOB_FINGERPRINTS.get(job_id) == fingerprint
+    ):
         return
 
     scheduler.add_job(
@@ -1669,6 +1693,7 @@ async def schedule_policy_job(policy: SlaPolicy):
         max_instances=1,
         **cron_params,
     )
+    _POLICY_JOB_FINGERPRINTS[job_id] = fingerprint
 
     days_info = f" days={policy.backup_days}" if policy.backup_days and len(policy.backup_days) < 7 else ""
     print(f"[SCHEDULER] Scheduled '{policy.name}' ({policy.frequency}{days_info}) -> job_id={job_id}")

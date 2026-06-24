@@ -592,42 +592,34 @@ async def azure_datasource_callback(
         from jose import jwt
         from jose.exceptions import JWTError
         
-        # Try to decode the access token to get user info
-        display_name = "Azure Tenant"
+        # Resolve the Azure AD tenant id (tid) and the subscription list.
+        # IMPORTANT: never name the data source after the signed-in user's
+        # JWT `name` claim — that stored the admin ("Amit Mishra") instead of
+        # the org ("QFION Software"). Naming is centralized in
+        # shared.azure_naming.derive_azure_datasource_name below.
         external_tenant_id = None
-        
+        arm_subscriptions = None
+
         try:
-            # Decode JWT without verification to extract claims
+            # Decode JWT without verification just to read the tenant id.
             decoded = jwt.decode(tokens.get("access_token", ""), key="", algorithms=["RS256", "HS256"], options={"verify_signature": False, "verify_aud": False})
-            display_name = decoded.get("name") or decoded.get("unique_name") or decoded.get("email") or "Azure Tenant"
             external_tenant_id = decoded.get("tid")  # Azure AD tenant ID
-            
-            if not external_tenant_id:
-                # Try calling Azure ARM to get subscription info
-                arm_response = await client.get(
-                    "https://management.azure.com/subscriptions?api-version=2022-12-01",
-                    headers={"Authorization": f"Bearer {tokens['access_token']}"},
-                )
-                if arm_response.status_code == 200:
-                    arm_data = arm_response.json()
-                    if arm_data.get("value"):
-                        # Use first subscription's tenant ID
-                        external_tenant_id = arm_data["value"][0].get("tenantId")
-                        display_name = f"Azure - {arm_data['value'][0].get('displayName', 'Subscription')}"
         except JWTError:
-            # If JWT decode fails, try ARM API
-            try:
-                arm_response = await client.get(
-                    "https://management.azure.com/subscriptions?api-version=2022-12-01",
-                    headers={"Authorization": f"Bearer {tokens['access_token']}"},
-                )
-                if arm_response.status_code == 200:
-                    arm_data = arm_response.json()
-                    if arm_data.get("value"):
-                        external_tenant_id = arm_data["value"][0].get("tenantId")
-                        display_name = f"Azure - {arm_data['value'][0].get('displayName', 'Subscription')}"
-            except Exception:
-                pass
+            pass
+
+        # Always query ARM for subscription identity (and the tenant id if the
+        # JWT lacked it). Org/subscription scoped — not user scoped.
+        try:
+            arm_response = await client.get(
+                "https://management.azure.com/subscriptions?api-version=2022-12-01",
+                headers={"Authorization": f"Bearer {tokens['access_token']}"},
+            )
+            if arm_response.status_code == 200:
+                arm_subscriptions = (arm_response.json() or {}).get("value") or None
+                if arm_subscriptions and not external_tenant_id:
+                    external_tenant_id = arm_subscriptions[0].get("tenantId")
+        except Exception:
+            pass
 
     # Check if tenant already exists for this org
     org_id = UUID(current_user["org_id"]) if current_user.get("org_id") else None
@@ -652,6 +644,26 @@ async def azure_datasource_callback(
 
     result = await db.execute(stmt)
     tenant = result.scalar_one_or_none()
+
+    # Name the data source after the org/subscription — prefer the org name
+    # from an existing M365 tenant for the same Azure AD tenant so Azure shows
+    # "QFION Software", never the admin who authorized the connection.
+    existing_org_name = None
+    if external_tenant_id:
+        _m365 = (await db.execute(
+            select(Tenant).where(
+                Tenant.external_tenant_id == external_tenant_id,
+                Tenant.type.cast(String) == "M365",
+            )
+        )).scalar_one_or_none()
+        if _m365 and _m365.display_name:
+            existing_org_name = _m365.display_name
+    from shared.azure_naming import derive_azure_datasource_name
+    display_name = derive_azure_datasource_name(
+        arm_subscriptions=arm_subscriptions,
+        external_tenant_id=external_tenant_id,
+        existing_org_name=existing_org_name,
+    )
 
     if tenant is None:
         # Ensure org exists

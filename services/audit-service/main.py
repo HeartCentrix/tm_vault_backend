@@ -1827,7 +1827,16 @@ async def get_batch_children(batch_id: str):
                    -- ran the settle path).
                    COALESCE(s.new_item_count, s.item_count)      AS item_count,
                    COALESCE(s.item_count, 0)                     AS item_count_total,
-                   s.bytes_added                                 AS bytes_added,
+                   -- bytesAdded must reconcile with the Activity row total,
+                   -- which SUMs snapshots.bytes_added across the whole batch.
+                   -- A resource can have >1 snapshot in a batch (retry, or a
+                   -- sparse no-op incremental whose latest row is 0 bytes);
+                   -- showing only the DISTINCT-ON latest row's bytes_added
+                   -- then made the row total ("~200 KB") un-attributable in
+                   -- the detail. Sum per resource so each contributor surfaces
+                   -- its bytes and the per-resource grid adds up to the row.
+                   SUM(s.bytes_added) OVER (PARTITION BY s.resource_id)
+                                                                 AS bytes_added,
                    s.bytes_total                                 AS bytes_total
               FROM snapshots s
               JOIN jobs j ON j.id = s.job_id
