@@ -190,6 +190,27 @@ def frequency_to_cron_params(
     return {"trigger": "cron", "hour": (base_hour + hour_carry) % 24, "minute": final_minute, **dow_clause}
 
 
+def resolve_finished_job_status(
+    n_snaps: int, n_open: int, n_completed: int, n_failed: int
+) -> Optional[str]:
+    """Decide the terminal status for a non-terminal (QUEUED/RUNNING) BACKUP
+    job whose work may already be done.
+
+    Returns None to leave the job alone — either it still has in-flight
+    snapshots (genuinely running) or it has none yet (the outbox reconciler's
+    job to republish). Otherwise returns the terminal status to flip it to.
+
+    This backs the orphan-job reaper that closes the "snapshots all terminal
+    but the job row never flipped" gap — single-resource triggers (which use
+    resource_id, not batch_resource_ids) and workers that died before the
+    job-level update — which left the Activity feed showing 'In Progress'
+    forever.
+    """
+    if n_snaps <= 0 or n_open > 0:
+        return None
+    return "COMPLETED" if n_completed > 0 else "FAILED"
+
+
 def _utc_naive(value: datetime) -> datetime:
     """Normalize datetimes for comparisons with the DB's UTC-naive columns."""
     if value.tzinfo is not None:
@@ -1464,6 +1485,59 @@ async def startup():
 
     scheduler.add_job(
         _reap_stuck_running_jobs, "interval", minutes=2,
+    )
+
+    # Orphan-job reaper — closes the gap _reap_stuck_running_jobs leaves: it
+    # only handles RUNNING jobs that carry batch_resource_ids. Single-resource
+    # jobs (resource_id, empty batch_resource_ids) and jobs stuck in QUEUED
+    # after their work finished (worker died before the job-level update, or a
+    # fanned-out child owns the snapshot) never flipped to terminal — so the
+    # Activity feed showed them "In Progress" forever. Flip any QUEUED/RUNNING
+    # BACKUP job, idle >5min, whose snapshots ALL reached a terminal status.
+    # Mirrors resolve_finished_job_status(); idempotent (WHERE filters non-
+    # terminal jobs) and n_open=0 guards against reaping a live run.
+    async def _reap_finished_nonterminal_jobs():
+        try:
+            async with async_session_factory() as session:
+                result = await session.execute(text("""
+                    WITH cand AS (
+                        SELECT j.id AS job_id,
+                               (SELECT count(*) FROM snapshots s WHERE s.job_id = j.id) AS n_snaps,
+                               (SELECT count(*) FROM snapshots s WHERE s.job_id = j.id
+                                  AND s.status NOT IN ('COMPLETED','FAILED','PARTIAL','CANCELLED')) AS n_open,
+                               (SELECT count(*) FROM snapshots s WHERE s.job_id = j.id
+                                  AND s.status = 'COMPLETED') AS n_completed
+                        FROM jobs j
+                        WHERE j.status IN ('QUEUED','RUNNING')
+                          AND j.type = 'BACKUP'
+                          AND j.updated_at < NOW() - INTERVAL '5 minutes'
+                    )
+                    UPDATE jobs j SET
+                        status = (CASE WHEN c.n_completed > 0 THEN 'COMPLETED' ELSE 'FAILED' END)::jobstatus,
+                        progress_pct = 100,
+                        completed_at = NOW(),
+                        updated_at = NOW(),
+                        result = COALESCE(j.result::jsonb, '{}'::jsonb)
+                                 || jsonb_build_object('reaped_by', 'finished_nonterminal_reaper')
+                    FROM cand c
+                    WHERE j.id = c.job_id
+                      AND c.n_snaps > 0
+                      AND c.n_open = 0
+                    RETURNING j.id
+                """))
+                rows = result.fetchall()
+                await session.commit()
+                if rows:
+                    print(
+                        f"[backup-scheduler] finished_nonterminal_reaper: "
+                        f"finalized {len(rows)} job(s) whose snapshots were all "
+                        f"terminal but the job row was stuck QUEUED/RUNNING"
+                    )
+        except Exception as exc:
+            print(f"[backup-scheduler] finished_nonterminal_reaper failed: {exc}")
+
+    scheduler.add_job(
+        _reap_finished_nonterminal_jobs, "interval", minutes=2,
     )
 
     # Task 26: Delete orphaned export ZIPs older than 1 day (3am UTC daily).

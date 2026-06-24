@@ -140,6 +140,30 @@ def test_schedule_policy_job_reregisters_when_frequency_changes(monkeypatch):
     )
 
 
+def test_resolve_finished_job_status_completed(monkeypatch):
+    """A non-terminal job whose snapshots are ALL terminal (none in-flight)
+    must be flipped — COMPLETED when any snapshot completed. This covers the
+    'job stuck QUEUED/RUNNING while its work is done' case (single-resource
+    triggers + workers that died before the job-level update) that made the
+    Activity feed show 'In Progress' forever."""
+    module = _load_scheduler(monkeypatch)
+    assert module.resolve_finished_job_status(n_snaps=5, n_open=0, n_completed=5, n_failed=0) == "COMPLETED"
+    assert module.resolve_finished_job_status(n_snaps=5, n_open=0, n_completed=4, n_failed=1) == "COMPLETED"
+
+
+def test_resolve_finished_job_status_failed_when_no_completions(monkeypatch):
+    module = _load_scheduler(monkeypatch)
+    assert module.resolve_finished_job_status(n_snaps=3, n_open=0, n_completed=0, n_failed=3) == "FAILED"
+
+
+def test_resolve_finished_job_status_leaves_inflight_and_empty(monkeypatch):
+    module = _load_scheduler(monkeypatch)
+    # Still has in-flight snapshots → leave it (genuinely running).
+    assert module.resolve_finished_job_status(n_snaps=5, n_open=2, n_completed=3, n_failed=0) is None
+    # No snapshots yet → not this reaper's job (outbox reconciler republishes).
+    assert module.resolve_finished_job_status(n_snaps=0, n_open=0, n_completed=0, n_failed=0) is None
+
+
 def test_scheduler_json_filters_use_json_extract_path_text():
     source = _SCHEDULER_MAIN.read_text()
 
