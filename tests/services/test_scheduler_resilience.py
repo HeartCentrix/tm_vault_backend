@@ -170,3 +170,33 @@ def test_scheduler_json_filters_use_json_extract_path_text():
     assert ".astext" not in source
     assert 'func.json_extract_path_text(Job.spec, "sla_policy_id")' in source
     assert 'func.json_extract_path_text(Job.spec, "triggered_by")' in source
+
+
+def test_select_resources_for_dispatch_covers_all_regardless_of_count(monkeypatch):
+    """Coverage MUST be complete every fire. The old max_concurrent_backups
+    budget did enabled_resources[:budget], silently DROPPING the rest — at
+    scale (e.g. 65k resources / 50-per-fire ≈ 430 days per full pass) that is
+    a silent SLA breach. select_resources_for_dispatch must return EVERY
+    enabled resource; simultaneity is bounded downstream (worker semaphores +
+    Graph pacing), never by capping how many resources get backed up."""
+    module = _load_scheduler(monkeypatch)
+    enabled = [SimpleNamespace(id=i) for i in range(500)]
+    out = module.select_resources_for_dispatch(enabled, set())
+    assert [r.id for r in out] == list(range(500))
+
+
+def test_select_resources_for_dispatch_skips_only_inflight(monkeypatch):
+    """The ONLY resources skipped are those already mid-backup (a QUEUED/
+    RUNNING job), so a slow / under-provisioned cycle never double-dispatches
+    the same resource (which would re-trigger the concurrent-drain snapshot
+    race). Everything else is still dispatched — full coverage preserved."""
+    module = _load_scheduler(monkeypatch)
+    enabled = [SimpleNamespace(id=i) for i in range(10)]
+    out = module.select_resources_for_dispatch(enabled, {2, 5, 7})
+    assert {r.id for r in out} == {0, 1, 3, 4, 6, 8, 9}
+
+
+def test_select_resources_for_dispatch_handles_none_inflight(monkeypatch):
+    module = _load_scheduler(monkeypatch)
+    enabled = [SimpleNamespace(id="a"), SimpleNamespace(id="b")]
+    assert len(module.select_resources_for_dispatch(enabled, None)) == 2

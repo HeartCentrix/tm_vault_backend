@@ -311,6 +311,11 @@ class SlaPolicy(Base):
     backup_azure_postgresql = Column(Boolean, default=True)
     resource_types = Column(ARRAY(String), default=[])
     batch_size = Column(Integer, default=20)
+    # NOTE: no longer a per-fire COVERAGE cap. The scheduler dispatches every
+    # due resource each fire (full coverage); simultaneity is bounded by the
+    # worker semaphores (WORKLOAD/BACKUP_CONCURRENCY) + Graph pacing. The
+    # dispatch path no longer reads this value — retained for backward-compat
+    # and a possible future true in-flight ceiling (continuous top-up).
     max_concurrent_backups = Column(Integer, default=50)
     sla_violation_alert = Column(Boolean, default=True)
     retention_type = Column(String, default="INDEFINITE")

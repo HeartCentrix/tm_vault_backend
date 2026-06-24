@@ -1862,6 +1862,28 @@ async def trigger_single_backup(resource_id: str, full_backup: bool = False):
         return {"status": "queued", "job_id": str(job_id)}
 
 
+def select_resources_for_dispatch(enabled_resources, inflight_resource_ids):
+    """Return every enabled resource that is NOT already being backed up.
+
+    Coverage is COMPLETE by design — the scheduler never caps how many
+    resources get backed up per fire. Capping coverage (the old
+    max_concurrent_backups budget) silently breaks the SLA at scale: e.g.
+    65k resources / 50-per-fire x 3 fires/day ~= 430 days for one full pass.
+    Simultaneity is bounded DOWNSTREAM where it belongs — per-queue prefetch
+    + the worker semaphores (WORKLOAD_CONCURRENCY / BACKUP_CONCURRENCY, which
+    process every resource N-at-a-time, never slicing the list) + Graph app
+    pacing / rotation / 429 backoff.
+
+    The only resources skipped are those that already have an in-flight
+    (QUEUED/RUNNING) backup, so a slow or under-provisioned cycle never
+    double-dispatches the same resource (which would also re-trigger the
+    concurrent-drain snapshot race). Those are covered on the next fire once
+    their current run finishes.
+    """
+    skip = set(inflight_resource_ids or ())
+    return [r for r in enabled_resources if r.id not in skip]
+
+
 async def dispatch_policy_backups(policy_id: str):
     """
     Dispatch backups for a specific SLA policy, filtering resources by the policy's backup flags.
@@ -1925,34 +1947,42 @@ async def dispatch_policy_backups(policy_id: str):
             print(f"[SCHEDULER] No enabled resources for policy '{policy.name}' after flag filtering")
             return
 
-        # R2.2 — honor max_concurrent_backups. Count Jobs already in flight for
-        # this policy (QUEUED + RUNNING) and cap how many new resources we
-        # publish this tick. The remainder will be picked up by the next
-        # scheduled trigger — we'd rather spread load across cycles than
-        # overload Graph and induce 429 throttling.
-        max_concurrent = getattr(policy, "max_concurrent_backups", None) or 0
-        if max_concurrent > 0:
-            inflight_stmt = (
-                select(func.count(Job.id)).where(and_(
-                    func.json_extract_path_text(Job.spec, "sla_policy_id") == str(policy.id),
-                    Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]),
-                ))
-            )
-            inflight = (await session.execute(inflight_stmt)).scalar() or 0
-            budget = max(0, max_concurrent - inflight)
-            if budget == 0:
-                print(f"[SCHEDULER] Policy '{policy.name}' at concurrency cap "
-                      f"({inflight}/{max_concurrent} in-flight) — deferring this tick")
-                return
-            if budget < len(enabled_resources):
-                print(f"[SCHEDULER] Policy '{policy.name}' concurrency cap "
-                      f"({inflight}/{max_concurrent} in-flight) — dispatching {budget} of {len(enabled_resources)} resources")
-                # Prefer the resources with the OLDEST last_backup — they're the
-                # most behind on SLA. None means never backed up → highest priority.
-                enabled_resources.sort(
-                    key=lambda r: (r.last_backup_at or datetime.min)
-                )
-                enabled_resources = enabled_resources[:budget]
+        # COVERAGE IS COMPLETE EVERY FIRE. We do NOT cap how many resources are
+        # backed up per cycle — capping coverage silently breaks the SLA at
+        # scale. The old max_concurrent_backups budget kept only
+        # enabled_resources[:budget] and dropped the rest ("next trigger"), but
+        # nothing re-dispatches between the 8h cron fires (check_sla_violations
+        # only alerts; catch_up only covers downtime), so 65k resources /
+        # 50-per-fire x 3/day ~= 430 days for one full pass. Simultaneity is
+        # bounded DOWNSTREAM where it belongs: per-queue prefetch + the worker
+        # semaphores (WORKLOAD/BACKUP_CONCURRENCY) + Graph app pacing/rotation.
+        # The ONLY resources we skip are those that already have an in-flight
+        # (QUEUED/RUNNING) backup, so a slow / under-provisioned cycle never
+        # double-dispatches the same resource (which also re-triggers the
+        # concurrent-drain snapshot race). They are covered on the next fire.
+        inflight_rows = (await session.execute(
+            select(Job.batch_resource_ids, Job.resource_id).where(and_(
+                Job.type == JobType.BACKUP,
+                Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]),
+                func.json_extract_path_text(Job.spec, "sla_policy_id") == str(policy.id),
+            ))
+        )).all()
+        inflight_resource_ids = set()
+        for _brids, _rid in inflight_rows:
+            if _rid:
+                inflight_resource_ids.add(_rid)
+            for _x in (_brids or []):
+                inflight_resource_ids.add(_x)
+        _before = len(enabled_resources)
+        enabled_resources = select_resources_for_dispatch(enabled_resources, inflight_resource_ids)
+        _skipped_inflight = _before - len(enabled_resources)
+        if _skipped_inflight:
+            print(f"[SCHEDULER] Policy '{policy.name}': {_skipped_inflight} resource(s) already have an "
+                  f"in-flight backup — covered once their current run finishes")
+        if not enabled_resources:
+            print(f"[SCHEDULER] Policy '{policy.name}': all {_before} enabled resource(s) already "
+                  f"in-flight — nothing to dispatch this tick")
+            return
 
         power_bi_resources = [resource for resource in enabled_resources if resource.type == ResourceType.POWER_BI]
         if power_bi_resources:
