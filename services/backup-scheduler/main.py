@@ -2054,8 +2054,22 @@ async def dispatch_policy_backups(policy_id: str):
         total_dispatched = 0
         BATCH_SIZE = 1000
 
+        # One Activity row per FIRE (not per type-job): stamp a shared batch_id
+        # on every job of this fire, keyed per tenant. The audit rollup groups
+        # jobs by COALESCE(spec->>'batch_id', id::text) — without a shared
+        # batch_id each of the ~6 type-jobs (mail/onedrive/chats/calendar/
+        # contacts/entra) falls back to its own id and renders as a SEPARATE
+        # row. A shared batch_id collapses them into one "N users" rollup whose
+        # status is derived from the child jobs (Done when all terminal).
+        # We deliberately do NOT create a backup_batches row: that would route
+        # the fire through the ENTRA_USER-centric finalizer, which can hang a
+        # scheduled incremental. With no row the rollup stays job-derived and
+        # _finalize_batch_if_complete no-ops on the missing row.
+        _fire_batch_ids: Dict[str, str] = {}
+
         for group_key, group_resources in groups.items():
             resource_type, tenant_id = group_key.split(":")
+            _batch_id = _fire_batch_ids.setdefault(tenant_id, str(uuid.uuid4()))
 
             # AZ-4: Route Azure workload resources to their dedicated queues
             azure_queue = None
@@ -2107,6 +2121,9 @@ async def dispatch_policy_backups(policy_id: str):
                         "triggered_by": "SCHEDULED",
                         "snapshot_label": "scheduled",
                         "fullBackup": effective_full_backup,
+                        # Shared per-fire/per-tenant id so the Activity rollup
+                        # renders ONE row for the whole fire (see _fire_batch_ids).
+                        "batch_id": _batch_id,
                     }
                 )
                 session.add(job)
