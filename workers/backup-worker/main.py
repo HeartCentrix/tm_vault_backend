@@ -901,6 +901,37 @@ async def _load_chat_thread_messages_for_pointer(
         ]
 
 
+def _chat_should_skip_message_query(saved_cursor, chat_lu):
+    """Durable contract: NEVER skip the per-chat /messages query based on
+    chat.lastUpdatedDateTime.
+
+    Microsoft Graph does NOT reliably bump a chat's lastUpdatedDateTime when a
+    new 1:1/group message is posted (verified live 2026-06-25: a chat with a
+    message at 2026-06-24T14:42Z reported lastUpdatedDateTime 2026-06-23T14:17Z
+    — a full day earlier). The old gate (`chat_lu <= saved_cursor` -> return
+    without calling /messages) therefore silently dropped every message sent
+    after lastUpdatedDateTime last moved. The cheap URL-embedded
+    lastModifiedDateTime filter (CHAT_INCREMENTAL_FILTER_ENABLED) turns an
+    unchanged chat into a single empty round-trip, so always issuing the query
+    is both correct and cheap. Returns False unconditionally — kept as a named
+    seam so a future Graph messages/delta deltaLink fast-path can hook here.
+    """
+    return False
+
+
+def _chat_next_cursor(message_max, chat_lu):
+    """Derive the per-chat drain cursor ONLY from real message timestamps.
+
+    The old code pinned the cursor to max(message_max, chat.lastUpdatedDateTime).
+    When lastUpdatedDateTime ran AHEAD of the newest real message (a reaction /
+    system-event bump), that inflated the cursor so the next
+    `lastModifiedDateTime gt cursor` filter skipped real messages. Returns the
+    message-derived max (or None to leave the prior cursor unchanged when no
+    messages were fetched this run) — never inflated to lastUpdatedDateTime.
+    """
+    return message_max
+
+
 async def _carry_forward_prior_chat_snapshot_items(
     *,
     tenant_id: str,
@@ -6825,7 +6856,7 @@ class BackupWorker:
                             and not str(saved_cursor).startswith("http")
                         ):
                             chat_lu = chat_last_updated_map.get(cid)
-                            if chat_lu and chat_lu <= saved_cursor:
+                            if _chat_should_skip_message_query(saved_cursor, chat_lu):
                                 # The chat had no activity since the cursor.
                                 # SPARSE path (default): write ZERO pointer rows
                                 # and let the sibling-snapshot union reconstruct
@@ -7186,11 +7217,15 @@ class BackupWorker:
                         # closes that loop: once we've drained for a
                         # given chat_lu, we won't drain it again until
                         # something actually moves chat_lu forward.
-                        chat_lu_local = chat_last_updated_map.get(cid)
-                        if chat_lu_local and (
-                            max_stamp is None or chat_lu_local > max_stamp
-                        ):
-                            max_stamp = chat_lu_local
+                        # Cursor is derived ONLY from real message timestamps —
+                        # never inflated to chat.lastUpdatedDateTime. Inflating
+                        # it (the old max(msg_max, chat_lu)) pinned the cursor
+                        # ahead of real messages and, together with the old
+                        # lastUpdatedDateTime skip, silently dropped new messages
+                        # (verified live 2026-06-25).
+                        max_stamp = _chat_next_cursor(
+                            max_stamp, chat_last_updated_map.get(cid)
+                        )
 
                         # Streaming persist — if a snapshot is in scope,
                         # persist this chat's items RIGHT NOW instead of

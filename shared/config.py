@@ -524,10 +524,14 @@ class Settings:
         # the params arg for absolute URLs — verified live that Graph DOES honor
         # lastModifiedDateTime on /chats/{id}/messages. We embed it in the URL
         # (survives the param-drop). DEFAULT OFF: changes incremental behavior +
-        # interacts with the cursor/$expand-retry logic, so it must pass a
-        # chat-incremental validation run (no missed messages) before enabling.
+        # interacts with the cursor/$expand-retry logic. Now DEFAULT-ON: it is
+        # required for correctness. The per-chat lastUpdatedDateTime skip was
+        # removed (Graph does not bump lastUpdatedDateTime on new messages —
+        # verified live 2026-06-25), so the URL-embedded lastModifiedDateTime
+        # filter is what keeps an unchanged chat to one cheap empty round-trip
+        # instead of a full re-pull. Set to "false" only to force full re-pulls.
         self.CHAT_INCREMENTAL_FILTER_ENABLED = os.getenv(
-            "CHAT_INCREMENTAL_FILTER_ENABLED", "false",
+            "CHAT_INCREMENTAL_FILTER_ENABLED", "true",
         ).lower() in ("true", "1", "yes")
         # User-level chat activity gate (2026-06-05). On an incremental, if
         # EVERY chat for a user is unchanged since we last drained it
