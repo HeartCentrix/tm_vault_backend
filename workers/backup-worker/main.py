@@ -902,21 +902,27 @@ async def _load_chat_thread_messages_for_pointer(
 
 
 def _chat_should_skip_message_query(saved_cursor, chat_lu):
-    """Durable contract: NEVER skip the per-chat /messages query based on
+    """Skip the per-chat /messages query ONLY when the chat has no new messages
+    since our cursor — judged by the chat's LAST MESSAGE time (`chat_lu`,
+    sourced from lastMessagePreview.createdDateTime in the chat list), NOT
     chat.lastUpdatedDateTime.
 
-    Microsoft Graph does NOT reliably bump a chat's lastUpdatedDateTime when a
-    new 1:1/group message is posted (verified live 2026-06-25: a chat with a
-    message at 2026-06-24T14:42Z reported lastUpdatedDateTime 2026-06-23T14:17Z
-    — a full day earlier). The old gate (`chat_lu <= saved_cursor` -> return
-    without calling /messages) therefore silently dropped every message sent
-    after lastUpdatedDateTime last moved. The cheap URL-embedded
-    lastModifiedDateTime filter (CHAT_INCREMENTAL_FILTER_ENABLED) turns an
-    unchanged chat into a single empty round-trip, so always issuing the query
-    is both correct and cheap. Returns False unconditionally — kept as a named
-    seam so a future Graph messages/delta deltaLink fast-path can hook here.
+    Graph does NOT bump lastUpdatedDateTime on new 1:1/group messages (verified
+    live 2026-06-25: a message at 06-24T14:42 in a chat whose lastUpdatedDateTime
+    read 06-23T14:17), so the old skip keyed on it silently dropped new messages.
+    lastMessagePreview.createdDateTime DOES track the latest message and rides
+    along free in the chat-list $expand — so skipping on it is BOTH correct
+    (never drops a new message) AND zero-cost (an unchanged chat costs no
+    per-chat call, preserving incremental backup duration). Only a string-
+    comparable ISO cursor is eligible; an http deltaLink cursor or a missing
+    last-message signal -> do NOT skip (drain to be safe).
     """
-    return False
+    return bool(
+        saved_cursor
+        and chat_lu
+        and not str(saved_cursor).startswith("http")
+        and chat_lu <= saved_cursor
+    )
 
 
 def _chat_next_cursor(message_max, chat_lu):
@@ -5329,7 +5335,7 @@ class BackupWorker:
                             f"{graph_client.GRAPH_URL}/users/{user_id}/chats"
                             "?$top=50"
                             "&$select=id,topic,chatType,lastUpdatedDateTime,tenantId"
-                            "&$expand=members"
+                            "&$expand=members,lastMessagePreview"
                         )
                         chats_raw = []
                         while _chat_list_url:
@@ -5351,6 +5357,7 @@ class BackupWorker:
                                 f"{graph_client.GRAPH_URL}/users/{user_id}/chats"
                                 "?$top=50"
                                 "&$select=id,topic,chatType,lastUpdatedDateTime,tenantId"
+                                "&$expand=lastMessagePreview"
                             )
                             chats_raw = []
                             while _chat_list_url:
@@ -5954,10 +5961,25 @@ class BackupWorker:
                             resource.id,
                         )
                     )
+                    # Activity signal = the chat's LAST MESSAGE time
+                    # (lastMessagePreview.createdDateTime), NOT
+                    # chat.lastUpdatedDateTime — Graph does NOT bump
+                    # lastUpdatedDateTime on new 1:1/group messages (verified
+                    # live 2026-06-25: preview=06-24 while lastUpdatedDateTime
+                    # read 06-23), which silently dropped new chats from every
+                    # incremental. lastMessagePreview rides along free in the
+                    # chat-list $expand, so the skip + claim gates that read this
+                    # map are now BOTH correct (never miss a new message) AND
+                    # zero-cost (unchanged chats are skipped with no per-chat
+                    # call). Fall back to lastUpdatedDateTime only when a chat
+                    # has no message preview (e.g. a brand-new empty chat).
                     chat_last_updated_map: Dict[str, str] = {}
                     for c in chats_raw:
                         _cid = c.get("id")
-                        _lu = c.get("lastUpdatedDateTime")
+                        _lu = (
+                            (c.get("lastMessagePreview") or {}).get("createdDateTime")
+                            or c.get("lastUpdatedDateTime")
+                        )
                         if _cid and _lu:
                             chat_last_updated_map[_cid] = _lu
 

@@ -46,22 +46,38 @@ except Exception as exc:  # pragma: no cover
     )
 
 
-def test_never_skips_message_query_on_lastupdated():
-    """The skip used to fire whenever chat_lu <= saved_cursor. Because Graph
-    freezes lastUpdatedDateTime, that dropped real new messages. The durable
-    contract: never skip the messages call on lastUpdatedDateTime — not when
-    it is older than the cursor, not when it is equal."""
-    # chat_lu newer than cursor (the rare case Graph DOES advance it) — run.
+def test_drains_when_chat_has_new_messages():
+    """chat_lu = the chat's LAST MESSAGE time (from lastMessagePreview). When it
+    is NEWER than our cursor there are unfetched messages -> MUST NOT skip. This
+    is the data-loss fix: a new message is never skipped (the old code keyed on
+    lastUpdatedDateTime, which Graph freezes, so it skipped real messages)."""
     assert _bw._chat_should_skip_message_query(
         "2026-06-23T00:00:00Z", "2026-06-25T00:00:00Z"
     ) is False
-    # chat_lu == cursor (the live-evidence case: frozen at 06-23) — STILL run.
-    assert _bw._chat_should_skip_message_query(
-        "2026-06-23T00:00:00Z", "2026-06-23T00:00:00Z"
-    ) is False
-    # chat_lu older than cursor (stale/frozen) — STILL run.
+
+
+def test_skips_when_no_new_messages():
+    """Last message at-or-before the cursor -> nothing new -> skip with NO
+    per-chat call (zero duration cost). Reliable because chat_lu is the real
+    last-message time, not the frozen lastUpdatedDateTime."""
     assert _bw._chat_should_skip_message_query(
         "2026-06-25T00:00:00Z", "2026-06-23T00:00:00Z"
+    ) is True
+    assert _bw._chat_should_skip_message_query(
+        "2026-06-23T00:00:00Z", "2026-06-23T00:00:00Z"
+    ) is True
+
+
+def test_no_skip_on_http_cursor_or_missing_signal():
+    """An http deltaLink cursor is not ISO-string-comparable, and a missing
+    last-message signal is ambiguous -> drain to be safe rather than risk a
+    drop."""
+    assert _bw._chat_should_skip_message_query(
+        "https://graph.microsoft.com/v1.0/x/delta?$deltatoken=abc",
+        "2026-06-23T00:00:00Z",
+    ) is False
+    assert _bw._chat_should_skip_message_query(
+        "2026-06-25T00:00:00Z", None
     ) is False
 
 
