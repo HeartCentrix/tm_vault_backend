@@ -96,3 +96,16 @@ def test_cursor_is_message_derived_not_lastupdated():
     ) == "2026-06-25T10:00:00Z"
     # no new messages this run → do not advance (None == "keep prior cursor").
     assert _bw._chat_next_cursor(None, "2026-06-23T00:00:00Z") is None
+
+
+def test_chat_messages_filter_url_has_no_orderby():
+    """Graph GET /chats/{id}/messages returns HTTP 400 on
+    $orderby=lastModifiedDateTime (verified live 2026-06-25), which failed the
+    ENTIRE per-chat drain and stranded the cursor -> new messages never
+    captured. The incremental URL must carry $filter ONLY (Graph honors it)."""
+    u = _bw._chat_messages_filter_url(
+        "https://graph.microsoft.com/v1.0/chats/19:abc@thread.v2/messages",
+        "2026-06-23T17:47:43.868Z",
+    )
+    assert "$orderby" not in u, "Graph 400s on $orderby for chat messages"
+    assert "$filter=" in u and "lastModifiedDateTime" in u

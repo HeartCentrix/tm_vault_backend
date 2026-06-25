@@ -938,6 +938,22 @@ def _chat_next_cursor(message_max, chat_lu):
     return message_max
 
 
+def _chat_messages_filter_url(base_url, cursor):
+    """Incremental URL for GET /chats/{id}/messages.
+
+    Embeds ONLY $filter (lastModifiedDateTime gt cursor) — NOT $orderby. Graph
+    rejects "$orderby=lastModifiedDateTime asc" on chat messages with HTTP 400
+    ("order by 'LastModifiedDateTime' in 'Ascending' direction is not
+    supported" — verified live 2026-06-25). That 400 failed the ENTIRE per-chat
+    drain, so the cursor never advanced and new messages were never captured.
+    $filter alone IS honored (verified: returns the new messages); message
+    order is irrelevant because the drain takes max(lastModifiedDateTime) for
+    the next cursor regardless of order.
+    """
+    from urllib.parse import quote as _q
+    return f"{base_url}?$filter={_q('lastModifiedDateTime gt ' + cursor, safe='')}"
+
+
 async def _carry_forward_prior_chat_snapshot_items(
     *,
     tenant_id: str,
@@ -6987,12 +7003,10 @@ class BackupWorker:
                             # params, so it must remain there. DEFAULT-OFF flag
                             # (CHAT_INCREMENTAL_FILTER_ENABLED) — needs a
                             # chat-incremental validation run before enabling.
-                            from urllib.parse import quote as _q_cf
-                            _cf = f"lastModifiedDateTime gt {saved_cursor}"
-                            url = (
-                                f"{url}?$filter={_q_cf(_cf, safe='')}"
-                                f"&$orderby={_q_cf('lastModifiedDateTime asc', safe='')}"
-                            )
+                            # $filter only — NO $orderby (Graph 400s on
+                            # $orderby for chat messages; see
+                            # _chat_messages_filter_url).
+                            url = _chat_messages_filter_url(url, saved_cursor)
                         elif saved_cursor:
                             # Legacy behavior (flag off): params $filter is
                             # dropped by the pager → re-pulls full history,
