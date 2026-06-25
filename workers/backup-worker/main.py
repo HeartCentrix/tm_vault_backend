@@ -1731,6 +1731,19 @@ def _message_to_contact_shape(msg: dict) -> dict:
     return shape
 
 
+def _contacts_delta_initial_params(select_fields):
+    """Initial (non-resume) query params for the /contacts/delta walk.
+
+    Microsoft Graph REJECTS $top on /contacts/delta change-tracking with HTTP
+    400 (ErrorInvalidUrlQuery) — verified live 2026-06-25 ($top -> 400,
+    $select -> OK, bare -> OK). The old code passed $top here, so EVERY
+    contacts delta 400'd and the except-handler swallowed it -> 0 contacts
+    captured silently (snapshot still COMPLETED). Omit $top; page size falls
+    back to the Graph default + @odata.nextLink paging (handled by the caller).
+    """
+    return {"$select": select_fields}
+
+
 async def _backup_contacts_for_user(
     graph_client, user_id: str, item_limit: int = 999,
     prior_deltas: Optional[Dict[str, str]] = None,
@@ -1821,7 +1834,7 @@ async def _backup_contacts_for_user(
             params = None
         else:
             next_url = initial_url
-            params = {"$top": str(item_limit), "$select": select_fields}
+            params = _contacts_delta_initial_params(select_fields)
         pages = 0
         while next_url and pages < 100:
             try:
