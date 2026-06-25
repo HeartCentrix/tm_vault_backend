@@ -602,33 +602,85 @@ async def get_snapshot_folders(
     else:
         # _sibling_uuids are uuid.UUID objects. Psycopg binds them fine
         # through the `snapshots` param when we use ANY(:snaps).
-        exclude_types = [] if item_type else ["EMAIL_ATTACHMENT", "CHAT_ATTACHMENT"]
-        sql = _text("""
-            WITH latest AS (
-              SELECT DISTINCT ON (external_id)
-                     external_id, COALESCE(folder_path, '') AS path
-              FROM snapshot_items
-              WHERE snapshot_id = ANY(:snaps)
-                {type_filter}
-              ORDER BY external_id, created_at DESC
-            )
-            SELECT path, COUNT(*) AS cnt
-            FROM latest
-            GROUP BY path
-            ORDER BY path
-        """.format(
-            type_filter=(
-                "AND item_type = :itype" if item_type
-                else "AND item_type <> ALL(:excluded)"
-            )
-        ))
-        params: Dict[str, Any] = {"snaps": _sibling_uuids}
-        if item_type:
-            params["itype"] = item_type
+        _CHAT_ITEM_TYPES = ("TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY")
+        if item_type in _CHAT_ITEM_TYPES:
+            # Chat folders ARE chats, and the per-chat count must match the
+            # message view (the durable union in list_snapshot_messages). A
+            # shared 1:1/group chat is ONE durable store + ONE cursor but lives
+            # in every member's chat list; whichever member's drain ran first
+            # captured the messages into THAT member's snapshot, so counting
+            # only this snapshot's pointers showed e.g. 2993 for one member vs
+            # 3010 for the other on the SAME chat (the data is complete in the
+            # shared store — only this per-snapshot COUNT was short). Count
+            # distinct message ids over the snapshot pointers (A) UNION the
+            # shared durable chat_thread_messages (B); attribute BOTH to the
+            # chat's representative folder_path (one row per chat via `scope`)
+            # and scope B to the chats this snapshot covers so nothing leaks.
+            sql = _text("""
+                WITH scope AS (
+                  SELECT si.tenant_id, si.parent_external_id AS chat_id,
+                         MAX(COALESCE(si.folder_path, '')) AS path
+                  FROM snapshot_items si
+                  WHERE si.snapshot_id = ANY(:snaps)
+                    AND si.item_type = :itype
+                    AND si.parent_external_id IS NOT NULL
+                  GROUP BY si.tenant_id, si.parent_external_id
+                ),
+                msg_ids AS (
+                  SELECT sc.path, si.external_id AS ext
+                  FROM snapshot_items si
+                  JOIN scope sc
+                    ON sc.tenant_id = si.tenant_id
+                   AND sc.chat_id = si.parent_external_id
+                  WHERE si.snapshot_id = ANY(:snaps)
+                    AND si.item_type = :itype
+                    AND si.parent_external_id IS NOT NULL
+                  UNION
+                  SELECT sc.path, ctm.message_external_id AS ext
+                  FROM chat_thread_messages ctm
+                  JOIN chat_threads ct
+                    ON ct.id = ctm.chat_thread_id AND ct.archived_at IS NULL
+                  JOIN scope sc
+                    ON sc.tenant_id = ct.tenant_id AND sc.chat_id = ct.chat_id
+                  WHERE ctm.archived_at IS NULL
+                )
+                SELECT path, COUNT(DISTINCT ext) AS cnt
+                FROM msg_ids
+                GROUP BY path
+                ORDER BY path
+            """)
+            rows = (await db.execute(
+                sql, {"snaps": _sibling_uuids, "itype": item_type},
+            )).all()
+            all_sorted = [{"path": r[0], "count": int(r[1])} for r in rows]
         else:
-            params["excluded"] = exclude_types
-        rows = (await db.execute(sql, params)).all()
-        all_sorted = [{"path": r[0], "count": int(r[1])} for r in rows]
+            exclude_types = [] if item_type else ["EMAIL_ATTACHMENT", "CHAT_ATTACHMENT"]
+            sql = _text("""
+                WITH latest AS (
+                  SELECT DISTINCT ON (external_id)
+                         external_id, COALESCE(folder_path, '') AS path
+                  FROM snapshot_items
+                  WHERE snapshot_id = ANY(:snaps)
+                    {type_filter}
+                  ORDER BY external_id, created_at DESC
+                )
+                SELECT path, COUNT(*) AS cnt
+                FROM latest
+                GROUP BY path
+                ORDER BY path
+            """.format(
+                type_filter=(
+                    "AND item_type = :itype" if item_type
+                    else "AND item_type <> ALL(:excluded)"
+                )
+            ))
+            params: Dict[str, Any] = {"snaps": _sibling_uuids}
+            if item_type:
+                params["itype"] = item_type
+            else:
+                params["excluded"] = exclude_types
+            rows = (await db.execute(sql, params)).all()
+            all_sorted = [{"path": r[0], "count": int(r[1])} for r in rows]
     total = len(all_sorted)
     off = (page - 1) * size
     return {
