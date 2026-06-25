@@ -675,34 +675,38 @@ async def get_backup_size(
     window_start = today - timedelta(days=29)
     window_start_ts = datetime.combine(window_start, datetime.min.time())
 
-    # Pull raw last_backup_at timestamps + bytes; bucket in Python by
-    # client_tz instead of Postgres date_trunc (which buckets in the
-    # DB session's tz, not the operator's).
+    # Per-day GROWTH = bytes ACTUALLY backed up that day (snapshots.bytes_added),
+    # bucketed by snapshot completed_at in the operator's tz. The old code
+    # bucketed each resource's FULL current storage_bytes on its last_backup_at
+    # day, so re-backing a large resource (any incremental) dragged its ENTIRE
+    # size onto the recent day — e.g. a 63 MB Jun-25 incremental showed as
+    # ~146 GB because every resource's last_backup_at had advanced to Jun 25.
+    # bytes_added is the true per-day delta and matches the Activity feed.
+    # Terminal-success snapshots only (bytes_added on FAILED/in-flight rows is
+    # noise); Tier-2 storage dupes excluded for parity with `total`.
     per_day_rows = (await db.execute(
-        select(Resource.last_backup_at, Resource.storage_bytes)
+        select(Snapshot.completed_at, Snapshot.bytes_added)
+        .join(Resource, Resource.id == Snapshot.resource_id)
         .where(
             exclude_tier2_storage_dupes_clause(),
-            Resource.last_backup_at.isnot(None),
-            Resource.last_backup_at >= window_start_ts,
+            Snapshot.completed_at.isnot(None),
+            Snapshot.completed_at >= window_start_ts,
+            Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL]),
             *filters,
         )
     )).all()
     per_day_map: dict = {}
-    for row in per_day_rows:
-        ts = row[0]
+    for ts, b in per_day_rows:
         if ts is None:
             continue
         day_key = _bucket_date(ts, client_tz)
-        per_day_map[day_key] = per_day_map.get(day_key, 0) + int(row[1] or 0)
+        per_day_map[day_key] = per_day_map.get(day_key, 0) + int(b or 0)
 
-    baseline = int((await db.execute(
-        select(func.sum(Resource.storage_bytes)).where(
-            exclude_tier2_storage_dupes_clause(),
-            Resource.last_backup_at.isnot(None),
-            Resource.last_backup_at < window_start_ts,
-            *filters,
-        )
-    )).scalar() or 0)
+    # Anchor the cumulative line to END at the current vault size (`total`),
+    # with in-window movement driven by the real per-day deltas. bytes_added is
+    # a delta-sum and won't perfectly reconcile with the dedup'd current size,
+    # so derive the baseline by subtraction rather than a second sum.
+    baseline = max(0, total - sum(per_day_map.values()))
 
     daily_data = []
     running_total = baseline
