@@ -1684,7 +1684,9 @@ async def list_snapshot_messages(
     # chat_thread_messages was deleted (e.g. mid-cascade).
     # P2: filter soft-archived singleton rows so reads never see a chat
     # that ops has scheduled for purge.
-    base_sql = (
+    # ── A: per-snapshot pointer rows (existing behavior; also the source for
+    #       export-path chats whose bodies live in si.metadata, ctm = NULL).
+    base_sql_a = (
         " FROM snapshot_items si "
         " LEFT JOIN chat_threads ct "
         "        ON ct.tenant_id = si.tenant_id "
@@ -1695,6 +1697,73 @@ async def list_snapshot_messages(
         "       AND ctm.message_external_id = si.external_id "
         "       AND ctm.archived_at IS NULL "
         f"WHERE {' AND '.join(where_parts)} "
+    )
+
+    # ── B: durable-store messages for the chats THIS snapshot covers that have
+    # NO pointer row here. Cross-member completeness fix: a shared 1:1/group
+    # chat has ONE durable store + ONE drain cursor but lives in EVERY member's
+    # chat list. Whichever member's drain runs first captures the messages into
+    # THAT member's snapshot (advancing the shared cursor), so other members'
+    # snapshots miss them even though the data is safely in chat_thread_messages
+    # (verified live: a member's snapshot had 0 pointers for a chat the store
+    # holds 3010 messages of). Scope is restricted to the chats this snapshot
+    # references (via si), so we never surface chats the user isn't a member of.
+    _chat_scope_sql = (
+        " SELECT DISTINCT ct2.id FROM snapshot_items si2 "
+        "   JOIN chat_threads ct2 ON ct2.tenant_id = si2.tenant_id "
+        "    AND ct2.chat_id = si2.parent_external_id AND ct2.archived_at IS NULL "
+        "  WHERE si2.snapshot_id = ANY(:sids) AND si2.item_type = ANY(:types) "
+    )
+    if chatId:
+        _chat_scope_sql += " AND si2.parent_external_id = :cid "
+    if folder is not None:
+        _chat_scope_sql += " AND si2.folder_path = :folder "
+    _b_where = [
+        "ct.id IN (" + _chat_scope_sql + ")",
+        "ctm.archived_at IS NULL",
+        "NOT EXISTS (SELECT 1 FROM snapshot_items si3 "
+        "  WHERE si3.snapshot_id = ANY(:sids) AND si3.item_type = ANY(:types) "
+        "    AND si3.parent_external_id = ct.chat_id "
+        "    AND si3.external_id = ctm.message_external_id) ",
+    ]
+    if search:
+        _b_where.append("ctm.body_content ILIKE :search")
+    base_sql_b = (
+        " FROM chat_thread_messages ctm "
+        " JOIN chat_threads ct ON ct.id = ctm.chat_thread_id AND ct.archived_at IS NULL "
+        f"WHERE {' AND '.join(_b_where)} "
+    )
+
+    # Unified projection so A and B align for UNION ALL. item_type cast to text
+    # so the enum (A) and the literal (B) match; si_created_at cast to plain
+    # timestamp so A's `timestamp` and B's `timestamptz` source align.
+    _cols_a = (
+        "    si.id, si.snapshot_id, si.external_id, si.parent_external_id, "
+        "    si.tenant_id AS si_tenant_id, si.item_type::text AS item_type, "
+        "    si.folder_path, si.content_size, si.is_deleted, "
+        "    si.created_at::timestamp AS si_created_at, si.metadata AS si_metadata, "
+        "    ct.chat_topic, ct.chat_type, ct.member_names_json, "
+        "    ctm.body_content, ctm.body_content_type, "
+        "    ctm.from_user_id, ctm.from_display_name, "
+        "    ctm.created_date_time, ctm.last_modified_date_time, "
+        "    ctm.deleted_date_time, ctm.metadata_raw "
+    )
+    _cols_b = (
+        "    NULL::uuid AS id, NULL::uuid AS snapshot_id, "
+        "    ctm.message_external_id AS external_id, ct.chat_id AS parent_external_id, "
+        "    ct.tenant_id AS si_tenant_id, 'TEAMS_CHAT_MESSAGE'::text AS item_type, "
+        "    NULL::varchar AS folder_path, ctm.content_size, "
+        "    (ctm.deleted_date_time IS NOT NULL) AS is_deleted, "
+        "    ctm.created_date_time::timestamp AS si_created_at, NULL::json AS si_metadata, "
+        "    ct.chat_topic, ct.chat_type, ct.member_names_json, "
+        "    ctm.body_content, ctm.body_content_type, "
+        "    ctm.from_user_id, ctm.from_display_name, "
+        "    ctm.created_date_time, ctm.last_modified_date_time, "
+        "    ctm.deleted_date_time, ctm.metadata_raw "
+    )
+    _union_sql = (
+        "(SELECT " + _cols_a + base_sql_a +
+        " UNION ALL SELECT " + _cols_b + base_sql_b + ") u "
     )
 
     # Newest-first by message send time. NULLs (pointer rows that lost
@@ -1709,7 +1778,7 @@ async def list_snapshot_messages(
     # row is single, so the body is consistent). Use DISTINCT ON to keep
     # one pointer per external_id (the newest-by-snapshot one).
     sql_count = (
-        "SELECT COUNT(DISTINCT si.external_id) AS n " + base_sql
+        "SELECT COUNT(DISTINCT external_id) AS n FROM " + _union_sql
     )
     total_row = (await db.execute(text(sql_count), params)).first()
     total = int(total_row.n or 0) if total_row else 0
@@ -1731,29 +1800,14 @@ async def list_snapshot_messages(
     # Fix: dedup in a subquery, then sort + paginate the deduped set by
     # message timestamp DESC. The in-process re-sort below is now redundant
     # but kept as a safety net for NULL timestamps.
+    # Dedup by external_id over the A∪B union, newest-by-message-time wins,
+    # then paginate by message date. (si.metadata still hydrates body/sender
+    # for export-path chats where ctm is NULL — those rows come from the A leg;
+    # B rows always carry ctm, so they need no si.metadata fallback.)
     sql_page = (
         "SELECT * FROM ("
-        "  SELECT DISTINCT ON (si.external_id) "
-        "    si.id, si.snapshot_id, si.external_id, si.parent_external_id, "
-        "    si.tenant_id AS si_tenant_id, "
-        "    si.item_type, si.folder_path, si.content_size, si.is_deleted, "
-        "    si.created_at AS si_created_at, "
-        # si.metadata holds the full Graph payload for chat messages
-        # written via the newer TEAMS_CHAT_EXPORT path
-        # (workers/backup-worker/main.py:14341-14376). When the LEFT
-        # JOIN to chat_thread_messages returns NULL — which it does
-        # for the entire snapshot when the chat-export-worker pipeline
-        # didn't populate that table — we hydrate body / sender /
-        # raw from si.metadata.raw instead.
-        "    si.metadata AS si_metadata, "
-        "    ct.chat_topic, ct.chat_type, ct.member_names_json, "
-        "    ctm.body_content, ctm.body_content_type, "
-        "    ctm.from_user_id, ctm.from_display_name, "
-        "    ctm.created_date_time, ctm.last_modified_date_time, "
-        "    ctm.deleted_date_time, ctm.metadata_raw "
-        + base_sql +
-        "  ORDER BY si.external_id, ctm.created_date_time DESC NULLS LAST, "
-        "           si.created_at DESC "
+        "  SELECT DISTINCT ON (external_id) * FROM " + _union_sql +
+        "  ORDER BY external_id, created_date_time DESC NULLS LAST, si_created_at DESC "
         ") sub "
         " ORDER BY sub.created_date_time DESC NULLS LAST, "
         "          sub.si_created_at DESC "
