@@ -2166,14 +2166,38 @@ async def list_snapshot_chat_groups(
     #      createdDateTime as the lastMessageAt label.
     rows = (await db.execute(
         text(
-            "WITH thread_msgs AS ( "
-            "  SELECT si.tenant_id, si.parent_external_id AS chat_id, "
-            "         COUNT(DISTINCT si.external_id) AS msg_count "
+            # Per-chat count must match the message VIEW (the A∪B union in
+            # list_snapshot_messages): a shared 1:1/group chat's count is the
+            # COMPLETE conversation for EVERY member, not just the messages this
+            # member's drain captured first under the shared cursor. Counting
+            # only this snapshot's pointers (the old COUNT(DISTINCT
+            # si.external_id)) made the panel-left show e.g. 2993 for one member
+            # vs 3010 for the other on the SAME chat. Count distinct message ids
+            # from the snapshot pointers (A) UNION the shared durable store (B),
+            # B scoped to the chats this snapshot covers so nothing leaks.
+            "WITH scope AS ( "
+            "  SELECT DISTINCT si.tenant_id, si.parent_external_id AS chat_id "
             "    FROM snapshot_items si "
             "   WHERE si.snapshot_id = ANY(:sids) "
             "     AND si.item_type IN ('TEAMS_CHAT_MESSAGE','TEAMS_MESSAGE','TEAMS_MESSAGE_REPLY') "
             "     AND si.parent_external_id IS NOT NULL "
-            "   GROUP BY si.tenant_id, si.parent_external_id "
+            "), "
+            "msg_ids AS ( "
+            "  SELECT si.tenant_id, si.parent_external_id AS chat_id, si.external_id AS ext "
+            "    FROM snapshot_items si "
+            "   WHERE si.snapshot_id = ANY(:sids) "
+            "     AND si.item_type IN ('TEAMS_CHAT_MESSAGE','TEAMS_MESSAGE','TEAMS_MESSAGE_REPLY') "
+            "     AND si.parent_external_id IS NOT NULL "
+            "  UNION "
+            "  SELECT ct.tenant_id, ct.chat_id, ctm.message_external_id AS ext "
+            "    FROM chat_thread_messages ctm "
+            "    JOIN chat_threads ct ON ct.id = ctm.chat_thread_id AND ct.archived_at IS NULL "
+            "    JOIN scope sc ON sc.tenant_id = ct.tenant_id AND sc.chat_id = ct.chat_id "
+            "   WHERE ctm.archived_at IS NULL "
+            "), "
+            "thread_msgs AS ( "
+            "  SELECT tenant_id, chat_id, COUNT(DISTINCT ext) AS msg_count "
+            "    FROM msg_ids GROUP BY tenant_id, chat_id "
             ") "
             "SELECT tm.chat_id, tm.msg_count, ct.chat_topic, ct.chat_type, "
             "       ct.member_names_json, "
