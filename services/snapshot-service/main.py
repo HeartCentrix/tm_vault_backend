@@ -3134,6 +3134,24 @@ async def get_item_content(
     return {"source": "none", "content": {}}
 
 
+def _safe_uuid(value):
+    """Parse a path/query param into a UUID, or return None if it isn't one.
+
+    The frontend sometimes serializes a null id into the URL as the literal
+    string 'None'/'null'/'undefined' — e.g. a chat message reconstructed from
+    the shared durable store (the f0481cb union) carries no snapshot_item id,
+    so its attachment fetch hits .../snapshots/None/items/None/attachments.
+    UUID('None') raises ValueError, which surfaced as an HTTP 500. Callers use
+    the None return to degrade gracefully (empty result / 404).
+    """
+    if not value or value in ("None", "null", "undefined"):
+        return None
+    try:
+        return UUID(value)
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/items/{item_id}/attachments")
 async def get_item_attachments(
     snapshot_id: str,
@@ -3153,14 +3171,22 @@ async def get_item_attachments(
     `resolved` is true when the bytes are actually in blob storage (so the
     chip links to the content endpoint); false for referenceAttachments
     whose sharing URL couldn't be resolved (metadata-only row)."""
-    parent = await db.get(SnapshotItem, UUID(item_id))
+    # Frontend can serialize a null id into the path as the literal string
+    # "None" (e.g. a chat message reconstructed from the durable store has no
+    # snapshot_item id). UUID("None") used to ValueError -> HTTP 500; degrade
+    # to "no attachments" so the message view never errors on such a row.
+    _sid = _safe_uuid(snapshot_id)
+    _iid = _safe_uuid(item_id)
+    if _sid is None or _iid is None:
+        return []
+    parent = await db.get(SnapshotItem, _iid)
     if not parent:
         raise HTTPException(status_code=404, detail="Item not found")
     # Defense in depth — the URL gives us both snapshot_id and item_id.
     # The auth layer enforces tenant ownership of the snapshot. Here we
     # also require the item belong to that snapshot so callers can't
     # enumerate other snapshots' items by guessing a stray item_id.
-    if parent.snapshot_id != UUID(snapshot_id):
+    if parent.snapshot_id != _sid:
         raise HTTPException(status_code=404, detail="Item not found")
 
     # Email and chat message external_id IS the Graph id — both attachment
@@ -3188,7 +3214,7 @@ async def get_item_attachments(
         or_(
             and_(
                 SnapshotItem.item_type == "EMAIL_ATTACHMENT",
-                SnapshotItem.snapshot_id == UUID(snapshot_id),
+                SnapshotItem.snapshot_id == _sid,
             ),
             and_(
                 SnapshotItem.item_type == "CHAT_ATTACHMENT",
