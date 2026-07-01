@@ -1545,13 +1545,20 @@ async def startup():
     # terminal jobs) and n_open=0 guards against reaping a live run.
     async def _reap_finished_nonterminal_jobs():
         try:
-            async with async_session_factory() as session:
-                result = await session.execute(text("""
+            from shared.models import SnapshotStatus as _SnapStatus
+            # Derive the terminal-status list from the enum, cast the column to
+            # text, and inject via placeholder (never an f-string — the SQL has
+            # literal '{}'::jsonb braces). Hand-typing this list is exactly what
+            # broke the reaper: a stray 'CANCELLED' literal (not an enum member)
+            # made Postgres reject the whole statement (InvalidTextRepresentation)
+            # so NO job was ever reaped. status::text avoids enum coercion.
+            terminal_sql = ", ".join("'%s'" % s.value for s in _SnapStatus.terminal())
+            reaper_sql = """
                     WITH cand AS (
                         SELECT j.id AS job_id,
                                (SELECT count(*) FROM snapshots s WHERE s.job_id = j.id) AS n_snaps,
                                (SELECT count(*) FROM snapshots s WHERE s.job_id = j.id
-                                  AND s.status NOT IN ('COMPLETED','FAILED','PARTIAL','CANCELLED')) AS n_open,
+                                  AND s.status::text NOT IN (__TERMINAL__)) AS n_open,
                                (SELECT count(*) FROM snapshots s WHERE s.job_id = j.id
                                   AND s.status = 'COMPLETED') AS n_completed
                         FROM jobs j
@@ -1571,7 +1578,9 @@ async def startup():
                       AND c.n_snaps > 0
                       AND c.n_open = 0
                     RETURNING j.id
-                """))
+            """.replace("__TERMINAL__", terminal_sql)
+            async with async_session_factory() as session:
+                result = await session.execute(text(reaper_sql))
                 rows = result.fetchall()
                 await session.commit()
                 if rows:

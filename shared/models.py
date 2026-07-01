@@ -165,6 +165,21 @@ class SnapshotStatus(str, enum.Enum):
     PARTIAL = "PARTIAL"
     PENDING_DELETION = "PENDING_DELETION"
 
+    @classmethod
+    def terminal(cls) -> tuple["SnapshotStatus", ...]:
+        """Statuses that mean a snapshot is no longer an in-flight backup.
+
+        A job whose snapshots are ALL terminal has finished and may be
+        finalized by the scheduler reaper. IN_PROGRESS is the only
+        non-terminal state. PENDING_DELETION is terminal — a snapshot marked
+        for deletion is not an active backup and must not keep its owning job
+        stuck "in progress". NOTE: there is deliberately no CANCELLED member —
+        cancellation flips a snapshot to FAILED — so callers must derive their
+        status lists from this method rather than hand-typing SQL literals
+        (a stray 'CANCELLED' literal crashed the reaper via enum coercion).
+        """
+        return (cls.COMPLETED, cls.FAILED, cls.PARTIAL, cls.PENDING_DELETION)
+
 
 class Organization(Base):
     __tablename__ = "organizations"
