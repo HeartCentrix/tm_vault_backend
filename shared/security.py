@@ -1,7 +1,9 @@
 """Shared security utilities."""
+import asyncio
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 try:
     from fastapi import Depends, HTTPException, Request, status
@@ -228,6 +230,80 @@ async def is_refresh_token_revoked(jti: str) -> bool:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Token validation service unavailable",
         )
+
+
+# ── Refresh-token rotation grace ──────────────────────────────────────────
+# Rotation is strict single-use (revoke_refresh_token burns the old jti). To
+# tolerate CONCURRENT legitimate use of the same refresh token — two browser
+# tabs each firing a proactive refresh, or a client retry after a lost response
+# — the winner of the rotation caches the freshly-minted (access, refresh) pair
+# keyed by the old jti for a short grace window. The loser of the race (or the
+# retry) retrieves that same pair instead of being handed a 401 and logged out.
+# After the window the cache is gone, so a genuinely replayed token still fails.
+_ROTATION_KEY_PREFIX = "refresh_rotation:"
+
+
+async def remember_rotated_tokens(
+    old_jti: str, access_token: str, refresh_token: str, grace_ttl_s: int
+) -> None:
+    """Cache the token pair minted while rotating ``old_jti`` for ``grace_ttl_s``
+    seconds so a concurrent/retried refresh presenting the same token gets the
+    SAME pair back (idempotent rotation). Best-effort: on Redis unavailability we
+    simply don't cache — the loser then falls back to the pre-existing 401, i.e.
+    no worse than before."""
+    if not old_jti or not access_token or not refresh_token:
+        return
+    client = await _get_revocation_redis()
+    if client is None:
+        return
+    try:
+        await client.set(
+            f"{_ROTATION_KEY_PREFIX}{old_jti}",
+            json.dumps({"a": access_token, "r": refresh_token}),
+            ex=max(1, int(grace_ttl_s)),
+        )
+    except Exception:
+        # Never let a caching hiccup break the (already-successful) rotation.
+        return
+
+
+async def get_rotated_tokens(old_jti: str) -> Optional[Tuple[str, str]]:
+    """Return the (access, refresh) pair cached for ``old_jti`` within the grace
+    window, or None. Fail-open to None so a lookup error degrades to the normal
+    401 path rather than 503-ing a legitimate refresh."""
+    if not old_jti:
+        return None
+    client = await _get_revocation_redis()
+    if client is None:
+        return None
+    try:
+        raw = await client.get(f"{_ROTATION_KEY_PREFIX}{old_jti}")
+        if not raw:
+            return None
+        d = json.loads(raw)
+        a, r = d.get("a"), d.get("r")
+        if a and r:
+            return a, r
+        return None
+    except Exception:
+        return None
+
+
+async def resolve_concurrent_refresh(
+    old_jti: str, poll_attempts: int = 3, poll_interval_s: float = 0.15
+) -> Optional[Tuple[str, str]]:
+    """When a refresh LOSES the rotation race, return the winner's grace-cached
+    token pair (idempotent) or None (genuine replay → caller must 401).
+
+    Polls a few times to close the tiny window between the winner claiming the
+    jti and the winner writing its cache entry (they are separate Redis ops)."""
+    for attempt in range(max(1, poll_attempts)):
+        pair = await get_rotated_tokens(old_jti)
+        if pair:
+            return pair
+        if attempt < poll_attempts - 1:
+            await asyncio.sleep(poll_interval_s)
+    return None
 
 
 def _unauthorized(detail: str):

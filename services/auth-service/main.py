@@ -20,6 +20,8 @@ from shared.security import (
     decode_token,
     get_current_user_from_token,
     is_refresh_token_revoked,
+    remember_rotated_tokens,
+    resolve_concurrent_refresh,
     revoke_refresh_token,
 )
 from shared.schemas import (
@@ -1232,11 +1234,38 @@ async def refresh_token(
             remaining = settings.JWT_REFRESH_EXPIRATION_DAYS * 86400
         claimed = await revoke_refresh_token(old_jti, remaining)
         if not claimed:
+            # We lost the rotation race (another /refresh already burned this
+            # jti) OR this is a retry after a lost response. Both are legitimate
+            # concurrent uses of the same token — not an attack. If the winner
+            # cached its freshly-minted pair within the grace window, hand the
+            # SAME pair back (idempotent rotation) instead of forcing a logout.
+            # Only a reuse AFTER the window (nothing cached) is treated as a
+            # replay and rejected.
+            grace_pair = await resolve_concurrent_refresh(old_jti)
+            if grace_pair:
+                access_token, new_refresh_token = grace_pair
+                expires_in = settings.JWT_EXPIRATION_HOURS * 3600
+                _set_auth_cookies(response, access_token, new_refresh_token)
+                return RefreshTokenResponse(
+                    accessToken=access_token,
+                    refreshToken=new_refresh_token,
+                    expiresIn=expires_in,
+                )
             raise HTTPException(status_code=401, detail="Refresh token already used")
 
     access_token = create_access_token(token_data)
     new_refresh_token = create_refresh_token(token_data)
     expires_in = settings.JWT_EXPIRATION_HOURS * 3600
+
+    # Cache the new pair under the OLD jti for the grace window so a concurrent
+    # refresh / retry that presents the same token converges on this exact pair
+    # (see resolve_concurrent_refresh). Best-effort; a cache miss just degrades
+    # to the prior 401-on-race behaviour.
+    if old_jti:
+        await remember_rotated_tokens(
+            old_jti, access_token, new_refresh_token,
+            settings.JWT_REFRESH_ROTATION_GRACE_S,
+        )
 
     _set_auth_cookies(response, access_token, new_refresh_token)
 

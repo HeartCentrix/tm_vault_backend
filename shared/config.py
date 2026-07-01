@@ -66,6 +66,12 @@ class Settings:
         # rotation + revocation, not by clock.
         self.JWT_EXPIRATION_HOURS = int(os.getenv("JWT_EXPIRATION_HOURS", "1"))
         self.JWT_REFRESH_EXPIRATION_DAYS = int(os.getenv("JWT_REFRESH_EXPIRATION_DAYS", "7"))
+        # Rotation grace: after a refresh rotates the token, the freshly-minted
+        # pair is cached under the OLD jti for this many seconds so a concurrent
+        # refresh (multi-tab) or a client retry after a lost response gets the
+        # SAME pair back instead of a 401 logout. Kept short so a genuinely
+        # replayed token still fails once the window elapses.
+        self.JWT_REFRESH_ROTATION_GRACE_S = int(os.getenv("JWT_REFRESH_ROTATION_GRACE_S", "60"))
         # Distinct per-class secrets prevent access<->refresh token swaps. Fall
         # back to JWT_SECRET so existing single-secret deployments keep booting;
         # the type-claim check in decode_token is the primary defense.
