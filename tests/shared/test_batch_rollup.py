@@ -84,6 +84,26 @@ def test_all_failed_means_failed():
     assert derive_batch_status(r) == ("Failed", None)
 
 
+def test_retention_pruned_batch_is_expired_not_failed():
+    # Root cause of "2 of 3 daily backups Failed": all jobs COMPLETED (no
+    # failure), but GFS retention later DELETED every snapshot of this fire, so
+    # snap_total==0. The backup succeeded and its restore point aged out under
+    # policy — that is Expired, NOT Failed. Mislabeling a policy-pruned backup
+    # as a failure is what alarmed the operator (every non-newest daily GFS
+    # fire showed "Failed").
+    r = _r(all_jobs_terminal=True, any_job_failed=False,
+           snap_total=0, snap_done=0, snap_partial=0, snap_failed=0)
+    assert derive_batch_status(r) == ("Expired", None)
+
+
+def test_job_failed_with_no_snapshots_is_failed_not_expired():
+    # A job that errored before writing any snapshot is a REAL failure, not an
+    # expiry — any_job_failed guards the Expired branch.
+    r = _r(all_jobs_terminal=True, any_job_failed=True,
+           snap_total=0, snap_done=0, snap_partial=0)
+    assert derive_batch_status(r) == ("Failed", None)
+
+
 def test_clean_done():
     r = _r(snap_done=10, snap_total=10)
     assert derive_batch_status(r) == ("Done", None)

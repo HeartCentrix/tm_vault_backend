@@ -83,7 +83,11 @@ def derive_batch_status(
     Returns ``(status_label, warnings_dict_or_None)``. Status labels
     match the existing frontend enum:
 
-        "In Progress" | "Done" | "Failed" | "Canceled"
+        "In Progress" | "Done" | "Failed" | "Canceled" | "Expired"
+
+    "Expired" = the backup completed but every snapshot has since been
+    pruned by the SLA retention policy — a succeeded backup whose restore
+    point aged out, NOT a failure.
 
     ``warnings`` is non-None only when status == "Done" and at least
     one child snapshot landed in PARTIAL or FAILED. Shape:
@@ -130,8 +134,20 @@ def derive_batch_status(
     if r.any_cancelled and not has_successes:
         return ("Canceled", None)
 
-    # 3. No successes at all → Failed.
+    # 3. No successes at all. Distinguish a genuine failure from a batch whose
+    #    snapshots were later pruned by the SLA retention policy:
+    #      * no snapshot rows remain (snap_total == 0) AND no job failed →
+    #        the backup COMPLETED and its restore point has since aged out
+    #        under retention. That is "Expired", NOT "Failed". Mislabeling a
+    #        policy-pruned backup as a failure is what surfaced as "2 of 3
+    #        daily backups Failed": GFS keeps only the newest snapshot per
+    #        day, so every earlier same-day fire had all its snapshots deleted
+    #        and the Activity feed screamed Failed on a backup that succeeded.
+    #      * anything else (a job actually FAILED, or snapshots still exist but
+    #        every one of them failed) → a real Failed.
     if not has_successes:
+        if r.snap_total == 0 and not r.any_job_failed:
+            return ("Expired", None)
         return ("Failed", None)
 
     # 4. Mixed outcome → Done with warnings chip. Cancellation that
@@ -571,7 +587,10 @@ def shape_batch_row(row: Any) -> Dict[str, Any]:
     # LAST thing that finished. For a Failed batch with no work
     # produced, falls back to jobs_max_completed_at.
     finish_iso = ""
-    if status in ("Done", "Failed", "Canceled"):
+    if status in ("Done", "Failed", "Canceled", "Expired"):
+        # "Expired" is terminal too (backup completed, snapshots later pruned by
+        # retention). Its snapshot timestamps are gone, so this falls back to
+        # jobs_max_completed_at — the fire's actual completion time.
         candidates = [
             row.parts_max_completed_at,
             row.snaps_max_completed_at,
