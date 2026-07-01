@@ -29,9 +29,24 @@ from sqlalchemy import select, delete, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.models import SlaPolicy, Snapshot, Resource, ResourceStatus, SnapshotItem, Tenant
+from shared.config import settings
 
 
 logger = logging.getLogger(__name__)
+
+
+def _retention_deletes_permitted(delete_enabled: bool, snap_ids) -> bool:
+    """Retention kill-switch gate.
+
+    Destructive deletes are permitted ONLY when the global
+    RETENTION_DELETE_ENABLED flag is on AND there is something to delete. When
+    the flag is off (the safe default), retention runs as a DRY-RUN: it still
+    computes what it WOULD delete (for audit/observability) but performs no
+    destructive delete. Durable safety default so a mis-tuned selector or an
+    un-migrated (sparse) resource can never silently destroy a base full again
+    — the bug that deleted a 136 GB base full and orphaned its blobs.
+    """
+    return bool(delete_enabled and snap_ids)
 
 
 def _is_archived(resource: Resource) -> bool:
@@ -376,7 +391,18 @@ async def enforce_retention_for_tenant(session: AsyncSession, tenant_id: uuid.UU
                 keep = _flat_keep_ids(snaps, policy)
 
         to_delete = {s.id for s in snaps} - keep
-        deleted = await _delete_snapshots(session, to_delete)
+        if _retention_deletes_permitted(settings.RETENTION_DELETE_ENABLED, to_delete):
+            deleted = await _delete_snapshots(session, to_delete)
+        else:
+            if to_delete:
+                logger.warning(
+                    "[retention] DRY-RUN (RETENTION_DELETE_ENABLED off): would "
+                    "delete %d snapshot(s) for resource %s — skipping (data-loss "
+                    "safety freeze until durable model is validated)",
+                    len(to_delete), res.id,
+                )
+                stats["would_delete"] = stats.get("would_delete", 0) + len(to_delete)
+            deleted = 0
         stats["deleted_snapshots"] += deleted
         stats["kept_snapshots"] += len(keep)
 

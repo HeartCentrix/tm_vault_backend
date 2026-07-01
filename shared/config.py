@@ -426,6 +426,17 @@ class Settings:
         self.EXPORT_ONEDRIVE_PATH_MAX_LEN = int(os.getenv("EXPORT_ONEDRIVE_PATH_MAX_LEN", "260"))
         self.EXPORT_ONEDRIVE_SANITIZE_CHARS = os.getenv("EXPORT_ONEDRIVE_SANITIZE_CHARS", '<>:"/\\|?*')
 
+        # ── Retention safety kill-switch ──
+        # Global freeze on destructive retention deletes. Default OFF (safe):
+        # retention runs as a DRY-RUN — it computes + audits what it WOULD
+        # delete but deletes nothing — until the durable synthetic-full
+        # inventory + ref-counted blob GC model is validated. This prevents the
+        # base-full-deletion data-loss bug (a GFS pass deleted a 136 GB base
+        # full, orphaning the blobs) from recurring while the model migrates.
+        # Set RETENTION_DELETE_ENABLED=true only after the durable model + a
+        # ref-counted GC are in place and verified.
+        self.RETENTION_DELETE_ENABLED = os.getenv("RETENTION_DELETE_ENABLED", "false").lower() in ("true", "1", "yes")
+
         # ── OneDrive backup uncap ──
         # Default on: removes the legacy per-drive cap + uses resumable
         # streaming so multi-TB drives survive transient failures.
