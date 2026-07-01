@@ -1031,6 +1031,7 @@ async def startup():
     #      handler (see workers/backup-worker/main.py).
     async def _sweep_cancelled_snapshots() -> None:
         from shared.storage.router import router as _storage_router
+        from shared.blob_gc import blobs_safe_to_delete, container_candidates
 
         try:
             async with async_session_factory() as session:
@@ -1079,9 +1080,14 @@ async def startup():
             blobs_deleted = 0
             for row in candidates:
                 sid = row.sid
-                resource_type = (row.resource_type or "generic").lower().replace("_", "-")
-                tenant_short = (row.tenant_id or "").replace("-", "")[:8]
-                container = f"backup-{resource_type}-{tenant_short}"
+                # Target the SAME container the bytes were written to. Blobs are
+                # written under the workload suffix (ONEDRIVE -> "files" ->
+                # backup-files-<t>), NOT the raw resource_type — deriving the
+                # container from resource_type ("backup-onedrive-<t>") targets an
+                # empty bucket and silently orphans the blob. Primary candidate
+                # is the correct workload container; legacy split-container rows
+                # fall through to the remaining candidates.
+                containers = container_candidates(row.resource_type, row.tenant_id)
 
                 # Step 1 — delete blobs. Done in its own short
                 # transaction-per-snapshot so any one snapshot stuck on
@@ -1098,17 +1104,58 @@ async def startup():
                             ),
                             {"sid": sid},
                         )).all()
-                    for blob_path, backend_id in items:
-                        try:
-                            store = _storage_router.get_store_by_id(str(backend_id))
-                            await store.delete(container, blob_path)
+
+                    # Ref-counted GC: a blob_path may be shared (content-addressed
+                    # / carried-forward) with a SURVIVING snapshot. Physically
+                    # deleting a shared blob would corrupt that live snapshot, so
+                    # only delete blob_paths no other snapshot still references.
+                    doomed_paths = [bp for bp, _ in items]
+                    backend_by_path = {bp: bid for bp, bid in items}
+                    safe_paths: set = set()
+                    if doomed_paths:
+                        async with async_session_factory() as ds:
+                            ref_rows = (await ds.execute(
+                                text(
+                                    "SELECT DISTINCT blob_path "
+                                    "  FROM snapshot_items "
+                                    " WHERE blob_path = ANY(CAST(:paths AS TEXT[])) "
+                                    "   AND snapshot_id != CAST(:sid AS UUID)"
+                                ),
+                                {"paths": doomed_paths, "sid": str(sid)},
+                            )).all()
+                        still_referenced = {r[0] for r in ref_rows}
+                        safe_paths = blobs_safe_to_delete(doomed_paths, still_referenced)
+                        shared_kept = len(set(doomed_paths)) - len(safe_paths)
+                        if shared_kept > 0:
+                            print(
+                                f"[backup-scheduler] cancelled_sweep "
+                                f"ref-count protected {shared_kept} shared blob(s) "
+                                f"sid={sid}"
+                            )
+
+                    for blob_path in safe_paths:
+                        backend_id = backend_by_path.get(blob_path)
+                        deleted_ok = False
+                        last_err = None
+                        # Delete is idempotent (S3/SeaweedFS 404 == success), so
+                        # attempting each candidate container is safe: the wrong
+                        # ones no-op, the right one frees the blob.
+                        for container in containers:
+                            try:
+                                store = _storage_router.get_store_by_id(str(backend_id))
+                                await store.delete(container, blob_path)
+                                deleted_ok = True
+                                break
+                            except Exception as bx:
+                                last_err = bx
+                        if deleted_ok:
                             blobs_deleted += 1
-                        except Exception as bx:
+                        else:
                             blob_errors += 1
                             print(
                                 f"[backup-scheduler] cancelled_sweep "
                                 f"blob delete failed sid={sid} "
-                                f"path={blob_path}: {bx}"
+                                f"path={blob_path}: {last_err}"
                             )
 
                     # Step 2 — DB cleanup (items first, then snapshot).
