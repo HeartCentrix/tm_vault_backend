@@ -284,6 +284,33 @@ async def _bulk_upsert_snapshot_items(
 # snapshot_items.extra_data['raw'] so restore paths don't change.
 # Future Phase 2 will JOIN here and stop the inline write.
 
+def _is_bare_mail_delta(m: Any) -> bool:
+    """True when a /messages/delta entry is a bare change-notification carrying
+    only identity fields (id + @odata.etag/@odata.type) and NO message content.
+
+    Microsoft Graph returns this shape for a message that merely CHANGED
+    (flagged / read / moved) and — stickily — for EVERY changed message once the
+    saved deltaLink was produced by a ``$select=id`` walk (see
+    ``_finalize_deltalink_idonly``, which captures the folder deltaLink cheaply
+    after the sub-shard body backfill). Persisting such an entry verbatim yields
+    a "(no subject)" snapshot item with no body and no mail_message_bodies row —
+    the exact defect seen on incremental Inbox backups. The caller must re-fetch
+    the full message by id (GET /messages/{id}?$select=...) before persisting.
+
+    Deletion tombstones (``@removed``) are NOT bare: they legitimately carry only
+    id + @removed and must be preserved as deletions, so they're excluded here.
+    Presence of a ``body`` or ``subject`` KEY (even an empty-string subject) means
+    the payload is a real message and needs no rehydration.
+    """
+    if not isinstance(m, dict):
+        return False
+    if m.get("@removed") is not None:
+        return False
+    if "body" in m or "subject" in m:
+        return False
+    return bool(m.get("id"))
+
+
 def _mail_message_fingerprint(msg: Dict[str, Any]) -> str:
     """Stable per-tenant dedup key for a Graph message.
 
@@ -4396,6 +4423,54 @@ class BackupWorker:
                             print(f"[MAIL_DEDUP] dual-write skipped: {_mmb_e}")
                         return len(rows), local_bytes
 
+                    async def _rehydrate_bare_mail(
+                        msgs: List[Dict[str, Any]],
+                    ) -> List[Dict[str, Any]]:
+                        """Replace bare id-only /messages/delta entries (see
+                        _is_bare_mail_delta) with the full message fetched by id.
+
+                        A changed message returned as {id, @odata.etag} — the
+                        norm once the saved deltaLink was produced by a
+                        $select=id walk — would otherwise persist as a
+                        "(no subject)" body-less item. Only the FEW messages that
+                        changed since the last backup are bare, so this is a
+                        handful of concurrent GETs, not a folder re-scan."""
+                        bare = [m for m in msgs if _is_bare_mail_delta(m)]
+                        if not bare:
+                            return msgs
+                        _rh_sem = asyncio.Semaphore(8)
+
+                        async def _one(mid: str):
+                            async with _rh_sem:
+                                try:
+                                    full = await graph_client._get(
+                                        f"{graph_client.GRAPH_URL}/users/{user_id}"
+                                        f"/messages/{mid}",
+                                        params={"$select": mail_select},
+                                    )
+                                    ok = isinstance(full, dict) and full.get("id")
+                                    return mid, (full if ok else None)
+                                except Exception:
+                                    return mid, None
+
+                        fetched = dict(await asyncio.gather(
+                            *[_one(str(m.get("id"))) for m in bare]
+                        ))
+                        n_ok = sum(1 for v in fetched.values() if v)
+                        if n_ok:
+                            print(
+                                f"[{self.worker_id}] [USER_MAIL] rehydrated "
+                                f"{n_ok}/{len(bare)} bare delta message(s) via GET "
+                                f"(id-only deltaLink change-notifications)"
+                            )
+                        out: List[Dict[str, Any]] = []
+                        for m in msgs:
+                            if _is_bare_mail_delta(m):
+                                out.append(fetched.get(str(m.get("id"))) or m)
+                            else:
+                                out.append(m)
+                        return out
+
                     async def _drain_one_folder(fid: Optional[str]) -> List:
                         """Drain one mail folder's delta stream. fid=None
                         falls back to /users/{uid}/messages (all folders)
@@ -4455,7 +4530,16 @@ class BackupWorker:
                                     p_url, params=p_params,
                                 ):
                                     page_raw_msgs: List[Dict[str, Any]] = []
-                                    for m in page.get("value", []) or []:
+                                    # Rehydrate bare id-only delta entries (a
+                                    # changed message returned as {id,etag}) into
+                                    # full messages BEFORE building rows, so an
+                                    # incremental never persists a "(no subject)"
+                                    # body-less item. Covers both the local_out
+                                    # and streaming persist paths from one place.
+                                    _page_vals = await _rehydrate_bare_mail(
+                                        page.get("value", []) or []
+                                    )
+                                    for m in _page_vals:
                                         path = (
                                             folder_tree.get(
                                                 m.get("parentFolderId"),
