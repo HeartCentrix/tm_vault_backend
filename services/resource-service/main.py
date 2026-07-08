@@ -510,15 +510,21 @@ async def health():
 # Tier-1 discovery via assignedPlans) → the Tier-2 workloads it gates. Used to
 # surface the Protection "Limited" pill for an unlicensed user even before any
 # Tier-2 child resources exist (e.g. a freshly discovered, unprotected user).
+#
+# ONLY workloads that genuinely have no data without the license belong here.
+# Live Graph probe of a 0-license user (2026-07-09): mail/calendar/contacts all
+# 404 (MailboxNotEnabledForRESTAPI — they share the Exchange mailbox), OneDrive
+# 423, but Teams chats return HTTP 200 with data. Teams chat is therefore
+# DELIBERATELY OMITTED — chat access is membership-based, backs up without a
+# Teams license, and must never be marked unbackable/no-license. Keep this in
+# lock-step with shared/licensing.py's CATEGORY_SERVICE.
 _LICENSE_SVC_WORKLOADS = {
     "exchange":   [("USER_MAIL", "Mailbox"), ("USER_CALENDAR", "Calendar"),
                    ("USER_CONTACTS", "Contacts")],
     "sharepoint": [("USER_ONEDRIVE", "OneDrive")],
-    "teams":      [("USER_CHATS", "Teams chat")],
 }
 _LICENSE_SVC_HINT = {"exchange": "Exchange Online",
-                     "sharepoint": "OneDrive for Business",
-                     "teams": "Microsoft Teams"}
+                     "sharepoint": "OneDrive for Business"}
 
 
 def _unbackable_from_licensed_services(meta):

@@ -27,13 +27,25 @@ _TEAMS_SERVICES = {
 # licensed. "Suspended"/"Deleted"/"LockedOut" mean it does not.
 _ACTIVE_STATUSES = {"enabled", "warning"}
 
-# Which license family each Tier-2 discovery category depends on.
+# Which license family each Tier-2 discovery category depends on — but ONLY the
+# categories that genuinely have NO data without the license. These are the only
+# workloads it is safe to entitlement-skip. Confirmed by a live READ-ONLY Graph
+# probe of a 0-license user (Amit Kumar, 2026-07-09):
+#   mail/calendar/contacts → HTTP 404 MailboxNotEnabledForRESTAPI (all three live
+#                            in the Exchange mailbox — no mailbox, no data)
+#   onedrive               → HTTP 423 notAllowed/resourceLocked (no SharePoint)
+#   chats                  → HTTP 200 with data  ← backs up WITHOUT a license
+#
+# "chats" is deliberately EXCLUDED: Teams chat access is chat-MEMBERSHIP based,
+# not license based. A user with zero assigned licenses can still be a member of
+# thousands of 1:1/group chats (Amit Kumar: 27k messages, 0 licenses). Gating
+# chats on a Teams license silently drops real, recoverable data. It must always
+# be probed and captured.
 CATEGORY_SERVICE: Dict[str, str] = {
     "mail": "exchange",
     "calendar": "exchange",
     "contacts": "exchange",
     "onedrive": "sharepoint",
-    "chats": "teams",
 }
 
 
