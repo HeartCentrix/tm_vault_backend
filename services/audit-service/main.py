@@ -1798,7 +1798,9 @@ async def get_batch_children(batch_id: str):
             return {"batchId": batch_id, "resources": []}
 
         resources_q = await db.execute(text("""
-            SELECT id, parent_resource_id, type::text, display_name
+            SELECT id, parent_resource_id, type::text, display_name,
+                   COALESCE((metadata->>'license_missing')::boolean, false) AS license_missing,
+                   metadata->>'license_hint' AS license_hint
             FROM resources
             WHERE id = ANY(CAST(:rids AS UUID[]))
                OR parent_resource_id = ANY(CAST(:rids AS UUID[]))
@@ -1927,7 +1929,7 @@ async def get_batch_children(batch_id: str):
 
         tier1: List[Dict[str, Any]] = []
         children_by_parent: Dict[Any, List[Dict[str, Any]]] = {}
-        for rid, parent, rtype, name in rs:
+        for rid, parent, rtype, name, license_missing, license_hint in rs:
             entry: Dict[str, Any] = {
                 "resourceId":  str(rid),
                 "displayName": name or "",
@@ -1940,6 +1942,15 @@ async def get_batch_children(batch_id: str):
                 parts = parts_by_sid.get(snap["snapshotId"])
                 if parts:
                     entry["partitions"] = parts
+            elif license_missing:
+                # No snapshot AND no M365 license for this workload → it was
+                # deliberately SKIPPED, not left pending. Give it an explicit
+                # terminal status so the drilldown shows "Skipped (no license)"
+                # instead of a perpetual "⋯ pending", and so the per-user
+                # rollup can settle to done instead of ◐ In Progress.
+                entry["status"] = "SKIPPED_NO_LICENSE"
+                entry["skippedNoLicense"] = True
+                entry["licenseHint"] = license_hint
             if rtype in TIER1_TYPES:
                 entry["children"] = []
                 tier1.append(entry)

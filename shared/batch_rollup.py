@@ -964,6 +964,16 @@ async def _finalize_batch_if_complete(batch_id, session) -> Optional[str]:
                   FROM resources r
                   JOIN scope s ON r.parent_resource_id = s.user_id
                  WHERE r.archived_at IS NULL
+                   -- Exclude workloads the user has NO M365 license for.
+                   -- They can never produce a snapshot, so requiring one in
+                   -- gates 2/3 below would pin the batch at IN_PROGRESS
+                   -- forever (the Amit-Kumar / Lyly "never completes" bug).
+                   -- Discovery clears metadata.license_missing when a license
+                   -- appears, so the workload rejoins the leaf set on the
+                   -- next fire automatically.
+                   AND COALESCE(
+                       (r.metadata->>'license_missing')::boolean, false
+                   ) = false
             )
             SELECT DISTINCT resource_id FROM targets
         """), {"ids": entra_ids})).all()

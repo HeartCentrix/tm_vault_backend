@@ -223,7 +223,12 @@ def prune_unrun_terminal_children(
             entry["children"] = [
                 dict(child)
                 for child in children
-                if child.get("snapshotId")
+                # Keep children that ran (have a snapshot) AND children that
+                # were deliberately SKIPPED for lack of an M365 license — the
+                # latter are meaningful ("Skipped (no license)"), not
+                # not-part-of-this-run noise. Only genuinely unrun/no-status
+                # children are hidden on a terminal batch.
+                if child.get("snapshotId") or child.get("skippedNoLicense")
             ]
         pruned.append(entry)
 

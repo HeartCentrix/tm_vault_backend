@@ -1003,6 +1003,32 @@ async def get_resources_by_type(
         counts_result = await db.execute(counts_query, {"resource_ids": resource_ids})
         backup_counts = {str(r[0]): r[1] for r in counts_result.fetchall()}
 
+    # Per-parent unbackable (no-license) workloads → Protection "Limited" pill.
+    # Mirrors the /resources (list_resources) enrichment; the Users tab hits
+    # THIS endpoint, so without it the pill never appears. Keyed by
+    # parent_resource_id. Auto-clears when a license is added (discovery
+    # removes metadata.license_missing).
+    unbackable_map: dict = {}
+    if resource_ids:
+        _WORKLOAD_LABEL = {
+            "USER_MAIL": "Mailbox", "USER_ONEDRIVE": "OneDrive",
+            "USER_CALENDAR": "Calendar", "USER_CONTACTS": "Contacts",
+            "USER_CHATS": "Teams chat",
+        }
+        lm_result = await db.execute(text("""
+            SELECT r.parent_resource_id AS pid, r.type::text AS rtype,
+                   r.metadata->>'license_hint' AS hint
+            FROM resources r
+            WHERE r.parent_resource_id = ANY(:resource_ids)
+              AND COALESCE((r.metadata->>'license_missing')::boolean, false) = true
+        """), {"resource_ids": resource_ids})
+        for row in lm_result.fetchall():
+            unbackable_map.setdefault(str(row[0]), []).append({
+                "workload": _WORKLOAD_LABEL.get(row[1], row[1]),
+                "resource_type": row[1],
+                "license_hint": row[2],
+            })
+
     # Subtree-aware size + window deltas (mirrors /resources path and the
     # /storage-summary endpoint — single source of truth so the Protection
     # table, the Recovery panel, and any future surfaces all agree).
@@ -1131,6 +1157,10 @@ async def get_resources_by_type(
             "sla": policies.get(str(row[7])) if row[7] else None,
             "last_backup": last_backup_dt.isoformat() if last_backup_dt else None,
             "last_backup_status": row[11] if row[11] else None,
+            # Workloads the user has no M365 license for → "Limited" pill.
+            "unbackable_workloads": unbackable_map.get(rid, []),
+            "license_missing": bool((row[6] or {}).get("license_missing")),
+            "license_hint": (row[6] or {}).get("license_hint"),
             "group_ids": [],
         })
 
