@@ -506,6 +506,49 @@ async def health():
 
 # ============ Resources ============
 
+# License family (from ENTRA_USER metadata.licensed_services, populated at
+# Tier-1 discovery via assignedPlans) → the Tier-2 workloads it gates. Used to
+# surface the Protection "Limited" pill for an unlicensed user even before any
+# Tier-2 child resources exist (e.g. a freshly discovered, unprotected user).
+_LICENSE_SVC_WORKLOADS = {
+    "exchange":   [("USER_MAIL", "Mailbox"), ("USER_CALENDAR", "Calendar"),
+                   ("USER_CONTACTS", "Contacts")],
+    "sharepoint": [("USER_ONEDRIVE", "OneDrive")],
+    "teams":      [("USER_CHATS", "Teams chat")],
+}
+_LICENSE_SVC_HINT = {"exchange": "Exchange Online",
+                     "sharepoint": "OneDrive for Business",
+                     "teams": "Microsoft Teams"}
+
+
+def _unbackable_from_licensed_services(meta):
+    """Unbackable workloads derived from an ENTRA_USER's licensed_services.
+    Returns [] when licensed_services is absent/unknown — we never guess, so a
+    user whose license coverage hasn't been discovered yet shows no pill."""
+    ls = (meta or {}).get("licensed_services")
+    if not isinstance(ls, dict):
+        return []
+    out = []
+    for svc, workloads in _LICENSE_SVC_WORKLOADS.items():
+        if ls.get(svc) is False:
+            for rtype, label in workloads:
+                out.append({"workload": label, "resource_type": rtype,
+                            "license_hint": _LICENSE_SVC_HINT[svc]})
+    return out
+
+
+def _merge_unbackable(child_derived, parent_derived):
+    """Union child-probe-derived + parent-entitlement-derived unbackable lists,
+    deduped by resource_type (child row wins on collision)."""
+    seen, merged = set(), []
+    for w in (child_derived or []) + (parent_derived or []):
+        rt = w.get("resource_type")
+        if rt not in seen:
+            seen.add(rt)
+            merged.append(w)
+    return merged
+
+
 @app.get("/api/v1/resources")
 async def list_resources(
     tenantId: str = Query(...),
@@ -810,7 +853,12 @@ async def list_resources(
             "last_backup_status": r[11] if r[11] else None,
             # Workloads this user has no M365 license for (empty list when
             # fully licensed). Drives the Protection-tab "Limited" pill.
-            "unbackable_workloads": unbackable_map.get(rid, []),
+            # Union of Tier-2 child probes AND the parent's licensed_services
+            # (assignedPlans) so the pill shows even before children exist.
+            "unbackable_workloads": _merge_unbackable(
+                unbackable_map.get(rid, []),
+                _unbackable_from_licensed_services(r[6]),
+            ),
             # This resource's OWN license state (set on Tier-2 children like
             # USER_MAIL / USER_ONEDRIVE). Lets a child row render its own
             # "no license" marker without re-deriving from `data`.
@@ -1158,7 +1206,11 @@ async def get_resources_by_type(
             "last_backup": last_backup_dt.isoformat() if last_backup_dt else None,
             "last_backup_status": row[11] if row[11] else None,
             # Workloads the user has no M365 license for → "Limited" pill.
-            "unbackable_workloads": unbackable_map.get(rid, []),
+            # Union of child probes + parent licensed_services (see /resources).
+            "unbackable_workloads": _merge_unbackable(
+                unbackable_map.get(rid, []),
+                _unbackable_from_licensed_services(row[6]),
+            ),
             "license_missing": bool((row[6] or {}).get("license_missing")),
             "license_hint": (row[6] or {}).get("license_hint"),
             "group_ids": [],
