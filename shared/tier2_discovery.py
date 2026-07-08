@@ -125,10 +125,15 @@ async def ensure_tier2_children(
     themselves; readers (UI, audit) want the full list.
     """
     upn = (user_resource.extra_data or {}).get("user_principal_name") or user_resource.email
+    # License coverage learned at Tier-1 discovery (assignedPlans) — lets
+    # discover_user_content skip probing workloads the user isn't licensed for
+    # and mark them license_missing instantly.
+    licensed_services = (user_resource.extra_data or {}).get("licensed_services")
     raw_children = await graph_client.discover_user_content(
         user_external_id=user_resource.external_id,
         user_principal_name=upn,
         user_display_name=user_resource.display_name,
+        licensed_services=licensed_services,
     )
 
     out: List[Resource] = []

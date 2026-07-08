@@ -1009,12 +1009,15 @@ class GraphClient:
     async def discover_users(self) -> List[Dict[str, Any]]:
         """Fetch all users from Entra ID. Skips Guest users and system mailboxes —
         afi.ai treats these as out-of-scope for backup."""
+        # ``assignedPlans`` is a directory property returned INLINE — adding it
+        # to this one bulk call costs zero extra requests, so we learn every
+        # user's license coverage at onboarding without any per-workload probe.
         result = await self._get(
             f"{self.GRAPH_URL}/users",
             params={
                 "$top": "999",
                 "$count": "true",
-                "$select": "id,displayName,mail,userPrincipalName,jobTitle,department,accountEnabled,createdDateTime,userType",
+                "$select": "id,displayName,mail,userPrincipalName,jobTitle,department,accountEnabled,createdDateTime,userType,assignedPlans",
             },
         )
         all_value = result.get("value", [])
@@ -1036,6 +1039,11 @@ class GraphClient:
                 skipped_system += 1
                 continue
             is_enabled = u.get("accountEnabled", True)
+            # License coverage from assignedPlans — computed here, inline, at
+            # onboarding. Downstream (tier-2 discovery) uses it to mark a
+            # workload license_missing and SKIP its Graph probe.
+            from shared.licensing import derive_licensed_services
+            licensed_services = derive_licensed_services(u.get("assignedPlans"))
             users.append({
                 "external_id": u.get("id"),
                 "display_name": display_name,
@@ -1048,6 +1056,7 @@ class GraphClient:
                     "account_enabled": is_enabled,
                     "user_type": u.get("userType"),
                     "created_at": u.get("createdDateTime"),
+                    "licensed_services": licensed_services,
                 },
                 "_account_enabled": is_enabled,  # For discovery worker to filter
             })
@@ -2025,6 +2034,7 @@ class GraphClient:
         user_external_id: str,
         user_principal_name: Optional[str] = None,
         user_display_name: Optional[str] = None,
+        licensed_services: Optional[Dict[str, bool]] = None,
     ) -> List[Dict[str, Any]]:
         """Discover the five fixed content categories for one Entra user.
 
@@ -2264,15 +2274,47 @@ class GraphClient:
                 },
             }
 
+        # Entitlement-driven fast path: when assignedPlans (fetched inline at
+        # Tier-1 discovery) already tells us the user has NO license for a
+        # category, skip its Graph probe entirely and emit the license_missing
+        # marker directly. This both speeds up Tier-2 discovery (fewer Graph
+        # calls) and makes the "no license" state known the moment children
+        # are materialised — no 403/404 round-trip needed. When entitlement
+        # data is absent/unknown, category_unlicensed returns False and we
+        # fall back to the live probe (zero behaviour change).
+        from shared.licensing import category_unlicensed
+
+        def _probe_or_skip(name: str, factory):
+            if category_unlicensed(licensed_services, name):
+                kind, label = _KIND[name]
+
+                async def _marker():
+                    return {
+                        "external_id": f"{user_external_id}:{name}",
+                        "display_name": label,
+                        "email": email,
+                        "type": kind,
+                        "parent_external_id": user_external_id,
+                        "metadata": {
+                            "user_id": user_external_id,
+                            "user_principal_name": user_principal_name,
+                            "license_missing": True,
+                            "license_hint": _LICENSE_HINT.get(name),
+                            "probe_status": "entitlement",
+                        },
+                    }
+                return _marker()
+            return _safe(name, factory)
+
         # Pass factories (not awaited coroutines) so _safe can retry
         # transient failures with a fresh coroutine each attempt — you
         # cannot await the same coroutine twice.
         results = await asyncio.gather(
-            _safe("mail", _mail),
-            _safe("onedrive", _onedrive),
-            _safe("contacts", _contacts),
-            _safe("calendar", _calendar),
-            _safe("chats", _chats),
+            _probe_or_skip("mail", _mail),
+            _probe_or_skip("onedrive", _onedrive),
+            _probe_or_skip("contacts", _contacts),
+            _probe_or_skip("calendar", _calendar),
+            _probe_or_skip("chats", _chats),
         )
         return [r for r in results if r]
 
