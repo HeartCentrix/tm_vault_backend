@@ -22,7 +22,7 @@ def _r(**kw):
         all_jobs_terminal=True, any_cancelled=False, any_job_failed=False,
         snap_total=0, snap_done=0, snap_partial=0, snap_failed=0,
         snap_pending=0, parts_pending=0, missing_t2=0,
-        expected_total=0, discovery_pending=False,
+        expected_total=0, discovery_pending=False, skipped_no_license=0,
     )
     defaults.update(kw)
     return RollupCounts(**defaults)
@@ -149,6 +149,61 @@ def test_discovery_complete_unblocks_done_branch():
         discovery_pending=False,
     )
     assert derive_batch_status(r) == ("Done", None)
+
+
+# ─── license-missing: skipped-workload accounting ──────────────────────
+
+def test_clean_done_with_license_skips_shows_skipped_chip():
+    """A user whose Mail/OneDrive/Calendar are unlicensed: those workloads
+    are excluded from expected (missing_t2 stays 0 — see SQL), the backable
+    workloads all completed cleanly, and the row settles Done with a neutral
+    'N skipped (no license)' chip instead of stalling In Progress. This is the
+    Amit-Kumar / Lyly '14% forever' bug."""
+    r = _r(snap_done=2, snap_total=2, missing_t2=0, skipped_no_license=3)
+    status, warnings = derive_batch_status(r)
+    assert status == "Done"
+    assert warnings == {"skipped_no_license": 3}
+
+
+def test_license_skips_merge_with_partial_failed_warnings():
+    """Skipped-no-license must not clobber the existing partial/failed chip —
+    both are surfaced together."""
+    r = _r(snap_done=1, snap_partial=1, snap_failed=0, snap_total=2,
+           skipped_no_license=2)
+    status, warnings = derive_batch_status(r)
+    assert status == "Done"
+    assert warnings == {"partial": 1, "failed": 0, "skipped_no_license": 2}
+
+
+def test_no_license_skips_keeps_clean_done_warnings_none():
+    """Regression guard: with zero skips a clean batch is still ('Done', None)
+    — the skipped key is only added when there is something to report."""
+    r = _r(snap_done=5, snap_total=5, skipped_no_license=0)
+    assert derive_batch_status(r) == ("Done", None)
+
+
+def test_all_backable_skipped_but_clean_is_done_not_failed():
+    """Edge: a batch whose only backable work already succeeded elsewhere so
+    snap_total==0 here, and the remaining workloads are all license-skipped.
+    That is a successful (fully-skipped) run, NOT a Failed/Expired one."""
+    r = _r(all_jobs_terminal=True, any_job_failed=False,
+           snap_total=0, snap_done=0, skipped_no_license=2)
+    status, warnings = derive_batch_status(r)
+    assert status == "Done"
+    assert warnings == {"skipped_no_license": 2}
+
+
+def test_sql_excludes_license_missing_and_surfaces_skip_count():
+    """The SQL must (a) exclude license_missing Tier-2 children from the
+    expected/fanout set so they never count as 'missing', and (b) surface a
+    skipped_no_license count column for the chip."""
+    stmt = build_batch_rollup_query(
+        tenant_id=None, start_date=None, end_date=None,
+        operation=None, size=50, offset=0,
+    )
+    sql = str(stmt)
+    assert "license_missing" in sql, "SQL must reference license_missing to exclude it"
+    assert "skipped_no_license" in sql, "SQL must surface skipped_no_license column"
 
 
 # ─── SQL builder smoke ─────────────────────────────────────────────────

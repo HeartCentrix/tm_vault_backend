@@ -73,6 +73,19 @@ class RollupCounts:
     # incident: 9-user backup briefly showed Done before Tier-2 work
     # had even been published).
     discovery_pending: bool = False
+    # Count of Tier-2 child workloads (Mail / OneDrive / Calendar / …) in
+    # this batch's scope that were SKIPPED because the user has no M365
+    # license for them (``resources.metadata.license_missing``). These are
+    # deliberately EXCLUDED from ``missing_t2`` and ``expected_total``
+    # upstream in the SQL — an unlicensed workload can never produce a
+    # snapshot, so counting it as "missing" pinned the batch at
+    # "In Progress" forever and inflated the progress denominator (the
+    # Amit-Kumar/Lyly "14% so far, never finishes" report). We keep the
+    # count only to render a neutral, informational "N skipped (no
+    # license)" chip on an otherwise-Done row. Discovery auto-clears
+    # license_missing when a license later appears, so the workload
+    # rejoins the expected set on the next fire automatically.
+    skipped_no_license: int = 0
 
 
 def derive_batch_status(
@@ -147,18 +160,31 @@ def derive_batch_status(
     #        every one of them failed) → a real Failed.
     if not has_successes:
         if r.snap_total == 0 and not r.any_job_failed:
+            # A fire that stored nothing itself and did not fail. Normally
+            # this is an Expired (retention-pruned) restore point. But if
+            # the ONLY thing left to do was license-skipped workloads, the
+            # backup ran correctly and simply had nothing to capture — that
+            # is a successful, fully-skipped run, NOT an expiry/failure.
+            if r.skipped_no_license > 0:
+                return ("Done", {"skipped_no_license": r.skipped_no_license})
             return ("Expired", None)
         return ("Failed", None)
 
     # 4. Mixed outcome → Done with warnings chip. Cancellation that
     # landed AFTER some snapshots completed is also a "not-clean" Done
     # — we surface a warning so the operator sees the truncation even
-    # if every committed snapshot itself was clean.
+    # if every committed snapshot itself was clean. License-skipped
+    # workloads are additive: they render a separate neutral chip and
+    # never suppress a partial/failed warning.
+    warnings: Dict[str, int] = {}
     if r.snap_partial > 0 or r.snap_failed > 0 or r.any_cancelled:
-        return ("Done", {"partial": r.snap_partial, "failed": r.snap_failed})
+        warnings["partial"] = r.snap_partial
+        warnings["failed"] = r.snap_failed
+    if r.skipped_no_license > 0:
+        warnings["skipped_no_license"] = r.skipped_no_license
 
-    # 5. Everything clean.
-    return ("Done", None)
+    # 5. Everything clean (and nothing skipped) → no chip.
+    return ("Done", warnings or None)
 
 
 def build_batch_rollup_query(
@@ -335,6 +361,40 @@ def build_batch_rollup_query(
                          AND r2.type::text IN (
                              'USER_MAIL','USER_ONEDRIVE','USER_CHATS',
                              'USER_CALENDAR','USER_CONTACTS')
+                         -- Exclude workloads the user has NO M365 license
+                         -- for: they can never produce a snapshot, so
+                         -- counting them as "missing" pins the batch at
+                         -- In Progress forever and inflates the progress
+                         -- denominator. Discovery sets metadata.license_
+                         -- missing=true and auto-clears it when a license
+                         -- appears, so the workload rejoins EXPECTED on the
+                         -- next fire with no manual action.
+                         AND COALESCE(
+                             (r2.metadata->>'license_missing')::boolean,
+                             false
+                         ) = false
+    ),
+    license_skip AS (
+        -- Per batch, the count of Tier-2 children in the Tier-1 scope that
+        -- ARE license_missing — the mirror of ``expected_t2``'s exclusion.
+        -- Surfaced as ``skipped_no_license`` so the Activity row can show a
+        -- neutral "N skipped (no license)" chip, and used below to keep the
+        -- pre-discovery progress floor honest.
+        SELECT
+            ts.batch_id,
+            COUNT(*) AS skipped_no_license
+        FROM tier1_scope ts
+        CROSS JOIN LATERAL unnest(ts.scope_ids) AS bid
+        JOIN resources r1 ON r1.id = bid AND r1.type::text = 'ENTRA_USER'
+        JOIN resources r2 ON r2.parent_resource_id = r1.id
+                         AND r2.type::text IN (
+                             'USER_MAIL','USER_ONEDRIVE','USER_CHATS',
+                             'USER_CALENDAR','USER_CONTACTS')
+                         AND COALESCE(
+                             (r2.metadata->>'license_missing')::boolean,
+                             false
+                         ) = true
+        GROUP BY 1
     ),
     observed_t2 AS (
         SELECT DISTINCT
@@ -419,7 +479,18 @@ def build_batch_rollup_query(
                     SELECT COUNT(*) FROM expected_t2 e
                      WHERE e.batch_id = b.batch_id
                 ), 0),
-                COALESCE(array_length(ts.scope_ids, 1), 0) * 5,
+                -- Pre-discovery floor (users × 5 canonical workloads),
+                -- minus the license-skipped children so a partially-
+                -- licensed user's bar isn't stuck below 100 % (e.g. a
+                -- 2-licensed user must not be measured against 5).
+                GREATEST(
+                    COALESCE(array_length(ts.scope_ids, 1), 0) * 5
+                    - COALESCE((
+                        SELECT ls.skipped_no_license FROM license_skip ls
+                         WHERE ls.batch_id = b.batch_id
+                    ), 0),
+                    0
+                ),
                 COUNT(*) FILTER (
                     WHERE r.type::text IN (
                         'USER_MAIL','USER_ONEDRIVE','USER_CHATS',
@@ -519,6 +590,7 @@ def build_batch_rollup_query(
         COALESCE(sr.snap_pending, 0)        AS snap_pending,
         COALESCE(pr.parts_pending, 0)       AS parts_pending,
         COALESCE(f.missing_t2, 0)           AS missing_t2,
+        COALESCE(ls.skipped_no_license, 0)  AS skipped_no_license,
         COALESCE(te.expected_count, 0)      AS expected_count,
         COALESCE(dp.pending, FALSE)         AS discovery_pending,
         COALESCE(tsp.tier1_total, 0)        AS tier1_total,
@@ -533,6 +605,7 @@ def build_batch_rollup_query(
     LEFT JOIN snap_roll   sr ON sr.batch_id = b.batch_id
     LEFT JOIN parts_roll  pr ON pr.batch_id = b.batch_id
     LEFT JOIN fanout       f ON f.batch_id  = b.batch_id
+    LEFT JOIN license_skip ls ON ls.batch_id = b.batch_id
     LEFT JOIN entra_count ec ON ec.batch_id = b.batch_id
     LEFT JOIN single_res  sres ON sres.batch_id = b.batch_id
     LEFT JOIN entra_one   eo ON eo.batch_id = b.batch_id
@@ -579,6 +652,7 @@ def shape_batch_row(row: Any) -> Dict[str, Any]:
         tier1_terminal=int(getattr(row, "tier1_terminal", 0) or 0),
         tier2_total=int(getattr(row, "tier2_total", 0) or 0),
         tier2_terminal=int(getattr(row, "tier2_terminal", 0) or 0),
+        skipped_no_license=int(getattr(row, "skipped_no_license", 0) or 0),
     )
     status, warnings = derive_batch_status(counts)
 
