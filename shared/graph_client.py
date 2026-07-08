@@ -1012,13 +1012,19 @@ class GraphClient:
         # ``assignedPlans`` is a directory property returned INLINE — adding it
         # to this one bulk call costs zero extra requests, so we learn every
         # user's license coverage at onboarding without any per-workload probe.
+        #
+        # $select MUST be embedded in the URL, NOT passed via params: the
+        # hardened pager's _safe_first_page_params DROPS $select for absolute
+        # URLs (keeps only $top), so passing it in params silently made Graph
+        # return just the default field set — no assignedPlans, no department/
+        # userType/etc. — which is why license detection saw nothing. $top is
+        # embedded too; the @odata.nextLink carries both forward on later pages.
+        _user_select = (
+            "id,displayName,mail,userPrincipalName,jobTitle,department,"
+            "accountEnabled,createdDateTime,userType,assignedPlans"
+        )
         result = await self._get(
-            f"{self.GRAPH_URL}/users",
-            params={
-                "$top": "999",
-                "$count": "true",
-                "$select": "id,displayName,mail,userPrincipalName,jobTitle,department,accountEnabled,createdDateTime,userType,assignedPlans",
-            },
+            f"{self.GRAPH_URL}/users?$top=999&$select={_user_select}"
         )
         all_value = result.get("value", [])
         while "@odata.nextLink" in result:
