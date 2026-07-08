@@ -705,6 +705,37 @@ async def list_resources(
             pid = str(row[0])
             backup_counts[pid] = backup_counts.get(pid, 0) + int(row[1] or 0)
 
+    # Per-parent list of Tier-2 workloads that CANNOT be backed up because the
+    # user has no M365 license for them (discovery stamped
+    # metadata.license_missing=true). Surfaced as `unbackable_workloads` on the
+    # parent user row so the Protection tab can render a "Limited" pill — and
+    # so an unlicensed Mail/OneDrive/Calendar reads as an expected, informational
+    # state, not a broken/stuck backup. Auto-clears when a license is added
+    # (discovery removes the flag). Keyed by parent_resource_id.
+    unbackable_map: dict = {}
+    if resource_ids:
+        _WORKLOAD_LABEL = {
+            "USER_MAIL": "Mailbox", "USER_ONEDRIVE": "OneDrive",
+            "USER_CALENDAR": "Calendar", "USER_CONTACTS": "Contacts",
+            "USER_CHATS": "Teams chat",
+        }
+        license_missing_query = text("""
+            SELECT r.parent_resource_id AS pid,
+                   r.type::text          AS rtype,
+                   r.metadata->>'license_hint' AS hint
+            FROM resources r
+            WHERE r.parent_resource_id = ANY(:resource_ids)
+              AND COALESCE((r.metadata->>'license_missing')::boolean, false) = true
+        """)
+        lm_result = await db.execute(license_missing_query, {"resource_ids": resource_ids})
+        for row in lm_result.fetchall():
+            pid = str(row[0])
+            unbackable_map.setdefault(pid, []).append({
+                "workload": _WORKLOAD_LABEL.get(row[1], row[1]),
+                "resource_type": row[1],
+                "license_hint": row[2],
+            })
+
     def map_kind(t):
         m = {"MAILBOX": "office_user", "SHARED_MAILBOX": "shared_mailbox", "ROOM_MAILBOX": "room_mailbox",
              "ONEDRIVE": "onedrive", "SHAREPOINT_SITE": "sharepoint_site", "TEAMS_CHANNEL": "teams_channel",
@@ -777,6 +808,14 @@ async def list_resources(
             "sla": policies.get(str(r[7])) if r[7] else None,
             "last_backup": r[10].isoformat() if r[10] else None,
             "last_backup_status": r[11] if r[11] else None,
+            # Workloads this user has no M365 license for (empty list when
+            # fully licensed). Drives the Protection-tab "Limited" pill.
+            "unbackable_workloads": unbackable_map.get(rid, []),
+            # This resource's OWN license state (set on Tier-2 children like
+            # USER_MAIL / USER_ONEDRIVE). Lets a child row render its own
+            # "no license" marker without re-deriving from `data`.
+            "license_missing": bool((r[6] or {}).get("license_missing")),
+            "license_hint": (r[6] or {}).get("license_hint"),
             "group_ids": [],
         })
 

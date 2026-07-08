@@ -200,3 +200,53 @@ def test_select_resources_for_dispatch_handles_none_inflight(monkeypatch):
     module = _load_scheduler(monkeypatch)
     enabled = [SimpleNamespace(id="a"), SimpleNamespace(id="b")]
     assert len(module.select_resources_for_dispatch(enabled, None)) == 2
+
+
+# ─── license-missing eligibility ───────────────────────────────────────
+
+def test_resource_backup_eligible_skips_license_missing(monkeypatch):
+    """A workload the user has NO M365 license for (discovery set
+    metadata.license_missing=true → resource.extra_data) can never produce a
+    snapshot. Dispatching it just queues a doomed job and pins the Activity
+    batch at In Progress forever (the Amit-Kumar/Lyly report), so it must be
+    ineligible for dispatch."""
+    module = _load_scheduler(monkeypatch)
+    r = SimpleNamespace(id=1, extra_data={"license_missing": True,
+                                          "license_hint": "Exchange Online"})
+    assert module.resource_backup_eligible(r) is False
+
+
+def test_resource_backup_eligible_allows_licensed(monkeypatch):
+    module = _load_scheduler(monkeypatch)
+    r = SimpleNamespace(id=2, extra_data={"license_missing": False})
+    assert module.resource_backup_eligible(r) is True
+
+
+def test_resource_backup_eligible_allows_when_flag_absent(monkeypatch):
+    """No license_missing key = licensed/backable. Discovery only stamps the
+    flag when it actually observes a 403/404/423, and CLEARS it when a license
+    later appears, so absence must mean eligible (auto-resume on license
+    grant, no manual re-enable)."""
+    module = _load_scheduler(monkeypatch)
+    r = SimpleNamespace(id=3, extra_data={"user_id": "x"})
+    assert module.resource_backup_eligible(r) is True
+
+
+def test_resource_backup_eligible_none_metadata_safe(monkeypatch):
+    module = _load_scheduler(monkeypatch)
+    r = SimpleNamespace(id=4, extra_data=None)
+    assert module.resource_backup_eligible(r) is True
+
+
+def test_select_resources_for_dispatch_also_skips_license_missing(monkeypatch):
+    """Integration of the two skip reasons: an in-flight resource AND an
+    unlicensed resource are both dropped; everything else is dispatched."""
+    module = _load_scheduler(monkeypatch)
+    enabled = [
+        SimpleNamespace(id=0, extra_data={}),                              # ok
+        SimpleNamespace(id=1, extra_data={"license_missing": True}),       # no license
+        SimpleNamespace(id=2, extra_data={}),                              # in-flight
+        SimpleNamespace(id=3, extra_data={"license_missing": False}),      # ok
+    ]
+    out = module.select_resources_for_dispatch(enabled, {2})
+    assert {r.id for r in out} == {0, 3}

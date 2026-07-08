@@ -354,6 +354,43 @@ async def publish_sla_skip_audit_events(policy: SlaPolicy, skipped_resources: Li
         await message_bus.publish("audit.events", audit_message, priority=3)
 
 
+async def publish_license_skip_audit_events(policy: SlaPolicy, skipped_resources: List[Resource]):
+    """Emit audit events for workloads skipped because the user has no M365
+    license for them. Distinct from ``publish_sla_skip_audit_events`` (SLA
+    scope mismatch) — the reason here is entitlement, not policy config, so
+    the message and ``skip_reason`` differ. Auto-resolves when a license is
+    added (discovery clears ``license_missing``)."""
+    if not skipped_resources:
+        return
+    for resource in skipped_resources:
+        resource_type = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
+        meta = getattr(resource, "extra_data", None) or {}
+        hint = meta.get("license_hint") or "the required M365 service"
+        audit_message = create_audit_event_message(
+            action="BACKUP_SKIPPED_NO_LICENSE",
+            tenant_id=str(resource.tenant_id),
+            actor_type="SYSTEM",
+            resource_id=str(resource.id),
+            resource_type=resource_type,
+            resource_name=resource.display_name,
+            outcome="PARTIAL",
+            details={
+                "message": (
+                    f"Skipped — this user has no {hint} license, so this "
+                    f"workload cannot be backed up. It resumes automatically "
+                    f"once a license is assigned."
+                ),
+                "skip_reason": "no_license",
+                "license_hint": hint,
+                "policy_id": str(policy.id),
+                "policy_name": policy.name,
+                "resource_status": resource.status.value if hasattr(resource.status, "value") else str(resource.status),
+                "source": "backup_scheduler",
+            },
+        )
+        await message_bus.publish("audit.events", audit_message, priority=3)
+
+
 @app.on_event("startup")
 async def startup():
     """Initialize services on startup and schedule jobs per SLA policy"""
@@ -1918,8 +1955,30 @@ async def trigger_single_backup(resource_id: str, full_backup: bool = False):
         return {"status": "queued", "job_id": str(job_id)}
 
 
+def resource_backup_eligible(resource) -> bool:
+    """False when the user has NO M365 license for this workload.
+
+    Discovery probes each Tier-2 workload and, on a permanent 403/404/423
+    (no Exchange Online / no OneDrive / locked mailbox), stamps
+    ``metadata.license_missing=True`` on the resource (surfaced on the ORM as
+    ``resource.extra_data``). An unlicensed workload can NEVER produce a
+    snapshot, so dispatching it just queues a doomed job AND leaves the
+    Activity batch pinned at "In Progress" forever with an inflated progress
+    denominator (the Amit-Kumar / Lyly "1.1 GiB so far, 14% — never finishes"
+    report). We therefore skip it at dispatch.
+
+    This is re-evaluated EVERY fire: ``tier2_discovery`` clears
+    ``license_missing`` as soon as a probe succeeds again (license added), so
+    a newly-licensed workload rejoins the dispatch set automatically with no
+    manual re-enable. Absence of the flag = eligible.
+    """
+    meta = getattr(resource, "extra_data", None) or {}
+    return not bool(meta.get("license_missing"))
+
+
 def select_resources_for_dispatch(enabled_resources, inflight_resource_ids):
-    """Return every enabled resource that is NOT already being backed up.
+    """Return every enabled resource that is NOT already being backed up
+    and is NOT license-ineligible (see ``resource_backup_eligible``).
 
     Coverage is COMPLETE by design — the scheduler never caps how many
     resources get backed up per fire. Capping coverage (the old
@@ -1930,14 +1989,20 @@ def select_resources_for_dispatch(enabled_resources, inflight_resource_ids):
     process every resource N-at-a-time, never slicing the list) + Graph app
     pacing / rotation / 429 backoff.
 
-    The only resources skipped are those that already have an in-flight
-    (QUEUED/RUNNING) backup, so a slow or under-provisioned cycle never
-    double-dispatches the same resource (which would also re-trigger the
-    concurrent-drain snapshot race). Those are covered on the next fire once
-    their current run finishes.
+    Two skip reasons, both self-correcting on the next fire:
+      * in-flight (QUEUED/RUNNING) backup — so a slow / under-provisioned
+        cycle never double-dispatches the same resource (which would also
+        re-trigger the concurrent-drain snapshot race);
+      * license-ineligible — the user has no M365 license for this workload
+        (see ``resource_backup_eligible``); dispatching it can only fail and
+        would stall the Activity batch. Discovery auto-clears the flag when a
+        license appears, so it rejoins the next fire.
     """
     skip = set(inflight_resource_ids or ())
-    return [r for r in enabled_resources if r.id not in skip]
+    return [
+        r for r in enabled_resources
+        if r.id not in skip and resource_backup_eligible(r)
+    ]
 
 
 async def dispatch_policy_backups(policy_id: str):
@@ -2001,6 +2066,28 @@ async def dispatch_policy_backups(policy_id: str):
 
         if not enabled_resources:
             print(f"[SCHEDULER] No enabled resources for policy '{policy.name}' after flag filtering")
+            return
+
+        # Skip workloads the user has NO M365 license for BEFORE the
+        # in-flight step, so the log/audit attributes each skip to the
+        # right reason. resource_backup_eligible re-reads the flag every
+        # fire; discovery clears it when a license appears, so this is
+        # self-correcting (no manual re-enable).
+        _license_skipped = [
+            r for r in enabled_resources if not resource_backup_eligible(r)
+        ]
+        if _license_skipped:
+            enabled_resources = [
+                r for r in enabled_resources if resource_backup_eligible(r)
+            ]
+            print(
+                f"[SCHEDULER] Policy '{policy.name}': {len(_license_skipped)} "
+                f"resource(s) skipped — user has no M365 license for that "
+                f"workload (auto-resumes when a license is added)"
+            )
+            await publish_license_skip_audit_events(policy, _license_skipped)
+        if not enabled_resources:
+            print(f"[SCHEDULER] No license-eligible resources for policy '{policy.name}'")
             return
 
         # COVERAGE IS COMPLETE EVERY FIRE. We do NOT cap how many resources are
