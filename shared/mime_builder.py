@@ -113,6 +113,45 @@ def build_eml(graph_msg: dict, attachments: Iterable[AttachmentRef]) -> bytes:
     return bytes(msg)
 
 
+def _inline_attachment_refs(attachments) -> List[AttachmentRef]:
+    """AttachmentRefs from a Graph message's inline ``fileAttachment`` dicts that
+    already carry ``contentBytes`` — used when re-serializing a nested email that
+    Graph expanded inline. Non-file / bytes-less entries are skipped."""
+    refs: List[AttachmentRef] = []
+    for a in attachments or []:
+        cb = a.get("contentBytes") if isinstance(a, dict) else None
+        if not cb:
+            continue
+        odata = (a.get("@odata.type") or "").lower()
+        if odata and "fileattachment" not in odata:
+            continue  # itemAttachment/referenceAttachment can't ride as bytes here
+        try:
+            refs.append(AttachmentRef(
+                name=a.get("name") or "attachment",
+                content_type=a.get("contentType") or "application/octet-stream",
+                data_bytes=base64.b64decode(cb),
+            ))
+        except Exception:
+            continue
+    return refs
+
+
+def build_nested_message_attachment(nested_msg: dict) -> AttachmentRef:
+    """Convert an ``itemAttachment``'s nested Graph message (mail-in-mail) into a
+    ``message/rfc822`` :class:`AttachmentRef` carrying the nested email's full
+    ``.eml`` bytes. Attaching this through the ordinary file-attachment path makes
+    mail-in-mail embed natively in EML, MBOX **and** PST — for every mailbox type
+    (primary / shared / archive), which all share this export layer. The nested
+    email's own inline file attachments ride inside its ``.eml``.
+    """
+    nested = nested_msg or {}
+    eml = build_eml(nested, _inline_attachment_refs(nested.get("attachments")))
+    subject = (nested.get("subject") or "").strip() or "attached-message"
+    safe = "".join(c if (c.isalnum() or c in " -._") else "_" for c in subject).strip()
+    safe = safe[:120].strip() or "attached-message"
+    return AttachmentRef(name=f"{safe}.eml", content_type="message/rfc822", data_bytes=eml)
+
+
 async def build_eml_streaming(
     graph_msg: dict,
     attachments: Iterable[AttachmentRef],
