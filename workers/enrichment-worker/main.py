@@ -92,6 +92,20 @@ def _make_download(shard):
     return _download
 
 
+def _make_upload(shard):
+    """Build the per-resource attachment-blob uploader over an already-resolved
+    ``shard`` — the mirror of ``_make_download``. Archive fileAttachment bytes
+    are stored as their own dedup-aware blobs (like EMAIL_ATTACHMENT) so export
+    inlines them through the unchanged mail path."""
+    from shared.azure_storage import upload_blob_with_dedup
+
+    async def _upload(tenant_id, content_hash, container, blob_path, data):
+        return await upload_blob_with_dedup(
+            tenant_id, content_hash, container, blob_path, data, shard, max_retries=3,
+        )
+    return _upload
+
+
 async def _with_retry(coro_factory, what: str, attempts: int = 4, base_delay: float = 0.5):
     """Retry a DB op on transient Postgres errors (deadlock / serialization).
     Each attempt gets a fresh session via the factory — the aborted txn from a
@@ -138,6 +152,7 @@ async def enrich_one_resource(resource_id) -> dict:
             resource=resource,
             gc=gc,
             download_blob=_make_download(shard),
+            upload_attachment=_make_upload(shard),
             batch_size=int(os.getenv("ARCHIVE_ENRICH_BATCH", "50")),
             worker_id=WORKER_ID,
         )

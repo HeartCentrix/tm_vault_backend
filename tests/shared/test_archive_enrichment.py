@@ -24,6 +24,40 @@ if str(_ROOT) not in sys.path:
 from shared import archive_enrichment as eng  # noqa: E402
 from shared import archive_enrich as ae  # noqa: E402
 
+import base64  # noqa: E402
+import hashlib  # noqa: E402
+
+
+# ── plan_archive_attachments: pure decode+hash of fileAttachments ──────────
+def test_plan_archive_attachments_decodes_only_file_attachments():
+    pdf = b"%PDF-1.7 fake bytes"
+    b64 = base64.b64encode(pdf).decode()
+    atts = [
+        {"id": "att1", "name": "inv.pdf", "contentType": "application/pdf",
+         "contentBytes": b64, "isInline": False, "contentId": "cid1",
+         "@odata.type": "#microsoft.graph.fileAttachment"},
+        # itemAttachment (nested email) — no contentBytes → skipped
+        {"id": "att2", "name": "fwd.eml", "@odata.type": "#microsoft.graph.itemAttachment"},
+        # referenceAttachment (cloud link) — no bytes → skipped
+        {"id": "att3", "name": "link", "@odata.type": "#microsoft.graph.referenceAttachment"},
+    ]
+    plans = eng.plan_archive_attachments(atts)
+    assert len(plans) == 1
+    p = plans[0]
+    assert p["att_id"] == "att1"
+    assert p["name"] == "inv.pdf"
+    assert p["content_type"] == "application/pdf"
+    assert p["data"] == pdf
+    assert p["content_hash"] == hashlib.sha256(pdf).hexdigest()
+    assert p["content_id"] == "cid1"
+
+
+def test_plan_archive_attachments_empty_and_bad_input():
+    assert eng.plan_archive_attachments(None) == []
+    assert eng.plan_archive_attachments([]) == []
+    assert eng.plan_archive_attachments([{"name": "x"}]) == []          # no contentBytes
+    assert eng.plan_archive_attachments([{"contentBytes": "!!notb64"}]) == []  # undecodable
+
 
 # ── fakes ────────────────────────────────────────────────────────────────
 class _Row:
@@ -59,6 +93,13 @@ class _Session:
 
     async def get(self, model, rid):
         return self.store["db_rows"].get(rid)
+
+    def add(self, obj):
+        self.store.setdefault("added", []).append(obj)
+
+    async def execute(self, stmt):
+        self.store.setdefault("executed", []).append(stmt)
+        return None
 
     async def commit(self):
         self.store["commits"] += 1
@@ -162,6 +203,57 @@ async def test_enriches_pending_strips_attachment_bytes_and_persists():
     stored_att = db1.extra_data["raw"]["attachments"][0]
     assert stored_att["name"] == "inv.pdf"
     assert "contentBytes" not in stored_att
+
+
+@pytest.mark.asyncio
+async def test_enrich_uploads_attachment_bytes_and_creates_sibling_row():
+    """With upload_attachment injected, a fileAttachment's bytes are uploaded and
+    a sibling ARCHIVE_ATTACHMENT row is created (mail-style) — while the parent
+    row's raw is still stripped of contentBytes."""
+    import base64 as _b64
+    import uuid as _uuid
+    pdf = b"%PDF-1.7 hello"
+    r1 = _Row("id-1", "MSG1", {})
+    db1 = _Row("id-1", "MSG1", {})
+    db1.snapshot_id = _uuid.uuid4()
+    db1.tenant_id = _uuid.uuid4()
+    db1.backend_id = _uuid.uuid4()
+    db1.folder_path = "Archive"
+    store = {"db_rows": {"id-1": db1}, "commits": 0}
+
+    staged_msg = {
+        "id": "scratch-1", "subject": "Invoice", "hasAttachments": True,
+        "attachments": [{"id": "att-9", "name": "inv.pdf", "contentType": "application/pdf",
+                         "contentBytes": _b64.b64encode(pdf).decode()}],
+    }
+    uploads = []
+
+    async def _fake_upload(tenant_id, content_hash, container, blob_path, data):
+        uploads.append({"container": container, "blob_path": blob_path, "data": data, "hash": content_hash})
+
+    res = await eng.enrich_resource(
+        session_factory=_session_factory(store),
+        resource=_Resource("res-1", {"user_id": "u", "primary_mailbox_id": "p"}),
+        gc=object(), download_blob=None, upload_attachment=_fake_upload,
+        _load_pending=lambda s, rid: _async_return([r1]),
+        _stager_factory=lambda **kw: _FakeStager([(r1, staged_msg)]),
+    )
+
+    assert res == {"enriched": 1, "pending": 1}
+    # exactly one attachment uploaded, bytes intact
+    assert len(uploads) == 1 and uploads[0]["data"] == pdf
+    assert "archive" in uploads[0]["container"]
+    # exactly one sibling ARCHIVE_ATTACHMENT row added, keyed to the parent
+    added = store.get("added", [])
+    assert len(added) == 1
+    sib = added[0]
+    assert sib.item_type == "ARCHIVE_ATTACHMENT"
+    assert sib.external_id == "MSG1::att-9"
+    assert sib.extra_data["parent_item_id"] == "MSG1"
+    assert sib.blob_path == uploads[0]["blob_path"]
+    assert sib.content_size == len(pdf)
+    # parent row still stripped
+    assert "contentBytes" not in db1.extra_data["raw"]["attachments"][0]
 
 
 @pytest.mark.asyncio

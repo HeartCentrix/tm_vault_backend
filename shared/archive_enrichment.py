@@ -19,10 +19,12 @@ helpers are DB-bound and proven by the live round-trip.
 """
 from __future__ import annotations
 
+import base64 as _b64
+import hashlib as _hashlib
 import uuid as _uuid
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
-from sqlalchemy import select, or_
+from sqlalchemy import select, or_, delete as _sa_delete
 
 from shared.models import Snapshot, SnapshotItem
 from shared import archive_enrich as ae
@@ -34,6 +36,52 @@ from shared.archive_export import (
 )
 
 ARCHIVE_ITEM_TYPE = "ARCHIVE_ITEM"
+ARCHIVE_ATTACHMENT_TYPE = "ARCHIVE_ATTACHMENT"
+ARCHIVE_WORKLOAD = "archive"
+
+
+def plan_archive_attachments(attachments) -> List[Dict[str, Any]]:
+    """Decode + hash the fileAttachments that carry ``contentBytes``. Pure — no
+    DB, no storage, no network. These become sibling ARCHIVE_ATTACHMENT rows
+    (mirroring EMAIL_ATTACHMENT) so export can inline the real bytes via the
+    unchanged mail attachment path. itemAttachment (nested email → carried in
+    ``item``, not contentBytes) and referenceAttachment (cloud link, no bytes)
+    are skipped — their content rides inside the lossless opaque MAPI blob."""
+    out: List[Dict[str, Any]] = []
+    for a in (attachments or []):
+        if not isinstance(a, dict):
+            continue
+        cb = a.get("contentBytes")
+        if not cb:
+            continue
+        try:
+            data = _b64.b64decode(cb, validate=True)
+        except Exception:
+            continue
+        if not data:
+            continue
+        out.append({
+            "att_id": a.get("id") or _hashlib.sha256((a.get("name") or "att").encode()).hexdigest()[:16],
+            "name": a.get("name") or "attachment",
+            "content_type": a.get("contentType"),
+            "is_inline": bool(a.get("isInline")),
+            "content_id": a.get("contentId"),
+            "data": data,
+            "content_hash": _hashlib.sha256(data).hexdigest(),
+        })
+    return out
+
+
+def delete_archive_attachments_stmt(snapshot_id, parent_external_id):
+    """Idempotency: drop any prior ARCHIVE_ATTACHMENT siblings of this parent
+    before re-inserting, so a forced re-enrich never duplicates them. Parent
+    link lives in ``extra_data.parent_item_id`` (generic JSON column 'metadata';
+    ``.as_string()`` emits ``->>`` — NOT ``.astext``, which JSON lacks)."""
+    return _sa_delete(SnapshotItem).where(
+        SnapshotItem.snapshot_id == snapshot_id,
+        SnapshotItem.item_type == ARCHIVE_ATTACHMENT_TYPE,
+        SnapshotItem.extra_data["parent_item_id"].as_string() == str(parent_external_id),
+    )
 
 
 # ── DB helpers (Postgres; statement builders are compile-tested, no DB) ────
@@ -114,6 +162,7 @@ async def enrich_resource(
     resource,
     gc,
     download_blob: Callable[[Any], Awaitable[Optional[bytes]]],
+    upload_attachment: Optional[Callable[..., Awaitable[Any]]] = None,
     batch_size: int = 50,
     worker_id: str = "enrich",
     resolve_primary_mailbox_id: Optional[Callable[..., Awaitable[Optional[str]]]] = None,
@@ -161,17 +210,58 @@ async def enrich_resource(
     )
 
     async def _apply(row, name, patch):
-        # Keep the row lean: store attachment names/sizes (browse shows "has
-        # attachments") but strip the heavy inline bytes — full bytes come from
-        # the opaque blob on export/download when actually needed.
+        # Attachments follow the MAILBOX model: the row stays lean (contentBytes
+        # stripped) while each fileAttachment's real bytes are stored as their
+        # own blob + a sibling ARCHIVE_ATTACHMENT row (like EMAIL_ATTACHMENT), so
+        # export inlines them through the unchanged mail attachment path. Bytes
+        # are still live in ``patch.raw.attachments[i].contentBytes`` here, just
+        # before the strip — decode + upload them now.
         raw = patch.get("raw") or {}
-        for a in (raw.get("attachments") or []):
-            if isinstance(a, dict):
-                a.pop("contentBytes", None)
+        plans = plan_archive_attachments(raw.get("attachments"))
         async with session_factory() as s:
             db_row = await s.get(SnapshotItem, row.id)
             if db_row is None:
                 return
+            if plans and upload_attachment is not None:
+                from shared.azure_storage import azure_storage_manager
+                # Idempotent on forced re-enrich: drop prior siblings first.
+                try:
+                    await s.execute(delete_archive_attachments_stmt(db_row.snapshot_id, db_row.external_id))
+                except Exception as e:  # noqa: BLE001 - fakes without execute()
+                    print(f"[{worker_id}] archive attachment cleanup skipped: {type(e).__name__}")
+                container = azure_storage_manager.get_container_name(str(db_row.tenant_id), ARCHIVE_WORKLOAD)
+                for p in plans:
+                    blob_path = azure_storage_manager.build_blob_path(
+                        str(db_row.tenant_id), str(resource.id), str(db_row.snapshot_id),
+                        f"{db_row.external_id}::{p['att_id']}",
+                    )
+                    await upload_attachment(db_row.tenant_id, p["content_hash"], container, blob_path, p["data"])
+                    s.add(SnapshotItem(
+                        id=_uuid.uuid4(),
+                        snapshot_id=db_row.snapshot_id,
+                        tenant_id=db_row.tenant_id,
+                        external_id=f"{db_row.external_id}::{p['att_id']}",
+                        parent_external_id=db_row.external_id,
+                        item_type=ARCHIVE_ATTACHMENT_TYPE,
+                        name=p["name"],
+                        folder_path=db_row.folder_path,
+                        content_hash=p["content_hash"],
+                        content_checksum=p["content_hash"],
+                        content_size=len(p["data"]),
+                        blob_path=blob_path,
+                        backend_id=db_row.backend_id,
+                        extra_data={
+                            "parent_item_id": db_row.external_id,
+                            "attachment_kind": "fileAttachment",
+                            "content_type": p["content_type"],
+                            "is_inline": p["is_inline"],
+                            "content_id": p["content_id"],
+                        },
+                    ))
+            # Keep the persisted raw lean — the heavy bytes now live in blobs.
+            for a in (raw.get("attachments") or []):
+                if isinstance(a, dict):
+                    a.pop("contentBytes", None)
             ed = dict(db_row.extra_data or {})
             ed.update(patch)
             db_row.extra_data = ed

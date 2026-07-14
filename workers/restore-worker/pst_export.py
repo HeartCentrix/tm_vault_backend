@@ -589,7 +589,7 @@ class PstExportOrchestrator:
                 f"items_to_write={len(items_to_write)}",
                 flush=True,
             )
-            if item_type == "EMAIL" and self.attachment_index:
+            if item_type in ("EMAIL", "ARCHIVE_ITEM") and self.attachment_index:
                 for it in items_to_write:
                     matched = self.attachment_index.get(it.external_id, [])
                     it._email_attachment_items = matched
@@ -1147,7 +1147,7 @@ class PstExportOrchestrator:
 
                 # Stamp pre-fetched attachment siblings onto each EMAIL item;
                 # see _run_streaming._flush_group for the matching call site.
-                if group.item_type == "EMAIL" and self.attachment_index:
+                if group.item_type in ("EMAIL", "ARCHIVE_ITEM") and self.attachment_index:
                     for _it in group.items:
                         _it._email_attachment_items = self.attachment_index.get(
                             _it.external_id, []

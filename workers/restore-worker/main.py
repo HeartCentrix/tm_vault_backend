@@ -2086,7 +2086,7 @@ class RestoreWorker:
                     item_ids=[],            # always pull all attachments for the picked snapshots
                     folder_paths=None,      # parent emails handle folder filtering
                     excluded_item_ids=None,
-                    item_types={"EMAIL_ATTACHMENT"},
+                    item_types={"EMAIL_ATTACHMENT", "ARCHIVE_ATTACHMENT"},
                     batch_size=_batch_size,
                 ):
                     for _att in _batch:
