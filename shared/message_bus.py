@@ -130,8 +130,12 @@ class MessageBus:
                 await self._declare_queue("restore.low", routing_key="restore.low")
                 # Archive preview-enrichment — dedicated queue drained by the
                 # standalone enrichment-worker (opaque blob → previewable JSON),
-                # kept off the restore pools so it scales independently.
-                await self._declare_queue("enrich.priority", routing_key="enrich.priority")
+                # kept off the restore pools so it scales independently. NO
+                # x-consumer-timeout: enrichment messages are fast, and (critically)
+                # this broker rejects that arg on a NEW queue's creation — applying
+                # it here would fail every service's connect (see _declare_queue).
+                await self._declare_queue("enrich.priority", routing_key="enrich.priority",
+                                          apply_consumer_timeout=False)
                 # Heavy restore pool — gated by HEAVY_EXPORT_ENABLED but
                 # the queue must exist either way so restore-worker-heavy
                 # can bind to it on startup without passive=True failing.
@@ -194,7 +198,8 @@ class MessageBus:
         if self.connection:
             await self.connection.close()
     
-    async def _declare_queue(self, queue_name: str, routing_key: str):
+    async def _declare_queue(self, queue_name: str, routing_key: str,
+                             apply_consumer_timeout: bool = True):
         # Declare a Dead Letter Queue for failed messages
         dlq_name = f"{queue_name}.dlq"
         dlq = await self.channel.declare_queue(dlq_name, durable=True)
@@ -204,14 +209,22 @@ class MessageBus:
         # Main queue routes rejected messages to the DLQ. Override
         # x-consumer-timeout at queue level so RabbitMQ's default (30 min on
         # 3.12+) doesn't redeliver week-long OneDrive backups mid-run.
+        args = {
+            "x-dead-letter-exchange": "tm.exchange",
+            "x-dead-letter-routing-key": dlq_routing_key,
+        }
+        # This broker REJECTS x-consumer-timeout at queue *creation* (the
+        # pre-existing queues were created before it and are grandfathered; a
+        # brand-new queue with it fails PRECONDITION "invalid arg" and takes
+        # down the whole connect for every service). Only apply it where it's
+        # meaningful (long-running drains); fast queues opt out so a NEW queue
+        # can always be created.
+        if apply_consumer_timeout:
+            args["x-consumer-timeout"] = settings.RABBITMQ_CONSUMER_TIMEOUT_MS
         queue = await self.channel.declare_queue(
             queue_name,
             durable=True,
-            arguments={
-                "x-dead-letter-exchange": "tm.exchange",
-                "x-dead-letter-routing-key": dlq_routing_key,
-                "x-consumer-timeout": settings.RABBITMQ_CONSUMER_TIMEOUT_MS,
-            },
+            arguments=args,
         )
         await queue.bind(self.exchange, routing_key)
     

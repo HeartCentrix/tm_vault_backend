@@ -98,7 +98,7 @@ async def enrich_one_resource(resource_id) -> dict:
             resource = await session.get(Resource, UUID(rid))
             if not resource:
                 return {"skipped": "no_resource"}
-            if resource.resource_type != ResourceType.USER_ARCHIVE:
+            if resource.type != ResourceType.USER_ARCHIVE:
                 return {"skipped": "not_archive"}
             tenant = await session.get(Tenant, resource.tenant_id)
             if not tenant:
