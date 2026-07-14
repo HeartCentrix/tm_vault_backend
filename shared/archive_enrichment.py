@@ -231,9 +231,16 @@ async def enrich_resource(
                     print(f"[{worker_id}] archive attachment cleanup skipped: {type(e).__name__}")
                 container = azure_storage_manager.get_container_name(str(db_row.tenant_id), ARCHIVE_WORKLOAD)
                 for p in plans:
+                    # Key the blob by content hash (att_<hash40>) exactly like the
+                    # mail worker (workers/backup-worker/main.py:9294). The raw
+                    # external_id::att_id runs ~320 chars — two Graph ids joined —
+                    # which overflows SeaweedFS's 255-byte filer-segment limit and
+                    # makes every PutObject fail with InternalError (silent: bytes
+                    # never land, /content returns source:none). Content-hash keys
+                    # are short, safe, and dedup-aligned.
                     blob_path = azure_storage_manager.build_blob_path(
                         str(db_row.tenant_id), str(resource.id), str(db_row.snapshot_id),
-                        f"{db_row.external_id}::{p['att_id']}",
+                        f"att_{p['content_hash'][:40]}",
                     )
                     up = await upload_attachment(db_row.tenant_id, p["content_hash"], container, blob_path, p["data"])
                     # Dedup-aware: on a dedup_hit the uploader writes NOTHING new
@@ -244,19 +251,6 @@ async def enrich_resource(
                     # returns source:none.
                     if isinstance(up, dict) and up.get("blob_path"):
                         blob_path = up["blob_path"]
-                    # TEMP DIAGNOSTIC (remove after root-cause): reveal exactly
-                    # what the uploader did — dedup_hit vs real upload vs failure
-                    # — and the container + stored path, so a source:none read can
-                    # be traced to write-side vs read-side.
-                    try:
-                        _m = up.get("method") if isinstance(up, dict) else None
-                        _ok = up.get("success") if isinstance(up, dict) else None
-                        _err = up.get("error") if isinstance(up, dict) else None
-                        print(f"[{worker_id}] ARCH_ATT_DIAG att={p['att_id'][:16]} bytes={len(p['data'])} "
-                              f"container={container} method={_m} success={_ok} err={_err} "
-                              f"stored_tail=...{str(blob_path)[-46:]}", flush=True)
-                    except Exception:
-                        pass
                     s.add(SnapshotItem(
                         id=_uuid.uuid4(),
                         snapshot_id=db_row.snapshot_id,

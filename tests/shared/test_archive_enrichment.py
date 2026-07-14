@@ -252,6 +252,13 @@ async def test_enrich_uploads_attachment_bytes_and_creates_sibling_row():
     assert sib.extra_data["parent_item_id"] == "MSG1"
     assert sib.blob_path == uploads[0]["blob_path"]
     assert sib.content_size == len(pdf)
+    # The blob KEY's final segment must be short + content-hashed (att_<hash40>),
+    # NOT the raw external_id::att_id — Graph ids are ~150 chars each, so the
+    # concatenation blew past SeaweedFS's 255-byte filer segment limit and every
+    # PutObject failed with InternalError. Mirror the mail worker's key format.
+    key = uploads[0]["blob_path"].rsplit("/", 1)[-1]
+    assert key == f"att_{hashlib.sha256(pdf).hexdigest()[:40]}"
+    assert len(key) < 60 and "::" not in key
     # parent row still stripped
     assert "contentBytes" not in db1.extra_data["raw"]["attachments"][0]
 
