@@ -4271,10 +4271,40 @@ class BackupWorker:
             )
             return {"item_count": total_items, "bytes_added": delta_bytes}
         except Exception as e:
+            es = f"{type(e).__name__}: {e}"
+            if ab.is_skippable_error(es):
+                # No archive access — the app isn't consented in this tenant, or
+                # the mailbox is unlicensed / gone. SKIP gracefully: complete the
+                # snapshot as a benign 0-item run (NOT failed) so the backup job
+                # doesn't alarm, and record why. A later re-discovery / consent
+                # picks it up. (Mirrors the license_missing handling for mail.)
+                print(f"[{self.worker_id}] [USER_ARCHIVE] {resource.display_name}: "
+                      f"inaccessible — skipping gracefully ({es[:160]})")
+                try:
+                    async with async_session_factory() as session:
+                        snap = await session.get(Snapshot, snapshot.id)
+                        if snap:
+                            snap.item_count = 0
+                            snap.new_item_count = 0
+                            snap.bytes_total = 0
+                            snap.bytes_added = 0
+                            snap.status = await _coerce_snapshot_terminal_on_cancel(
+                                snap, SnapshotStatus.COMPLETED,
+                            )
+                            snap.completed_at = datetime.utcnow()
+                            _ed = dict(snap.extra_data or {})
+                            _ed["archive_skipped"] = True
+                            _ed["archive_skip_reason"] = es[:300]
+                            snap.extra_data = _ed
+                            await session.commit()
+                except Exception as _fin_err:
+                    print(f"[{self.worker_id}] [USER_ARCHIVE] skip-finalize warning: {_fin_err}")
+                return {"item_count": 0, "bytes_added": 0, "skipped": True}
+            # Genuine / transient failure — fail the snapshot so it retries.
             async with async_session_factory() as session:
                 snap = await session.get(Snapshot, snapshot.id)
                 if snap:
-                    await self.fail_snapshot(session, snap, f"{type(e).__name__}: {e}")
+                    await self.fail_snapshot(session, snap, es)
             raise
 
     async def _load_archive_state(self, tenant: Tenant, resource: Resource) -> Optional[Dict[str, str]]:

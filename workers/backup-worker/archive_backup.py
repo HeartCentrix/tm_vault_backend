@@ -25,6 +25,55 @@ ARCHIVE_WORKLOAD = "archive"
 ARCHIVE_ITEM_TYPE = "ARCHIVE_ITEM"
 
 
+# Error signals meaning "this archive is inaccessible to us" — the app lacks
+# consent in the tenant, or the mailbox is unlicensed / gone. These must SKIP
+# gracefully (benign 0-item snapshot), never mark the backup FAILED. Everything
+# else (5xx, timeouts, bugs) is a real/transient failure that should fail+retry.
+_SKIP_SIGNALS = (
+    "MailboxNotEnabledForRESTAPI", "ErrorAccessDenied", "Authorization_RequestDenied",
+    "ErrorMailboxNotFound", "does not have access", "Access is denied", "Forbidden",
+    "Unauthorized",
+)
+
+
+def is_skippable_error(error_text: Optional[str]) -> bool:
+    """True if the error means the archive is simply inaccessible (skip), not a
+    transient/real failure (fail + retry)."""
+    s = error_text or ""
+    sl = s.lower()
+    if any(sig.lower() in sl for sig in _SKIP_SIGNALS):
+        return True
+    # bare HTTP auth/consent status codes (GraphClient stringifies errors)
+    return any(code in s for code in ("403", "401"))
+
+
+def item_kind(mapi_type: Optional[str]) -> str:
+    """Map a mailboxItem's MAPI message class (the only descriptive field the
+    Import/Export items endpoint exposes — live-verified that $select of
+    subject/sender/from returns HTTP 400 "no such property") to a human kind for
+    the Recovery browse. Subjects are unavailable without staging, so this is the
+    most a catalog row can say about "what it is"."""
+    t = (mapi_type or "").strip()
+    tl = t.lower()
+    if tl.startswith("ipm.note"):
+        return "Email"
+    if tl.startswith("ipm.contact") or tl.startswith("ipm.distlist"):
+        return "Contact"
+    if tl.startswith("ipm.appointment") or tl.startswith("ipm.schedule"):
+        return "Calendar event"
+    if tl.startswith("ipm.task"):
+        return "Task"
+    if tl.startswith("ipm.stickynote"):
+        return "Note"
+    if tl.startswith("ipm.activity"):
+        return "Journal"
+    if tl.startswith("ipm.post"):
+        return "Post"
+    if tl.startswith("report."):
+        return "Delivery report"
+    return t or "Item"
+
+
 def state_blob_path(tenant_id: str, resource_id: str) -> str:
     """Deterministic, OVERWRITABLE path for a resource's incremental changeKey
     state blob. Fixed (no snapshot id / timestamp) so every run reads and
@@ -76,6 +125,7 @@ def build_archive_item_row(
     ``metadata``, or it silently vanishes). The item's ``changeKey`` rides in
     ``extra_data`` so the catalog self-describes for restore; the blob itself is
     the opaque MAPI FastTransfer stream, stored verbatim."""
+    kind = item_kind(item.get("type"))
     return {
         "id": uuid.uuid4(),
         "snapshot_id": snapshot_id,
@@ -83,7 +133,9 @@ def build_archive_item_row(
         "external_id": item["id"],
         "parent_external_id": folder.get("id"),
         "item_type": ARCHIVE_ITEM_TYPE,
-        "name": (item.get("subject") or item.get("type") or "archive-item")[:255],
+        # No subject is available from the opaque endpoint — the friendly kind
+        # (Email/Contact/Calendar…) is the most a browse row can show.
+        "name": kind,
         "folder_path": folder.get("displayName") or folder.get("id"),
         "content_size": blob_len,
         "content_hash": content_hash,
@@ -92,6 +144,8 @@ def build_archive_item_row(
         "extra_data": {
             "change_key": item.get("changeKey"),
             "opaque": True,
+            "kind": kind,
+            "mapi_type": item.get("type"),
             "mailbox_id": mailbox_id,
             "graph_version": graph_version,
             "size": item.get("size"),

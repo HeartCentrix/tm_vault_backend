@@ -20,8 +20,48 @@ from archive_backup import (  # noqa: E402
     ARCHIVE_ITEM_TYPE,
     advance_state,
     build_archive_item_row,
+    is_skippable_error,
+    item_kind,
     state_blob_path,
 )
+
+
+# ── is_skippable_error: permission/no-access => skip gracefully, don't FAIL ──
+
+def test_skippable_errors_are_access_and_license_signals():
+    # perms not consented / mailbox unlicensed / access denied => skip
+    assert is_skippable_error("404 MailboxNotEnabledForRESTAPI")
+    assert is_skippable_error("HTTP 403 Forbidden")
+    assert is_skippable_error("401 Unauthorized")
+    assert is_skippable_error("Authorization_RequestDenied: insufficient privileges")
+    assert is_skippable_error("ErrorAccessDenied")
+    assert is_skippable_error("Access is denied")
+
+
+def test_transient_and_real_errors_are_NOT_skippable():
+    # these should FAIL (and retry), not be silently skipped
+    assert not is_skippable_error("503 Service Unavailable")
+    assert not is_skippable_error("500 Internal Server Error")
+    assert not is_skippable_error("ConnectTimeout")
+    assert not is_skippable_error("KeyError: 'id'")
+    assert not is_skippable_error("")
+    assert not is_skippable_error(None)
+
+
+# ── item_kind: MAPI class -> human kind (the only "what is it" we can show) ──
+
+def test_item_kind_maps_common_mapi_classes():
+    assert item_kind("IPM.Note") == "Email"
+    assert item_kind("IPM.Note.SMIME") == "Email"
+    assert item_kind("IPM.Contact") == "Contact"
+    assert item_kind("IPM.Appointment") == "Calendar event"
+    assert item_kind("IPM.Schedule.Meeting.Request") == "Calendar event"
+    assert item_kind("IPM.Task") == "Task"
+    assert item_kind("IPM.StickyNote") == "Note"
+    # unknown / empty fall back to the raw class or a generic
+    assert item_kind("IPM.Weird") == "IPM.Weird"
+    assert item_kind("") == "Item"
+    assert item_kind(None) == "Item"
 
 
 # ── advance_state: the incremental engine ────────────────────────────────
@@ -66,7 +106,7 @@ def test_row_shape_uses_extra_data_key_not_metadata():
     row = build_archive_item_row(
         snapshot_id="S", tenant_id="T",
         folder={"id": "F", "displayName": "Archive/2019"},
-        item={"id": "I", "changeKey": "CK", "type": "message", "size": 1234,
+        item={"id": "I", "changeKey": "CK", "type": "IPM.Note", "size": 1234,
               "lastModifiedDateTime": "2026-07-14T00:00:00Z"},
         blob_path="T/R/S/I", content_hash="H", blob_len=2048,
         mailbox_id="MBX", graph_version="beta",
@@ -78,22 +118,28 @@ def test_row_shape_uses_extra_data_key_not_metadata():
     assert row["blob_path"] == "T/R/S/I"
     assert row["content_size"] == 2048
     assert row["content_hash"] == row["content_checksum"] == "H"
+    # name = friendly kind (no subject is available from the opaque endpoint)
+    assert row["name"] == "Email"
     # mapped-class insert -> MUST be the ORM attribute 'extra_data', never the
     # column name 'metadata' (that key would silently vanish on insert).
     assert "extra_data" in row and "metadata" not in row
     assert row["extra_data"]["change_key"] == "CK"
     assert row["extra_data"]["opaque"] is True
     assert row["extra_data"]["mailbox_id"] == "MBX"
+    # "what it is" — kind + raw MAPI class exposed for the browse UI
+    assert row["extra_data"]["kind"] == "Email"
+    assert row["extra_data"]["mapi_type"] == "IPM.Note"
 
 
-def test_row_name_falls_back_when_no_subject():
-    # archive item listing $selects id,changeKey,size,type — no subject present
+def test_row_name_is_friendly_kind_not_raw_mapi_class():
+    # archive item listing $selects id,changeKey,size,type — NO subject; the
+    # name must be a human kind, never the raw "IPM.*" class.
     row = build_archive_item_row(
         snapshot_id="S", tenant_id="T", folder={"id": "F"},
-        item={"id": "I", "changeKey": "CK", "type": "message"},
+        item={"id": "I", "changeKey": "CK", "type": "IPM.Contact"},
         blob_path="p", content_hash="H", blob_len=1, mailbox_id="M", graph_version="v1.0",
     )
-    assert row["name"] == "message"
+    assert row["name"] == "Contact"
     assert row["folder_path"] == "F"  # falls back to folder id when no displayName
 
 
