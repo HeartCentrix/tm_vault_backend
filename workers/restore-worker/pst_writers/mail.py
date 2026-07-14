@@ -34,6 +34,12 @@ from .base import PstWriterBase, MAX_ATTACHMENT_BYTES  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
+# Non-reserved root folder that Online Archive items are nested under in a PST,
+# so Outlook's import can't merge them into the special "Archive" folder. Keeps
+# the source archive hierarchy underneath. Overridable if a client prefers a
+# different label.
+ARCHIVE_PST_ROOT = os.getenv("ARCHIVE_PST_ROOT_FOLDER", "Online Archive (Recovered)")
+
 
 class MailPstWriter(PstWriterBase):
     item_type = "EMAIL"
@@ -178,6 +184,15 @@ class MailPstWriter(PstWriterBase):
                 or msg_json.get("_full_folder_path")
                 or ""
             )
+        # Online Archive items: nest under a NON-reserved root. The source
+        # archive's own folders are often reserved names (e.g. "Archive",
+        # "Deleted Items") — importing a PST with a top-level "Archive" folder
+        # merges it into the mailbox's special Archive / online-archive folder,
+        # so the message vanishes from view even though the PST is valid. A
+        # neutral root keeps the archive's folder hierarchy intact while landing
+        # it in a plainly visible new folder on import.
+        if getattr(item, "item_type", None) == "ARCHIVE_ITEM":
+            item_folder_path = f"{ARCHIVE_PST_ROOT}/{item_folder_path}".rstrip("/")
         if item_folder_path:
             msg_json["_folderPath"] = str(item_folder_path)
 
