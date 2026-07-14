@@ -18,8 +18,13 @@ from shared.database import get_db, init_db, close_db, AsyncSession
 from shared.models import Snapshot, SnapshotItem, Resource, SnapshotType, SnapshotStatus, ResourceType, Job
 from shared.snapshot_reuse import resolve_snapshot_items_target, SnapshotNotFound
 from shared.config import settings
-from shared.message_bus import message_bus
 from shared.archive_enrich import needs_enrichment as _needs_enrichment
+# Producer-only; on-demand archive enrichment nudge. Defensive so this read API
+# still boots if the broker deps are ever absent — the trigger just no-ops.
+try:
+    from shared.message_bus import message_bus
+except Exception:  # noqa: BLE001
+    message_bus = None
 from shared.power_bi_snapshot import assemble_power_bi_items
 from shared.azure_storage import azure_storage_manager, workload_candidates_for_resource_type
 from shared.schemas import (
@@ -223,7 +228,7 @@ async def lifespan(app: FastAPI):
     # Producer-only RabbitMQ connect so browse can nudge on-demand archive
     # preview-enrichment (enrich.priority). Best-effort — a read API must still
     # start if the broker is down; publish() no-ops when the exchange is unset.
-    if settings.RABBITMQ_ENABLED:
+    if settings.RABBITMQ_ENABLED and message_bus is not None:
         try:
             await message_bus.connect()
         except Exception as e:
@@ -241,6 +246,8 @@ async def _maybe_trigger_archive_enrichment(db: AsyncSession, items: List[Snapsh
     archive first (enrich.priority). Best-effort + idempotent — the worker's
     in-flight guard + needs_enrichment() absorb duplicate browses, so firing once
     per page load is harmless."""
+    if message_bus is None:
+        return
     try:
         pend = next(
             (it for it in items
