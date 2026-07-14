@@ -1608,6 +1608,15 @@ async def list_snapshot_emails(
     return {"content": [fmt(i) for i in items], "totalElements": total, "totalPages": max(1, (total+size-1)//size), "size": size, "number": page}
 
 
+_ARCHIVE_CATEGORY_MATCH = {
+    # Which archive items belong under each content tab's "Online Archive"
+    # folder, by MAPI class (extra_data.mapi_type) / friendly kind.
+    "mail": lambda mt, k: mt.startswith("IPM.Note") or k == "Email" or (not mt and not k),
+    "contacts": lambda mt, k: mt.startswith("IPM.Contact") or k == "Contact",
+    "calendar": lambda mt, k: mt.startswith("IPM.Appointment") or mt.startswith("IPM.Schedule") or "Calendar" in (k or ""),
+}
+
+
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/archive")
 async def list_snapshot_archive(
     snapshot_id: str,
@@ -1615,6 +1624,7 @@ async def list_snapshot_archive(
     size: int = Query(500, ge=1),
     folder: Optional[str] = Query(None, description="Filter to a specific archive folder path"),
     search: Optional[str] = Query(None, description="Case-insensitive substring match on name/subject"),
+    category: Optional[str] = Query(None, description="mail | contacts | calendar — filter archive items to a content tab's kind"),
     db: AsyncSession = Depends(get_db),
 ):
     """Exchange Online Archive items for the browse tab. Archive items are
@@ -1648,6 +1658,15 @@ async def list_snapshot_archive(
             continue
         seen.add(key)
         deduped.append(it)
+
+    # Split by content kind so each tab's "Online Archive" folder shows only its
+    # own items (mail under Mail, contacts under Contacts, events under Calendar).
+    _match = _ARCHIVE_CATEGORY_MATCH.get((category or "").lower())
+    if _match:
+        def _keep(r):
+            ed = r.extra_data or {}
+            return _match((ed.get("mapi_type") or ""), (ed.get("kind") or ""))
+        deduped = [r for r in deduped if _keep(r)]
 
     def _arch_sort_key(r):
         raw = (r.extra_data or {}).get("raw") or {}
