@@ -561,6 +561,7 @@ async def storage_summary(
 async def get_snapshot_folders(
     snapshot_id: str = Query(...),
     item_type: Optional[str] = Query(None),
+    category: Optional[str] = Query(None, description="With item_type=ARCHIVE_ITEM: mail|contacts|calendar — count only that kind"),
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
@@ -578,6 +579,12 @@ async def get_snapshot_folders(
     Falling back inline like this avoids a one-time backfill migration and
     keeps the endpoint useful for snapshots taken before the folder_path
     plumbing landed."""
+    # Archive folders are shared across kinds (one physical folder can hold
+    # mail + contacts + events), so a kind-agnostic count would show the mail
+    # total under the Contacts tab. Count per-category using the SAME MAPI-kind
+    # match as the item view so the folder count matches what opening it shows.
+    if (item_type or "").upper() == "ARCHIVE_ITEM" and category:
+        return await _serve_archive_folders(db, snapshot_id, category)
     assembled_items = await _get_power_bi_assembled_items(db, snapshot_id)
     if assembled_items is not None:
         filtered = [item for item in assembled_items if not item_type or item.item_type == item_type]
@@ -1624,6 +1631,38 @@ _ARCHIVE_CATEGORY_MATCH = {
     "contacts": lambda mt, k: mt.startswith("IPM.Contact") or k == "Contact",
     "calendar": lambda mt, k: mt.startswith("IPM.Appointment") or mt.startswith("IPM.Schedule") or "Calendar" in (k or ""),
 }
+
+
+async def _serve_archive_folders(db: AsyncSession, snapshot_id: str, category: str):
+    """Per-category archive folder list + counts for the left panel. Mirrors
+    `_serve_archive_items`' sibling-resolution, first-seen dedup, and MAPI-kind
+    match so each folder's count equals exactly what opening it (same folder +
+    category) would show — no kind-agnostic over-count leaking mail totals onto
+    the Contacts/Calendar tabs. Shape matches `get_snapshot_folders`."""
+    sibling_ids = await _resolve_sibling_snapshot_ids(
+        db, snapshot_id, target_child_type=ResourceType.USER_ARCHIVE,
+    )
+    if not sibling_ids:
+        sibling_ids = [UUID(snapshot_id)]
+    rows = (await db.execute(select(SnapshotItem).where(
+        SnapshotItem.snapshot_id.in_(sibling_ids),
+        SnapshotItem.item_type == "ARCHIVE_ITEM",
+    ))).scalars().all()
+    _match = _ARCHIVE_CATEGORY_MATCH.get((category or "").lower())
+    seen: set = set()
+    counts: Dict[str, int] = {}
+    for it in rows:
+        key = it.external_id or str(it.id)
+        if key in seen:
+            continue
+        seen.add(key)
+        ed = it.extra_data or {}
+        if _match and not _match((ed.get("mapi_type") or ""), (ed.get("kind") or "")):
+            continue
+        p = it.folder_path or ""
+        counts[p] = counts.get(p, 0) + 1
+    content = [{"path": p, "count": c} for p, c in sorted(counts.items())]
+    return {"content": content, "total": len(content), "page": 1, "size": len(content), "hasMore": False}
 
 
 async def _serve_archive_items(db: AsyncSession, snapshot_id: str, page: int = 1,
