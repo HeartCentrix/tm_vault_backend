@@ -3,8 +3,9 @@
 Turns a staged Graph JSON message (the scratch-mailbox read of an archive item's
 opaque blob) into the update applied to the source ``ARCHIVE_ITEM`` row, so the
 item becomes previewable/exportable exactly like normal mail. The heavy async
-orchestration (stage → map → persist, paced + incremental) lives in the worker;
-this module is the pure, testable transform. Pairs with archive_export.py
+orchestration (stage → map → persist, paced + incremental) lives in
+``shared/archive_enrichment.py`` + the enrichment-worker; this module is the
+pure, testable transform. Pairs with archive_export.py
 (:meth:`ArchiveExportStager.stage_and_map`).
 
 Backup/restore/export never depend on enrichment — it only unlocks in-browser

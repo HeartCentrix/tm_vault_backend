@@ -128,6 +128,10 @@ class MessageBus:
                 await self._declare_queue("restore.urgent", routing_key="restore.urgent")
                 await self._declare_queue("restore.normal", routing_key="restore.normal")
                 await self._declare_queue("restore.low", routing_key="restore.low")
+                # Archive preview-enrichment — dedicated queue drained by the
+                # standalone enrichment-worker (opaque blob → previewable JSON),
+                # kept off the restore pools so it scales independently.
+                await self._declare_queue("enrich.priority", routing_key="enrich.priority")
                 # Heavy restore pool — gated by HEAVY_EXPORT_ENABLED but
                 # the queue must exist either way so restore-worker-heavy
                 # can bind to it on startup without passive=True failing.
@@ -501,6 +505,7 @@ def create_restore_message(
         "EXPORT_PST": 6,
         "EXPORT_ZIP": 7,
         "DOWNLOAD": 8,
+        "ARCHIVE_ENRICH": 9,  # background preview-enrichment — lowest priority
     }
 
     queue_map = {
@@ -510,6 +515,12 @@ def create_restore_message(
         "EXPORT_PST": "restore.normal",
         "EXPORT_ZIP": "restore.low",
         "DOWNLOAD": "restore.low",
+        # Archive preview-enrichment runs on its own dedicated service +
+        # queue (workers/enrichment-worker), NOT the restore workers — so it
+        # scales independently and never touches the restore pools. Publishers
+        # normally send to enrich.priority directly; kept here so this router
+        # stays correct if ever reused for it.
+        "ARCHIVE_ENRICH": "enrich.priority",
     }
 
     queue = AZURE_RESTORE_QUEUE_BY_TYPE.get(resource_type or "")

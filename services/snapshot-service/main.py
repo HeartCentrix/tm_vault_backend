@@ -18,6 +18,8 @@ from shared.database import get_db, init_db, close_db, AsyncSession
 from shared.models import Snapshot, SnapshotItem, Resource, SnapshotType, SnapshotStatus, ResourceType, Job
 from shared.snapshot_reuse import resolve_snapshot_items_target, SnapshotNotFound
 from shared.config import settings
+from shared.message_bus import message_bus
+from shared.archive_enrich import needs_enrichment as _needs_enrichment
 from shared.power_bi_snapshot import assemble_power_bi_items
 from shared.azure_storage import azure_storage_manager, workload_candidates_for_resource_type
 from shared.schemas import (
@@ -218,11 +220,46 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[SNAPSHOT] chat_topic backfill failed (non-fatal): {e}")
     await startup_router()
+    # Producer-only RabbitMQ connect so browse can nudge on-demand archive
+    # preview-enrichment (enrich.priority). Best-effort — a read API must still
+    # start if the broker is down; publish() no-ops when the exchange is unset.
+    if settings.RABBITMQ_ENABLED:
+        try:
+            await message_bus.connect()
+        except Exception as e:
+            print(f"[SNAPSHOT] message_bus connect failed (non-fatal): {e}")
     try:
         yield
     finally:
         await shutdown_router()
         await close_db()
+
+
+async def _maybe_trigger_archive_enrichment(db: AsyncSession, items: List[SnapshotItem]) -> None:
+    """On-demand preview enrichment: if this browsed page includes archive items
+    that still need enriching, nudge the enrichment-worker to process THIS user's
+    archive first (enrich.priority). Best-effort + idempotent — the worker's
+    in-flight guard + needs_enrichment() absorb duplicate browses, so firing once
+    per page load is harmless."""
+    try:
+        pend = next(
+            (it for it in items
+             if it.item_type == "ARCHIVE_ITEM" and _needs_enrichment(it.extra_data or {})),
+            None,
+        )
+        if pend is None:
+            return
+        snap = await db.get(Snapshot, pend.snapshot_id)
+        rid = getattr(snap, "resource_id", None)
+        if not rid:
+            return
+        await message_bus.publish(
+            "enrich.priority",
+            {"resourceId": str(rid), "restoreType": "ARCHIVE_ENRICH"},
+            priority=9,
+        )
+    except Exception as e:  # noqa: BLE001 - trigger must never break a browse
+        print(f"[SNAPSHOT] archive enrich trigger skipped (non-fatal): {e}")
 
 
 app = FastAPI(title="Snapshot Service", version="1.0.0", lifespan=lifespan)
@@ -821,6 +858,7 @@ async def list_snapshot_items(
     result = await db.execute(stmt)
     items = result.scalars().all()
 
+    await _maybe_trigger_archive_enrichment(db, items)
     return SnapshotItemListResponse(
         content=[_item_to_response(item) for item in items],
         totalPages=max(1, (total + size - 1) // size),
@@ -874,6 +912,7 @@ async def browse_snapshot_items(
     result = await db.execute(stmt)
     items = result.scalars().all()
 
+    await _maybe_trigger_archive_enrichment(db, items)
     return SnapshotItemListResponse(
         content=[_item_to_response(item) for item in items],
         totalPages=max(1, (total + size - 1) // size),

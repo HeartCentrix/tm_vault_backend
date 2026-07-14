@@ -395,6 +395,41 @@ services:
     networks:
       - tm-network
 
+  # Dedicated, independently-scalable service that converts backed-up archive
+  # OPAQUE blobs → previewable Graph JSON via restore-to-staging. Two drivers:
+  # on-demand (enrich.priority, user opened their archive) + a bulk parallel
+  # sweep. Never blocks backup/restore/export. See workers/enrichment-worker.
+  enrichment-worker:
+    build:
+      context: .
+      dockerfile: workers/enrichment-worker/Dockerfile
+    container_name: tm_vault_enrichment
+    env_file: .env
+    environment:
+      DB_HOST: postgres
+      RABBITMQ_ENABLED: ${RABBITMQ_ENABLED:-false}
+      RABBITMQ_HOST: ${RABBITMQ_HOST:-rabbitmq}
+      RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
+      RABBITMQ_USER: ${RABBITMQ_USER:?RABBITMQ_USER must be set — do not fall back to the default guest account}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set — do not fall back to the default guest account}
+      # Distinct metrics port so it doesn't collide with a sibling worker on the
+      # same host (each Railway service is its own container; this is for compose).
+      CORE_METRICS_PORT: ${ENRICH_CORE_METRICS_PORT:-9111}
+      # Enrichment tunables (see workers/enrichment-worker/main.py).
+      ENRICH_BULK_ENABLED: ${ENRICH_BULK_ENABLED:-true}
+      ENRICH_BULK_INTERVAL_S: ${ENRICH_BULK_INTERVAL_S:-300}
+      ENRICH_BULK_CONCURRENCY: ${ENRICH_BULK_CONCURRENCY:-4}
+      ENRICH_BULK_BATCH_LIMIT: ${ENRICH_BULK_BATCH_LIMIT:-50}
+      ARCHIVE_ENRICH_BATCH: ${ARCHIVE_ENRICH_BATCH:-50}
+      ARCHIVE_GRAPH_VERSION: ${ARCHIVE_GRAPH_VERSION:-beta}
+      ARCHIVE_IMPORT_TIMEOUT_S: ${ARCHIVE_IMPORT_TIMEOUT_S:-120}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - tm-network
+
   # ===== Mass Backup Services =====
   
   backup-scheduler:

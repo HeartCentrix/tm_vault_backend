@@ -13,7 +13,7 @@ for _p in (str(_ROOT), str(_WORKER)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import archive_enrich as ax  # noqa: E402
+from shared import archive_enrich as ax  # noqa: E402
 
 
 NESTED = {

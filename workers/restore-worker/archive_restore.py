@@ -14,30 +14,14 @@ callable; :func:`post_json_no_auth` is the bare client the import path needs.
 """
 from __future__ import annotations
 
-import os
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
-import httpx
-
 from shared import archive_graph
-
-
-async def post_json_no_auth(
-    url: str, body: Dict[str, Any], *, _client_transport: Optional[Any] = None,
-) -> Dict[str, Any]:
-    """POST JSON to a preauthenticated import URL with NO Authorization header.
-
-    ``_client_transport`` is a test seam (an ``httpx.MockTransport``); production
-    callers omit it and a real network client is used."""
-    timeout = float(os.getenv("ARCHIVE_IMPORT_TIMEOUT_S", "120"))
-    kwargs: Dict[str, Any] = {"timeout": timeout}
-    if _client_transport is not None:
-        kwargs["transport"] = _client_transport
-    async with httpx.AsyncClient(**kwargs) as client:
-        resp = await client.post(url, json=body)
-        resp.raise_for_status()
-        return resp.json() if resp.content else {}
+# Canonical home for the unauth import POST is shared/archive_export.py (both the
+# restore + enrichment paths stage through it). Re-exported here so restore-path
+# callers and test_archive_restore's `ar.post_json_no_auth` keep resolving.
+from shared.archive_export import post_json_no_auth  # noqa: F401
 
 
 def resolve_target_mailbox_id(items: List[Any]) -> Optional[str]:

@@ -1,23 +1,53 @@
-"""Archive → EML/MBOX/PST EXPORT via restore-to-staging.
+"""Archive → EML/MBOX/PST EXPORT + PREVIEW-ENRICHMENT via restore-to-staging.
 
-The opaque MAPI blob can't be parsed, so to export an archive to files we stage
-it: import blobs into a TEMP folder of the user's OWN PRIMARY mailbox (the only
-mailbox the standard Graph mail API can read), read them back as normal Graph
-JSON, then hand that JSON to the EXISTING exporters (build_eml / MboxWriter /
-pst_convert) unchanged. Footprint is bounded by batching (import → read → empty
-→ repeat), and the temp folder is ALWAYS deleted at the end — an export must
-never leave archive data sitting in the user's live mailbox.
+The opaque MAPI blob can't be parsed, so to read an archive item's content we
+stage it: import blobs into a TEMP folder of the user's OWN PRIMARY mailbox (the
+only mailbox the standard Graph mail API can read), read them back as normal
+Graph JSON, then either hand that JSON to the EXISTING exporters (build_eml /
+MboxWriter / pst_convert) unchanged, or map it back onto the source
+``ARCHIVE_ITEM`` row for preview-enrichment. Footprint is bounded by batching
+(import → read → empty → repeat), and the temp folder is ALWAYS deleted at the
+end — staging must never leave archive data sitting in the user's live mailbox.
 
 Split into a TESTABLE engine (:class:`ArchiveExportStager` — the batching loop +
 the cleanup guarantee) and the LIVE Graph ops (:class:`LiveStagingOps`), injected
 so the engine is unit-tested with fakes. The live ops are exercised end-to-end by
 the Phase-6 round-trip proof.
+
+Lives in ``shared/`` because BOTH the restore-worker (export-to-file) and the
+enrichment-worker (preview-enrichment) stage through it.
 """
 from __future__ import annotations
 
+import os
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 
+import httpx
+
 from shared import archive_graph
+
+
+async def post_json_no_auth(
+    url: str, body: Dict[str, Any], *, _client_transport: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """POST JSON to a preauthenticated import URL with NO Authorization header.
+
+    The Import/Export API returns a preauthenticated ``outlook.office365.com``
+    ``importUrl`` whose token is embedded — it must carry NO ``Authorization``
+    header (``GraphClient._post`` always attaches auth + targets
+    ``graph.microsoft.com``, so it is the wrong callable). Canonical home for
+    the import path; ``archive_restore`` re-exports it for the restore side.
+
+    ``_client_transport`` is a test seam (an ``httpx.MockTransport``); production
+    callers omit it and a real network client is used."""
+    timeout = float(os.getenv("ARCHIVE_IMPORT_TIMEOUT_S", "120"))
+    kwargs: Dict[str, Any] = {"timeout": timeout}
+    if _client_transport is not None:
+        kwargs["transport"] = _client_transport
+    async with httpx.AsyncClient(**kwargs) as client:
+        resp = await client.post(url, json=body)
+        resp.raise_for_status()
+        return resp.json() if resp.content else {}
 
 
 def _chunks(seq: List[Any], n: int):
