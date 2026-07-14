@@ -190,6 +190,27 @@ async def test_only_rows_needing_enrichment_are_staged():
     assert [r.external_id for r in seen["items"]] == ["A"]  # 'done' excluded
 
 
+# ── SQL builders compile to valid Postgres (no DB) ───────────────────────
+# extra_data is a generic JSON column, not JSONB — `.astext` doesn't exist on
+# it, so the bulk query MUST use `.as_string()` (emits ->>). These guard that
+# both statements compile and the enrich-status filter extracts text (not the
+# quoted-JSON `->`, which would never equal 'enriched').
+def test_find_pending_stmt_compiles_and_extracts_text_not_quoted_json():
+    from sqlalchemy.dialects import postgresql
+    sql = str(eng.find_pending_archive_resource_ids_stmt(50).compile(
+        dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
+    assert "->>" in sql                  # text extraction (quote-stripped)
+    assert "metadata -> 'enrich_status'" not in sql  # NOT the quoted-JSON form
+    assert "ARCHIVE_ITEM" in sql
+
+
+def test_pending_rows_stmt_compiles_distinct_on_external_id():
+    from sqlalchemy.dialects import postgresql
+    sql = str(eng.pending_archive_rows_stmt("res-1").compile(dialect=postgresql.dialect()))
+    assert "DISTINCT ON" in sql.upper()
+    assert "external_id" in sql
+
+
 # ── tiny async helper (avoid importing asyncio just for a coroutine) ──────
 async def _async_return(v):
     return v

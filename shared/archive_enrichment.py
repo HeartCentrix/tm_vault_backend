@@ -36,14 +36,14 @@ from shared.archive_export import (
 ARCHIVE_ITEM_TYPE = "ARCHIVE_ITEM"
 
 
-# ── DB helpers (Postgres; proven live) ────────────────────────────────────
-async def pending_archive_rows(session, resource_id) -> List[SnapshotItem]:
+# ── DB helpers (Postgres; statement builders are compile-tested, no DB) ────
+def pending_archive_rows_stmt(resource_id):
     """The CURRENT set of ARCHIVE_ITEM rows for one resource — newest row per
     ``external_id`` (delta backups re-emit a changed item on a later snapshot;
     we want its latest captured blob). Enrich-status is filtered in Python by
     the caller via ``needs_enrichment`` so the SQL stays a plain newest-wins
     dedupe. Excludes tombstones."""
-    stmt = (
+    return (
         select(SnapshotItem)
         .join(Snapshot, SnapshotItem.snapshot_id == Snapshot.id)
         .where(
@@ -55,20 +55,22 @@ async def pending_archive_rows(session, resource_id) -> List[SnapshotItem]:
         .order_by(SnapshotItem.external_id, Snapshot.created_at.desc())
         .distinct(SnapshotItem.external_id)
     )
-    return list((await session.execute(stmt)).scalars().all())
 
 
-async def find_pending_archive_resource_ids(session, limit: int = 50) -> List[Any]:
+def find_pending_archive_resource_ids_stmt(limit: int = 50):
     """Resource ids that have at least one ARCHIVE_ITEM row still needing
     enrichment — the work-list for the bulk sweep. A row is pending when its
     ``enrich_status`` is NULL/absent or FAILED (retry); ENRICHED/PROCESSING are
     excluded.
 
-    ponytail: filters on ``metadata->>'enrich_status'`` (a JSON column, no
-    index) — fine at demo scale; add a partial index on that expression if the
-    bulk sweep becomes hot at the client's user count."""
-    enrich_status = SnapshotItem.extra_data["enrich_status"].astext
-    stmt = (
+    ``extra_data`` is a generic ``JSON`` column (not JSONB), so ``.astext`` is
+    unavailable — ``.as_string()`` is the portable accessor and emits ``->>``
+    (quote-stripped text) so the equality against 'enriched'/'processing' is
+    correct (``cast(-> , str)`` would compare against '"enriched"' and never
+    match). ponytail: filters on ``metadata->>'enrich_status'`` with no index —
+    fine at demo scale; add a partial expression index if the sweep gets hot."""
+    enrich_status = SnapshotItem.extra_data["enrich_status"].as_string()
+    return (
         select(Snapshot.resource_id)
         .join(SnapshotItem, SnapshotItem.snapshot_id == Snapshot.id)
         .where(
@@ -82,7 +84,15 @@ async def find_pending_archive_resource_ids(session, limit: int = 50) -> List[An
         .distinct()
         .limit(limit)
     )
-    return [row[0] for row in (await session.execute(stmt)).all()]
+
+
+async def pending_archive_rows(session, resource_id) -> List[SnapshotItem]:
+    return list((await session.execute(pending_archive_rows_stmt(resource_id))).scalars().all())
+
+
+async def find_pending_archive_resource_ids(session, limit: int = 50) -> List[Any]:
+    rows = (await session.execute(find_pending_archive_resource_ids_stmt(limit))).all()
+    return [row[0] for row in rows]
 
 
 # ── per-resource orchestration ────────────────────────────────────────────
