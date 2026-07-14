@@ -53,6 +53,14 @@ RATE_LIMIT_PER_KEY = int(
 RATE_LIMIT_SCOPE = os.environ.get("PST_RATE_LIMIT_SCOPE", "user").lower()
 CANCEL_CHECK_INTERVAL = int(os.environ.get("PST_CANCEL_CHECK_INTERVAL", "10"))
 
+# Workload prefixes PST export probes (in order) for attachment bytes. Mail
+# bytes have shipped under "email"/"mailbox"/"group-mailbox" over time; "archive"
+# is required so Online Archive fileAttachments — stored in backup-archive-<tenant>
+# by shared/archive_enrichment.py — resolve too. Without it the export never
+# searched the archive container, so mail.py got None and wrote a metadata-only
+# (broken, ~270-byte) attachment. get_container_name maps each to a real container.
+PST_SOURCE_WORKLOADS = ("email", "mailbox", "group-mailbox", "archive")
+
 
 def _get_write_semaphore() -> asyncio.Semaphore:
     global _PST_WRITE_SEMAPHORE

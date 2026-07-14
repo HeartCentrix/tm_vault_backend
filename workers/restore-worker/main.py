@@ -1831,9 +1831,10 @@ class RestoreWorker:
         # straight through the orchestrator → writer → download helpers,
         # which now accept a sequence as well as a single string.
         if tenant_id:
+            from pst_export import PST_SOURCE_WORKLOADS
             source_container_candidates = tuple(
                 azure_storage_manager.get_container_name(tenant_id, w)
-                for w in ("email", "mailbox", "group-mailbox")
+                for w in PST_SOURCE_WORKLOADS
             )
         else:
             source_container_candidates = ("mailbox",)
