@@ -126,3 +126,43 @@ async def export_items(
             data = e.get("data")
             blob = base64.b64decode(data) if (data and not err) else b""
             yield e.get("itemId"), blob, err
+
+
+async def create_import_session(gc, mailbox_id: str, *, version: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+    """Create an import session → ``(import_url, expiration_iso)``.
+
+    The ``import_url`` is a preauthenticated ``outlook.office365.com`` URL (its
+    auth token is embedded and expires at ``expiration_iso``) — POST items to it
+    with **no** Authorization header. Restore replays a blob into the SAME
+    mailbox; the export-to-staging bridge imports into a PRIMARY/recovery mailbox
+    (standard-Graph-readable) instead of the archive, since the standard mail API
+    can't read the archive back out."""
+    j = await gc._post(
+        f"{_base(version)}/admin/exchange/mailboxes/{mailbox_id}/createImportSession", {}
+    )
+    return j.get("importUrl"), j.get("expirationDateTime")
+
+
+async def import_item(
+    post_json, import_url: str, folder_id: str, blob_bytes: bytes, *,
+    mode: str = "create", item_id: Optional[str] = None, change_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Upload one exported blob back into ``folder_id`` via the preauthenticated
+    ``import_url``. Returns the ``{itemId, changeKey}`` of the created/updated item.
+
+    ``post_json(url, body) -> dict`` is an async callable that POSTs JSON WITHOUT
+    an Authorization header (the url is preauthenticated). ``blob_bytes`` is the
+    raw opaque stream from :func:`export_items`; it is base64-encoded verbatim
+    into the FTS ``Data`` field — the exportItems→import round-trip is Microsoft's
+    only lossless path. ``mode="update"`` needs ``item_id`` + ``change_key``."""
+    body: Dict[str, Any] = {
+        "FolderId": folder_id,
+        "Mode": mode,
+        "Data": base64.b64encode(blob_bytes).decode("ascii"),
+    }
+    if mode == "update":
+        if not (item_id and change_key):
+            raise ValueError("import update mode requires item_id and change_key")
+        body["ItemId"] = item_id
+        body["ChangeKey"] = change_key
+    return await post_json(import_url, body)

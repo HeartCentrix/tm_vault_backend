@@ -130,3 +130,43 @@ async def test_export_items_surfaces_per_item_error_without_blob():
     out = [x async for x in ag.export_items(gc, "M", ["ok", "bad"])]
     assert out[0] == ("ok", b"x", None)
     assert out[1][0] == "bad" and out[1][1] == b"" and out[1][2]["code"] == "ErrorArchiveFolderMovedPermanently"
+
+
+# ─── restore / import primitive ───────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_create_import_session_returns_url_and_expiry():
+    gc = FakeGC(post_responses=[{
+        "importUrl": "https://outlook.office365.com/api/gv1.0/.../importItem?authtoken=XYZ",
+        "expirationDateTime": "2026-07-14T19:00:00Z",
+    }])
+    url, exp = await ag.create_import_session(gc, "MBX:m@t")
+    assert url.startswith("https://outlook.office365.com/") and exp == "2026-07-14T19:00:00Z"
+    # POST hits the createImportSession endpoint with an empty body
+    assert gc.post_calls[0][0].endswith("/admin/exchange/mailboxes/MBX:m@t/createImportSession")
+
+
+@pytest.mark.asyncio
+async def test_import_item_create_mode_body_is_base64_no_itemid():
+    captured = {}
+    async def post_json(url, body):
+        captured["url"] = url; captured["body"] = body
+        return {"itemId": "NEW", "changeKey": "CK"}
+    res = await ag.import_item(post_json, "https://outlook.office365.com/import?t=1",
+                               "FOLDER123", b"OPAQUE-FTS-BYTES")
+    assert res == {"itemId": "NEW", "changeKey": "CK"}
+    assert captured["body"]["FolderId"] == "FOLDER123"
+    assert captured["body"]["Mode"] == "create"
+    assert base64.b64decode(captured["body"]["Data"]) == b"OPAQUE-FTS-BYTES"  # verbatim round-trip
+    assert "ItemId" not in captured["body"]  # create must not send ItemId/ChangeKey
+
+
+@pytest.mark.asyncio
+async def test_import_item_update_requires_itemid_and_changekey():
+    async def post_json(url, body):
+        return {"itemId": body.get("ItemId"), "changeKey": body.get("ChangeKey")}
+    with pytest.raises(ValueError):
+        await ag.import_item(post_json, "u", "F", b"x", mode="update")  # missing ids
+    res = await ag.import_item(post_json, "u", "F", b"x", mode="update",
+                               item_id="I1", change_key="C1")
+    assert res == {"itemId": "I1", "changeKey": "C1"}
