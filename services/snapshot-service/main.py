@@ -564,6 +564,7 @@ async def get_snapshot_folders(
         "CALENDAR_EVENT": ResourceType.USER_CALENDAR,
         "USER_CONTACT": ResourceType.USER_CONTACTS,
         "CONTACT": ResourceType.USER_CONTACTS,
+        "ARCHIVE_ITEM": ResourceType.USER_ARCHIVE,
     }
     target_child = _item_type_to_child.get(item_type or "")
     sibling_ids = await _resolve_sibling_snapshot_ids(
