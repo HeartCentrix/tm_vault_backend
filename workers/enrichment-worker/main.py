@@ -72,18 +72,24 @@ async def _get_graph_client(tenant: Tenant) -> GraphClient:
     )
 
 
-async def _download_archive_blob(item):
-    """Fetch an ARCHIVE_ITEM's opaque blob from the dedicated ``archive``
-    container (the workload the backup handler wrote it to)."""
-    if not getattr(item, "blob_path", None):
-        return None
-    try:
-        container = azure_storage_manager.get_container_name(str(item.tenant_id), "archive")
-        return await azure_storage_manager.download_blob(container, item.blob_path)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("[%s] archive blob download failed for %s: %s: %s",
-                       WORKER_ID, item.blob_path, type(e).__name__, e)
-        return None
+def _make_download(shard):
+    """Build the per-resource blob fetcher over an already-resolved ``shard``.
+
+    Downloads go through a shard/facade's ``download_blob`` — the manager
+    singleton has NO ``download_blob`` of its own (the proven idiom, used by
+    snapshot-service + backup-scheduler, is
+    ``get_shard_for_resource(resource_id, tenant_id).download_blob(container, path)``)."""
+    async def _download(item):
+        if not getattr(item, "blob_path", None):
+            return None
+        try:
+            container = azure_storage_manager.get_container_name(str(item.tenant_id), "archive")
+            return await shard.download_blob(container, item.blob_path)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[%s] archive blob download failed for %s: %s: %s",
+                           WORKER_ID, item.blob_path, type(e).__name__, e)
+            return None
+    return _download
 
 
 async def enrich_one_resource(resource_id) -> dict:
@@ -106,11 +112,13 @@ async def enrich_one_resource(resource_id) -> dict:
             session.expunge_all()  # detach; loaded columns stay readable
 
         gc = await _get_graph_client(tenant)
+        shard = azure_storage_manager.get_shard_for_resource(
+            str(resource.id), str(resource.tenant_id))
         result = await eng.enrich_resource(
             session_factory=async_session_factory,
             resource=resource,
             gc=gc,
-            download_blob=_download_archive_blob,
+            download_blob=_make_download(shard),
             batch_size=int(os.getenv("ARCHIVE_ENRICH_BATCH", "50")),
             worker_id=WORKER_ID,
         )

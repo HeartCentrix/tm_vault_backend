@@ -3606,15 +3606,17 @@ class RestoreWorker:
 
     async def _download_archive_blob(self, item: SnapshotItem) -> Optional[bytes]:
         """Fetch an ARCHIVE_ITEM's OPAQUE MAPI blob from the dedicated ``archive``
-        container (the workload the backup handler wrote it to). Routed through
-        ``azure_storage_manager.download_blob`` so it resolves the active backend
-        (SeaweedFS/Azure) regardless of which shard the upload used."""
+        container (the workload the backup handler wrote it to). Downloads go
+        through a shard/facade — the manager singleton has NO ``download_blob``;
+        ``get_shard_for_item`` resolves the owning backend (via item.backend_id
+        when present, else the active backend)."""
         if not item.blob_path:
             return None
         try:
             from shared.azure_storage import azure_storage_manager
             container = azure_storage_manager.get_container_name(str(item.tenant_id), "archive")
-            return await azure_storage_manager.download_blob(container, item.blob_path)
+            shard = azure_storage_manager.get_shard_for_item(item)
+            return await shard.download_blob(container, item.blob_path)
         except Exception as e:
             print(f"[{self.worker_id}] [ARCHIVE_DOWNLOAD] failed for {item.blob_path}: {type(e).__name__}: {e}")
             return None

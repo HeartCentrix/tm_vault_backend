@@ -4314,7 +4314,12 @@ class BackupWorker:
         container = azure_storage_manager.get_container_name(str(tenant.id), ab.ARCHIVE_WORKLOAD)
         path = ab.state_blob_path(str(tenant.id), str(resource.id))
         try:
-            raw = await azure_storage_manager.download_blob(container, path)
+            # Downloads go through a shard (the manager singleton has no
+            # download_blob). Without this the load ALWAYS raised → the except
+            # below silently degraded every run to a full re-export (incremental
+            # never engaged). get_shard_for_resource matches the write side.
+            shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
+            raw = await shard.download_blob(container, path)
         except Exception as e:
             # A read failure must NOT masquerade as "no prior state" if we can
             # help it, but there's no safe fallback other than a full re-export
