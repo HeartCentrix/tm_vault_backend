@@ -3371,6 +3371,22 @@ def _safe_uuid(value):
         return None
 
 
+def _attachment_resolved(item_type: str, meta: dict, blob_path) -> bool:
+    """Whether the UI should link the download chip to our /content endpoint
+    (bytes are local) vs. fall back to an external sourceUrl.
+
+    ARCHIVE_ATTACHMENT rows are always our own captured fileAttachment blobs —
+    enrichment only creates the sibling row after it decoded + uploaded the
+    bytes (plan_archive_attachments skips item/referenceAttachments), so they
+    carry NO `resolved` meta flag; blob (or inline_b64) presence alone resolves
+    them. EMAIL/CHAT rows keep the explicit flag because a referenceAttachment
+    gets a metadata-only row with no local bytes."""
+    has_bytes = bool(blob_path) or bool((meta or {}).get("inline_b64"))
+    if item_type == "ARCHIVE_ATTACHMENT":
+        return has_bytes
+    return bool((meta or {}).get("resolved")) and has_bytes
+
+
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/items/{item_id}/attachments")
 async def get_item_attachments(
     snapshot_id: str,
@@ -3427,12 +3443,16 @@ async def get_item_attachments(
     #     already proved this caller can see the parent message in their
     #     own snapshot above (parent.snapshot_id == :snapshot_id), and
     #     tenant_id on the parent gates cross-tenant lookup.
+    #   ARCHIVE_ATTACHMENT — sibling of an enriched ARCHIVE_ITEM, captured into
+    #     the user's own archive snapshot. Private like EMAIL_ATTACHMENT, so
+    #     scope strictly by snapshot_id (the parent archive item lives in the
+    #     same snapshot).
     filters = [
-        SnapshotItem.item_type.in_(["EMAIL_ATTACHMENT", "CHAT_ATTACHMENT"]),
+        SnapshotItem.item_type.in_(["EMAIL_ATTACHMENT", "CHAT_ATTACHMENT", "ARCHIVE_ATTACHMENT"]),
         func.json_extract_path_text(SnapshotItem.extra_data, "parent_item_id") == parent_msg_id,
         or_(
             and_(
-                SnapshotItem.item_type == "EMAIL_ATTACHMENT",
+                SnapshotItem.item_type.in_(["EMAIL_ATTACHMENT", "ARCHIVE_ATTACHMENT"]),
                 SnapshotItem.snapshot_id == _sid,
             ),
             and_(
@@ -3483,9 +3503,7 @@ async def get_item_attachments(
             # the inline_b64 branch, every attachment under the 256 KB
             # inline threshold renders as an external SharePoint link
             # that 401s for any user other than the original uploader.
-            "resolved": bool(meta.get("resolved")) and (
-                bool(r.blob_path) or bool(meta.get("inline_b64"))
-            ),
+            "resolved": _attachment_resolved(r.item_type, meta, r.blob_path),
             "sourceUrl": meta.get("source_url") or meta.get("content_url"),
         }
 

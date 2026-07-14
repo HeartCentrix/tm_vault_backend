@@ -50,3 +50,25 @@ def test_safe_uuid_rejects_none_and_junk():
 def test_safe_uuid_parses_valid():
     u = str(uuid.uuid4())
     assert _m._safe_uuid(u) == uuid.UUID(u)
+
+
+# ── ARCHIVE_ATTACHMENT chips resolve on blob presence alone ────────────────
+# Archive fileAttachments are captured as sibling ARCHIVE_ATTACHMENT rows whose
+# bytes always live in a blob (enrichment only creates the row after it
+# decoded+uploaded them). Unlike EMAIL/CHAT rows they carry NO `resolved` meta
+# flag, so the attachments endpoint must treat blob presence as resolved — else
+# the preview chip stays stuck on "Has attachments (capturing…)" forever.
+def test_archive_attachment_resolves_on_blob_without_meta_flag():
+    assert _m._attachment_resolved("ARCHIVE_ATTACHMENT", {}, "tenant/x/blob") is True
+    # inline_b64 path also counts as local bytes
+    assert _m._attachment_resolved("ARCHIVE_ATTACHMENT", {"inline_b64": "abc"}, None) is True
+
+
+def test_archive_attachment_unresolved_without_bytes():
+    assert _m._attachment_resolved("ARCHIVE_ATTACHMENT", {}, None) is False
+
+
+def test_email_attachment_still_requires_explicit_resolved_flag():
+    # referenceAttachment: has a row + blob path but resolved flag absent → not local
+    assert _m._attachment_resolved("EMAIL_ATTACHMENT", {}, "tenant/x/blob") is False
+    assert _m._attachment_resolved("EMAIL_ATTACHMENT", {"resolved": True}, "tenant/x/blob") is True
