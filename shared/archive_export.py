@@ -19,6 +19,7 @@ enrichment-worker (preview-enrichment) stage through it.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 
@@ -163,20 +164,37 @@ class LiveStagingOps:
         return getattr(self.gc, "GRAPH_URL", "https://graph.microsoft.com/v1.0")
 
     async def create_temp_folder(self) -> str:
+        # NOT isHidden: live-proven that the Import/Export folder listing
+        # (/admin/exchange/mailboxes/{id}/folders) EXCLUDES hidden folders — a
+        # hidden temp folder is invisible to resolve_ie_folder_id and staging
+        # can't target it. The folder is transient (guaranteed-deleted in
+        # ArchiveExportStager.finally) and named _TMvault_enrich_* / _TMvault_*.
         j = await self.gc._post(
             f"{self._graph()}/users/{self.user_id}/mailFolders",
-            {"displayName": self.folder_name, "isHidden": True},
+            {"displayName": self.folder_name, "isHidden": False},
         )
         return j["id"]
 
     async def resolve_ie_folder_id(self, _std_id: str) -> str:
         # The Import/Export API folder-id namespace differs from standard Graph,
         # so match our just-created temp folder by displayName in the I/E listing.
-        folders = await archive_graph.list_archive_folders(self.gc, self.primary_mailbox_id)
-        for f in folders:
-            if f.get("displayName") == self.folder_name:
-                return f["id"]
-        raise RuntimeError(f"temp folder {self.folder_name!r} not found in Import/Export folder listing")
+        # The mail API (create) and the I/E admin API (list) are separate
+        # subsystems → a just-created folder can lag a few seconds before it
+        # appears; poll with backoff rather than fail on the first miss.
+        attempts = int(os.getenv("ARCHIVE_STAGE_FOLDER_RESOLVE_ATTEMPTS", "8"))
+        delay = float(os.getenv("ARCHIVE_STAGE_FOLDER_RESOLVE_DELAY_S", "2.0"))
+        seen = 0
+        for i in range(max(1, attempts)):
+            folders = await archive_graph.list_archive_folders(self.gc, self.primary_mailbox_id)
+            seen = len(folders)
+            for f in folders:
+                if f.get("displayName") == self.folder_name:
+                    return f["id"]
+            if i < attempts - 1:
+                await asyncio.sleep(delay)
+        raise RuntimeError(
+            f"temp folder {self.folder_name!r} not found in Import/Export folder "
+            f"listing after {attempts} attempt(s) ({seen} folders listed)")
 
     async def create_import_session(self) -> Tuple[Optional[str], Optional[str]]:
         return await archive_graph.create_import_session(self.gc, self.primary_mailbox_id)

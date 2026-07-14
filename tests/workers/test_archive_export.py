@@ -200,3 +200,58 @@ def test_message_to_eml_reuses_shared_builders_with_file_and_nested():
     # mail-in-mail: nested email embedded as message/rfc822 with its own subject
     assert any(p.get_content_type() == "message/rfc822" for p in parsed.walk())
     assert b"INNER-MAIL" in eml
+
+
+# ── LiveStagingOps: temp-folder visibility + I/E resolve retry ──
+# The Import/Export folder listing EXCLUDES hidden folders (proven live), so the
+# staging temp folder must be created non-hidden, and the mail-API create vs the
+# I/E list are separate subsystems so resolve retries for propagation.
+
+class _GC:
+    GRAPH_URL = "https://g/v1.0"
+    def __init__(self):
+        self.posted = {}
+    async def _post(self, url, body):
+        self.posted = dict(body)
+        return {"id": "STD1"}
+
+
+@pytest.mark.asyncio
+async def test_create_temp_folder_is_not_hidden():
+    gc = _GC()
+    ops = ae.LiveStagingOps(gc, user_id="u", primary_mailbox_id="p",
+                            folder_name="_TMvault_x", post_json=None)
+    fid = await ops.create_temp_folder()
+    assert fid == "STD1"
+    assert gc.posted["isHidden"] is False  # must be visible to the I/E folder listing
+
+
+@pytest.mark.asyncio
+async def test_resolve_ie_folder_id_retries_until_folder_appears(monkeypatch):
+    monkeypatch.setenv("ARCHIVE_STAGE_FOLDER_RESOLVE_DELAY_S", "0")
+    monkeypatch.setenv("ARCHIVE_STAGE_FOLDER_RESOLVE_ATTEMPTS", "5")
+    calls = {"n": 0}
+    async def fake_list(gc, mid):
+        calls["n"] += 1
+        # temp folder only becomes visible on the 3rd listing (propagation lag)
+        return ([{"displayName": "_TMvault_x", "id": "IE9"}] if calls["n"] >= 3
+                else [{"displayName": "Inbox", "id": "i"}])
+    monkeypatch.setattr(ae.archive_graph, "list_archive_folders", fake_list)
+    ops = ae.LiveStagingOps(object(), user_id="u", primary_mailbox_id="p",
+                            folder_name="_TMvault_x", post_json=None)
+    fid = await ops.resolve_ie_folder_id("STD1")
+    assert fid == "IE9"
+    assert calls["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_resolve_ie_folder_id_raises_after_attempts(monkeypatch):
+    monkeypatch.setenv("ARCHIVE_STAGE_FOLDER_RESOLVE_DELAY_S", "0")
+    monkeypatch.setenv("ARCHIVE_STAGE_FOLDER_RESOLVE_ATTEMPTS", "3")
+    async def fake_list(gc, mid):
+        return [{"displayName": "Inbox", "id": "i"}]
+    monkeypatch.setattr(ae.archive_graph, "list_archive_folders", fake_list)
+    ops = ae.LiveStagingOps(object(), user_id="u", primary_mailbox_id="p",
+                            folder_name="_TMvault_x", post_json=None)
+    with pytest.raises(RuntimeError, match="not found"):
+        await ops.resolve_ie_folder_id("STD1")
