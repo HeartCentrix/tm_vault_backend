@@ -1429,7 +1429,15 @@ class RestoreWorker:
                     download_blob=self._download_archive_blob,
                     worker_id=self.worker_id,
                 )
-                a_summary = await a_engine.run(archive_items)
+                # "Recover to a separate folder" (spec.targetFolder) lands the
+                # archived items in that named folder in the user's ACTIVE
+                # mailbox; without it they go back in-place to their origin
+                # archive folder. user_id resolves the active mailbox.
+                a_summary = await a_engine.run(
+                    archive_items,
+                    target_folder=spec.get("targetFolder"),
+                    user_id=(resource.extra_data or {}).get("user_id"),
+                )
                 restored_count += a_summary.get("created", 0)
                 failed_count += a_summary.get("failed", 0)
 

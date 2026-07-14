@@ -157,3 +157,63 @@ async def test_post_json_no_auth_sends_no_authorization_header():
     assert res == {"itemId": "OK"}
     assert seen["auth"] is None  # preauthenticated URL -> no Authorization header
     assert b"FolderId" in seen["body"]
+
+
+# ── restore to a NAMED folder in the user's PRIMARY (active) mailbox ────────
+
+@pytest.mark.asyncio
+async def test_run_target_folder_lands_in_primary_named_folder(monkeypatch):
+    """recover-to-a-separate-folder: the archived items go into a NEW folder we
+    create in the ACTIVE (primary) mailbox, NOT their origin archive folder.
+    (The in-place archive has no folder-create API.)"""
+    imports = []
+    sessions = []
+
+    async def _fake_session(gc, mailbox_id, **kw):
+        sessions.append(mailbox_id)
+        return ("https://o/import", "2999-01-01T00:00:00Z")
+
+    async def _fake_import(post_json, url, folder_id, blob, **kw):
+        imports.append(folder_id)
+        return {"itemId": "x"}
+
+    async def _fake_primary(gc, user_id, **kw):
+        return "MBX:primary"
+
+    async def _fake_list(gc, mailbox_id, **kw):
+        # I/E listing of the PRIMARY mailbox includes our just-created folder.
+        return [{"displayName": "dddd", "id": "IE_DDDD"}]
+
+    monkeypatch.setattr(archive_graph, "create_import_session", _fake_session)
+    monkeypatch.setattr(archive_graph, "import_item", _fake_import)
+    monkeypatch.setattr(archive_graph, "get_primary_mailbox_id", _fake_primary)
+    monkeypatch.setattr(archive_graph, "list_archive_folders", _fake_list)
+
+    class _GC:
+        GRAPH_URL = "https://graph.microsoft.com/v1.0"
+        async def _post(self, url, body):
+            return {"id": "STD_DDDD"}
+
+    items = [_Item("a", "origin1"), _Item("b", "origin2")]
+    eng = ar.ArchiveRestoreEngine(_GC(), download_blob=_dl(None))
+    out = await eng.run(items, target_folder="dddd", user_id="user-1")
+
+    assert out == {"created": 2, "failed": 0}
+    assert sessions == ["MBX:primary"]        # session opened on the PRIMARY mailbox
+    assert imports == ["IE_DDDD", "IE_DDDD"]  # both into the named folder, not origin
+
+
+@pytest.mark.asyncio
+async def test_run_target_folder_unavailable_fails_cleanly(monkeypatch):
+    async def _fake_primary(gc, user_id, **kw):
+        return None  # no primary mailbox -> can't prepare target
+    monkeypatch.setattr(archive_graph, "get_primary_mailbox_id", _fake_primary)
+
+    class _GC:
+        GRAPH_URL = "https://graph.microsoft.com/v1.0"
+        async def _post(self, url, body):
+            return {"id": "X"}
+
+    eng = ar.ArchiveRestoreEngine(_GC(), download_blob=_dl(None))
+    out = await eng.run([_Item("a", "F1")], target_folder="dddd", user_id="u1")
+    assert out["created"] == 0 and out["failed"] == 1
