@@ -20,6 +20,7 @@ from archive_backup import (  # noqa: E402
     ARCHIVE_ITEM_TYPE,
     advance_state,
     build_archive_item_row,
+    build_folder_path_map,
     is_skippable_error,
     item_kind,
     state_blob_path,
@@ -98,6 +99,52 @@ def test_new_item_that_failed_export_is_omitted_for_retry():
     current = {"new": "k1"}
     assert advance_state(prev, current, {}) == {}  # failed new -> retry next run
     assert advance_state(prev, current, {"new": "k1"}) == {"new": "k1"}  # stored -> tracked
+
+
+# ── build_folder_path_map: full nested path from parentFolderId chain ─────
+
+def test_folder_path_map_builds_full_nested_path():
+    # Live shape: displayName is only the LEAF name; the mailbox root is NOT in
+    # the list (its id appears as some folder's parentFolderId but resolves to
+    # nothing) -> a top-level folder maps to just its own name.
+    folders = [
+        {"id": "root_archive", "displayName": "Archive", "parentFolderId": "MBXROOT"},
+        {"id": "proj", "displayName": "Projects", "parentFolderId": "root_archive"},
+        {"id": "y2024", "displayName": "2024", "parentFolderId": "proj"},
+        {"id": "deleted", "displayName": "Deleted Items", "parentFolderId": "MBXROOT"},
+    ]
+    m = build_folder_path_map(folders)
+    assert m["root_archive"] == "Archive"
+    assert m["proj"] == "Archive/Projects"
+    assert m["y2024"] == "Archive/Projects/2024"
+    assert m["deleted"] == "Deleted Items"
+
+
+def test_folder_path_map_is_cycle_and_orphan_safe():
+    # A malformed parent cycle must terminate, not hang; a missing id is skipped.
+    folders = [
+        {"id": "a", "displayName": "A", "parentFolderId": "b"},
+        {"id": "b", "displayName": "B", "parentFolderId": "a"},
+        {"displayName": "no-id"},
+    ]
+    m = build_folder_path_map(folders)
+    # both resolve to a bounded (non-infinite) path containing their own name
+    assert "A" in m["a"] and "B" in m["b"]
+    assert None not in m  # id-less folder skipped
+
+
+def test_row_uses_explicit_folder_path_over_leaf_display_name():
+    # When the caller supplies the reconstructed full path, it wins over the
+    # folder's leaf displayName (which is only the leaf, e.g. "2024").
+    row = build_archive_item_row(
+        snapshot_id="S", tenant_id="T",
+        folder={"id": "y2024", "displayName": "2024"},
+        item={"id": "I", "changeKey": "CK", "type": "IPM.Note"},
+        blob_path="p", content_hash="H", blob_len=1, mailbox_id="M",
+        graph_version="beta", folder_path="Archive/Projects/2024",
+    )
+    assert row["folder_path"] == "Archive/Projects/2024"
+    assert row["parent_external_id"] == "y2024"
 
 
 # ── build_archive_item_row: SnapshotItem shape ───────────────────────────

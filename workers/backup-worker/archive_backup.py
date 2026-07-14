@@ -15,7 +15,7 @@ catalog is reconstructed from the snapshot chain at restore.
 from __future__ import annotations
 
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 # Object-storage workload string for opaque archive blobs. Deliberately NOT
 # "email": the readable Graph-JSON mail blobs and the opaque MAPI archive blobs
@@ -115,10 +115,32 @@ def advance_state(
     return out
 
 
+def build_folder_path_map(folders: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Map each folder id -> its full ``/``-joined path from the mailbox root,
+    walking ``parentFolderId``. The Import/Export folder object's ``displayName``
+    is only the LEAF name (proven live: 'Archive', 'Deleted Items'), and the
+    mailbox root itself is NOT in the list — so a top-level folder maps to just
+    its own name and a nested folder to 'Parent/Child/Leaf'. Cycle/orphan-safe:
+    the walk is bounded by the folder count, so a malformed parent loop
+    terminates instead of hanging."""
+    by_id = {f["id"]: f for f in folders if f.get("id")}
+    out: Dict[str, str] = {}
+    for fid, f in by_id.items():
+        parts: List[str] = []
+        cur: Optional[Dict[str, Any]] = f
+        seen: set = set()
+        while cur is not None and cur.get("id") not in seen and len(parts) <= len(by_id):
+            seen.add(cur.get("id"))
+            parts.append(cur.get("displayName") or cur.get("id"))
+            cur = by_id.get(cur.get("parentFolderId"))  # None at the (unlisted) root
+        out[fid] = "/".join(reversed(parts))
+    return out
+
+
 def build_archive_item_row(
     *, snapshot_id: Any, tenant_id: Any, folder: Dict[str, Any], item: Dict[str, Any],
     blob_path: str, content_hash: str, blob_len: int, mailbox_id: str,
-    graph_version: str,
+    graph_version: str, folder_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """One SnapshotItem dict for ``_bulk_upsert_snapshot_items`` (mapped-class
     insert -> the JSON-envelope key MUST be ``extra_data``, NOT the column name
@@ -136,7 +158,9 @@ def build_archive_item_row(
         # No subject is available from the opaque endpoint — the friendly kind
         # (Email/Contact/Calendar…) is the most a browse row can show.
         "name": kind,
-        "folder_path": folder.get("displayName") or folder.get("id"),
+        # Full nested path ('Archive/Projects/2024') when the caller reconstructs
+        # it from the parentFolderId chain; else the folder's own leaf name.
+        "folder_path": folder_path or folder.get("displayName") or folder.get("id"),
         "content_size": blob_len,
         "content_hash": content_hash,
         "blob_path": blob_path,

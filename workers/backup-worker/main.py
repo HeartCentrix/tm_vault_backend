@@ -4167,6 +4167,10 @@ class BackupWorker:
             # 1) Enumerate every folder + item (lightweight fields only; content
             #    comes solely from exportItems). Folders listed concurrently.
             folders = await archive_graph.list_archive_folders(graph_client, mailbox_id)
+            # Full nested folder paths ('Archive/Projects/2024') from the
+            # parentFolderId chain — displayName alone is only the leaf name, so
+            # this is what actually RETAINS the archive's folder hierarchy.
+            folder_paths = ab.build_folder_path_map(folders)
             fsem = asyncio.Semaphore(int(os.getenv("ARCHIVE_FOLDER_CONCURRENCY", "8")))
 
             async def _list(folder):
@@ -4223,6 +4227,7 @@ class BackupWorker:
                             snapshot_id=snapshot.id, tenant_id=tenant.id, folder=f, item=it,
                             blob_path=blob_path, content_hash=content_hash, blob_len=len(blob),
                             mailbox_id=mailbox_id, graph_version=archive_graph.ARCHIVE_GRAPH_VERSION,
+                            folder_path=folder_paths.get(f.get("id")),
                         )
                         async with _lock:
                             rows.append(row)
