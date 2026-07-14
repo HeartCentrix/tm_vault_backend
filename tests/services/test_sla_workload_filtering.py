@@ -36,6 +36,23 @@ def test_resource_type_enabled_allows_chat_without_other_m365_workloads():
     assert resource_type_enabled("USER_ONEDRIVE", policy) is False
 
 
+def test_user_archive_rides_the_exchange_checkbox():
+    # Archive is part of the user's Exchange mailbox — it is dispatched exactly
+    # when primary mail is (backup_exchange), never on its own flag.
+    assert resource_type_enabled("USER_ARCHIVE", Policy(backup_exchange=True)) is True
+    assert resource_type_enabled("USER_ARCHIVE", Policy(backup_exchange=False)) is False
+    # and it filters alongside USER_MAIL, not with onedrive/chats
+    resources = {
+        "mail": Resource("mail", "USER_MAIL"),
+        "archive": Resource("archive", "USER_ARCHIVE"),
+        "drive": Resource("drive", "USER_ONEDRIVE"),
+    }
+    filtered, _ = filter_resource_map_by_policy_flags(
+        resources, {"policy-1": Policy(backup_exchange=True)}
+    )
+    assert set(filtered) == {"mail", "archive"}
+
+
 def test_filter_resource_map_keeps_only_workloads_enabled_by_sla():
     policy = Policy(backup_exchange=True)
     resources = {

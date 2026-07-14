@@ -2280,6 +2280,43 @@ class GraphClient:
                 },
             }
 
+        # Archive — Exchange in-place archive mailbox (opt-in per user). Emits a
+        # USER_ARCHIVE child ONLY when an archive is actually provisioned;
+        # absence (no archive, or no Exchange license) yields NO row — not a
+        # license_missing marker like the licensed baseline categories, because
+        # the archive is optional per user, not a guaranteed workload. Reached
+        # via the Graph Import/Export API (the standard mail API can't see the
+        # archive); the resolved mailbox id is cached in metadata so the backup
+        # handler skips a re-probe. Behind ARCHIVE_BACKUP_ENABLED — see _archive
+        # in the gather below.
+        from shared import archive_graph
+
+        async def _archive():
+            try:
+                mailbox_id = await archive_graph.get_archive_mailbox_id(
+                    self, user_external_id
+                )
+            except Exception as e:
+                # settings/exchange 404s for mailbox-less / unlicensed users.
+                # Swallow — no archive means no row, never a failed gather.
+                print(f"[GraphClient] archive probe skipped for {display}: {e}")
+                return None
+            if not mailbox_id:
+                return None
+            return {
+                "external_id": f"{user_external_id}:archive",
+                "display_name": f"Archive — {display}",
+                "email": email,
+                "type": "USER_ARCHIVE",
+                "parent_external_id": user_external_id,
+                "metadata": {
+                    "user_id": user_external_id,
+                    "user_principal_name": user_principal_name,
+                    "archive_mailbox_id": mailbox_id,
+                    "graph_version": archive_graph.ARCHIVE_GRAPH_VERSION,
+                },
+            }
+
         # Entitlement-driven fast path: when assignedPlans (fetched inline at
         # Tier-1 discovery) already tells us the user has NO license for a
         # category, skip its Graph probe entirely and emit the license_missing
@@ -2315,13 +2352,18 @@ class GraphClient:
         # Pass factories (not awaited coroutines) so _safe can retry
         # transient failures with a fresh coroutine each attempt — you
         # cannot await the same coroutine twice.
-        results = await asyncio.gather(
+        probes = [
             _probe_or_skip("mail", _mail),
             _probe_or_skip("onedrive", _onedrive),
             _probe_or_skip("contacts", _contacts),
             _probe_or_skip("calendar", _calendar),
             _probe_or_skip("chats", _chats),
-        )
+        ]
+        # Archive is additive and flag-gated: when off, no extra Graph call is
+        # made and no USER_ARCHIVE row is emitted (zero prod exposure).
+        if archive_graph.ARCHIVE_BACKUP_ENABLED:
+            probes.append(_archive())
+        results = await asyncio.gather(*probes)
         return [r for r in results if r]
 
     # ── Conditional Access policies ─────────────────────────────────────────

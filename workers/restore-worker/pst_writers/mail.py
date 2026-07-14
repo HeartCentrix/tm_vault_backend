@@ -87,6 +87,62 @@ class MailPstWriter(PstWriterBase):
 
         return self._PC_ENVELOPE_BYTES + body_bytes + att_bytes
 
+    async def _nested_rfc822_att_dict(self, att, ed, blob_path, source_container):
+        """Rebuild an ``itemAttachment``'s nested email into a
+        ``message/rfc822`` fileAttachment dict (pst_convert reads
+        ``contentBytes``). Bytes come from ``blob_path`` (downloaded via the
+        same machinery as file attachments) or ``extra_data.inline_b64`` when
+        the backup inlined a small nested message. Returns ``None`` on any
+        failure so one bad nested email never fails the whole message."""
+        import json
+        from shared.mime_builder import build_nested_message_attachment
+
+        _name = getattr(att, "name", "?")
+        try:
+            raw = None
+            inline_b64 = ed.get("inline_b64")
+            if blob_path:
+                from shared.azure_storage import azure_storage_manager
+                from mail_fetch import _normalize_containers, _download_first_hit
+                att_shard = azure_storage_manager.get_shard_for_item(att)
+                item_extra = list(
+                    getattr(att, "_source_container_candidates", None) or ()
+                )
+                legacy_fb = getattr(att, "_mailbox_fallback_container", None)
+                if legacy_fb:
+                    item_extra.append(legacy_fb)
+                containers = _normalize_containers(source_container, item_extra)
+                raw, _hit = await _download_first_hit(att_shard, containers, blob_path)
+            elif inline_b64:
+                raw = base64.b64decode(inline_b64)
+            if not raw:
+                print(f"[mail.collect] DROP itemattachment no_bytes att={_name}", flush=True)
+                return None
+            if len(raw) > MAX_ATTACHMENT_BYTES:
+                print(
+                    f"[mail.collect] DROP itemattachment oversize att={_name} "
+                    f"bytes={len(raw)} cap={MAX_ATTACHMENT_BYTES}",
+                    flush=True,
+                )
+                return None
+            nested = json.loads(raw.decode("utf-8"))
+            ref = build_nested_message_attachment(nested)
+            return {
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "name": ref.name,
+                "contentType": "message/rfc822",
+                "contentBytes": base64.b64encode(ref.data_bytes).decode("ascii"),
+                "size": len(ref.data_bytes),
+                "isInline": False,
+            }
+        except Exception as exc:
+            print(
+                f"[mail.collect] itemAttachment rebuild failed att={_name}: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            return None
+
     async def _collect_graph_item(self, item, shard, source_container: str):
         """Return the Graph message JSON for this item with attachment
         bytes inlined as base64. ``None`` when the body cannot be located."""
@@ -142,16 +198,27 @@ class MailPstWriter(PstWriterBase):
             for att in email_atts:
                 blob_path = getattr(att, "blob_path", None)
                 _att_name = getattr(att, "name", "?")
+                ed = (getattr(att, "extra_data", None) or {})
+                kind = (ed.get("attachment_kind") or "").lower()
+                # Mail-in-mail: a nested email (itemAttachment) is rebuilt into
+                # a message/rfc822 fileAttachment so it embeds natively in the
+                # PST. Bytes come from blob_path or, for small inlined nested
+                # messages, extra_data.inline_b64 (blob_path is None then, so
+                # this must run before the no_blob_path drop below).
+                if "itemattachment" in kind:
+                    item_att = await self._nested_rfc822_att_dict(
+                        att, ed, blob_path, source_container,
+                    )
+                    if item_att is not None:
+                        inline_atts.append(item_att)
+                    continue
                 if not blob_path:
                     print(f"[mail.collect] DROP no_blob_path att={_att_name}", flush=True)
                     continue
-                ed = (getattr(att, "extra_data", None) or {})
-                kind = (ed.get("attachment_kind") or "").lower()
-                # itemAttachment / referenceAttachment can't roundtrip via
-                # contentBytes — pstwriter's mail CLI only consumes
-                # fileAttachment. The live-restore path handles them via
-                # Graph POST; for PST export they're skipped (matches the
-                # legacy MBOX/EML behaviour).
+                # referenceAttachment can't roundtrip via contentBytes —
+                # pstwriter's mail CLI only consumes fileAttachment. The
+                # live-restore path handles it via Graph POST; for PST export
+                # it stays skipped (matches the legacy MBOX/EML behaviour).
                 if kind and "fileattachment" not in kind:
                     print(f"[mail.collect] DROP non_file_kind={kind} att={_att_name}", flush=True)
                     continue

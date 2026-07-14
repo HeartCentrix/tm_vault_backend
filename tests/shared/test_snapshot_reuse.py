@@ -60,7 +60,10 @@ class _StubSession:
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # A fresh loop per call — get_event_loop() raises "no current event loop"
+    # once any prior pytest-asyncio test in the run closes the default loop
+    # (this file's failures were purely that ordering artifact, not logic).
+    return asyncio.new_event_loop().run_until_complete(coro)
 
 
 def test_full_snapshot_resolves_to_itself():

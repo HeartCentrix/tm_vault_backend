@@ -4073,8 +4073,238 @@ class BackupWorker:
             # user_id in metadata so the handler can fetch + persist content
             # against Graph without a top-level MAILBOX/ONEDRIVE row existing.
             return await self._backup_user_content_parallel(resources, graph_client, tenant, message, job_id)
+        elif resource_type == "USER_ARCHIVE":
+            # Exchange in-place ARCHIVE mailbox — opaque MAPI blobs via the
+            # Graph Import/Export API, stored 1:1, changeKey-diff incremental.
+            return await self._backup_archive_mailbox(resources, graph_client, tenant, message, job_id)
         else:
             return await self._backup_generic_parallel(resources, graph_client, tenant, message, job_id)
+
+    # ==================== Exchange ARCHIVE mailbox backup ====================
+
+    async def _backup_archive_mailbox(
+        self,
+        resources: List[Resource],
+        graph_client: GraphClient,
+        tenant: Tenant,
+        message: Dict,
+        job_id: uuid.UUID,
+    ) -> Dict:
+        """Back up Exchange in-place ARCHIVE mailboxes (USER_ARCHIVE Tier-2
+        children) via the Graph Import/Export API.
+
+        Each item's OPAQUE MAPI FastTransfer blob is stored 1:1 (restore-grade;
+        NEVER parsed — HTML bodies + attachments live in separate MAPI props the
+        embedded MIME drops). Incremental is a changeKey diff against a
+        per-resource state blob (the ``mailboxItem:delta`` endpoint is broken on
+        ``/beta``). All throttling/pacing/app-rotation is inherited from the
+        shared ``GraphClient`` — the same machinery primary mail rides — so a
+        TB-scale, 3k-user archive sweep stays throttle-free. Resources are fanned
+        out under ``BACKUP_CONCURRENCY`` exactly like every other handler."""
+        semaphore = asyncio.Semaphore(settings.BACKUP_CONCURRENCY)
+
+        async def _one(resource: Resource) -> Dict:
+            async with semaphore:
+                try:
+                    return await self._backup_one_archive(
+                        resource, graph_client, tenant, message, job_id,
+                    )
+                except Exception as e:
+                    print(
+                        f"[{self.worker_id}] [USER_ARCHIVE] "
+                        f"{getattr(resource, 'display_name', None) or resource.id} "
+                        f"failed: {type(e).__name__}: {e}"
+                    )
+                    return {"item_count": 0, "bytes_added": 0}
+
+        results = await asyncio.gather(
+            *[_one(r) for r in resources], return_exceptions=True
+        )
+        return {
+            "item_count": sum(r.get("item_count", 0) for r in results if isinstance(r, dict)),
+            "bytes_added": sum(r.get("bytes_added", 0) for r in results if isinstance(r, dict)),
+        }
+
+    async def _backup_one_archive(
+        self,
+        resource: Resource,
+        graph_client: GraphClient,
+        tenant: Tenant,
+        message: Dict,
+        job_id: uuid.UUID,
+    ) -> Dict:
+        """Back up ONE archive mailbox. Enumerate → changeKey-diff → export
+        changed → store blobs 1:1 → persist sparse SnapshotItem rows → finalize
+        → advance state. Mirrors the Tier-2 finalize idiom exactly so rollup /
+        Activity / retention all treat archive like any other incremental."""
+        from shared import archive_graph
+        from shared.azure_storage import upload_blob_with_dedup
+        import archive_backup as ab
+
+        await _raise_if_job_cancelled(job_id)
+        meta = resource.extra_data or {}
+        user_id = meta.get("user_id")
+        mailbox_id = meta.get("archive_mailbox_id")
+        if not mailbox_id and user_id:
+            # Discovery metadata can be stale (archive enabled after discovery).
+            mailbox_id = await archive_graph.get_archive_mailbox_id(graph_client, user_id)
+        if not mailbox_id:
+            print(f"[{self.worker_id}] [USER_ARCHIVE] {resource.display_name}: no archive mailbox — skip")
+            return {"item_count": 0, "bytes_added": 0}
+
+        # First run (or forced) => full export; else diff against prior state.
+        force_full = bool(message.get("forceFullBackup") or message.get("type") == "FULL")
+        prev = None if force_full else await self._load_archive_state(tenant, resource)
+        snap_type = SnapshotType.FULL if prev is None else SnapshotType.INCREMENTAL
+        snapshot = await self.create_snapshot(resource, message, job_id, snapshot_type=snap_type)
+
+        try:
+            # 1) Enumerate every folder + item (lightweight fields only; content
+            #    comes solely from exportItems). Folders listed concurrently.
+            folders = await archive_graph.list_archive_folders(graph_client, mailbox_id)
+            fsem = asyncio.Semaphore(int(os.getenv("ARCHIVE_FOLDER_CONCURRENCY", "8")))
+
+            async def _list(folder):
+                async with fsem:
+                    items = await archive_graph.list_archive_items(
+                        graph_client, mailbox_id, folder["id"],
+                    )
+                    return [(folder, it) for it in items]
+
+            pairs: List[tuple] = []
+            for chunk in await asyncio.gather(*[_list(f) for f in folders]):
+                pairs.extend(chunk)
+
+            current_ck = {it["id"]: it.get("changeKey") for (_f, it) in pairs if it.get("id")}
+            id_to_pair = {it["id"]: (f, it) for (f, it) in pairs if it.get("id")}
+            changed_ids = archive_graph.select_changed([it for (_f, it) in pairs], prev)
+
+            # 2) Export changed items, store each opaque blob 1:1, build rows.
+            #    Bounded concurrency over <=20-id export batches keeps peak
+            #    memory O(concurrency * one batch of blobs), not O(mailbox).
+            container = azure_storage_manager.get_container_name(str(tenant.id), ab.ARCHIVE_WORKLOAD)
+            shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
+            esem = asyncio.Semaphore(int(os.getenv("ARCHIVE_EXPORT_CONCURRENCY", "8")))
+            rows: List[Dict[str, Any]] = []
+            stored_ck: Dict[str, str] = {}
+            bytes_total = 0
+            _lock = asyncio.Lock()
+
+            def _chunks(seq, n=archive_graph.EXPORT_BATCH_MAX):
+                for i in range(0, len(seq), n):
+                    yield seq[i:i + n]
+
+            async def _export_chunk(id_chunk):
+                nonlocal bytes_total
+                async with esem:
+                    async for item_id, blob, err in archive_graph.export_items(
+                        graph_client, mailbox_id, id_chunk,
+                    ):
+                        if err or not blob:
+                            if err:
+                                code = err.get("code") if isinstance(err, dict) else err
+                                print(f"[{self.worker_id}] [USER_ARCHIVE] export error item={item_id}: {code}")
+                            continue  # not stored -> keeps old key -> retried next run
+                        f, it = id_to_pair.get(item_id, ({}, {"id": item_id}))
+                        content_hash = _fast_hash_hex(blob)
+                        blob_path = azure_storage_manager.build_blob_path(
+                            str(tenant.id), str(resource.id), str(snapshot.id), item_id,
+                        )
+                        up = await upload_blob_with_dedup(
+                            tenant.id, content_hash, container, blob_path, blob, shard, max_retries=3,
+                        )
+                        blob_path = up.get("blob_path", blob_path)
+                        row = ab.build_archive_item_row(
+                            snapshot_id=snapshot.id, tenant_id=tenant.id, folder=f, item=it,
+                            blob_path=blob_path, content_hash=content_hash, blob_len=len(blob),
+                            mailbox_id=mailbox_id, graph_version=archive_graph.ARCHIVE_GRAPH_VERSION,
+                        )
+                        async with _lock:
+                            rows.append(row)
+                            stored_ck[item_id] = it.get("changeKey")
+                            bytes_total += len(blob)
+
+            await asyncio.gather(*[_export_chunk(c) for c in _chunks(changed_ids)])
+
+            # 3) Persist SnapshotItem rows (SPARSE — only this run's changed
+            #    items; the full catalog is reconstructed from the chain).
+            if rows:
+                async with async_session_factory() as _sess:
+                    await _bulk_upsert_snapshot_items(_sess, rows)
+
+            # 4) Finalize — identical to the Tier-2 idiom. item_count = rows
+            #    stored THIS run; delta is a set-difference vs the prior snapshot.
+            total_items = len(rows)
+            async with async_session_factory() as session:
+                delta_items, delta_bytes = await self._compute_snapshot_delta_from_prior(
+                    session, snapshot.id, resource.id, total_items, bytes_total,
+                    current_job_id=job_id,
+                )
+                snap = await session.get(Snapshot, snapshot.id)
+                snap.item_count = total_items
+                snap.new_item_count = delta_items
+                snap.bytes_total = bytes_total
+                snap.bytes_added = delta_bytes
+                snap.status = await _coerce_snapshot_terminal_on_cancel(snap, SnapshotStatus.COMPLETED)
+                snap.completed_at = datetime.utcnow()
+                if snap.started_at:
+                    snap.duration_secs = int((snap.completed_at - snap.started_at).total_seconds())
+                await session.commit()
+                await self.update_resource_backup_info(session, resource, job_id, snapshot.id, {
+                    "item_count": total_items,
+                    "bytes_added": delta_bytes,
+                })
+
+            # 5) Advance the incremental cursor LAST, only after a clean finalize.
+            #    Failed-export items keep their old key (auto-retry next run);
+            #    deleted items drop out; their backed-up blobs stay in old snaps.
+            await self._save_archive_state(tenant, resource, ab.advance_state(prev, current_ck, stored_ck))
+
+            print(
+                f"[{self.worker_id}] [USER_ARCHIVE] {resource.display_name}: "
+                f"catalog={len(pairs)} changed={len(changed_ids)} stored={len(rows)} bytes={bytes_total}"
+            )
+            return {"item_count": total_items, "bytes_added": delta_bytes}
+        except Exception as e:
+            async with async_session_factory() as session:
+                snap = await session.get(Snapshot, snapshot.id)
+                if snap:
+                    await self.fail_snapshot(session, snap, f"{type(e).__name__}: {e}")
+            raise
+
+    async def _load_archive_state(self, tenant: Tenant, resource: Resource) -> Optional[Dict[str, str]]:
+        """Load the ``{item_id: changeKey}`` incremental cursor blob, or ``None``
+        when this resource has never been backed up (first run => full export)."""
+        import archive_backup as ab
+        container = azure_storage_manager.get_container_name(str(tenant.id), ab.ARCHIVE_WORKLOAD)
+        path = ab.state_blob_path(str(tenant.id), str(resource.id))
+        try:
+            raw = await azure_storage_manager.download_blob(container, path)
+        except Exception as e:
+            # A read failure must NOT masquerade as "no prior state" if we can
+            # help it, but there's no safe fallback other than a full re-export
+            # (idempotent + deduped), so degrade to full and log loudly.
+            print(f"[{self.worker_id}] [USER_ARCHIVE] state load failed for {resource.id}: {e} — full re-export")
+            return None
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw.decode("utf-8"))
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    async def _save_archive_state(self, tenant: Tenant, resource: Resource, state: Dict[str, str]) -> None:
+        """Overwrite the resource's incremental cursor blob (fixed path). Uses a
+        plain ret+overwrite upload — NOT dedup (which can redirect to a shared
+        path and skip our write)."""
+        import archive_backup as ab
+        from shared.azure_storage import upload_blob_with_retry
+        container = azure_storage_manager.get_container_name(str(tenant.id), ab.ARCHIVE_WORKLOAD)
+        path = ab.state_blob_path(str(tenant.id), str(resource.id))
+        shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
+        payload = json.dumps(state, separators=(",", ":")).encode("utf-8")
+        await upload_blob_with_retry(container, path, payload, shard, max_retries=3)
 
     # ==================== Tier 2 per-user content backup ====================
 

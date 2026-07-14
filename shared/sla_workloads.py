@@ -22,6 +22,10 @@ RESOURCE_TYPE_TO_SLA_FLAG: dict[str, str] = {
     "TEAMS_CHAT": "backup_teams_chats",
     "TEAMS_CHAT_EXPORT": "backup_teams_chats",
     "USER_MAIL": "backup_exchange",
+    # Exchange in-place archive rides the SAME Exchange checkbox as primary mail
+    # — it's part of the user's mailbox. (Master gate is ARCHIVE_BACKUP_ENABLED;
+    # a dedicated policy toggle can come later if granular control is wanted.)
+    "USER_ARCHIVE": "backup_exchange",
     "USER_ONEDRIVE": "backup_onedrive",
     "USER_CONTACTS": "contacts",
     "USER_CALENDAR": "calendars",

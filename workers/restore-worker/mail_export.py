@@ -100,6 +100,18 @@ class FolderExportTask:
         from mail_fetch import gather_attachments
         return await gather_attachments(att_paths, self.shard, self.source_container, self.include_attachments)
 
+    async def _gather_item_attachments(self, item) -> List[AttachmentRef]:
+        """message/rfc822 refs for any itemAttachment (mail-in-mail) siblings
+        stamped on the EMAIL item. Additive — fileAttachment / inline-image
+        handling above is untouched."""
+        from mail_fetch import gather_item_attachments
+        rows = getattr(item, "_email_attachment_items", None) or []
+        if not rows:
+            return []
+        return await gather_item_attachments(
+            rows, self.shard, self.source_container, self.include_attachments
+        )
+
     async def _build_eml_for_item(self, item):
         print(f"[FolderExportTask/{self.folder_name}] _build_eml_for_item START ext_id={item.external_id}", flush=True)
         msg_json = await self._fetch_message(item)
@@ -108,6 +120,12 @@ class FolderExportTask:
         attachments = await self._gather_attachments(
             getattr(item, "attachment_blob_paths", []) or []
         )
+        # Mail-in-mail: nested emails (itemAttachment) embed as message/rfc822
+        # parts. Separate channel from file attachments so the latter is
+        # unchanged; refs simply append to the same attachment list.
+        item_atts = await self._gather_item_attachments(item)
+        if item_atts:
+            attachments = list(attachments) + item_atts
         print(f"[FolderExportTask/{self.folder_name}] building EML ext_id={item.external_id} atts={len(attachments)}", flush=True)
         if attachments:
             pieces = []

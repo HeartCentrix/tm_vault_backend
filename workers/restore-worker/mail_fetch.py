@@ -196,6 +196,87 @@ async def fetch_message(item, shard, source_container: ContainerCandidates) -> O
     return json.loads(raw.decode("utf-8"))
 
 
+async def gather_item_attachments(
+    email_att_rows: list,
+    shard,
+    source_container: ContainerCandidates,
+    include_attachments: bool = True,
+) -> List[AttachmentRef]:
+    """Rebuild ``itemAttachment`` (mail-in-mail) rows as ``message/rfc822``
+    :class:`AttachmentRef` objects so a nested email embeds natively in the
+    parent's EML/MBOX.
+
+    ``email_att_rows`` are the rich ``EMAIL_ATTACHMENT`` SnapshotItem-like
+    siblings stamped on the parent EMAIL as ``_email_attachment_items``.  Only
+    ``itemAttachment`` rows are handled here — ``fileAttachment`` keeps riding
+    the existing ``attachment_blob_paths`` -> :func:`gather_attachments`
+    channel unchanged, and ``referenceAttachment`` stays skipped.
+
+    The nested email's stored JSON bytes come from ``blob_path`` (downloaded via
+    the same ``_download_first_hit`` machinery used for file attachments) or,
+    when the backup inlined a small nested message, from
+    ``extra_data.inline_b64``.  A failure on any single row is logged and that
+    row skipped — never crash the whole message/export.  Rows over
+    ``PST_MAX_ATTACHMENT_BYTES`` are skipped to respect the memory cap.
+    """
+    import base64 as _b64
+    import json as _json
+    import os as _os
+
+    from shared.mime_builder import build_nested_message_attachment
+
+    if not include_attachments or not email_att_rows:
+        return []
+
+    max_bytes = int(
+        _os.environ.get("PST_MAX_ATTACHMENT_BYTES", str(50 * 1024 * 1024))
+    )
+    out: List[AttachmentRef] = []
+    for att in email_att_rows:
+        ed = getattr(att, "extra_data", None) or {}
+        kind = (ed.get("attachment_kind") or "").lower()
+        if "itemattachment" not in kind:
+            continue  # fileAttachment / referenceAttachment handled elsewhere
+        name = getattr(att, "name", "?")
+        try:
+            blob_path = getattr(att, "blob_path", None)
+            inline_b64 = ed.get("inline_b64")
+            raw: Optional[bytes] = None
+            if blob_path:
+                # ponytail: uses the folder shard for nested-email blobs;
+                # add per-att backend resolution if cross-backend toggles
+                # ever split a nested-email blob from its parent message.
+                item_extra = list(
+                    getattr(att, "_source_container_candidates", None) or ()
+                )
+                legacy_fb = getattr(att, "_mailbox_fallback_container", None)
+                if legacy_fb:
+                    item_extra.append(legacy_fb)
+                containers = _normalize_containers(source_container, item_extra)
+                raw, _hit = await _download_first_hit(shard, containers, blob_path)
+            elif inline_b64:
+                raw = _b64.b64decode(inline_b64)
+            if not raw:
+                logger.warning(
+                    "gather_item_attachments: no bytes for itemAttachment %s", name
+                )
+                continue
+            if len(raw) > max_bytes:
+                logger.warning(
+                    "gather_item_attachments: skipping oversize itemAttachment "
+                    "%s (%d bytes > %d cap)", name, len(raw), max_bytes,
+                )
+                continue
+            nested = _json.loads(raw.decode("utf-8"))
+            out.append(build_nested_message_attachment(nested))
+        except Exception as exc:
+            logger.warning(
+                "gather_item_attachments: skipping itemAttachment %s: %s: %s",
+                name, type(exc).__name__, exc,
+            )
+    return out
+
+
 async def gather_attachments(
     att_paths: list,
     shard,

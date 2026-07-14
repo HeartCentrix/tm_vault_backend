@@ -179,7 +179,14 @@ async def build_eml_streaming(
     headers_msg["MIME-Version"] = "1.0"
     headers_msg["Content-Type"] = f'multipart/mixed; boundary="{boundary}"'
 
-    header_bytes = headers_msg.as_bytes(policy=SMTP).rstrip(b"\r\n") + b"\r\n\r\n"
+    # Emit ONLY the header block. ``as_bytes`` on a body-less multipart message
+    # auto-generates an empty body skeleton (``--boundary`` … ``--boundary--``),
+    # whose premature closing boundary would truncate the parts we stream in
+    # manually below. Cut at the header/body separator to keep the encoded,
+    # folded headers while dropping that skeleton.
+    _full = headers_msg.as_bytes(policy=SMTP)
+    _sep = _full.find(b"\r\n\r\n")
+    header_bytes = (_full[:_sep] if _sep != -1 else _full.rstrip(b"\r\n")) + b"\r\n\r\n"
     yield header_bytes
 
     body = graph_msg.get("body") or {}
@@ -196,25 +203,37 @@ async def build_eml_streaming(
 
     for att in attachments:
         maintype_sub = att.content_type or "application/octet-stream"
+        # message/rfc822 (mail-in-mail) MUST NOT be base64-encoded — RFC 2046
+        # §5.2.1 permits only 7bit/8bit/binary for message/* parts, and base64
+        # here makes strict parsers (incl. eDiscovery tooling) drop the nested
+        # email. Emit the nested .eml bytes verbatim under 8bit. All other
+        # content types keep the base64 path exactly as before.
+        is_message = maintype_sub.lower().startswith("message/")
+        cte = "8bit" if is_message else "base64"
         yield (
             f"--{boundary}\r\n"
             f"Content-Type: {maintype_sub}\r\n"
-            f"Content-Transfer-Encoding: base64\r\n"
+            f"Content-Transfer-Encoding: {cte}\r\n"
             f'Content-Disposition: attachment; filename="{att.name}"\r\n\r\n'
         ).encode("ascii")
 
         if att.data_bytes is not None:
-            yield base64.b64encode(att.data_bytes) + b"\r\n"
+            yield (att.data_bytes if is_message else base64.b64encode(att.data_bytes)) + b"\r\n"
         elif att.data_stream is not None:
-            buf = bytearray()
-            async for chunk in att.data_stream:
-                buf.extend(chunk)
-                cut = (len(buf) // 57) * 57
-                if cut:
-                    yield base64.b64encode(bytes(buf[:cut])) + b"\r\n"
-                    del buf[:cut]
-            if buf:
-                yield base64.b64encode(bytes(buf)) + b"\r\n"
+            if is_message:
+                async for chunk in att.data_stream:
+                    yield chunk
+                yield b"\r\n"
+            else:
+                buf = bytearray()
+                async for chunk in att.data_stream:
+                    buf.extend(chunk)
+                    cut = (len(buf) // 57) * 57
+                    if cut:
+                        yield base64.b64encode(bytes(buf[:cut])) + b"\r\n"
+                        del buf[:cut]
+                if buf:
+                    yield base64.b64encode(bytes(buf)) + b"\r\n"
         else:
             raise ValueError(f"AttachmentRef {att.name} has no data")
 

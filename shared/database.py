@@ -218,6 +218,10 @@ async def _ensure_enum_values() -> None:
         "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'USER_CONTACTS';",
         "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'USER_CALENDAR';",
         "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'USER_CHATS';",
+        # Exchange in-place ARCHIVE mailbox — Tier 2 child backed up via the
+        # Graph Import/Export API (behind ARCHIVE_BACKUP_ENABLED). Idempotent
+        # add so enabling the flag never needs a manual prod migration.
+        "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'USER_ARCHIVE';",
         # Singleton per-tenant "Azure Active Directory" resource.
         "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'ENTRA_DIRECTORY';",
         "ALTER TYPE tenantstatus ADD VALUE IF NOT EXISTS 'PENDING_DISCOVERY';",

@@ -95,6 +95,9 @@ class ResourceType(str, enum.Enum):
     USER_CONTACTS = "USER_CONTACTS"
     USER_CALENDAR = "USER_CALENDAR"
     USER_CHATS = "USER_CHATS"
+    # Exchange in-place ARCHIVE mailbox — a Tier-2 child like USER_MAIL, backed up
+    # via the Graph Import/Export API (opaque blobs). Behind ARCHIVE_BACKUP_ENABLED.
+    USER_ARCHIVE = "USER_ARCHIVE"
 
 
 # Resource types hidden from UI listing endpoints by default. Shared between
@@ -108,17 +111,20 @@ class ResourceType(str, enum.Enum):
 #   TEAMS_CHAT_EXPORT — backup-scheduler-internal per-user shard that carries
 #       the Graph delta token for the whole-user chat export; not a
 #       user-facing entity (TEAMS_CHAT rows are).
-#   USER_MAIL / USER_ONEDRIVE / USER_CONTACTS / USER_CALENDAR / USER_CHATS —
-#       Tier 2 per-content-category children under an ENTRA_USER parent.
-#       The parent row already rolls up their storage_bytes and last-backup
-#       timestamps, so surfacing them in Protection creates five dupes per
-#       user each needing their own SLA — which isn't how protection works.
+#   USER_MAIL / USER_ONEDRIVE / USER_CONTACTS / USER_CALENDAR / USER_CHATS /
+#   USER_ARCHIVE — Tier 2 per-content-category children under an ENTRA_USER
+#       parent. The parent row already rolls up their storage_bytes and
+#       last-backup timestamps, so surfacing them in Protection creates dupes
+#       per user each needing their own SLA — which isn't how protection works.
+#       (USER_ARCHIVE = the Exchange in-place archive mailbox, backed up via
+#       the Graph Import/Export API; its bytes roll into the user's total.)
 #   TEAMS_CHANNEL — duplicates an M365_GROUP row for the same Team (same
 #       external_id). M365_GROUP backup fans out into channels + group
 #       mailbox + team site, so the TEAMS_CHANNEL row is redundant.
 UI_HIDDEN_TYPES: set[str] = {
     "TEAMS_CHAT_EXPORT",
     "USER_MAIL", "USER_ONEDRIVE", "USER_CONTACTS", "USER_CALENDAR", "USER_CHATS",
+    "USER_ARCHIVE",
     "TEAMS_CHANNEL",
 }
 

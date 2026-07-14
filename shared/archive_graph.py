@@ -30,8 +30,11 @@ from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Tuple
 # "v1.0" via env the day archive support GAs — one flip, no code change.
 ARCHIVE_GRAPH_VERSION = os.environ.get("ARCHIVE_GRAPH_VERSION", "beta")
 
-# Master feature flag. Default OFF: ship + test on beta without exposing prod.
-ARCHIVE_BACKUP_ENABLED = os.environ.get("ARCHIVE_BACKUP_ENABLED", "false").lower() in (
+# Master feature flag. Default ON — set ARCHIVE_BACKUP_ENABLED=false (or 0/no)
+# in the environment to turn archive backup off. Pairs with ARCHIVE_GRAPH_VERSION
+# (kept on "beta" until archive support GAs) so the whole workload rides one env
+# switch each.
+ARCHIVE_BACKUP_ENABLED = os.environ.get("ARCHIVE_BACKUP_ENABLED", "true").lower() in (
     "1", "true", "yes",
 )
 
@@ -48,12 +51,27 @@ def _batches(ids: List[str], n: int = EXPORT_BATCH_MAX) -> Iterator[List[str]]:
         yield ids[i:i + n]
 
 
+async def get_mailbox_ids(gc, user_id: str, *, version: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+    """Return ``(primary_mailbox_id, archive_mailbox_id)`` in one call.
+    ``/settings/exchange`` carries both; either may be ``None``. The primary id
+    is the staging target for archive→EML/MBOX/PST export (opaque blobs are
+    imported into the primary, which the STANDARD mail API can read back)."""
+    j = await gc._get(f"{_base(version)}/users/{user_id}/settings/exchange") or {}
+    return (j.get("primaryMailboxId") or None), (j.get("inPlaceArchiveMailboxId") or None)
+
+
 async def get_archive_mailbox_id(gc, user_id: str, *, version: Optional[str] = None) -> Optional[str]:
     """Return the user's in-place archive mailbox id, or ``None`` if no archive
     is provisioned. Cheap single call; reuses the existing bulk-discovery era
     of ``/settings/exchange`` which also carries ``primaryMailboxId``."""
-    j = await gc._get(f"{_base(version)}/users/{user_id}/settings/exchange")
-    return (j or {}).get("inPlaceArchiveMailboxId") or None
+    _primary, archive = await get_mailbox_ids(gc, user_id, version=version)
+    return archive
+
+
+async def get_primary_mailbox_id(gc, user_id: str, *, version: Optional[str] = None) -> Optional[str]:
+    """Return the user's PRIMARY mailbox id (the archive→export staging target)."""
+    primary, _archive = await get_mailbox_ids(gc, user_id, version=version)
+    return primary
 
 
 async def list_archive_folders(gc, mailbox_id: str, *, version: Optional[str] = None) -> List[Dict[str, Any]]:

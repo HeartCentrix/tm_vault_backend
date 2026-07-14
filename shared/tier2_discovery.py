@@ -49,6 +49,11 @@ _TIER2_TYPE_MAP: Dict[str, ResourceType] = {
     "USER_CONTACTS": ResourceType.USER_CONTACTS,
     "USER_CALENDAR": ResourceType.USER_CALENDAR,
     "USER_CHATS": ResourceType.USER_CHATS,
+    # Exchange in-place archive — persistable Tier-2 child (inherits the parent
+    # user's SLA, so it's backed up on the user's normal fire). Deliberately NOT
+    # in TIER2_CHILD_TYPES: archive is opt-in per user, so requiring it would
+    # make has_complete_tier2 never-complete and force endless re-discovery.
+    "USER_ARCHIVE": ResourceType.USER_ARCHIVE,
 }
 
 

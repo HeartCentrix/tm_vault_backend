@@ -65,6 +65,23 @@ async def test_get_archive_mailbox_id_none_when_no_archive():
 
 
 @pytest.mark.asyncio
+async def test_get_mailbox_ids_returns_primary_and_archive():
+    gc = FakeGC(get_map={
+        "https://graph.microsoft.com/beta/users/U/settings/exchange":
+            {"primaryMailboxId": "MBX:prim@t", "inPlaceArchiveMailboxId": "MBX:arch@t"},
+    })
+    assert await ag.get_mailbox_ids(gc, "U") == ("MBX:prim@t", "MBX:arch@t")
+    # primary is the archive->export staging target
+    assert await ag.get_primary_mailbox_id(gc, "U") == "MBX:prim@t"
+
+
+@pytest.mark.asyncio
+async def test_get_mailbox_ids_none_pair_when_settings_empty():
+    gc = FakeGC(get_map={"https://graph.microsoft.com/beta/users/U/settings/exchange": {}})
+    assert await ag.get_mailbox_ids(gc, "U") == (None, None)
+
+
+@pytest.mark.asyncio
 async def test_list_folders_follows_nextlink():
     base = "https://graph.microsoft.com/beta/admin/exchange/mailboxes/M/folders"
     gc = FakeGC(get_map={

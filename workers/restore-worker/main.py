@@ -516,6 +516,7 @@ class RestoreWorker:
         "Contacts": {"USER_CONTACT"},
         "Calendar": {"CALENDAR_EVENT", "EVENT_ATTACHMENT"},
         "Chats": {"TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY", "TEAMS_CHAT_MESSAGE"},
+        "Archive": {"ARCHIVE_ITEM"},
     }
 
     def __init__(self):
@@ -1415,6 +1416,23 @@ class RestoreWorker:
                 )
                 failed_count += entra_summary.get("failed", 0)
 
+            # Archive (opaque MAPI) items restore via the Graph Import/Export
+            # API — replay each blob VERBATIM into its origin folder through a
+            # reused import session (the only lossless round-trip). Sieve them
+            # out of the per-item loop below, batch-import via the engine.
+            archive_items = [it for it in resource_items if it.item_type == "ARCHIVE_ITEM"]
+            if archive_items:
+                resource_items = [it for it in resource_items if it.item_type != "ARCHIVE_ITEM"]
+                from archive_restore import ArchiveRestoreEngine
+                a_engine = ArchiveRestoreEngine(
+                    graph_client,
+                    download_blob=self._download_archive_blob,
+                    worker_id=self.worker_id,
+                )
+                a_summary = await a_engine.run(archive_items)
+                restored_count += a_summary.get("created", 0)
+                failed_count += a_summary.get("failed", 0)
+
             for item in resource_items:
                 try:
                     if item.item_type in ("EMAIL",):
@@ -2223,6 +2241,26 @@ class RestoreWorker:
             and _email_items
             and all(getattr(it, "item_type", None) in _MAIL_V2_TYPES for it in items)
         ):
+            # Stamp itemAttachment (mail-in-mail) siblings onto their parent
+            # EMAIL rows so the EML/MBOX builder can embed nested emails as
+            # message/rfc822 parts. Built from the EMAIL_ATTACHMENT rows already
+            # in the selection (mixed EMAIL+EMAIL_ATTACHMENT, e.g. "Download
+            # all"). fileAttachment rows are ignored by that path — they keep
+            # their existing channel — and referenceAttachment stays skipped.
+            # ponytail: covers whole-mailbox exports (attachment rows present);
+            # add an EMAIL_ATTACHMENT pre-fetch (like export_as_pst) if granular
+            # email-only selections must embed itemAttachments too.
+            _eml_att_index: Dict[str, List] = {}
+            for _it in items:
+                if getattr(_it, "item_type", None) != "EMAIL_ATTACHMENT":
+                    continue
+                _ed = getattr(_it, "extra_data", None) or {}
+                _parent = _ed.get("parent_item_id")
+                if _parent:
+                    _eml_att_index.setdefault(_parent, []).append(_it)
+            if _eml_att_index:
+                for _it in _email_items:
+                    _it._email_attachment_items = _eml_att_index.get(_it.external_id, [])
             # Drop attachment rows — they're handled inline by the orchestrator.
             items = _email_items
             from mail_export import MailExportOrchestrator
@@ -3564,6 +3602,21 @@ class RestoreWorker:
             return await stream.readall()
         except Exception as e:
             print(f"[{self.worker_id}] [DOWNLOAD] failed for {item.blob_path}: {type(e).__name__}: {e}")
+            return None
+
+    async def _download_archive_blob(self, item: SnapshotItem) -> Optional[bytes]:
+        """Fetch an ARCHIVE_ITEM's OPAQUE MAPI blob from the dedicated ``archive``
+        container (the workload the backup handler wrote it to). Routed through
+        ``azure_storage_manager.download_blob`` so it resolves the active backend
+        (SeaweedFS/Azure) regardless of which shard the upload used."""
+        if not item.blob_path:
+            return None
+        try:
+            from shared.azure_storage import azure_storage_manager
+            container = azure_storage_manager.get_container_name(str(item.tenant_id), "archive")
+            return await azure_storage_manager.download_blob(container, item.blob_path)
+        except Exception as e:
+            print(f"[{self.worker_id}] [ARCHIVE_DOWNLOAD] failed for {item.blob_path}: {type(e).__name__}: {e}")
             return None
 
     async def _replay_file_permissions(
