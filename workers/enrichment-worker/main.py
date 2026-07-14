@@ -92,6 +92,25 @@ def _make_download(shard):
     return _download
 
 
+async def _with_retry(coro_factory, what: str, attempts: int = 4, base_delay: float = 0.5):
+    """Retry a DB op on transient Postgres errors (deadlock / serialization).
+    Each attempt gets a fresh session via the factory — the aborted txn from a
+    deadlock can't be reused. Boot storms (all services redeploying → concurrent
+    DDL) make a bare SELECT a deadlock victim; steady state won't."""
+    for i in range(attempts):
+        try:
+            return await coro_factory()
+        except Exception as e:  # noqa: BLE001
+            msg = str(e).lower()
+            transient = "deadlock" in msg or "serialization" in msg
+            if transient and i < attempts - 1:
+                await asyncio.sleep(base_delay * (2 ** i))
+                logger.warning("[%s] %s transient DB error (retry %d): %s",
+                               WORKER_ID, what, i + 1, type(e).__name__)
+                continue
+            raise
+
+
 async def enrich_one_resource(resource_id) -> dict:
     """Enrich a single USER_ARCHIVE resource end-to-end. Never raises for the
     ordinary skip cases (missing resource/tenant, wrong type, no mailbox); those
@@ -184,10 +203,13 @@ async def bulk_sweep_loop():
             except Exception as e:  # noqa: BLE001
                 logger.exception("[%s] bulk enrich failed for %s: %s", WORKER_ID, rid, e)
 
+    async def _find():
+        async with async_session_factory() as session:
+            return await eng.find_pending_archive_resource_ids(session, limit=limit)
+
     while True:
         try:
-            async with async_session_factory() as session:
-                rids = await eng.find_pending_archive_resource_ids(session, limit=limit)
+            rids = await _with_retry(_find, "find_pending")
             if rids:
                 logger.info("[%s] bulk sweep: %d resource(s) with pending archive items", WORKER_ID, len(rids))
                 await asyncio.gather(*[_one(rid) for rid in rids])
