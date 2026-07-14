@@ -244,6 +244,19 @@ async def enrich_resource(
                     # returns source:none.
                     if isinstance(up, dict) and up.get("blob_path"):
                         blob_path = up["blob_path"]
+                    # TEMP DIAGNOSTIC (remove after root-cause): reveal exactly
+                    # what the uploader did — dedup_hit vs real upload vs failure
+                    # — and the container + stored path, so a source:none read can
+                    # be traced to write-side vs read-side.
+                    try:
+                        _m = up.get("method") if isinstance(up, dict) else None
+                        _ok = up.get("success") if isinstance(up, dict) else None
+                        _err = up.get("error") if isinstance(up, dict) else None
+                        print(f"[{worker_id}] ARCH_ATT_DIAG att={p['att_id'][:16]} bytes={len(p['data'])} "
+                              f"container={container} method={_m} success={_ok} err={_err} "
+                              f"stored_tail=...{str(blob_path)[-46:]}", flush=True)
+                    except Exception:
+                        pass
                     s.add(SnapshotItem(
                         id=_uuid.uuid4(),
                         snapshot_id=db_row.snapshot_id,
