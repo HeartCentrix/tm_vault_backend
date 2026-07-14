@@ -1090,6 +1090,10 @@ CONTENT_TAB_TO_TYPE: Dict[str, str] = {
     "contacts": "USER_CONTACTS",
     "calendar": "USER_CALENDAR",
     "chats": "USER_CHATS",
+    # Exchange Online Archive — its own Tier-2 child. The tab only renders
+    # when this child has a completed snapshot (byContent.archive != null), so
+    # users without an archive never see it.
+    "archive": "USER_ARCHIVE",
 }
 
 
@@ -1166,6 +1170,7 @@ async def get_content_snapshots(
         "contacts": ["USER_CONTACT", "CONTACT"],
         "calendar": ["CALENDAR_EVENT"],
         "chats": ["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"],
+        "archive": ["ARCHIVE_ITEM"],
     }
 
     by_content: Dict[str, Optional[Dict[str, Any]]] = {}
@@ -1598,6 +1603,97 @@ async def list_snapshot_emails(
             "createdAt": i.created_at.isoformat() if i.created_at else "",
             "name": raw.get("subject") or i.name or "",
             "metadata": {"raw": raw},
+        }
+
+    return {"content": [fmt(i) for i in items], "totalElements": total, "totalPages": max(1, (total+size-1)//size), "size": size, "number": page}
+
+
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/archive")
+async def list_snapshot_archive(
+    snapshot_id: str,
+    page: int = Query(1, ge=1),
+    size: int = Query(500, ge=1),
+    folder: Optional[str] = Query(None, description="Filter to a specific archive folder path"),
+    search: Optional[str] = Query(None, description="Case-insensitive substring match on name/subject"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Exchange Online Archive items for the browse tab. Archive items are
+    backed up as OPAQUE MAPI blobs (unparseable), so subject/body/from only
+    exist once the ENRICHMENT service has staged them (extra_data.raw +
+    enrich_status='enriched'). Un-enriched rows return their friendly kind
+    ("Email"/"Contact"/…) + enrich_status so the UI shows a "processing" pill;
+    enriched rows render through the same EmailPreview as primary mail.
+
+    Browsing the tab also NUDGES on-demand enrichment (enrich.priority) for any
+    rows still pending — so opening your archive processes it first."""
+    sibling_ids = await _resolve_sibling_snapshot_ids(
+        db, snapshot_id, target_child_type=ResourceType.USER_ARCHIVE,
+    )
+    if not sibling_ids:
+        sibling_ids = [UUID(snapshot_id)]
+    filters = [
+        SnapshotItem.snapshot_id.in_(sibling_ids),
+        SnapshotItem.item_type == "ARCHIVE_ITEM",
+    ]
+    if folder is not None:
+        filters.append(SnapshotItem.folder_path == folder)
+    if search:
+        filters.append(SnapshotItem.name.ilike(f"%{search}%"))
+    all_rows = (await db.execute(select(SnapshotItem).where(*filters))).scalars().all()
+    seen: set = set()
+    deduped = []
+    for it in all_rows:
+        key = it.external_id or str(it.id)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(it)
+
+    def _arch_sort_key(r):
+        raw = (r.extra_data or {}).get("raw") or {}
+        ts = raw.get("receivedDateTime") or raw.get("sentDateTime") or (r.extra_data or {}).get("received")
+        return ts or (r.created_at.isoformat() if r.created_at else "")
+    deduped.sort(key=_arch_sort_key, reverse=True)
+    total = len(deduped)
+    offset = (page - 1) * size
+    items = deduped[offset: offset + size]
+
+    # Fire on-demand enrichment for any un-enriched rows in scope (idempotent).
+    await _maybe_trigger_archive_enrichment(db, items)
+
+    def fmt(i):
+        ed = i.extra_data or {}
+        raw = ed.get("raw") or {}
+        enriched = ed.get("enrich_status") == "enriched"
+        from_addr = raw.get("from", {}).get("emailAddress", {})
+        to_list = [r.get("emailAddress", {}) for r in raw.get("toRecipients", [])]
+        cc_list = [r.get("emailAddress", {}) for r in raw.get("ccRecipients", [])]
+        # Enriched → real subject; else the friendly kind so the row isn't blank.
+        display = raw.get("subject") if enriched else None
+        display = display or i.name or ed.get("kind") or "Archived item"
+        return {
+            "id": str(i.id),
+            "snapshotId": str(i.snapshot_id),
+            "externalId": i.external_id,
+            "itemType": i.item_type,  # ARCHIVE_ITEM
+            "subject": raw.get("subject") or i.name,
+            "from": f"{from_addr.get('name', '')} <{from_addr.get('address', '')}>".strip(" <>") or None,
+            "to": "; ".join(f"{r.get('name','')} <{r.get('address','')}>".strip(" <>") for r in to_list),
+            "cc": "; ".join(f"{r.get('name','')} <{r.get('address','')}>".strip(" <>") for r in cc_list),
+            "date": raw.get("sentDateTime") or raw.get("receivedDateTime") or ed.get("received") or (i.created_at.isoformat() if i.created_at else None),
+            "bodyPreview": raw.get("bodyPreview") or "",
+            "body": raw.get("body", {}).get("content") or "",
+            "bodyContentType": raw.get("body", {}).get("contentType") or "text",
+            "hasAttachments": raw.get("hasAttachments", ed.get("has_attachments", False)),
+            "attachments": raw.get("attachments", []),
+            "folderPath": i.folder_path,
+            "contentSize": i.content_size or 0,
+            "isDeleted": i.is_deleted or False,
+            "createdAt": i.created_at.isoformat() if i.created_at else "",
+            "name": display,
+            # enrich_status drives the UI's "processing" pill; raw drives preview.
+            "metadata": {"raw": raw, "enrich_status": ed.get("enrich_status"),
+                         "kind": ed.get("kind"), "mapi_type": ed.get("mapi_type")},
         }
 
     return {"content": [fmt(i) for i in items], "totalElements": total, "totalPages": max(1, (total+size-1)//size), "size": size, "number": page}
