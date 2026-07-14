@@ -2305,7 +2305,7 @@ class GraphClient:
                 return None
             return {
                 "external_id": f"{user_external_id}:archive",
-                "display_name": f"Archive — {display}",
+                "display_name": f"Online Archive — {display}",
                 "email": email,
                 "type": "USER_ARCHIVE",
                 "parent_external_id": user_external_id,

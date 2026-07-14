@@ -3148,6 +3148,11 @@ class BackupWorker:
         "USER_CONTACTS": "_backup_user_content_single",
         "USER_CALENDAR": "_backup_user_content_single",
         "USER_CHATS": "_backup_user_content_single",
+        # Exchange in-place archive. Same story as the USER_* types above: the
+        # real handler is _backup_archive_mailbox (group path), so single/fanout
+        # triggers need this thin wrapper or they fall to metadata-only and write
+        # a 1-row stub instead of exporting the archive.
+        "USER_ARCHIVE": "_backup_archive_single",
     }
 
     async def _process_single_backup(self, job_id: uuid.UUID, message: Dict, resource_id: str):
@@ -19360,6 +19365,41 @@ class BackupWorker:
         except Exception as _bump_err:
             print(
                 f"[{self.worker_id}] [USER_CONTENT_SINGLE] outer snapshot "
+                f"counter bump failed: {_bump_err}",
+            )
+        return result
+
+    async def _backup_archive_single(self, graph_client: GraphClient, resource: Resource,
+                                     snapshot: Snapshot, tenant: Tenant, message: Dict) -> Dict:
+        """Single-resource entry point for USER_ARCHIVE — mirrors
+        ``_backup_user_content_single``. Runs the real ``_backup_archive_mailbox``
+        against ``[resource]`` (it creates its own inner snapshot) and bumps the
+        outer ``_process_single_backup`` snapshot to the real totals so the UI
+        doesn't show a 0-item ghost. Without this, single/fanout archive
+        triggers fell to metadata-only and wrote a 1-row stub."""
+        import uuid as _uuid
+        job_id_raw = (message or {}).get("jobId") or (message or {}).get("job_id")
+        try:
+            job_id = _uuid.UUID(str(job_id_raw)) if job_id_raw else _uuid.uuid4()
+        except Exception:
+            job_id = _uuid.uuid4()
+        result = await self._backup_archive_mailbox(
+            [resource], graph_client, tenant, message, job_id,
+        )
+        try:
+            async with async_session_factory() as _s:
+                snap = await _s.get(Snapshot, snapshot.id)
+                if snap is not None:
+                    items = int(result.get("item_count", 0) or 0)
+                    bytes_total = int(result.get("bytes_added", 0) or 0)
+                    snap.item_count = items
+                    snap.new_item_count = items
+                    snap.bytes_total = bytes_total
+                    snap.bytes_added = bytes_total
+                    await _s.commit()
+        except Exception as _bump_err:
+            print(
+                f"[{self.worker_id}] [ARCHIVE_SINGLE] outer snapshot "
                 f"counter bump failed: {_bump_err}",
             )
         return result
