@@ -32,6 +32,7 @@ class FakeOps:
         self._msgs = messages_per_batch or {}   # batch_index -> [graph msgs]
         self._fail_read_on = fail_read_on
         self._read_idx = 0
+        self._import_n = 0
 
     async def create_temp_folder(self):
         self.calls.append(("create_temp_folder",))
@@ -47,6 +48,8 @@ class FakeOps:
 
     async def import_blob(self, url, folder_ie_id, blob):
         self.calls.append(("import", folder_ie_id, blob))
+        self._import_n += 1
+        return f"NEW{self._import_n}"  # scratch-mailbox item id assigned on import
 
     async def read_messages(self, std_id):
         idx = self._read_idx
@@ -131,6 +134,36 @@ async def test_items_with_no_blob_are_skipped_and_empty_batch_skips_read():
 def test_chunks_helper():
     assert list(ae._chunks([1, 2, 3, 4, 5], 2)) == [[1, 2], [3, 4], [5]]
     assert list(ae._chunks([], 3)) == []
+
+
+# ── stage_and_map: enrichment needs (source_item -> graph_json) matching ──
+
+@pytest.mark.asyncio
+async def test_stage_and_map_matches_staged_json_back_to_source_item():
+    # imports assign NEW1/NEW2; the temp-folder read returns messages carrying
+    # those ids, so each staged message must map back to its ORIGINAL item.
+    ops = FakeOps(messages_per_batch={
+        0: [{"id": "NEW1", "subject": "first"}, {"id": "NEW2", "subject": "second"}],
+    })
+    eng = ae.ArchiveExportStager(ops=ops, download_blob=_dl, batch_size=10)
+    a, b = _Item("A"), _Item("B")
+    pairs = [(src.external_id, msg) async for src, msg in eng.stage_and_map([a, b])]
+
+    # source A imported first -> NEW1 -> "first"; B -> NEW2 -> "second"
+    assert pairs == [("A", {"id": "NEW1", "subject": "first"}),
+                     ("B", {"id": "NEW2", "subject": "second"})]
+    assert ("delete", "STD-TMP") == ops.calls[-1]  # cleanup still guaranteed
+
+
+@pytest.mark.asyncio
+async def test_stage_and_map_skips_unmatched_and_no_blob_items():
+    # C downloads empty -> not imported; a stray staged msg with unknown id is dropped
+    ops = FakeOps(messages_per_batch={
+        0: [{"id": "NEW1", "subject": "ok"}, {"id": "GHOST", "subject": "orphan"}],
+    })
+    eng = ae.ArchiveExportStager(ops=ops, download_blob=_dl, batch_size=10)
+    got = [(s.external_id, m["subject"]) async for s, m in eng.stage_and_map([_Item("A"), _Item("C", blob=b"")])]
+    assert got == [("A", "ok")]  # C skipped (no blob); GHOST dropped (no source)
 
 
 def test_message_to_eml_reuses_shared_builders_with_file_and_nested():

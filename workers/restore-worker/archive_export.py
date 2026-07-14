@@ -82,6 +82,36 @@ class ArchiveExportStager:
             # Never leave imported archive data in the user's live mailbox.
             await self.ops.delete_folder(temp_std_id)
 
+    async def stage_and_map(self, items: List[Any]) -> AsyncIterator[tuple]:
+        """Like :meth:`stage_and_read`, but yields ``(source_item, graph_json)``
+        pairs — the ENRICHMENT path needs to write each staged message's JSON
+        back onto its ORIGINAL ``ARCHIVE_ITEM`` row. Matching is by the scratch
+        item id returned from ``import_blob``: import assigns a new id, the temp
+        folder read returns messages carrying those ids, so ``{new_id: source}``
+        maps a staged message back to its source. Same guaranteed cleanup."""
+        temp_std_id = await self.ops.create_temp_folder()
+        try:
+            temp_ie_id = await self.ops.resolve_ie_folder_id(temp_std_id)
+            for batch in _chunks(list(items), self.batch_size):
+                import_url, _exp = await self.ops.create_import_session()
+                new_to_src: Dict[str, Any] = {}
+                for it in batch:
+                    blob = await self.download_blob(it)
+                    if not blob:
+                        continue
+                    new_id = await self.ops.import_blob(import_url, temp_ie_id, blob)
+                    if new_id:
+                        new_to_src[new_id] = it
+                if not new_to_src:
+                    continue
+                async for msg in self.ops.read_messages(temp_std_id):
+                    src = new_to_src.get(msg.get("id"))
+                    if src is not None:  # drop any stray/pre-existing scratch msg
+                        yield src, msg
+                await self.ops.empty_folder(temp_std_id)
+        finally:
+            await self.ops.delete_folder(temp_std_id)
+
 
 class LiveStagingOps:
     """Live Graph implementation of the staging ops. Standard mail API (v1.0) for
@@ -121,8 +151,11 @@ class LiveStagingOps:
     async def create_import_session(self) -> Tuple[Optional[str], Optional[str]]:
         return await archive_graph.create_import_session(self.gc, self.primary_mailbox_id)
 
-    async def import_blob(self, import_url: str, folder_ie_id: str, blob: bytes) -> None:
-        await archive_graph.import_item(self.post_json, import_url, folder_ie_id, blob, mode="create")
+    async def import_blob(self, import_url: str, folder_ie_id: str, blob: bytes) -> Optional[str]:
+        # Returns the scratch-mailbox item id so enrichment can map the staged
+        # message back to its source ARCHIVE_ITEM row.
+        res = await archive_graph.import_item(self.post_json, import_url, folder_ie_id, blob, mode="create")
+        return (res or {}).get("itemId") if isinstance(res, dict) else None
 
     async def read_messages(self, std_id: str) -> AsyncIterator[Dict[str, Any]]:
         url = (
