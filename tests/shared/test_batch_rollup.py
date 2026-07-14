@@ -28,6 +28,30 @@ def _r(**kw):
     return RollupCounts(**defaults)
 
 
+# ─── USER_ARCHIVE expected-set gating (ARCHIVE_BACKUP_ENABLED) ──────────
+
+def _rollup_sql():
+    return str(build_batch_rollup_query(
+        tenant_id=None, start_date=None, end_date=None,
+        operation=None, size=10, offset=0,
+    ))
+
+
+def test_archive_counts_toward_batch_when_flag_on(monkeypatch):
+    # Default (and explicit true) → archive is an expected Tier-2 child, so a
+    # batch is not "Done" until the archive snapshots are terminal.
+    monkeypatch.setenv("ARCHIVE_BACKUP_ENABLED", "true")
+    assert "USER_ARCHIVE" in _rollup_sql()
+
+
+def test_archive_dropped_from_expected_when_flag_off(monkeypatch):
+    # Flag off → archive is silently dropped from EXPECTED at query-build time,
+    # so a batch never pins to In Progress waiting on archive snapshots that
+    # will never come (no hang). This is what makes the flag safely reversible.
+    monkeypatch.setenv("ARCHIVE_BACKUP_ENABLED", "false")
+    assert "USER_ARCHIVE" not in _rollup_sql()
+
+
 # ─── state machine: In Progress branches ───────────────────────────────
 
 def test_pending_jobs_means_in_progress():

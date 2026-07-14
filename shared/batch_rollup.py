@@ -187,6 +187,18 @@ def derive_batch_status(
     return ("Done", warnings or None)
 
 
+def archive_backup_enabled() -> bool:
+    """Whether Online Archive backup is on (default ON — mirrors
+    archive_graph). Gates USER_ARCHIVE in both the batch DISPLAY rollup and the
+    FINALIZER leaf set so the flag is safely reversible: off → archive is
+    dropped from what a batch waits on, so no batch pins to In Progress on
+    archive snapshots that were never dispatched."""
+    import os as _os
+    return _os.getenv("ARCHIVE_BACKUP_ENABLED", "true").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 def build_batch_rollup_query(
     *,
     tenant_id: Optional[str],
@@ -215,6 +227,20 @@ def build_batch_rollup_query(
     aggregate queries.
     """
     op_filter = "AND j.type::text = :op" if operation else ""
+
+    # Online Archive (USER_ARCHIVE) counts toward batch completion only WHILE
+    # archive backup is enabled. Gating the EXPECTED / terminal type-list on the
+    # flag at query-BUILD time is what makes the flag safely reversible: turn it
+    # off and archive silently drops out of "expected", so an in-flight batch
+    # never pins to In Progress waiting on archive snapshots that will never come
+    # (archive resources persist once discovered, so an unconditional add would
+    # hang the batch forever). Default ON — matches archive_graph's default and
+    # the operator's intent to always back up archives.
+    _t2_types = ["USER_MAIL", "USER_ONEDRIVE", "USER_CHATS", "USER_CALENDAR", "USER_CONTACTS"]
+    if archive_backup_enabled():
+        _t2_types.append("USER_ARCHIVE")
+    t2_types_sql = ", ".join(f"'{t}'" for t in _t2_types)
+
     sql = f"""
     WITH filtered_jobs AS (
         SELECT *
@@ -358,9 +384,7 @@ def build_batch_rollup_query(
         CROSS JOIN LATERAL unnest(ts.scope_ids) AS bid
         JOIN resources r1 ON r1.id = bid AND r1.type::text = 'ENTRA_USER'
         JOIN resources r2 ON r2.parent_resource_id = r1.id
-                         AND r2.type::text IN (
-                             'USER_MAIL','USER_ONEDRIVE','USER_CHATS',
-                             'USER_CALENDAR','USER_CONTACTS')
+                         AND r2.type::text IN ({t2_types_sql})
                          -- Exclude workloads the user has NO M365 license
                          -- for: they can never produce a snapshot, so
                          -- counting them as "missing" pins the batch at
@@ -492,15 +516,11 @@ def build_batch_rollup_query(
                     0
                 ),
                 COUNT(*) FILTER (
-                    WHERE r.type::text IN (
-                        'USER_MAIL','USER_ONEDRIVE','USER_CHATS',
-                        'USER_CALENDAR','USER_CONTACTS')
+                    WHERE r.type::text IN ({t2_types_sql})
                 )
             )                                              AS tier2_total,
             COUNT(*) FILTER (
-                WHERE r.type::text IN (
-                    'USER_MAIL','USER_ONEDRIVE','USER_CHATS',
-                    'USER_CALENDAR','USER_CONTACTS')
+                WHERE r.type::text IN ({t2_types_sql})
                   AND s.status::text IN ('COMPLETED','PARTIAL','FAILED')
             )                                              AS tier2_terminal
         FROM batches b
@@ -974,9 +994,14 @@ async def _finalize_batch_if_complete(batch_id, session) -> Optional[str]:
                    AND COALESCE(
                        (r.metadata->>'license_missing')::boolean, false
                    ) = false
+                   -- Same safety valve for Online Archive: when archive backup
+                   -- is disabled no archive snapshot is dispatched, so keeping
+                   -- USER_ARCHIVE in the leaf set would pin the batch forever.
+                   -- Gated to match the DISPLAY rollup (archive_backup_enabled).
+                   AND (:archive_on OR r.type::text <> 'USER_ARCHIVE')
             )
             SELECT DISTINCT resource_id FROM targets
-        """), {"ids": entra_ids})).all()
+        """), {"ids": entra_ids, "archive_on": archive_backup_enabled()})).all()
         leaf_ids = [str(r.resource_id) for r in leaves_rows]
     else:
         leaf_ids = []
