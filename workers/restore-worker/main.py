@@ -2234,8 +2234,29 @@ class RestoreWorker:
         # types). EMAIL_ATTACHMENT rows are skipped — their bytes already get
         # inlined into the parent EML via _build_eml_for_item.
         from shared.config import settings as _mail_export_settings
-        _MAIL_V2_TYPES = {"EMAIL", "EMAIL_ATTACHMENT"}
-        _email_items = [it for it in items if getattr(it, "item_type", None) == "EMAIL"]
+        # ARCHIVE_ITEM rides the mail path: enrichment stores the Graph message
+        # JSON inline on extra_data.raw (exactly like USER_MAIL), and
+        # mail_fetch.fetch_message reads that inline raw first — so an enriched
+        # archive item builds an EML/MBOX identically, never touching its opaque
+        # blob. Un-enriched archive rows have no raw yet → skip them (they export
+        # once the enrichment service has staged them; browsing/exporting nudges
+        # it). We DON'T silently include them — that would emit empty EMLs.
+        _MAIL_V2_TYPES = {"EMAIL", "EMAIL_ATTACHMENT", "ARCHIVE_ITEM"}
+
+        def _is_exportable_mail(it):
+            t = getattr(it, "item_type", None)
+            if t == "EMAIL":
+                return True
+            if t == "ARCHIVE_ITEM":
+                return bool((getattr(it, "extra_data", None) or {}).get("raw"))
+            return False
+        _email_items = [it for it in items if _is_exportable_mail(it)]
+        _arch_total = sum(1 for it in items if getattr(it, "item_type", None) == "ARCHIVE_ITEM")
+        _arch_ready = sum(1 for it in _email_items if getattr(it, "item_type", None) == "ARCHIVE_ITEM")
+        if _arch_total and _arch_ready < _arch_total:
+            print(f"[{self.worker_id}] [ARCHIVE_EXPORT] {_arch_total - _arch_ready}/"
+                  f"{_arch_total} archive items not yet enriched — skipped this export "
+                  f"(will export once their preview is built)", flush=True)
         if (
             _mail_export_settings.EXPORT_MAIL_V2_ENABLED
             and _email_items
