@@ -1022,6 +1022,11 @@ RESOURCE_TYPE_TO_WORKLOADS: Dict[str, Tuple[str, ...]] = {
     "USER_CONTACTS": ("mailbox",),
     "USER_CALENDAR": ("mailbox",),
     "USER_CHATS": ("teams",),
+    # Exchange in-place ARCHIVE opaque MAPI blobs — dedicated "archive"
+    # container (archive_backup.ARCHIVE_WORKLOAD). Without this the orphan-blob
+    # GC / retention purge falls back to "backup-user-archive-<t>" (empty) and
+    # never reclaims real archive blobs in "backup-archive-<t>".
+    "USER_ARCHIVE": ("archive",),
 }
 
 

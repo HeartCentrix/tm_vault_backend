@@ -1919,6 +1919,7 @@ class RestoreWorker:
             "EMAIL": {"USER_MAIL", "MAILBOX", "SHARED_MAILBOX", "ROOM_MAILBOX", "M365_GROUP"},
             "CALENDAR_EVENT": {"USER_CALENDAR", "M365_GROUP"},
             "USER_CONTACT": {"USER_CONTACTS"},
+            "ARCHIVE_ITEM": {"USER_ARCHIVE"},
             # Non-PST workloads — files come through verbatim into the zip.
             "ONEDRIVE_FILE": {"USER_ONEDRIVE", "ONEDRIVE"},
             "FILE": {"USER_ONEDRIVE", "ONEDRIVE", "SHAREPOINT_SITE"},
@@ -1928,7 +1929,10 @@ class RestoreWorker:
         # These travel into the final zip as raw blob members.
         raw_file_types: set = set()
         if wl:
-            non_pst_workloads = [w for w in wl if w not in ("Mail", "Contacts", "Calendar")]
+            # Archive is PST-capable (enriched archive → mail writer), so it must
+            # NOT fall into raw_file_types — else its opaque MAPI blob would be
+            # dumped into the zip as a file instead of converted to a .pst.
+            non_pst_workloads = [w for w in wl if w not in ("Mail", "Contacts", "Calendar", "Archive")]
             for w in non_pst_workloads:
                 raw_file_types |= self.WORKLOAD_ITEM_TYPES.get(w, set())
         # Run sibling expansion if any cross-workload type (PST or raw) is requested.
@@ -2132,7 +2136,8 @@ class RestoreWorker:
         return {
             "exported_count": result.get("item_counts_by_type", {}).get("EMAIL", 0)
                              + result.get("item_counts_by_type", {}).get("CALENDAR_EVENT", 0)
-                             + result.get("item_counts_by_type", {}).get("USER_CONTACT", 0),
+                             + result.get("item_counts_by_type", {}).get("USER_CONTACT", 0)
+                             + result.get("item_counts_by_type", {}).get("ARCHIVE_ITEM", 0),
             "failed_count": sum(result.get("failed_counts_by_type", {}).values()),
             "skipped_count": sum(result.get("skipped_counts_by_type", {}).values()),
             "export_type": "PST",

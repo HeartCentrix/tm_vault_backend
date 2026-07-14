@@ -233,12 +233,27 @@ class PstGroup:
     pst_filename: str = ""                      # e.g. "snapshot123-mail.pst"
 
 
+def _archive_pst_exportable(item) -> bool:
+    """ARCHIVE_ITEM converts to PST only once ENRICHED — the mail writer reads
+    the Graph message JSON from ``extra_data.raw`` (via ``fetch_message``). An
+    un-enriched archive row carries only the opaque MAPI blob; feeding it to the
+    writer would blow up on ``json.loads``. Non-archive items always pass."""
+    if getattr(item, "item_type", None) != "ARCHIVE_ITEM":
+        return True
+    meta = getattr(item, "extra_data", None) or getattr(item, "metadata", None) or {}
+    return bool(isinstance(meta, dict) and meta.get("raw"))
+
+
 class PstGroupPlanner:
-    PST_ITEM_TYPES = {"EMAIL", "CALENDAR_EVENT", "USER_CONTACT"}
+    # ARCHIVE_ITEM rides the MAIL writer (enriched archive JSON is a Graph
+    # message); its own "archive" suffix keeps the PST distinct from the
+    # primary mailbox's "-mail.pst".
+    PST_ITEM_TYPES = {"EMAIL", "CALENDAR_EVENT", "USER_CONTACT", "ARCHIVE_ITEM"}
     TYPE_SUFFIX = {
         "EMAIL": "mail",
         "CALENDAR_EVENT": "calendar",
         "USER_CONTACT": "contacts",
+        "ARCHIVE_ITEM": "archive",
     }
 
     def plan(
@@ -278,10 +293,12 @@ class PstGroupPlanner:
 
         effective_types = self.PST_ITEM_TYPES & include_types
 
-        # Filter items first
+        # Filter items first. Un-enriched ARCHIVE_ITEM rows are dropped here —
+        # they have no Graph JSON to convert (only the opaque MAPI blob).
         filtered = [
             it for it in items
             if getattr(it, "item_type", None) in effective_types
+            and _archive_pst_exportable(it)
         ]
 
         # ITEM granularity guardrails (checked before building the full dict)
@@ -401,7 +418,7 @@ class PstExportOrchestrator:
         self.granularity = spec.get("pstGranularity", "MAILBOX").upper()
         self.split_gb = float(spec.get("pstSplitSizeGb", 45))
         self.include_types = set(
-            spec.get("pstIncludeTypes", ["EMAIL", "CALENDAR_EVENT", "USER_CONTACT"])
+            spec.get("pstIncludeTypes", ["EMAIL", "CALENDAR_EVENT", "USER_CONTACT", "ARCHIVE_ITEM"])
         )
         self.workdir = Path(f"/tmp/pst-export/{job_id}")
         # When the user picks MAILBOX granularity but the mailbox holds
@@ -533,6 +550,8 @@ class PstExportOrchestrator:
             "EMAIL": MailPstWriter,
             "CALENDAR_EVENT": CalendarPstWriter,
             "USER_CONTACT": ContactPstWriter,
+            # Enriched archive items are Graph message JSON → mail writer.
+            "ARCHIVE_ITEM": MailPstWriter,
         }
 
         async def _flush_group(group_key: tuple) -> None:
@@ -827,6 +846,11 @@ class PstExportOrchestrator:
 
                 if item.item_type not in self.include_types:
                     continue
+                # Un-enriched archive rows have no Graph JSON to convert —
+                # skip (counted) rather than crash the mail writer on the blob.
+                if not _archive_pst_exportable(item):
+                    skipped_counts["ARCHIVE_ITEM"] += 1
+                    continue
                 group_key = _compute_group_key(item)
                 if group_key in completed_keys:
                     continue
@@ -1086,6 +1110,8 @@ class PstExportOrchestrator:
             "EMAIL": MailPstWriter,
             "CALENDAR_EVENT": CalendarPstWriter,
             "USER_CONTACT": ContactPstWriter,
+            # Enriched archive items are Graph message JSON → mail writer.
+            "ARCHIVE_ITEM": MailPstWriter,
         }
         all_pst_paths: list = []
         item_counts: dict = {}
