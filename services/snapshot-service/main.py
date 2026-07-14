@@ -1524,9 +1524,18 @@ async def list_snapshot_emails(
     size: int = Query(500, ge=1),
     folder: Optional[str] = Query(None, description="Filter to a specific mail folder path"),
     search: Optional[str] = Query(None, description="Case-insensitive substring match on name/subject"),
+    source: Optional[str] = Query(None, description="'archive' → serve Online Archive items via this (gateway-allowed) path"),
+    category: Optional[str] = Query(None, description="With source=archive: mail | contacts | calendar"),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return emails with from/to/cc/subject/body/date extracted from metadata."""
+    """Return emails with from/to/cc/subject/body/date extracted from metadata.
+
+    ``source=archive`` serves the Online Archive here instead: the api-gateway
+    allow-lists the per-content paths (/mail, /contacts, …) but not a new
+    /archive path, so the archive folder-in-tab UI reaches its items through
+    this endpoint. ``category`` then splits archive items by kind."""
+    if (source or "").lower() == "archive":
+        return await _serve_archive_items(db, snapshot_id, page, size, folder, search, category)
     # Delta-based mail backups split content across multiple snapshots.
     # Aggregate every EMAIL row across all sibling snapshots (newest-wins)
     # so the view shows "inbox state as of this snapshot" instead of just
@@ -1617,16 +1626,9 @@ _ARCHIVE_CATEGORY_MATCH = {
 }
 
 
-@app.get("/api/v1/resources/snapshots/{snapshot_id}/archive")
-async def list_snapshot_archive(
-    snapshot_id: str,
-    page: int = Query(1, ge=1),
-    size: int = Query(500, ge=1),
-    folder: Optional[str] = Query(None, description="Filter to a specific archive folder path"),
-    search: Optional[str] = Query(None, description="Case-insensitive substring match on name/subject"),
-    category: Optional[str] = Query(None, description="mail | contacts | calendar — filter archive items to a content tab's kind"),
-    db: AsyncSession = Depends(get_db),
-):
+async def _serve_archive_items(db: AsyncSession, snapshot_id: str, page: int = 1,
+                               size: int = 500, folder: Optional[str] = None,
+                               search: Optional[str] = None, category: Optional[str] = None):
     """Exchange Online Archive items for the browse tab. Archive items are
     backed up as OPAQUE MAPI blobs (unparseable), so subject/body/from only
     exist once the ENRICHMENT service has staged them (extra_data.raw +
@@ -1716,6 +1718,22 @@ async def list_snapshot_archive(
         }
 
     return {"content": [fmt(i) for i in items], "totalElements": total, "totalPages": max(1, (total+size-1)//size), "size": size, "number": page}
+
+
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/archive")
+async def list_snapshot_archive(
+    snapshot_id: str,
+    page: int = Query(1, ge=1),
+    size: int = Query(500, ge=1),
+    folder: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    category: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Direct Online Archive path. Kept for when the api-gateway allow-lists it;
+    today the frontend reaches archive items via /mail?source=archive (which the
+    gateway already forwards)."""
+    return await _serve_archive_items(db, snapshot_id, page, size, folder, search, category)
 
 
 # ============================================================================
