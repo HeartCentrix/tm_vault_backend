@@ -235,7 +235,15 @@ async def enrich_resource(
                         str(db_row.tenant_id), str(resource.id), str(db_row.snapshot_id),
                         f"{db_row.external_id}::{p['att_id']}",
                     )
-                    await upload_attachment(db_row.tenant_id, p["content_hash"], container, blob_path, p["data"])
+                    up = await upload_attachment(db_row.tenant_id, p["content_hash"], container, blob_path, p["data"])
+                    # Dedup-aware: on a dedup_hit the uploader writes NOTHING new
+                    # and returns the EXISTING blob's path (different from the one
+                    # we built). Store the path the bytes ACTUALLY live at, exactly
+                    # like EMAIL_ATTACHMENT (workers/backup-worker/main.py:9328) —
+                    # else the row points at a never-written key and /content
+                    # returns source:none.
+                    if isinstance(up, dict) and up.get("blob_path"):
+                        blob_path = up["blob_path"]
                     s.add(SnapshotItem(
                         id=_uuid.uuid4(),
                         snapshot_id=db_row.snapshot_id,

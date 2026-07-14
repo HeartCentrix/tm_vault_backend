@@ -257,6 +257,46 @@ async def test_enrich_uploads_attachment_bytes_and_creates_sibling_row():
 
 
 @pytest.mark.asyncio
+async def test_enrich_stores_dedup_resolved_blob_path():
+    """The uploader is dedup-aware: on a dedup_hit it writes nothing new and
+    returns the EXISTING blob's path (which differs from the one we built). The
+    sibling row MUST store the RETURNED path — else it points at a key that was
+    never written and /content returns source:none (the '/./' legacy-path bug).
+    Mirrors EMAIL_ATTACHMENT (workers/backup-worker/main.py:9328)."""
+    import base64 as _b64
+    import uuid as _uuid
+    pdf = b"%PDF-1.7 hello"
+    r1 = _Row("id-1", "MSG1", {})
+    db1 = _Row("id-1", "MSG1", {})
+    db1.snapshot_id = _uuid.uuid4()
+    db1.tenant_id = _uuid.uuid4()
+    db1.backend_id = _uuid.uuid4()
+    db1.folder_path = "Archive"
+    store = {"db_rows": {"id-1": db1}, "commits": 0}
+    staged_msg = {
+        "id": "scratch-1", "subject": "Invoice", "hasAttachments": True,
+        "attachments": [{"id": "att-9", "name": "inv.pdf", "contentType": "application/pdf",
+                         "contentBytes": _b64.b64encode(pdf).decode()}],
+    }
+    DEDUP_PATH = "tenant/res/snap/existing-blob-key"
+
+    async def _dedup_upload(tenant_id, content_hash, container, blob_path, data):
+        assert blob_path != DEDUP_PATH  # we constructed a different path
+        return {"success": True, "blob_path": DEDUP_PATH, "method": "dedup_hit"}
+
+    res = await eng.enrich_resource(
+        session_factory=_session_factory(store),
+        resource=_Resource("res-1", {"user_id": "u", "primary_mailbox_id": "p"}),
+        gc=object(), download_blob=None, upload_attachment=_dedup_upload,
+        _load_pending=lambda s, rid: _async_return([r1]),
+        _stager_factory=lambda **kw: _FakeStager([(r1, staged_msg)]),
+    )
+    assert res == {"enriched": 1, "pending": 1}
+    sib = store["added"][0]
+    assert sib.blob_path == DEDUP_PATH  # stored the path the bytes ACTUALLY live at
+
+
+@pytest.mark.asyncio
 async def test_only_rows_needing_enrichment_are_staged():
     """Mixed batch: enrich_resource passes ONLY the un-enriched rows to staging."""
     fresh = _Row("id-1", "A", {})
