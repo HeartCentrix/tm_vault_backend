@@ -65,41 +65,62 @@ async def maybe_decrypt(data: Optional[bytes]) -> Optional[bytes]:
     return blob_cipher.open_blob(data, dek)
 
 
+async def _rechunk(src: AsyncIterator[bytes], chunk_size: int) -> AsyncIterator[bytes]:
+    """Yield ``src`` re-packed into <= chunk_size pieces (never buffers more than
+    one chunk)."""
+    buf = bytearray()
+    async for piece in src:
+        buf += piece
+        while len(buf) >= chunk_size:
+            yield bytes(buf[:chunk_size])
+            del buf[:chunk_size]
+    if buf:
+        yield bytes(buf)
+
+
+async def maybe_encrypt_stream(
+    plaintext: AsyncIterator[bytes], tenant_id: Optional[str], *, chunk_size: int = 1 << 20
+) -> Tuple[AsyncIterator[bytes], bool]:
+    """Return ``(byte_stream, will_encrypt)`` for the STREAMING write path (large
+    OneDrive/SQL blobs). When writes are enabled and a tenant is known, the stream
+    is TMVE-framed on the fly (no full buffering); otherwise the original stream is
+    returned unchanged. Byte-identical to the single-shot seal, so a stream-written
+    blob opens with the single-shot read path and vice-versa."""
+    if not is_write_enabled() or tenant_id is None:
+        return plaintext, False
+    key_id, dek = await _dek_manager.active_dek(tenant_id)  # type: ignore[union-attr]
+    return envelope.encrypt_stream(plaintext, dek, key_id, chunk_size=chunk_size), True
+
+
 async def decrypt_stream(raw: AsyncIterator[bytes], chunk_size: int) -> AsyncIterator[bytes]:
     """Wrap a raw object-store byte stream so callers always see PLAINTEXT.
 
     Legacy (unframed) blobs pass straight through, re-chunked to ``chunk_size``.
-    TMVE-framed blobs are buffered whole, decrypted, then re-chunked — safe
-    because framed blobs are only ever written by the single-shot ``upload()``
-    path (``upload_stream`` multipart does not encrypt), so they are already
-    bounded to what the writer held in memory.
+    TMVE-framed blobs are decrypted INCREMENTALLY (via the streaming framer) so
+    GB-scale blobs are never buffered whole — the key_id in the envelope header
+    resolves the DEK. Raises if a framed blob is seen with no DEK manager
+    installed (cannot recover — better than emitting ciphertext)."""
+    ait = raw.__aiter__()
+    head = bytearray()
+    while len(head) < _PEEK:
+        try:
+            head.extend(await ait.__anext__())
+        except StopAsyncIteration:
+            break
 
-    ponytail: buffer+decrypt is correct while only single-shot writes encrypt;
-    add a chunk-aligned streaming decryptor when multipart writes get encrypted.
-    """
-    buf = bytearray()
-    framed: Optional[bool] = None
-    async for piece in raw:
-        if framed is None:
-            buf += piece
-            if len(buf) >= _PEEK:
-                framed = envelope.is_encrypted(bytes(buf))
-                if not framed:
-                    for i in range(0, len(buf), chunk_size):
-                        yield bytes(buf[i : i + chunk_size])
-                    buf = bytearray()
-            continue
-        if framed:
-            buf += piece
-        else:
+    async def _restream() -> AsyncIterator[bytes]:
+        if head:
+            yield bytes(head)
+        async for piece in ait:
             yield piece
 
-    if framed is None:  # stream ended before we had enough bytes to decide
-        framed = envelope.is_encrypted(bytes(buf))
-    if framed:
-        plaintext = await maybe_decrypt(bytes(buf))
-        for i in range(0, len(plaintext or b""), chunk_size):
-            yield plaintext[i : i + chunk_size]
-    elif buf:
-        for i in range(0, len(buf), chunk_size):
-            yield bytes(buf[i : i + chunk_size])
+    if not envelope.is_encrypted(bytes(head)):
+        async for chunk in _rechunk(_restream(), chunk_size):
+            yield chunk
+        return
+
+    if _dek_manager is None:
+        raise blob_cipher.BlobCipherError("encrypted blob but no DEK manager configured")
+    plaintext = envelope.decrypt_stream(_restream(), _dek_manager.dek_for_key_id)
+    async for chunk in _rechunk(plaintext, chunk_size):
+        yield chunk

@@ -221,7 +221,7 @@ async def lifespan(app: FastAPI):
     try:
         from shared.crypto import bootstrap as _enc_bootstrap
         from shared.database import async_session_factory as _asf
-        if _enc_bootstrap.install_from_env(_asf):
+        if await _enc_bootstrap.install(_asf):
             print("[SNAPSHOT] at-rest encryption hook installed")
     except Exception as e:
         print(f"[SNAPSHOT] encryption hook install failed (non-fatal): {e}")

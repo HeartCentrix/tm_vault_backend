@@ -23,6 +23,7 @@ boto3==1.34.131
 # vendor/pstwriter — no Python-side PST dependency needed.
 azure-keyvault-secrets>=4.7
 azure-identity>=1.15
+azure-keyvault-keys>=4.9,<5  # KEK provider for envelope encryption (azure.keyvault.keys.crypto)
 # Observability — Prometheus metrics scraped on PST_METRICS_PORT (default 9100)
 prometheus-client>=0.20.0
 

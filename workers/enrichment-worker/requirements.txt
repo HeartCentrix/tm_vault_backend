@@ -11,6 +11,7 @@ python-jose==3.3.0
 aiohttp>=3.9.0
 # Azure SDK for Azure resource discovery
 azure-identity>=1.17.0
+azure-keyvault-keys>=4.9,<5  # KEK provider for envelope encryption (azure.keyvault.keys.crypto)
 azure-mgmt-compute>=31.0.0
 azure-mgmt-sql>=3.0.1
 azure-mgmt-rdbms>=10.1.1

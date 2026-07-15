@@ -46,6 +46,7 @@ apscheduler==3.10.4
 # --- Azure SDK ---
 azure-storage-blob==12.19.0
 azure-identity==1.15.0
+azure-keyvault-keys==4.9.0  # KEK provider (envelope encryption): azure.keyvault.keys.crypto
 azure-mgmt-storage==21.0.0
 
 # --- S3 / SeaweedFS (on-prem backend) ---

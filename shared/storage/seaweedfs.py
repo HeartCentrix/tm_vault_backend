@@ -201,6 +201,7 @@ class SeaweedStore:
         metadata=None,
         chunk_size: int = 8 * 1024 * 1024,
         max_parallel_parts: Optional[int] = None,
+        *, tenant_id=None,
     ) -> BlobInfo:
         """Stream-upload bytes arriving from an async iterator directly
         into an S3 multipart upload — never touches the worker's /tmp.
@@ -237,8 +238,29 @@ class SeaweedStore:
         bucket = self._bucket(container)
         key = self._key(container, path)
         md = _clean_metadata(metadata or {})
-        hasher = _hl.sha256()
-        total_written = 0
+        hasher = _hl.sha256()          # sha256 of the PLAINTEXT (dedup + content hash)
+        total_written = 0              # stored bytes (ciphertext when encrypted)
+
+        # Encrypt the stream on the fly (large OneDrive/SQL blobs). We hash the
+        # PLAINTEXT as it flows in — dedup keys on plaintext, and encryption is a
+        # transparent storage transform — then seal for storage. Byte-identical to
+        # the single-shot seal, so a stream-written blob opens single-shot too.
+        eff_tenant = tenant_id or self._tenant_id
+
+        async def _hash_plaintext(src):
+            async for c in src:
+                if c:
+                    hasher.update(c)
+                yield c
+
+        if _crypto_runtime.is_write_enabled() and not eff_tenant:
+            logger.warning(
+                "upload_stream: encryption ON but no tenant_id for %s/%s — storing PLAINTEXT",
+                container, path,
+            )
+        byte_stream, _stream_encrypted = await _crypto_runtime.maybe_encrypt_stream(
+            _hash_plaintext(byte_stream), eff_tenant,
+        )
 
         async with self._client_ctx() as s3:
             try:
@@ -268,7 +290,6 @@ class SeaweedStore:
                 async for chunk in byte_stream:
                     if not chunk:
                         continue
-                    hasher.update(chunk)
                     total_written += len(chunk)
                     buf.extend(chunk)
                     while len(buf) >= chunk_size:
@@ -329,7 +350,23 @@ class SeaweedStore:
         )
 
     async def upload_from_file(self, container, path, file_path, size,
-                               metadata=None, overwrite=True) -> BlobInfo:
+                               metadata=None, overwrite=True, *, tenant_id=None) -> BlobInfo:
+        # When encryption is on, seal the file by streaming it through the
+        # multipart encrypt path (never buffers the whole file); otherwise keep
+        # the fast zero-copy upload_fileobj path unchanged.
+        if _crypto_runtime.is_write_enabled() and (tenant_id or self._tenant_id):
+            async def _file_chunks():
+                with open(file_path, "rb") as f:
+                    while True:
+                        b = f.read(8 * 1024 * 1024)
+                        if not b:
+                            break
+                        yield b
+            return await self.upload_stream(
+                container, path, _file_chunks(), size,
+                metadata=metadata, tenant_id=tenant_id,
+            )
+
         bucket = self._bucket(container)
         key = self._key(container, path)
         try:
@@ -348,6 +385,21 @@ class SeaweedStore:
             url=f"{self._endpoint}/{bucket}/{key}",
             content_md5=None, last_modified=head["LastModified"],
         )
+
+    async def head_is_encrypted(self, container, path) -> bool:
+        """True if the stored blob begins with a TMVE envelope. Cheap ranged read
+        (first 5 bytes) — used by the plaintext-blob migration to skip already-
+        encrypted blobs. Missing blob → False."""
+        bucket, key = self._bucket(container), self._key(container, path)
+        try:
+            async with self._client_ctx() as s3:
+                obj = await s3.get_object(Bucket=bucket, Key=key, Range="bytes=0-4")
+                head = await obj["Body"].read()
+        except ClientError as e:
+            if e.response["Error"]["Code"] in ("NoSuchKey", "404", "NoSuchBucket"):
+                return False
+            raise BackendUnreachableError(str(e)) from e
+        return head[:4] == b"TMVE"
 
     async def download(self, container, path) -> Optional[bytes]:
         bucket, key = self._bucket(container), self._key(container, path)

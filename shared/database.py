@@ -1097,6 +1097,20 @@ async def init_db() -> None:
         CREATE UNIQUE INDEX IF NOT EXISTS uq_tenant_dek_active
         ON tenant_dek(tenant_id) WHERE state = 'active'
         """,
+        # Operator-selected at-rest encryption config (UI-managed singleton).
+        # Non-secret only: provider + key reference; secrets stay in env/managed
+        # identity. The crypto bootstrap prefers this over env when present.
+        """
+        CREATE TABLE IF NOT EXISTS encryption_config (
+            id              VARCHAR PRIMARY KEY DEFAULT 'singleton',
+            provider        VARCHAR NOT NULL,
+            key_reference   VARCHAR,
+            enabled         BOOLEAN NOT NULL DEFAULT FALSE,
+            verify_readback BOOLEAN NOT NULL DEFAULT TRUE,
+            updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_by      VARCHAR
+        )
+        """,
     ]
 
     index_statements = [

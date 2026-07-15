@@ -976,6 +976,73 @@ async def delete_tenant_secret(
 
 
 # ──────────────────────────────────────────────────────────────────────
+# At-rest encryption config (UI-selected KEK provider). Singleton row.
+# Stores ONLY non-secret material (provider + key reference). Secret key
+# material (env master key / cloud creds) stays in env / managed identity.
+# The crypto services read this at startup (shared.crypto.bootstrap.install).
+# ──────────────────────────────────────────────────────────────────────
+
+_ENC_PROVIDERS = ("env", "aws_kms", "azure_key_vault")
+
+
+@app.get("/api/v1/encryption/config")
+async def get_encryption_config(db: AsyncSession = Depends(get_db)):
+    from shared.models import EncryptionConfig
+    row = await db.get(EncryptionConfig, "singleton")
+    if row is None:
+        # sensible default: env provider, OFF — matches a fresh deployment
+        return {"provider": "env", "key_reference": None, "enabled": False,
+                "verify_readback": True, "configured": False}
+    return {
+        "provider": row.provider, "key_reference": row.key_reference,
+        "enabled": bool(row.enabled), "verify_readback": bool(row.verify_readback),
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        "updated_by": row.updated_by, "configured": True,
+    }
+
+
+@app.put("/api/v1/encryption/config")
+async def put_encryption_config(request: dict, db: AsyncSession = Depends(get_db)):
+    from shared.models import EncryptionConfig, TenantDek
+    provider = (request or {}).get("provider")
+    if provider not in _ENC_PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"provider must be one of {_ENC_PROVIDERS}")
+    key_reference = (request or {}).get("key_reference")
+    if provider in ("aws_kms", "azure_key_vault") and not key_reference:
+        raise HTTPException(status_code=400,
+                            detail="key_reference (KMS key ARN / Key Vault key URL) is required for this provider")
+    enabled = bool((request or {}).get("enabled", False))
+    verify = bool((request or {}).get("verify_readback", True))
+
+    row = await db.get(EncryptionConfig, "singleton")
+    # Guard against orphaning: switching provider/key after DEKs exist would make
+    # every wrapped DEK unrecoverable under the new KEK. Block it until an
+    # explicit re-wrap has run (shared.crypto.dek_manager.rewrap_all).
+    if row is not None and (row.provider != provider or row.key_reference != key_reference):
+        existing = (await db.execute(
+            select(func.count()).select_from(TenantDek).where(TenantDek.state == "active")
+        )).scalar_one()
+        if existing:
+            raise HTTPException(
+                status_code=409,
+                detail=("rewrap_required: existing encrypted data uses the current KEK. "
+                        "Run the key re-wrap before changing provider/key so blobs stay decryptable."),
+            )
+    if row is None:
+        row = EncryptionConfig(id="singleton")
+        db.add(row)
+    row.provider = provider
+    row.key_reference = key_reference
+    row.enabled = enabled
+    row.verify_readback = verify
+    row.updated_by = (request or {}).get("updated_by")
+    await db.commit()
+    return {"provider": provider, "key_reference": key_reference, "enabled": enabled,
+            "verify_readback": verify, "configured": True,
+            "note": "Encryption services apply this on their next restart."}
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Azure restore options — feed the destination dropdowns in the Azure
 # DB Recover modal. Both the tenant domain and the cascading
 # subscription/RG/location/server lists are discovered LIVE from

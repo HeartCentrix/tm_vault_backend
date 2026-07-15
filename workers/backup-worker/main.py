@@ -23765,7 +23765,7 @@ async def main():
     # is set). Needed here so write-then-verify can read blobs back decrypted.
     from shared.crypto import bootstrap as _enc_bootstrap
     from shared.database import async_session_factory as _asf
-    if _enc_bootstrap.install_from_env(_asf):
+    if await _enc_bootstrap.install(_asf):
         print("[main] at-rest encryption hook installed")
     worker = BackupWorker()
     try:

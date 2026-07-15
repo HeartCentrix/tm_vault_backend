@@ -44,6 +44,23 @@ class DekStore(abc.ABC):
     @abc.abstractmethod
     async def insert(self, rec: DekRecord) -> None: ...
 
+    # --- rotation support (default: unsupported; rotation-capable stores override) ---
+
+    async def rotate(self, tenant_id: str, new_rec: DekRecord) -> None:
+        """Atomically retire the tenant's current active DEK and insert
+        ``new_rec`` as the new active one. Single transaction so there is never
+        more than one active row per tenant (uq_tenant_dek_active)."""
+        raise NotImplementedError
+
+    async def all_records(self) -> "list[DekRecord]":
+        """Every DEK record (active + retired) — used by KEK re-wrap."""
+        raise NotImplementedError
+
+    async def update_wrapping(self, key_id: bytes, wrapped_dek: bytes, kek_id: str, provider: str) -> None:
+        """Replace the wrapped form of one DEK (KEK rotation). The plaintext DEK
+        is unchanged, so blob ciphertext is untouched and still decrypts."""
+        raise NotImplementedError
+
 
 class DekManager:
     def __init__(self, kek: KekProvider, store: DekStore):
@@ -87,3 +104,40 @@ class DekManager:
         dek = self._kek.unwrap_dek(rec.wrapped_dek)
         self._by_kid[key_id] = dek
         return dek
+
+    async def rotate_dek(self, tenant_id: str) -> bytes:
+        """Mint a fresh active DEK for ``tenant_id`` and retire the old one.
+        New blobs seal under the new DEK; blobs already written keep decrypting
+        via their ``key_id`` (which resolves the now-retired DEK). Returns the
+        new key_id."""
+        dek = envelope.new_dek()
+        rec = DekRecord(
+            tenant_id=tenant_id,
+            key_id=uuid.uuid4().bytes,
+            wrapped_dek=self._kek.wrap_dek(dek),
+            kek_id=self._kek.kek_id,
+            provider=self._kek.provider_name,
+            state="active",
+        )
+        await self._store.rotate(tenant_id, rec)
+        self._by_kid[rec.key_id] = dek          # keep old kids cached too (old blobs)
+        self._active_kid[tenant_id] = rec.key_id
+        return rec.key_id
+
+    async def rewrap_all(self, new_kek: KekProvider) -> int:
+        """Re-wrap every DEK under ``new_kek`` and adopt it. The DEK plaintext is
+        unchanged so blob ciphertext is never touched. Call this with the manager
+        still holding the CURRENT KEK and pass the NEW one — i.e. BEFORE retiring
+        the old master key / KMS key — otherwise the existing wrapped bytes can no
+        longer be unwrapped (the master-key-change data-loss trap). Returns the
+        number of DEKs re-wrapped."""
+        n = 0
+        for rec in await self._store.all_records():
+            dek = self._by_kid.get(rec.key_id) or self._kek.unwrap_dek(rec.wrapped_dek)
+            await self._store.update_wrapping(
+                rec.key_id, new_kek.wrap_dek(dek), new_kek.kek_id, new_kek.provider_name
+            )
+            self._by_kid[rec.key_id] = dek
+            n += 1
+        self._kek = new_kek
+        return n

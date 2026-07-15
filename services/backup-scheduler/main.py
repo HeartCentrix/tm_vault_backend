@@ -405,7 +405,7 @@ async def startup():
     # BACKUP_ENCRYPTION_* env is configured).
     try:
         from shared.crypto import bootstrap as _enc_bootstrap
-        if _enc_bootstrap.install_from_env(async_session_factory):
+        if await _enc_bootstrap.install(async_session_factory):
             print("[SCHEDULER] at-rest encryption hook installed")
     except Exception as e:
         print(f"[SCHEDULER] encryption hook install failed (non-fatal): {e}")

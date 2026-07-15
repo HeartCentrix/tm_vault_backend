@@ -46,6 +46,59 @@ def build_kek_from_env() -> Optional[KekProvider]:
     raise ValueError(f"unknown BACKUP_ENCRYPTION_KEK_PROVIDER: {provider!r}")
 
 
+def _config_dict_from(cfg: dict) -> dict:
+    """Turn a stored encryption_config row (provider + non-secret key_reference)
+    into the dict :func:`shared.crypto.kek.build_kek` expects. Secret material is
+    pulled from env / managed identity here — never from the DB row:
+      * env             → master key from BACKUP_ENCRYPTION_MASTER_KEY_HEX
+      * aws_kms         → key_id = key_reference (the KMS key ARN), region from env
+      * azure_key_vault → key_id = key_reference (the Key Vault key URL)
+    """
+    provider = cfg.get("provider")
+    ref = cfg.get("key_reference")
+    if provider == "env":
+        return {
+            "provider": "env",
+            "master_key_hex": os.environ["BACKUP_ENCRYPTION_MASTER_KEY_HEX"],
+            "kek_id": os.getenv("BACKUP_ENCRYPTION_KEK_ID", "env"),
+        }
+    if provider == "aws_kms":
+        return {"provider": "aws_kms", "key_id": ref, "region_name": os.getenv("AWS_REGION")}
+    if provider == "azure_key_vault":
+        return {"provider": "azure_key_vault", "key_id": ref}
+    raise ValueError(f"unknown encryption provider: {provider!r}")
+
+
+def build_kek_from_config(cfg: dict) -> KekProvider:
+    """Construct the KEK named by a stored config row (UI-selected provider)."""
+    from .kek import build_kek
+
+    return build_kek(_config_dict_from(cfg))
+
+
+def configure_from_config(cfg: Optional[dict], session_factory) -> bool:
+    """Install the crypto runtime from a stored config row (UI-selected), or fall
+    back to env when there is no row. Returns True if a DEK manager was installed.
+
+    A present config always installs the DEK manager (so existing encrypted blobs
+    decrypt); ``cfg['enabled']`` only gates whether NEW writes are encrypted."""
+    if not cfg or not cfg.get("provider"):
+        return install_from_env(session_factory)
+    try:
+        kek = build_kek_from_config(cfg)
+    except Exception as e:  # missing env secret / bad reference -> stay safe (off)
+        print(f"[crypto] encryption_config present but KEK build failed ({e}); leaving encryption OFF")
+        runtime.configure(None)
+        return False
+    mgr = DekManager(kek, SqlDekStore(session_factory))
+    runtime.configure(
+        mgr,
+        write_enabled=bool(cfg.get("enabled")),
+        verify_readback=bool(cfg.get("verify_readback", True)),
+    )
+    return True
+
+
 def install_from_env(session_factory) -> bool:
     """Wire the crypto runtime from env. Returns True if a DEK manager was
     installed (encryption is reachable), False if left as passthrough."""
@@ -60,3 +113,19 @@ def install_from_env(session_factory) -> bool:
         verify_readback=_truthy(os.getenv("BACKUP_ENCRYPTION_VERIFY", "true")),
     )
     return True
+
+
+async def install(session_factory) -> bool:
+    """Preferred startup entry point: install the crypto runtime from the
+    UI-selected DB config (``encryption_config`` singleton) when present,
+    otherwise fall back to env. Returns True if a DEK manager was installed.
+
+    Safe if the config table doesn't exist yet (fresh DB) — falls back to env."""
+    cfg = None
+    try:
+        from . import config_store
+
+        cfg = await config_store.get_config(session_factory)
+    except Exception as e:
+        print(f"[crypto] could not read encryption_config ({e}); falling back to env")
+    return configure_from_config(cfg, session_factory)

@@ -28,6 +28,7 @@ layer up so this stays free of DB/KEK dependencies.
 from __future__ import annotations
 
 import os
+from typing import AsyncIterator, Awaitable, Callable
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -91,5 +92,56 @@ def decrypt_blob(data: bytes, dek: bytes) -> bytes:
     blob_key = _derive(dek, salt)
     try:
         return framer.decrypt(data[_HEADER_LEN:], blob_key)
+    except framer.DecryptError as e:
+        raise EnvelopeError(str(e)) from e
+
+
+async def encrypt_stream(
+    plaintext: AsyncIterator[bytes], dek: bytes, key_id: bytes, *, chunk_size: int = 1 << 20
+) -> AsyncIterator[bytes]:
+    """Streaming form of :func:`encrypt_blob` — yields envelope-framed ciphertext
+    for a plaintext that is never held whole (GB-scale OneDrive/SQL blobs). The
+    output is byte-identical to :func:`encrypt_blob`, so a stream-written blob
+    opens with the single-shot :func:`decrypt_blob`."""
+    if len(key_id) != _KEY_ID_LEN:
+        raise ValueError("key_id must be 16 bytes")
+    salt = os.urandom(_SALT_LEN)
+    blob_key = _derive(dek, salt)
+    yield ENV_MAGIC + bytes([ENV_VERSION]) + key_id + salt
+    async for piece in framer.encrypt_stream(plaintext, blob_key, chunk_size=chunk_size):
+        yield piece
+
+
+async def decrypt_stream(
+    cipher: AsyncIterator[bytes], resolve: Callable[[bytes], Awaitable[bytes]]
+) -> AsyncIterator[bytes]:
+    """Streaming form of :func:`decrypt_blob`. Reads the envelope header, resolves
+    the DEK for its ``key_id`` via the async ``resolve`` callable, then streams the
+    framer chunks as plaintext. Raises :class:`EnvelopeError` on any malformation,
+    wrong DEK, or tamper."""
+    ait = cipher.__aiter__()
+    buf = bytearray()
+    while len(buf) < _HEADER_LEN:
+        try:
+            buf.extend(await ait.__anext__())
+        except StopAsyncIteration:
+            break
+    if not is_encrypted(bytes(buf)):
+        raise EnvelopeError("not a TMVE envelope")
+    key_id = bytes(buf[5 : 5 + _KEY_ID_LEN])
+    salt = bytes(buf[5 + _KEY_ID_LEN : _HEADER_LEN])
+    dek = await resolve(key_id)
+    blob_key = _derive(dek, salt)
+    rest = bytes(buf[_HEADER_LEN:])
+
+    async def _frame_bytes():
+        if rest:
+            yield rest
+        async for piece in ait:
+            yield piece
+
+    try:
+        async for pt in framer.decrypt_stream(_frame_bytes(), blob_key):
+            yield pt
     except framer.DecryptError as e:
         raise EnvelopeError(str(e)) from e

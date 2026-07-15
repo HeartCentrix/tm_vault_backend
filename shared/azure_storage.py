@@ -598,11 +598,11 @@ class _StoreFacade:
         self.kind = getattr(store, "kind", "unknown")
 
     async def upload_blob(self, container_name, blob_path, content,
-                          overwrite=True, metadata=None):
+                          overwrite=True, metadata=None, *, tenant_id=None):
         try:
             info = await self._store.upload(
                 container_name, blob_path, content,
-                metadata=metadata, overwrite=overwrite,
+                metadata=metadata, overwrite=overwrite, tenant_id=tenant_id,
             )
             return {
                 "success": True,
@@ -664,6 +664,12 @@ class _StoreFacade:
                 "success": False, "error": str(e),
                 "method": "stream_multipart",
             }
+
+    async def head_is_encrypted(self, container_name, blob_path):
+        fn = getattr(self._store, "head_is_encrypted", None)
+        if fn is None:
+            return False
+        return await fn(container_name, blob_path)
 
     async def download_blob(self, container_name, blob_path):
         return await self._store.download(container_name, blob_path)

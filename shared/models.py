@@ -1446,3 +1446,20 @@ class TenantDek(Base):
     provider = Column(String, nullable=False)  # env | aws_kms | azure_key_vault
     state = Column(String, nullable=False, default="active")    # active | retired
     created_at = Column(DateTime, default=utcnow)
+
+
+class EncryptionConfig(Base):
+    """Singleton (id='singleton') holding the operator's chosen at-rest
+    encryption settings, selectable from the UI. Stores only NON-SECRET material:
+    the provider and a key REFERENCE (KMS key ARN / Key Vault key URL). Secret key
+    material (env master key, cloud credentials) stays in env / managed identity
+    and is NEVER written here or entered in the web form. The crypto bootstrap
+    prefers this row over env when present."""
+    __tablename__ = "encryption_config"
+    id = Column(String, primary_key=True, default="singleton")
+    provider = Column(String, nullable=False)          # env | aws_kms | azure_key_vault
+    key_reference = Column(String, nullable=True)      # KMS key ARN / Key Vault key URL (non-secret)
+    enabled = Column(Boolean, nullable=False, default=False)   # encrypt NEW writes
+    verify_readback = Column(Boolean, nullable=False, default=True)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+    updated_by = Column(String, nullable=True)

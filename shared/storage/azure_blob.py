@@ -95,7 +95,9 @@ class AzureBlobStore:
 
     # --- BackendStore impl
 
-    async def upload(self, container, path, content, metadata=None, overwrite=True) -> BlobInfo:
+    async def upload(self, container, path, content, metadata=None, overwrite=True, *, tenant_id=None) -> BlobInfo:
+        # tenant_id ignored: the Azure backend relies on server-side (CMK)
+        # encryption, not the app-layer TMVE envelope used by SeaweedFS.
         shard = self._default_shard()
         result = await shard.upload_blob(container, path, content,
                                          overwrite=overwrite, metadata=metadata)

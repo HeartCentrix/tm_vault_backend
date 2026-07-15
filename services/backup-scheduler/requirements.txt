@@ -21,3 +21,4 @@ prometheus_client>=0.20.0
 
 # Alembic for prod-safe schema migrations
 alembic>=1.13.0,<2
+azure-keyvault-keys>=4.9,<5  # KEK provider for envelope encryption (azure.keyvault.keys.crypto)

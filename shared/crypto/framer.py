@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import os
 import struct
+from typing import AsyncIterator
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -97,6 +98,109 @@ def encrypt(plaintext: bytes, key: bytes, *, chunk_size: int = _DEFAULT_CHUNK) -
         ct = aes.encrypt(nonce, chunk, _aad(header, i, i == last))
         out += struct.pack(">I", len(ct)) + ct
     return bytes(out)
+
+
+def _seal_chunk(aes: AESGCM, nonce_pfx: bytes, header: bytes, index: int, chunk: bytes, final: bool) -> bytes:
+    nonce = nonce_pfx + struct.pack(">I", index)
+    ct = aes.encrypt(nonce, chunk, _aad(header, index, final))
+    return struct.pack(">I", len(ct)) + ct
+
+
+def _open_chunk(aes: AESGCM, nonce_pfx: bytes, header: bytes, index: int, ct: bytes, final: bool) -> bytes:
+    nonce = nonce_pfx + struct.pack(">I", index)
+    try:
+        return aes.decrypt(nonce, ct, _aad(header, index, final))
+    except InvalidTag as e:
+        raise DecryptError(f"authentication failed at chunk {index}") from e
+
+
+async def encrypt_stream(
+    plaintext: AsyncIterator[bytes], key: bytes, *, chunk_size: int = _DEFAULT_CHUNK
+) -> AsyncIterator[bytes]:
+    """Streaming form of :func:`encrypt` — yields the SAME bytes a single-shot
+    call would, without ever holding the whole plaintext. Re-chunks the incoming
+    (arbitrarily-sized) pieces into ``chunk_size`` plaintext chunks; a chunk is
+    emitted only once we know another follows, so the final chunk is correctly
+    marked ``final`` in its AAD. Empty input yields one empty final chunk, exactly
+    like :func:`encrypt`."""
+    if len(key) != 32:
+        raise ValueError("key must be 32 bytes (AES-256)")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+
+    nonce_pfx = os.urandom(8)
+    header = _header(chunk_size, nonce_pfx)
+    yield header
+    aes = AESGCM(key)
+
+    buf = bytearray()
+    index = 0
+    # `held` is a full plaintext chunk we cannot emit yet (might be the last).
+    held = None
+    async for piece in plaintext:
+        buf += piece
+        while len(buf) > chunk_size:  # strict: >chunk_size guarantees more follows
+            chunk = bytes(buf[:chunk_size])
+            del buf[:chunk_size]
+            if held is not None:
+                yield _seal_chunk(aes, nonce_pfx, header, index, held, False)
+                index += 1
+            held = chunk
+    # stream ended: the remainder in buf is the tail (0..chunk_size bytes)
+    if held is not None:
+        yield _seal_chunk(aes, nonce_pfx, header, index, held, False)
+        index += 1
+    yield _seal_chunk(aes, nonce_pfx, header, index, bytes(buf), True)
+
+
+async def decrypt_stream(cipher: AsyncIterator[bytes], key: bytes) -> AsyncIterator[bytes]:
+    """Streaming form of :func:`decrypt` — yields plaintext chunks as ciphertext
+    chunks arrive, holding exactly one chunk back so the true final chunk gets
+    ``final=True`` in its AAD (finality is only known when the stream ends).
+    Raises :class:`DecryptError` on malformation, tamper, truncation, reorder, or
+    wrong key — never yields unauthenticated plaintext."""
+    if len(key) != 32:
+        raise ValueError("key must be 32 bytes (AES-256)")
+
+    ait = cipher.__aiter__()
+    buf = bytearray()
+
+    async def _fill(n: int) -> bool:
+        while len(buf) < n:
+            try:
+                buf.extend(await ait.__anext__())
+            except StopAsyncIteration:
+                return False
+        return True
+
+    if not await _fill(_HEADER_LEN):
+        raise DecryptError("truncated header")
+    header = bytes(buf[:_HEADER_LEN])
+    if header[:4] != MAGIC or header[4] != VERSION:
+        raise DecryptError("not a TMV1 frame")
+    nonce_pfx = header[10:18]
+    del buf[:_HEADER_LEN]
+
+    aes = AESGCM(key)
+    index = 0
+    held = None          # (index, ct) parsed but finality unknown
+    while True:
+        if not await _fill(4):
+            break  # clean end at a chunk boundary
+        (ct_len,) = struct.unpack(">I", buf[:4])
+        if ct_len < _TAG_LEN:
+            raise DecryptError("invalid chunk length")
+        if not await _fill(4 + ct_len):
+            raise DecryptError("truncated chunk")
+        ct = bytes(buf[4 : 4 + ct_len])
+        del buf[: 4 + ct_len]
+        if held is not None:
+            yield _open_chunk(aes, nonce_pfx, header, held[0], held[1], False)
+        held = (index, ct)
+        index += 1
+    if held is None:
+        raise DecryptError("no chunks")
+    yield _open_chunk(aes, nonce_pfx, header, held[0], held[1], True)
 
 
 def decrypt(frame: bytes, key: bytes) -> bytes:
