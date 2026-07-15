@@ -1076,6 +1076,27 @@ async def init_db() -> None:
             UNIQUE (snapshot_id, file_external_id)
         )
         """,
+        # Per-tenant Data Encryption Keys, stored WRAPPED by the configured KEK
+        # (env / AWS KMS / Azure Key Vault). Never holds a plaintext key. One
+        # 'active' record per tenant; retired records stay so older encrypted
+        # blobs still resolve their key_id. See shared/crypto/.
+        """
+        CREATE TABLE IF NOT EXISTS tenant_dek (
+            id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            tenant_id    VARCHAR NOT NULL,
+            key_id       BYTEA NOT NULL UNIQUE,
+            wrapped_dek  BYTEA NOT NULL,
+            kek_id       VARCHAR NOT NULL,
+            provider     VARCHAR NOT NULL,
+            state        VARCHAR NOT NULL DEFAULT 'active',
+            created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        # At most one active DEK per tenant (belt-and-suspenders vs a mint race).
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_tenant_dek_active
+        ON tenant_dek(tenant_id) WHERE state = 'active'
+        """,
     ]
 
     index_statements = [

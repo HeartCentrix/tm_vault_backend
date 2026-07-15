@@ -1430,3 +1430,19 @@ def snapshot_is_restore_ready(snapshot: "Snapshot") -> Tuple[bool, str]:
     if status == "FAILED":
         return False, "hc_drain_status=FAILED — at least one hostedContent task raised; restore unsafe"
     return False, f"unknown hc_drain_status={status!r}"
+
+
+class TenantDek(Base):
+    """Per-tenant Data Encryption Key, stored WRAPPED by the configured KEK
+    (env / AWS KMS / Azure Key Vault) — never a plaintext key. Backs
+    shared.crypto.dek_manager. One 'active' row per tenant; retired rows stay
+    so older encrypted blobs still resolve their key_id."""
+    __tablename__ = "tenant_dek"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(String, nullable=False, index=True)
+    key_id = Column(LargeBinary, nullable=False, unique=True)   # 16 bytes, stamped into every envelope
+    wrapped_dek = Column(LargeBinary, nullable=False)
+    kek_id = Column(String, nullable=False)
+    provider = Column(String, nullable=False)  # env | aws_kms | azure_key_vault
+    state = Column(String, nullable=False, default="active")    # active | retired
+    created_at = Column(DateTime, default=utcnow)

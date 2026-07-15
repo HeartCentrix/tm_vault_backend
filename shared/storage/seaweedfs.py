@@ -38,6 +38,7 @@ _SEAWEED_BOTO_CONFIG = _BotoConfig(
 
 from shared.storage.base import BlobInfo, BlobProps
 from shared.storage.errors import BackendUnreachableError, ImmutableBlobError
+from shared.crypto import runtime as _crypto_runtime
 
 _MODE_TMVAULT_TO_S3 = {"Locked": "COMPLIANCE", "Unlocked": "GOVERNANCE"}
 
@@ -79,6 +80,9 @@ class SeaweedStore:
         self._upload_concurrency = upload_concurrency
         self._multipart_threshold = multipart_threshold_mb * 1024 * 1024
         self._forced_bucket: Optional[str] = None
+        # Set on shard clones so upload() can encrypt under the tenant's DEK
+        # (the crypto hook is a no-op unless encryption is configured on).
+        self._tenant_id: Optional[str] = None
 
     @classmethod
     def from_config(cls, backend_id: str, name: str, endpoint: str,
@@ -132,6 +136,7 @@ class SeaweedStore:
             public_endpoint=self._public_endpoint,
         )
         clone._forced_bucket = chosen
+        clone._tenant_id = tenant_id
         return clone
 
     def _client_ctx(self):
@@ -153,18 +158,35 @@ class SeaweedStore:
             return f"{container}/{path}"
         return path
 
-    async def upload(self, container, path, content, metadata=None, overwrite=True) -> BlobInfo:
+    async def upload(self, container, path, content, metadata=None, overwrite=True, *, tenant_id=None) -> BlobInfo:
         bucket = self._bucket(container)
         key = self._key(container, path)
+        # Encrypt-at-rest hook — no-op passthrough unless encryption is
+        # configured ON (default off). Encrypts under the tenant's DEK, then
+        # (write-then-verify) reads the bytes back and confirms they decrypt to
+        # the original before returning — we never report an item stored that
+        # we can't recover.
+        plaintext = content
+        stored, encrypted = await _crypto_runtime.maybe_encrypt(content, tenant_id or self._tenant_id)
         try:
             async with self._client_ctx() as s3:
                 await s3.put_object(
-                    Bucket=bucket, Key=key, Body=content,
+                    Bucket=bucket, Key=key, Body=stored,
                     Metadata=_clean_metadata(metadata or {}),
                 )
                 head = await s3.head_object(Bucket=bucket, Key=key)
         except ClientError as e:
             raise BackendUnreachableError(str(e)) from e
+        if encrypted and _crypto_runtime.verify_readback_enabled():
+            readback = await self.download(container, path)  # auto-decrypts
+            if readback != plaintext:
+                try:
+                    await self.delete(container, path)
+                except Exception:
+                    pass
+                raise BackendUnreachableError(
+                    f"encryption write-then-verify failed for {bucket}/{key}"
+                )
         return BlobInfo(
             backend_id=self.backend_id, container=container, path=path,
             size=head["ContentLength"], etag=head["ETag"].strip('"'),
@@ -332,7 +354,9 @@ class SeaweedStore:
         try:
             async with self._client_ctx() as s3:
                 obj = await s3.get_object(Bucket=bucket, Key=key)
-                return await obj["Body"].read()
+                # Auto-decrypt TMVE-framed blobs (key_id in the envelope
+                # resolves the DEK); legacy plaintext passes through unchanged.
+                return await _crypto_runtime.maybe_decrypt(await obj["Body"].read())
         except ClientError as e:
             if e.response["Error"]["Code"] in ("NoSuchKey", "404", "NoSuchBucket"):
                 return None
