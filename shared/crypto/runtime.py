@@ -13,10 +13,15 @@ Split of concerns:
 """
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import AsyncIterator, Optional, Tuple
 
 from . import blob_cipher, envelope
 from .dek_manager import DekManager
+
+# Enough bytes to recognise a TMVE envelope header (magic + version + key_id +
+# salt); the streaming read path buffers at least this much before deciding
+# whether a blob is framed.
+_PEEK = envelope._HEADER_LEN
 
 _dek_manager: Optional[DekManager] = None
 _write_enabled: bool = False
@@ -58,3 +63,43 @@ async def maybe_decrypt(data: Optional[bytes]) -> Optional[bytes]:
         raise blob_cipher.BlobCipherError("encrypted blob but no DEK manager configured")
     dek = await _dek_manager.dek_for_key_id(envelope.read_key_id(data))
     return blob_cipher.open_blob(data, dek)
+
+
+async def decrypt_stream(raw: AsyncIterator[bytes], chunk_size: int) -> AsyncIterator[bytes]:
+    """Wrap a raw object-store byte stream so callers always see PLAINTEXT.
+
+    Legacy (unframed) blobs pass straight through, re-chunked to ``chunk_size``.
+    TMVE-framed blobs are buffered whole, decrypted, then re-chunked — safe
+    because framed blobs are only ever written by the single-shot ``upload()``
+    path (``upload_stream`` multipart does not encrypt), so they are already
+    bounded to what the writer held in memory.
+
+    ponytail: buffer+decrypt is correct while only single-shot writes encrypt;
+    add a chunk-aligned streaming decryptor when multipart writes get encrypted.
+    """
+    buf = bytearray()
+    framed: Optional[bool] = None
+    async for piece in raw:
+        if framed is None:
+            buf += piece
+            if len(buf) >= _PEEK:
+                framed = envelope.is_encrypted(bytes(buf))
+                if not framed:
+                    for i in range(0, len(buf), chunk_size):
+                        yield bytes(buf[i : i + chunk_size])
+                    buf = bytearray()
+            continue
+        if framed:
+            buf += piece
+        else:
+            yield piece
+
+    if framed is None:  # stream ended before we had enough bytes to decide
+        framed = envelope.is_encrypted(bytes(buf))
+    if framed:
+        plaintext = await maybe_decrypt(bytes(buf))
+        for i in range(0, len(plaintext or b""), chunk_size):
+            yield plaintext[i : i + chunk_size]
+    elif buf:
+        for i in range(0, len(buf), chunk_size):
+            yield bytes(buf[i : i + chunk_size])

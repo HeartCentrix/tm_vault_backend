@@ -371,7 +371,11 @@ class SeaweedStore:
                 if e.response["Error"]["Code"] in ("NoSuchKey", "404", "NoSuchBucket"):
                     return
                 raise BackendUnreachableError(str(e)) from e
-            async for chunk in obj["Body"].iter_chunks(chunk_size):
+            # Decrypt TMVE-framed blobs on the fly (legacy plaintext streams
+            # through untouched) so restore/export always get plaintext.
+            async for chunk in _crypto_runtime.decrypt_stream(
+                obj["Body"].iter_chunks(chunk_size), chunk_size
+            ):
                 yield chunk
 
     async def stage_block(self, container, path, block_id, data) -> None:
