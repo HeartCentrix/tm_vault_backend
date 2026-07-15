@@ -435,12 +435,23 @@ class Settings:
         # ── Retention safety kill-switch ──
         # Global freeze on destructive retention deletes. Default OFF (safe):
         # retention runs as a DRY-RUN — it computes + audits what it WOULD
-        # delete but deletes nothing — until the durable synthetic-full
-        # inventory + ref-counted blob GC model is validated. This prevents the
-        # base-full-deletion data-loss bug (a GFS pass deleted a 136 GB base
-        # full, orphaning the blobs) from recurring while the model migrates.
-        # Set RETENTION_DELETE_ENABLED=true only after the durable model + a
-        # ref-counted GC are in place and verified.
+        # delete but deletes nothing.
+        #
+        # The durable-safety model that motivated this freeze is now in place and
+        # verified (retention_cleanup.py):
+        #   P3  — always keep the newest RESTORABLE (COMPLETED) snapshot
+        #         (_latest_restorable_id), never merely the newest by time.
+        #   P4a — one forensic AuditEvent per deleted snapshot
+        #         (build_retention_audit), atomic with the delete.
+        #   P4b — the reuse heir inherits the doomed snapshot's delta cursor, so a
+        #         valid incremental cursor always survives on a kept snapshot.
+        #   P1  — reuse-chain rehydration promotes the heir BEFORE repointing
+        #         siblings (fixes an immediate-trigger abort on >=2-descendant
+        #         chains); characterization-tested + live-proven on real Postgres.
+        # Ref-counted blob GC (shared/blob_gc.py) is also in place.
+        #
+        # Flipping RETENTION_DELETE_ENABLED=true is now safe but remains a manual,
+        # deliberate operator decision — enable per-tenant/observe first.
         self.RETENTION_DELETE_ENABLED = os.getenv("RETENTION_DELETE_ENABLED", "false").lower() in ("true", "1", "yes")
 
         # ── OneDrive backup uncap ──

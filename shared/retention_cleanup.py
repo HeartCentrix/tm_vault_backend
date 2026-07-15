@@ -17,6 +17,18 @@ Legal hold + immutability:
   - legal_hold_enabled + (legal_hold_until is NULL or in the future) → skip pruning
   - immutability_mode == "Locked" → skip pruning (honor WORM)
   - immutability_mode == "Unlocked" → prune normally (user-managed)
+
+Data-safety guarantees (the durable model behind the RETENTION_DELETE_ENABLED
+freeze — see shared/config.py):
+  - P3  every selector keeps the newest RESTORABLE (COMPLETED) snapshot via
+        _latest_restorable_id — a failed latest run can never leave a resource
+        with nothing to restore.
+  - P4a build_retention_audit writes one forensic AuditEvent per deleted
+        snapshot, in the SAME transaction as the delete.
+  - P4b/P1 _delete_snapshots rehydrates any reuse chain-root into its heir BEFORE
+        deleting it (promote heir → then repoint siblings, so the immediate reuse
+        trigger never aborts on multi-descendant chains), and carries the doomed
+        snapshot's delta cursor forward to the heir.
 """
 
 from __future__ import annotations
@@ -28,11 +40,86 @@ import uuid
 from sqlalchemy import select, delete, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from shared.models import SlaPolicy, Snapshot, Resource, ResourceStatus, SnapshotItem, Tenant
+from shared.models import (
+    AuditEvent, SlaPolicy, Snapshot, Resource, ResourceStatus, SnapshotItem,
+    SnapshotStatus, Tenant,
+)
 from shared.config import settings
 
 
+def _enum_val(v):
+    return v.value if hasattr(v, "value") else (str(v) if v is not None else None)
+
+
+def build_retention_audit(snapshot, resource, policy, *, reason: str) -> AuditEvent:
+    """P4a: one forensic AuditEvent per snapshot retention deletes, so a delete is
+    always reconstructable — WHICH snapshot of WHICH resource, when it was created,
+    its size, and under which rule. AuditEvent.snapshot_id/resource_id are plain
+    UUID columns (not FKs), so the audit row survives the snapshot row it records."""
+    started = getattr(snapshot, "started_at", None)
+    created = getattr(snapshot, "created_at", None)
+    return AuditEvent(
+        action="RETENTION_SNAPSHOT_DELETED",
+        actor_type="SYSTEM",
+        outcome="SUCCESS",
+        org_id=getattr(resource, "org_id", None),
+        tenant_id=getattr(resource, "tenant_id", None),
+        snapshot_id=snapshot.id,
+        resource_id=getattr(resource, "id", None),
+        resource_type=_enum_val(getattr(resource, "type", None)),
+        resource_name=getattr(resource, "display_name", None) or getattr(resource, "external_id", None),
+        details={
+            "reason": reason,
+            "retention_mode": _enum_val(getattr(policy, "retention_mode", None)),
+            "policy_id": str(getattr(policy, "id", "")) or None,
+            "policy_name": getattr(policy, "name", None),
+            "snapshot_type": _enum_val(getattr(snapshot, "type", None)),
+            "snapshot_status": _enum_val(getattr(snapshot, "status", None)),
+            "item_count": getattr(snapshot, "item_count", None),
+            "bytes_total": getattr(snapshot, "bytes_total", None),
+            "started_at": started.isoformat() if started else None,
+            "created_at": created.isoformat() if created else None,
+            "reuse_of_snapshot_id": str(snapshot.reuse_of_snapshot_id) if getattr(snapshot, "reuse_of_snapshot_id", None) else None,
+            "reuse_chain_root_id": str(snapshot.reuse_chain_root_id) if getattr(snapshot, "reuse_chain_root_id", None) else None,
+        },
+    )
+
+
 logger = logging.getLogger(__name__)
+
+
+def _snap_status(s) -> Optional[str]:
+    st = getattr(s, "status", None)
+    return st.value if hasattr(st, "value") else (str(st) if st is not None else None)
+
+
+def _snap_ts(s) -> datetime:
+    return s.started_at or s.created_at or datetime.min
+
+
+def _latest_restorable_id(snapshots: List[Snapshot]):
+    """P3 safety net: the id of the newest RESTORABLE (COMPLETED) snapshot —
+    the one retention must NEVER prune so a resource always has something to
+    restore. Falls back to newest-by-time only when nothing is COMPLETED at all
+    (nothing is restorable anyway; keep the newest so the resource is not
+    silently emptied). Returns None for an empty list."""
+    if not snapshots:
+        return None
+    completed = [s for s in snapshots if _snap_status(s) == SnapshotStatus.COMPLETED.value]
+    pool = completed or list(snapshots)
+    return max(pool, key=_snap_ts).id
+
+
+def _audit_events_for_deletion(snaps, to_delete, resource, policy) -> List[AuditEvent]:
+    """P4a: one RETENTION_SNAPSHOT_DELETED AuditEvent per snapshot in ``snaps``
+    whose id is in ``to_delete`` — kept snapshots get none. The caller adds these
+    to the session in the SAME transaction as the delete, so the audit trail can
+    never disagree with what actually vanished."""
+    mode = (getattr(policy, "retention_mode", None) or "FLAT").upper()
+    reason = (f"archived-resource retention ({policy.archived_retention_mode})"
+              if _is_archived(resource) else f"outside {mode} retention window")
+    return [build_retention_audit(s, resource, policy, reason=reason)
+            for s in snaps if s.id in to_delete]
 
 
 def _retention_deletes_permitted(delete_enabled: bool, snap_ids) -> bool:
@@ -74,8 +161,8 @@ def _archived_keep_ids(snapshots: List[Snapshot], policy: SlaPolicy) -> Set[uuid
     if mode == "KEEP_ALL":
         return {s.id for s in snapshots}
     if mode == "KEEP_LAST":
-        latest = max(snapshots, key=lambda s: s.started_at or s.created_at or datetime.min)
-        return {latest.id}
+        # Keep the newest RESTORABLE snapshot, not merely the newest by time.
+        return {_latest_restorable_id(snapshots)}
     if mode == "CUSTOM":
         days = policy.archived_retention_days
         if days is None:
@@ -83,9 +170,9 @@ def _archived_keep_ids(snapshots: List[Snapshot], policy: SlaPolicy) -> Set[uuid
         cutoff = datetime.utcnow() - timedelta(days=int(days))
         kept = {s.id for s in snapshots
                 if (s.started_at or s.created_at or datetime.utcnow()) >= cutoff}
-        # Always keep the most recent so a resource never goes "empty" silently.
-        latest = max(snapshots, key=lambda s: s.started_at or s.created_at or datetime.min)
-        kept.add(latest.id)
+        # Always keep the newest RESTORABLE snapshot so a resource never goes
+        # "empty" (or "un-restorable") silently.
+        kept.add(_latest_restorable_id(snapshots))
         return kept
     # SAME (default) → caller handles via the normal FLAT/GFS path.
     return None  # type: ignore[return-value]  # sentinel: caller branches
@@ -119,9 +206,8 @@ def _flat_keep_ids(snapshots: List[Snapshot], policy: SlaPolicy) -> Set[uuid.UUI
         return {s.id for s in snapshots}
     cutoff = datetime.utcnow() - timedelta(days=keep_days)
     kept = {s.id for s in snapshots if (s.started_at or s.created_at or datetime.utcnow()) >= cutoff}
-    # Always keep the most recent snapshot as a safety net
-    latest = max(snapshots, key=lambda s: s.started_at or s.created_at or datetime.min)
-    kept.add(latest.id)
+    # P3 safety net: always keep the newest RESTORABLE (COMPLETED) snapshot.
+    kept.add(_latest_restorable_id(snapshots))
     return kept
 
 
@@ -145,8 +231,8 @@ def _gfs_keep_ids(snapshots: List[Snapshot], policy: SlaPolicy) -> Set[uuid.UUID
         return s.started_at or s.created_at or datetime.min
 
     keep: Set[uuid.UUID] = set()
-    # Always keep the most recent
-    keep.add(sorted_snaps[0].id)
+    # P3 safety net: always keep the newest RESTORABLE (COMPLETED) snapshot.
+    keep.add(_latest_restorable_id(snapshots))
 
     # Daily: first snapshot per calendar day, cap at n_daily
     seen_days: Dict[str, uuid.UUID] = {}
@@ -282,11 +368,47 @@ async def _rehydrate_reuse_heir(
         ON CONFLICT DO NOTHING
     """), {"heir": str(heir_id), "did": str(doomed_id)})
 
-    # 3. Repoint every still-live descendant. Any descendant that
-    # currently points its reuse_of_snapshot_id straight at the doomed
-    # row gets pointed at the heir instead. Every descendant's
-    # reuse_chain_root_id moves to the heir. The heir itself is
-    # excluded from this UPDATE (it's about to be promoted in step 4).
+    # 3. Promote the heir to a full snapshot FIRST — BEFORE repointing the
+    # siblings. The reuse-validation trigger (BEFORE UPDATE, FOR EACH ROW —
+    # immediate, NOT deferred) requires a row's reuse_chain_root_id to point at a
+    # FULL snapshot (reuse_of_snapshot_id IS NULL). If we repointed the siblings
+    # at the heir while the heir were still a reuse row, that trigger would abort
+    # the whole retention transaction — a latent bug that only bites when a doomed
+    # chain-root has >=2 surviving descendants (with 0-1 the repoint below matches
+    # no rows). Promoting the heir to a full first makes it a valid chain root.
+    # Setting both reuse columns to NULL is always allowed by the trigger.
+    #
+    # P4b (deltaLink handoff): also carry the doomed row's incremental cursor
+    # forward to the heir when the heir has none. The delta-token resolver's DB
+    # fallback (services/delta-token/main.py) reads the newest snapshot's
+    # ``delta_token``; if retention deletes the row holding the active cursor
+    # without this, the next incremental would fall back to a staler cursor or
+    # re-baseline. COALESCE only fills a gap — a heir with its own (newer) cursor
+    # keeps it. The doomed row (``:did``) still exists here (delete happens after
+    # this rehydration), so the correlated FROM can read it.
+    await session.execute(text("""
+        UPDATE snapshots AS h
+           SET reuse_of_snapshot_id = NULL,
+               reuse_chain_root_id  = NULL,
+               delta_token = COALESCE(h.delta_token, d.delta_token),
+               delta_tokens_json = CASE
+                     WHEN COALESCE(h.delta_tokens_json::jsonb, '{}'::jsonb) = '{}'::jsonb
+                         THEN d.delta_tokens_json ELSE h.delta_tokens_json END,
+               extra_data = COALESCE(h.extra_data::jsonb, '{}'::jsonb)
+                          || jsonb_build_object(
+                                'reuse_rehydrated_from', CAST(:did AS TEXT),
+                                'reuse_rehydrated_at',   to_char(NOW() AT TIME ZONE 'UTC',
+                                                                'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+                             )
+          FROM snapshots AS d
+         WHERE h.id = CAST(:heir AS UUID) AND d.id = CAST(:did AS UUID)
+    """), {"did": str(doomed_id), "heir": str(heir_id)})
+
+    # 4. Now repoint every OTHER still-live descendant at the (now-full) heir.
+    # A descendant that pointed reuse_of_snapshot_id straight at the doomed row
+    # gets pointed at the heir; every descendant's reuse_chain_root_id moves to
+    # the heir. The heir is excluded (it was promoted in step 3). The heir is now
+    # a full snapshot, so the chain-root validation passes.
     await session.execute(text("""
         UPDATE snapshots
            SET reuse_of_snapshot_id = CASE
@@ -296,21 +418,6 @@ async def _rehydrate_reuse_heir(
                reuse_chain_root_id = CAST(:heir AS UUID)
          WHERE reuse_chain_root_id = CAST(:did AS UUID)
            AND id != CAST(:heir AS UUID)
-    """), {"did": str(doomed_id), "heir": str(heir_id)})
-
-    # 4. Promote the heir to a full snapshot. Validation trigger
-    # tolerates both columns going to NULL.
-    await session.execute(text("""
-        UPDATE snapshots
-           SET reuse_of_snapshot_id = NULL,
-               reuse_chain_root_id  = NULL,
-               extra_data = COALESCE(extra_data::jsonb, '{}'::jsonb)
-                          || jsonb_build_object(
-                                'reuse_rehydrated_from', CAST(:did AS TEXT),
-                                'reuse_rehydrated_at',   to_char(NOW() AT TIME ZONE 'UTC',
-                                                                'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
-                             )
-         WHERE id = CAST(:heir AS UUID)
     """), {"did": str(doomed_id), "heir": str(heir_id)})
 
     logger.info(
@@ -392,6 +499,11 @@ async def enforce_retention_for_tenant(session: AsyncSession, tenant_id: uuid.UU
 
         to_delete = {s.id for s in snaps} - keep
         if _retention_deletes_permitted(settings.RETENTION_DELETE_ENABLED, to_delete):
+            # P4a: write one forensic AuditEvent per doomed snapshot IN THE SAME
+            # transaction as the delete — if the delete/rehydration rolls back,
+            # so does the audit, so the record never disagrees with reality.
+            for _ev in _audit_events_for_deletion(snaps, to_delete, res, policy):
+                session.add(_ev)
             deleted = await _delete_snapshots(session, to_delete)
         else:
             if to_delete:
