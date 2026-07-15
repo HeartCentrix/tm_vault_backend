@@ -700,6 +700,15 @@ async def lifespan(app: FastAPI):
         await conn.execute(text("SELECT 1"))
     await message_bus.connect()
     await startup_router()
+    # At-rest encryption hook so blob downloads decrypt (no-op unless
+    # BACKUP_ENCRYPTION_* env is configured).
+    try:
+        from shared.crypto import bootstrap as _enc_bootstrap
+        from shared.database import async_session_factory as _asf
+        if _enc_bootstrap.install_from_env(_asf):
+            print("[JOB] at-rest encryption hook installed")
+    except Exception as e:
+        print(f"[JOB] encryption hook install failed (non-fatal): {e}")
     try:
         yield
     finally:

@@ -401,6 +401,14 @@ async def startup():
     core_metrics.init()
     await db_init_db()
     await startup_router()
+    # At-rest encryption hook so scheduler blob reads decrypt (no-op unless
+    # BACKUP_ENCRYPTION_* env is configured).
+    try:
+        from shared.crypto import bootstrap as _enc_bootstrap
+        if _enc_bootstrap.install_from_env(async_session_factory):
+            print("[SCHEDULER] at-rest encryption hook installed")
+    except Exception as e:
+        print(f"[SCHEDULER] encryption hook install failed (non-fatal): {e}")
 
     await message_bus.connect()
 
