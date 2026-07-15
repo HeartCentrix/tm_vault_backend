@@ -1591,6 +1591,54 @@ def _should_skip_subcalendar(
         return False
     elapsed_h = (now_dt - last_fetched_dt).total_seconds() / 3600.0
     return elapsed_h < refresh_hours
+
+
+# Descriptive fields a recurring-event OCCURRENCE inherits from its series
+# master. Graph's /calendarView/delta returns occurrences as bare stubs
+# (id/start/end/type/seriesMasterId only) — subject, body, organizer, etc.
+# live on the master — so without this every occurrence stores as
+# "(no subject)". Occurrence-specific fields (id, start, end, type,
+# seriesMasterId) are NEVER overwritten.
+CAL_INHERIT_FIELDS = (
+    "subject", "bodyPreview", "body", "location", "organizer", "categories",
+    "showAs", "sensitivity", "isOnlineMeeting", "onlineMeeting",
+    "onlineMeetingUrl", "onlineMeetingProvider", "importance",
+    "responseRequested", "webLink", "attendees",
+)
+
+
+def _inherit_master_fields(out_rows, master_cache):
+    """Merge series-master descriptive fields into CALENDAR_EVENT occurrence
+    rows that lack a subject. Pure (no I/O) so it is unit-testable.
+
+    `out_rows` entries are (item_type, name, external_id, metadata, folder).
+    `master_cache` maps seriesMasterId -> the master event dict (with subject).
+    Returns (enriched_rows, enriched_count). Rows without a cached master, or
+    that already carry a subject, pass through untouched.
+    """
+    enriched = []
+    n = 0
+    for r in out_rows:
+        item_type, name, ext_id, md, folder = r
+        raw = md.get("raw") or {}
+        mid = md.get("seriesMasterId")
+        if (
+            item_type == "CALENDAR_EVENT"
+            and not raw.get("subject")
+            and mid
+            and mid in master_cache
+        ):
+            m = master_cache[mid]
+            for f in CAL_INHERIT_FIELDS:
+                if m.get(f) is not None and raw.get(f) is None:
+                    raw[f] = m[f]
+            md = {**md, "raw": raw, "inheritedFromMaster": True}
+            name = m.get("subject") or name
+            n += 1
+        enriched.append((item_type, name, ext_id, md, folder))
+    return enriched, n
+
+
 from shared.message_bus import (
     message_bus,
     create_onedrive_partition_message,
@@ -5672,6 +5720,45 @@ class BackupWorker:
                                     await _s.commit()
                         except Exception as _e:
                             print(f"[{self.worker_id}]   [USER_CALENDAR] delta persist failed: {_e}")
+
+                    # ── Inherit subjects for recurring-event occurrences ──
+                    # calendarView/delta returns occurrences as bare stubs with
+                    # no subject (it lives on the seriesMaster). Resolve each
+                    # distinct master once and inherit its descriptive fields so
+                    # every occurrence stores a real subject instead of
+                    # "(no subject)". Best-effort: a deleted/inaccessible master
+                    # leaves that occurrence unchanged.
+                    try:
+                        master_ids = {
+                            r[3].get("seriesMasterId")
+                            for r in out_rows
+                            if r[0] == "CALENDAR_EVENT"
+                            and not (r[3].get("raw") or {}).get("subject")
+                            and r[3].get("seriesMasterId")
+                        }
+                        master_cache: Dict[str, Any] = {}
+                        for mid in master_ids:
+                            try:
+                                m = await graph_client._get(
+                                    f"{graph_client.GRAPH_URL}/users/{user_id}/events/{mid}",
+                                    params={"$select": ",".join(CAL_INHERIT_FIELDS)},
+                                )
+                                if isinstance(m, dict) and m.get("subject"):
+                                    master_cache[mid] = m
+                            except Exception:
+                                continue  # master gone/inaccessible — skip
+                        if master_cache:
+                            out_rows, _enr = _inherit_master_fields(out_rows, master_cache)
+                            print(
+                                f"[{self.worker_id}]   [USER_CALENDAR] enriched "
+                                f"{_enr} occurrence(s) from {len(master_cache)} "
+                                f"series master(s)"
+                            )
+                    except Exception as _ee:
+                        print(f"[{self.worker_id}]   [USER_CALENDAR] occurrence enrichment failed: {type(_ee).__name__}: {_ee}")
+                        # ponytail: sequential master fetches (cached, usually
+                        # <50/user); batch via graph_client.batch if it ever
+                        # dominates calendar backup latency at scale.
 
                     print(f"[{self.worker_id}]   [USER_CALENDAR] {user_id}: {len(calendars)} calendar(s), {len(out_rows)} event occurrence(s)")
                     return out_rows

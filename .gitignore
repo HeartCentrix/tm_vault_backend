@@ -70,3 +70,6 @@ graphify-out/
 skills-lock.json
 # Git worktrees
 .worktrees/
+
+# Client hand-off setup doc (local reference; content lives in-app Help Centre)
+ARCHIVE_MAILBOX_SETUP.md
