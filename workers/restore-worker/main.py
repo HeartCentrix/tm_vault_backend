@@ -2253,8 +2253,9 @@ class RestoreWorker:
         # mail_fetch.fetch_message reads that inline raw first — so an enriched
         # archive item builds an EML/MBOX identically, never touching its opaque
         # blob. Un-enriched archive rows have no raw yet → skip them (they export
-        # once the enrichment service has staged them; browsing/exporting nudges
-        # it). We DON'T silently include them — that would emit empty EMLs.
+        # once the enrichment service has staged them; we NUDGE that enrichment
+        # below so a re-export succeeds — browse does the same in snapshot-service).
+        # We DON'T silently include them — that would emit empty EMLs.
         _MAIL_V2_TYPES = {"EMAIL", "EMAIL_ATTACHMENT", "ARCHIVE_ITEM"}
 
         def _is_exportable_mail(it):
@@ -2265,12 +2266,24 @@ class RestoreWorker:
                 return bool((getattr(it, "extra_data", None) or {}).get("raw"))
             return False
         _email_items = [it for it in items if _is_exportable_mail(it)]
-        _arch_total = sum(1 for it in items if getattr(it, "item_type", None) == "ARCHIVE_ITEM")
-        _arch_ready = sum(1 for it in _email_items if getattr(it, "item_type", None) == "ARCHIVE_ITEM")
-        if _arch_total and _arch_ready < _arch_total:
-            print(f"[{self.worker_id}] [ARCHIVE_EXPORT] {_arch_total - _arch_ready}/"
-                  f"{_arch_total} archive items not yet enriched — skipped this export "
-                  f"(will export once their preview is built)", flush=True)
+        # Un-enriched archive rows can't be exported (opaque blob only) → they get
+        # skipped above (not in _email_items). Nudge preview-enrichment for them so
+        # a re-export after the preview builds succeeds instead of them staying
+        # un-enriched forever. All the detect+skip-log+nudge logic lives in the
+        # tested helper (shared/archive_enrichment.py::nudge_unenriched_export);
+        # best-effort — a nudge failure must never break the export producing output.
+        try:
+            from shared import archive_enrichment as _arch_eng
+            await _arch_eng.nudge_unenriched_export(
+                items, session, message_bus.publish,
+                log=lambda _skip, _tot: print(
+                    f"[{self.worker_id}] [ARCHIVE_EXPORT] {_skip}/{_tot} archive items "
+                    f"not yet enriched — skipped this export (will export once their "
+                    f"preview is built)", flush=True),
+            )
+        except Exception as _e:  # noqa: BLE001
+            print(f"[{self.worker_id}] [ARCHIVE_EXPORT] enrich nudge skipped "
+                  f"(non-fatal): {type(_e).__name__}", flush=True)
         if (
             _mail_export_settings.EXPORT_MAIL_V2_ENABLED
             and _email_items

@@ -143,6 +143,76 @@ async def find_pending_archive_resource_ids(session, limit: int = 50) -> List[An
     return [row[0] for row in rows]
 
 
+async def nudge_enrichment(session, items, publish) -> List[str]:
+    """Publish ``enrich.priority`` once per DISTINCT resource among ``items`` that
+    still has un-enriched ARCHIVE_ITEM rows — the SINGLE on-demand nudge shared by
+    BROWSE (snapshot-service) and EXPORT (restore-worker), so both actually kick
+    preview-enrichment for exactly the rows they'd otherwise skip (an un-enriched
+    archive row has no Graph JSON, so export drops it — without this nudge those
+    rows never enrich on their own and re-exporting stays incomplete forever).
+
+    ``publish(routing_key, message, priority=...)`` is injected (``message_bus.
+    publish`` in prod; a fake in tests). Read-only over the DB + idempotent (the
+    worker's in-flight guard + ``needs_enrichment`` absorb duplicate nudges), and
+    it MUST never raise — a nudge failure must not break a browse or an export.
+    Returns the sorted resource ids actually nudged (for logging/tests)."""
+    snap_to_rid: Dict[Any, Any] = {}
+    want: List[Any] = []  # distinct resource ids to nudge, first-seen order
+    for it in items or []:
+        if getattr(it, "item_type", None) != ARCHIVE_ITEM_TYPE:
+            continue
+        if not ae.needs_enrichment(getattr(it, "extra_data", None) or {}):
+            continue
+        sid = getattr(it, "snapshot_id", None)
+        if sid is None:
+            continue
+        if sid not in snap_to_rid:
+            try:
+                snap = await session.get(Snapshot, sid)
+            except Exception:  # noqa: BLE001 - a nudge must never break the caller
+                snap = None
+            snap_to_rid[sid] = getattr(snap, "resource_id", None) if snap else None
+        rid = snap_to_rid[sid]
+        if rid is not None and rid not in want:
+            want.append(rid)
+    nudged: List[str] = []
+    for rid in want:
+        try:
+            await publish(
+                "enrich.priority",
+                {"resourceId": str(rid), "restoreType": "ARCHIVE_ENRICH"},
+                priority=9,
+            )
+            nudged.append(str(rid))
+        except Exception as e:  # noqa: BLE001 - a nudge must never break the caller
+            print(f"[archive_enrich] nudge skipped for {rid} (non-fatal): "
+                  f"{type(e).__name__}: {e}")
+    return sorted(nudged)
+
+
+async def nudge_unenriched_export(items, session, publish, *, log=None) -> List[str]:
+    """EXPORT bug-locus, made testable: an ARCHIVE_ITEM row with no
+    ``extra_data.raw`` carries only the opaque MAPI blob, so it CAN'T be exported
+    to EML/MBOX/PST — the export path must SKIP it. Pre-fix it skipped silently
+    and never enriched, so a re-export never completed. This counts the skipped
+    (un-enriched) archive rows, calls ``log(skipped, total_archive)`` if any, and
+    nudges preview-enrichment for them (via :func:`nudge_enrichment`) so a later
+    re-export succeeds. No-op (returns []) when the selection has no archive rows
+    or they're all enriched. Never raises."""
+    arch = [it for it in (items or []) if getattr(it, "item_type", None) == ARCHIVE_ITEM_TYPE]
+    if not arch:
+        return []
+    skipped = sum(1 for it in arch if not ((getattr(it, "extra_data", None) or {}).get("raw")))
+    if not skipped:
+        return []
+    if log is not None:
+        try:
+            log(skipped, len(arch))
+        except Exception:  # noqa: BLE001 - logging must never break an export
+            pass
+    return await nudge_enrichment(session, items, publish)
+
+
 # ── per-resource orchestration ────────────────────────────────────────────
 def _build_stager(*, gc, user_id, primary_id, folder_name, download_blob,
                   batch_size, worker_id, post_json):

@@ -18,7 +18,6 @@ from shared.database import get_db, init_db, close_db, AsyncSession
 from shared.models import Snapshot, SnapshotItem, Resource, SnapshotType, SnapshotStatus, ResourceType, Job
 from shared.snapshot_reuse import resolve_snapshot_items_target, SnapshotNotFound
 from shared.config import settings
-from shared.archive_enrich import needs_enrichment as _needs_enrichment
 # Producer-only; on-demand archive enrichment nudge. Defensive so this read API
 # still boots if the broker deps are ever absent — the trigger just no-ops.
 try:
@@ -251,31 +250,13 @@ async def lifespan(app: FastAPI):
 
 async def _maybe_trigger_archive_enrichment(db: AsyncSession, items: List[SnapshotItem]) -> None:
     """On-demand preview enrichment: if this browsed page includes archive items
-    that still need enriching, nudge the enrichment-worker to process THIS user's
-    archive first (enrich.priority). Best-effort + idempotent — the worker's
-    in-flight guard + needs_enrichment() absorb duplicate browses, so firing once
-    per page load is harmless."""
+    that still need enriching, nudge the enrichment-worker (enrich.priority).
+    Delegates to the SHARED nudge so browse and export stay in lock-step; it's
+    best-effort + idempotent and never raises."""
     if message_bus is None:
         return
-    try:
-        pend = next(
-            (it for it in items
-             if it.item_type == "ARCHIVE_ITEM" and _needs_enrichment(it.extra_data or {})),
-            None,
-        )
-        if pend is None:
-            return
-        snap = await db.get(Snapshot, pend.snapshot_id)
-        rid = getattr(snap, "resource_id", None)
-        if not rid:
-            return
-        await message_bus.publish(
-            "enrich.priority",
-            {"resourceId": str(rid), "restoreType": "ARCHIVE_ENRICH"},
-            priority=9,
-        )
-    except Exception as e:  # noqa: BLE001 - trigger must never break a browse
-        print(f"[SNAPSHOT] archive enrich trigger skipped (non-fatal): {e}")
+    from shared import archive_enrichment as _arch_eng
+    await _arch_eng.nudge_enrichment(db, items, message_bus.publish)
 
 
 app = FastAPI(title="Snapshot Service", version="1.0.0", lifespan=lifespan)
