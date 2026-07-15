@@ -53,6 +53,25 @@ def test_user_archive_rides_the_exchange_checkbox():
     assert set(filtered) == {"mail", "archive"}
 
 
+def test_entra_directory_rides_the_entra_id_checkbox():
+    # Tenant-level Entra directory config (a real backed-up resource with a
+    # backup_entra_directory handler) must ride the Entra ID checkbox like every
+    # other ENTRA_* type — NOT fall through to "no workload mapping", which
+    # silently skipped it on every scheduled Gold fire.
+    assert resource_type_enabled("ENTRA_DIRECTORY", Policy(backup_entra_id=True)) is True
+    assert resource_type_enabled("ENTRA_DIRECTORY", Policy(backup_entra_id=False)) is False
+    # filters alongside the other Entra resources under one checkbox
+    resources = {
+        "dir": Resource("dir", "ENTRA_DIRECTORY"),
+        "user": Resource("user", "ENTRA_USER"),
+        "mail": Resource("mail", "USER_MAIL"),
+    }
+    filtered, _ = filter_resource_map_by_policy_flags(
+        resources, {"policy-1": Policy(backup_entra_id=True)}
+    )
+    assert set(filtered) == {"dir", "user"}
+
+
 def test_filter_resource_map_keeps_only_workloads_enabled_by_sla():
     policy = Policy(backup_exchange=True)
     resources = {

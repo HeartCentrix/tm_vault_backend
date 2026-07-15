@@ -57,6 +57,8 @@ RESOURCE_TYPE_DISPLAY_NAMES: Dict[str, str] = {
     "USER_CONTACTS": "User contacts",
     "USER_CALENDAR": "User calendars",
     "USER_CHATS": "User chats",
+    "USER_ARCHIVE": "Exchange online archive",
+    "ENTRA_DIRECTORY": "Azure Active Directory",
     "ENTRA_USER": "Entra user data",
     "ENTRA_GROUP": "Entra group data",
     "ENTRA_APP": "Entra app data",

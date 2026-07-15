@@ -30,6 +30,11 @@ RESOURCE_TYPE_TO_SLA_FLAG: dict[str, str] = {
     "USER_CONTACTS": "contacts",
     "USER_CALENDAR": "calendars",
     "USER_CHATS": "backup_teams_chats",
+    # Tenant-level directory config (org settings, CA policies, named locations,
+    # branding, …) — a real backed-up resource via backup_entra_directory. Rides
+    # the same Entra ID checkbox as the other ENTRA_* types; without this it fell
+    # through to "no workload mapping" and was silently skipped every fire.
+    "ENTRA_DIRECTORY": "backup_entra_id",
     "ENTRA_USER": "backup_entra_id",
     "ENTRA_GROUP": "backup_entra_id",
     "ENTRA_APP": "backup_entra_id",
@@ -38,6 +43,8 @@ RESOURCE_TYPE_TO_SLA_FLAG: dict[str, str] = {
     "ENTRA_ROLE": "backup_entra_id",
     "ENTRA_ADMIN_UNIT": "backup_entra_id",
     "ENTRA_AUDIT_LOG": "backup_entra_id",
+    "ENTRA_CONDITIONAL_ACCESS": "backup_entra_id",
+    "ENTRA_BITLOCKER_KEY": "backup_entra_id",
     "INTUNE_MANAGED_DEVICE": "backup_entra_id",
     "POWER_BI": "backup_power_platform",
     "POWER_APPS": "backup_power_platform",
