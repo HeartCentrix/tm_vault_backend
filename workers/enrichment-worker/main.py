@@ -248,6 +248,12 @@ async def main():
 
     await init_db()
 
+    # At-rest encryption hook so enrichment can read encrypted archive blobs
+    # (no-op unless BACKUP_ENCRYPTION_* env is configured).
+    from shared.crypto import bootstrap as _enc_bootstrap
+    if _enc_bootstrap.install_from_env(async_session_factory):
+        logger.info("[%s] at-rest encryption hook installed", WORKER_ID)
+
     await asyncio.gather(
         asyncio.create_task(consume_enrich_priority()),
         asyncio.create_task(bulk_sweep_loop()),

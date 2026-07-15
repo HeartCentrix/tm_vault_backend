@@ -4645,6 +4645,11 @@ async def main():
     await graph_rate_limiter.maybe_init_redis()
     print("Starting restore worker...")
     await startup_router()
+    # At-rest encryption hook so restores can decrypt encrypted blobs on read
+    # (no-op unless BACKUP_ENCRYPTION_* env is configured).
+    from shared.crypto import bootstrap as _enc_bootstrap
+    if _enc_bootstrap.install_from_env(async_session_factory):
+        print("[main] at-rest encryption hook installed")
     try:
         await worker.start()
     finally:

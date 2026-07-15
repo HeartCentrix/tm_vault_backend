@@ -23761,6 +23761,12 @@ async def main():
     core_metrics.init()
     await graph_rate_limiter.maybe_init_redis()
     await startup_router()
+    # Install the at-rest encryption hook (no-op unless BACKUP_ENCRYPTION_* env
+    # is set). Needed here so write-then-verify can read blobs back decrypted.
+    from shared.crypto import bootstrap as _enc_bootstrap
+    from shared.database import async_session_factory as _asf
+    if _enc_bootstrap.install_from_env(_asf):
+        print("[main] at-rest encryption hook installed")
     worker = BackupWorker()
     try:
         await worker.start()
