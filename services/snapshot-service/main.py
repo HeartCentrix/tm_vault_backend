@@ -2858,7 +2858,13 @@ async def list_snapshot_calendar(
         organizer_obj = (raw.get("organizer") or {}).get("emailAddress") or {}
         start_obj = raw.get("start") or {}
         end_obj = raw.get("end") or {}
-        subject = raw.get("subject") or raw.get("name") or ""
+        # Prefer real titles: raw.subject, then raw.name, then the stored item
+        # name (recurring occurrences inherit their series-master subject into
+        # SnapshotItem.name during backup). Only fabricate a placeholder when
+        # NONE of those exist — otherwise the inherited title was being thrown
+        # away in favour of "Event · <time>".
+        _item_name = i.name if i.name and i.name != "(no subject)" else ""
+        subject = raw.get("subject") or raw.get("name") or _item_name
         graph_type = raw.get("type") or ""  # singleInstance, occurrence, seriesMaster, exception
 
         # Build display name from available fields
