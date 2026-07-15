@@ -756,10 +756,14 @@ class MailExportOrchestrator:
                 if shard_index == dest_shard_index:
                     same_shard_members.append((arc, self.dest_container, blob_path))
                 else:
+                    # Server-side S3-to-S3 copy (put_block_from_url) — the SAS is
+                    # consumed by the backend, never by a browser, and the copy
+                    # preserves any TMVE envelope byte-for-byte, so signing an
+                    # encrypted blob here is safe (allow_encrypted=True).
                     try:
-                        sas_src = await shard.get_blob_sas_url(self.dest_container, blob_path)
+                        sas_src = await shard.get_blob_sas_url(self.dest_container, blob_path, allow_encrypted=True)
                     except Exception:
-                        sas_src = await shard.get_blob_url(self.dest_container, blob_path)
+                        sas_src = await shard.get_blob_url(self.dest_container, blob_path, allow_encrypted=True)
                     tmp_path = f"{self.job_id}/_crosshard/shard-{shard_index}/{arc}"
                     try:
                         await dest_shard.put_block_from_url(

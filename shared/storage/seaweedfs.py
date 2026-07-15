@@ -40,6 +40,16 @@ from shared.storage.base import BlobInfo, BlobProps
 from shared.storage.errors import BackendUnreachableError, ImmutableBlobError
 from shared.crypto import runtime as _crypto_runtime
 
+
+def _record_blob_write(encrypted: bool) -> None:
+    """Best-effort at-rest-encryption coverage counter (no-op without prometheus)."""
+    try:
+        from shared import sla_metrics
+        sla_metrics.record_blob_write(encrypted)
+    except Exception:
+        pass
+
+
 _MODE_TMVAULT_TO_S3 = {"Locked": "COMPLIANCE", "Unlocked": "GOVERNANCE"}
 
 
@@ -187,6 +197,7 @@ class SeaweedStore:
                 raise BackendUnreachableError(
                     f"encryption write-then-verify failed for {bucket}/{key}"
                 )
+        _record_blob_write(encrypted)
         return BlobInfo(
             backend_id=self.backend_id, container=container, path=path,
             size=head["ContentLength"], etag=head["ETag"].strip('"'),
@@ -335,6 +346,7 @@ class SeaweedStore:
 
             head = await s3.head_object(Bucket=bucket, Key=key)
 
+        _record_blob_write(_stream_encrypted)
         # Stash the sha256 we computed on the stream onto BlobInfo so
         # callers don't re-hash by reading the object back. BlobInfo's
         # content_md5 field is reused as the "content hash" slot for
@@ -536,7 +548,18 @@ class SeaweedStore:
                 return
             raise BackendUnreachableError(str(e)) from e
 
-    async def presigned_url(self, container, path, valid_hours=6) -> str:
+    async def presigned_url(self, container, path, valid_hours=6, *, allow_encrypted: bool = False) -> str:
+        # A presigned URL is fetched DIRECTLY by the client from the object store,
+        # bypassing the app's decrypt seam — for a TMVE blob that serves raw
+        # ciphertext. Refuse to sign one unless the caller explicitly opts into a
+        # server-side use (e.g. an S3-to-S3 copy that preserves the envelope).
+        if not allow_encrypted and await self.head_is_encrypted(container, path):
+            raise ValueError(
+                f"refusing to presign encrypted blob {container}/{path}: a raw presigned "
+                f"URL bypasses decryption and would serve ciphertext to the client. Stream "
+                f"it through the app (download_blob_stream) instead, or pass "
+                f"allow_encrypted=True for a server-side copy."
+            )
         bucket, key = self._bucket(container), self._key(container, path)
         async with self._client_ctx() as s3:
             url = await s3.generate_presigned_url(

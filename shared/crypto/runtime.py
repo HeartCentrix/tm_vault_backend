@@ -34,6 +34,11 @@ def configure(dek_manager: Optional[DekManager], *, write_enabled: bool = False,
     _dek_manager = dek_manager
     _write_enabled = bool(write_enabled)
     _verify_readback = bool(verify_readback)
+    try:  # best-effort observability; never let metrics break configuration
+        from shared import sla_metrics
+        sla_metrics.set_encryption_write_enabled(is_write_enabled())
+    except Exception:
+        pass
 
 
 def is_write_enabled() -> bool:

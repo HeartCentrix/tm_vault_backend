@@ -19,7 +19,6 @@ from shared.azure_storage import (
 )
 from shared.config import settings
 
-from workers.chat_export_worker.blob_shard import sign_download_url
 from workers.chat_export_worker.progress import publish
 from workers.chat_export_worker.scope import resolve
 from workers.chat_export_worker.render.normalizer import normalize_messages

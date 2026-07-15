@@ -261,7 +261,8 @@ class AzureBlobStore:
     async def delete(self, container, path) -> None:
         await self._default_shard().delete_blob(container, path)
 
-    async def presigned_url(self, container, path, valid_hours=6) -> str:
+    async def presigned_url(self, container, path, valid_hours=6, *, allow_encrypted=False) -> str:
+        # allow_encrypted is a no-op for Azure (its uploads never TMVE-encrypt).
         return await self._default_shard().get_blob_sas_url(container, path, valid_hours)
 
     async def apply_immutability(self, container, path, until, mode="Unlocked") -> None:

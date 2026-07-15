@@ -699,9 +699,9 @@ class _StoreFacade:
     async def delete_blob(self, container_name, blob_path):
         await self._store.delete(container_name, blob_path)
 
-    async def get_blob_sas_url(self, container_name, blob_path, valid_for_hours=6):
+    async def get_blob_sas_url(self, container_name, blob_path, valid_for_hours=6, *, allow_encrypted=False):
         return await self._store.presigned_url(
-            container_name, blob_path, valid_for_hours,
+            container_name, blob_path, valid_for_hours, allow_encrypted=allow_encrypted,
         )
 
     async def list_blobs(self, container_name, name_starts_with: Optional[str] = None):
@@ -759,8 +759,8 @@ class _StoreFacade:
             return await self._store.put_block_from_url(*a, **kw)
         raise NotImplementedError(f"put_block_from_url not supported by {self.kind}")
 
-    async def get_blob_url(self, container_name, blob_path):
-        return await self._store.presigned_url(container_name, blob_path, valid_hours=1)
+    async def get_blob_url(self, container_name, blob_path, *, allow_encrypted=False):
+        return await self._store.presigned_url(container_name, blob_path, valid_hours=1, allow_encrypted=allow_encrypted)
 
     async def close(self):
         close = getattr(self._store, "close", None)

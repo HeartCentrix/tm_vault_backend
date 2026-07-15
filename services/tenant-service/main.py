@@ -1042,6 +1042,61 @@ async def put_encryption_config(request: dict, db: AsyncSession = Depends(get_db
             "note": "Encryption services apply this on their next restart."}
 
 
+@app.post("/api/v1/encryption/rewrap")
+async def rewrap_encryption_key(request: dict, db: AsyncSession = Depends(get_db)):
+    """Re-wrap every tenant DEK under a NEW KEK (provider/key change) WITHOUT
+    touching blob ciphertext, then persist the new config. This is the escape
+    hatch for the 409 'rewrap_required' guard: change provider/key safely once
+    encrypted data already exists. After it runs, the crypto services must be
+    restarted to load the new KEK."""
+    from shared.crypto import bootstrap, config_store
+    from shared.crypto.dek_manager import DekManager
+    from shared.crypto.store import SqlDekStore
+    from shared.models import EncryptionConfig, TenantDek
+
+    provider = (request or {}).get("provider")
+    if provider not in _ENC_PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"provider must be one of {_ENC_PROVIDERS}")
+    key_reference = (request or {}).get("key_reference")
+    if provider in ("aws_kms", "azure_key_vault") and not key_reference:
+        raise HTTPException(status_code=400, detail="key_reference is required for this provider")
+
+    active = (await db.execute(
+        select(func.count()).select_from(TenantDek).where(TenantDek.state == "active")
+    )).scalar_one()
+
+    # OLD KEK = the currently-configured one (DB config, else env), needed to
+    # unwrap the existing DEKs before re-wrapping them under the new one.
+    current = await config_store.get_config(async_session_factory)
+    try:
+        old_kek = (bootstrap.build_kek_from_config(current)
+                   if current and current.get("provider") else bootstrap.build_kek_from_env())
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"cannot build the current KEK to unwrap existing DEKs: {e}")
+    try:
+        new_kek = bootstrap.build_kek_from_config({"provider": provider, "key_reference": key_reference})
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"cannot build the new KEK ({provider}): {e}")
+
+    rewrapped = 0
+    if active:
+        if old_kek is None:
+            raise HTTPException(status_code=409,
+                                detail="existing DEKs but no current KEK is configured to unwrap them")
+        mgr = DekManager(old_kek, SqlDekStore(async_session_factory))
+        rewrapped = await mgr.rewrap_all(new_kek)
+
+    enabled = bool((request or {}).get("enabled", (current or {}).get("enabled", False)))
+    verify = bool((request or {}).get("verify_readback", (current or {}).get("verify_readback", True)))
+    await config_store.set_config(
+        async_session_factory, provider=provider, key_reference=key_reference,
+        enabled=enabled, verify_readback=verify, updated_by=(request or {}).get("updated_by"),
+    )
+    return {"rewrapped": rewrapped, "provider": provider, "enabled": enabled, "restart_required": True,
+            "note": ("Re-wrapped %d DEK(s) under the new key. Restart the encryption services "
+                     "to load the new KEK." % rewrapped)}
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Azure restore options — feed the destination dropdowns in the Azure
 # DB Recover modal. Both the tenant domain and the cascading

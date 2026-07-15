@@ -36,9 +36,11 @@ cmk_rotated_total = None            # ()
 encryption_status_transitions_total = None  # from→to
 attempt_cap_reached_total = None    # ()
 audit_publish_failed_total = None   # ()
+blob_writes_total = None            # at-rest encryption: labelled encrypted=true|false
 
 # Gauges
 dirty_policies_gauge = None         # current count of lifecycle_dirty=true rows
+encryption_write_enabled_gauge = None  # 1 when this process is encrypting new writes
 
 
 def init(metrics_port: Optional[int] = None) -> bool:
@@ -58,6 +60,7 @@ def init(metrics_port: Optional[int] = None) -> bool:
     global reconcile_total, worm_locks_applied_total, worm_loosen_refused_total
     global cmk_drift_detected_total, cmk_rotated_total, encryption_status_transitions_total
     global attempt_cap_reached_total, audit_publish_failed_total, dirty_policies_gauge
+    global blob_writes_total, encryption_write_enabled_gauge
 
     with _LOCK:
         if _INIT_DONE:
@@ -107,6 +110,15 @@ def init(metrics_port: Optional[int] = None) -> bool:
         dirty_policies_gauge = Gauge(
             "sla_lifecycle_dirty_policies",
             "Current count of policies awaiting lifecycle reconcile",
+        )
+        blob_writes_total = Counter(
+            "backup_blob_writes_total",
+            "Backup blob writes by at-rest encryption outcome",
+            ["encrypted"],  # 'true' | 'false'
+        )
+        encryption_write_enabled_gauge = Gauge(
+            "backup_encryption_write_enabled",
+            "1 if this process encrypts new backup writes, else 0",
         )
 
         # Bring up /metrics on a separate port from pst_metrics (9100)
@@ -168,3 +180,14 @@ def inc_audit_publish_failed() -> None:
 def set_dirty_count(n: int) -> None:
     if dirty_policies_gauge is not None:
         dirty_policies_gauge.set(n)
+
+def record_blob_write(encrypted: bool) -> None:
+    """Count one backup blob write by whether it was sealed at rest. Lets an
+    operator alert when plaintext writes are non-zero while encryption is meant
+    to be on (i.e. the 'encrypted at rest' claim is silently false)."""
+    if blob_writes_total is not None:
+        blob_writes_total.labels(encrypted=("true" if encrypted else "false")).inc()
+
+def set_encryption_write_enabled(enabled: bool) -> None:
+    if encryption_write_enabled_gauge is not None:
+        encryption_write_enabled_gauge.set(1 if enabled else 0)
