@@ -10,18 +10,48 @@ Responsibilities:
 - Request metrics and monitoring
 """
 import asyncio
+import secrets
 import time
 import uuid
 from datetime import datetime
 from typing import Dict, List, Any, Optional
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel
 import httpx
 from redis.asyncio import Redis
 
 from shared.config import settings
 
+from shared.audit_middleware import AuditMiddleware  # Ops/Data Check 3: mutation-audit backstop
 app = FastAPI(title="Graph Proxy Service", version="2.0.0")
+app.add_middleware(AuditMiddleware, service_name="graph-proxy", extra_excludes=("/graph",))  # /graph is an outbound MS-Graph passthrough, not a TM Vault data mutation — auditing it floods audit_events
+
+
+def require_internal_api_key(
+    x_internal_api_key: Optional[str] = Header(default=None, alias="X-Internal-Api-Key"),
+) -> None:
+    """Reject any request that doesn't carry the internal-services shared secret.
+
+    The /graph routes forward arbitrary Microsoft Graph calls with the backup
+    app's client-credentials token — unauthenticated, any pod (or kubectl exec)
+    in the namespace could act as the app against every tenant. Same gate as
+    services/delta-token: fail closed (503) when the secret isn't configured so
+    a misconfigured deploy can't silently expose the routes.
+    """
+    expected = settings.INTERNAL_API_KEY
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="INTERNAL_API_KEY not configured",
+        )
+    if not x_internal_api_key or not secrets.compare_digest(
+        x_internal_api_key, expected
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing internal API key",
+        )
+
 
 # Redis for token caching
 redis_client: Optional[Redis] = None
@@ -141,6 +171,10 @@ async def startup():
                 host=settings.REDIS_HOST,
                 port=settings.REDIS_PORT,
                 db=settings.REDIS_DB,
+                # `or None` is load-bearing (ITO-10192): password="" would
+                # send AUTH against a no-auth server and error, so pods
+                # without the env var keep working unchanged.
+                password=settings.REDIS_PASSWORD or None,
                 decode_responses=True
             )
             await redis_client.ping()
@@ -171,7 +205,7 @@ async def health_check():
     }
 
 
-@app.post("/graph/batch")
+@app.post("/graph/batch", dependencies=[Depends(require_internal_api_key)])
 async def execute_batch_request(batch_request: GraphBatchRequest, tenant_id: str):
     """
     Execute batch request to Graph API
@@ -229,13 +263,13 @@ async def execute_batch_request(batch_request: GraphBatchRequest, tenant_id: str
     )
 
 
-@app.get("/graph/{path:path}")
+@app.get("/graph/{path:path}", dependencies=[Depends(require_internal_api_key)])
 async def proxy_get_request(path: str, tenant_id: str, request: Request):
     """Proxy GET request to Graph API with throttling"""
     return await proxy_request("GET", path, tenant_id, dict(request.query_params))
 
 
-@app.post("/graph/{path:path}")
+@app.post("/graph/{path:path}", dependencies=[Depends(require_internal_api_key)])
 async def proxy_post_request(path: str, tenant_id: str, request: Request):
     """Proxy POST request to Graph API with throttling"""
     body = await request.json() if request.method == "POST" else None
@@ -316,16 +350,26 @@ async def get_graph_token(tenant_id: str) -> str:
         if cached:
             return cached
     
-    # Acquire new token
-    token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
-    
+    # Acquire new token. Credentials come from the shared multi-app pool
+    # (APP_<N>_CLIENT_ID/SECRET/TENANT_ID env family) — the old
+    # `settings.AZURE_AD_CLIENT_ID` attribute never existed, so every
+    # passthrough request 500'd since this service shipped. The token is
+    # minted against the APP's directory tenant (mirrors the workers:
+    # callers pass the INTERNAL tenants.id uuid, whose DB
+    # external_tenant_id is NULL in this deployment, so it is only used
+    # for cache keying and throttle bucketing — never as the AAD
+    # authority).
+    from shared.multi_app_manager import multi_app_manager
+    app_reg = multi_app_manager.get_next_app()
+    token_url = f"https://login.microsoftonline.com/{app_reg.tenant_id}/oauth2/v2.0/token"
+
     async with httpx.AsyncClient() as client:
         response = await client.post(
             token_url,
             data={
                 "grant_type": "client_credentials",
-                "client_id": settings.AZURE_AD_CLIENT_ID,
-                "client_secret": settings.AZURE_AD_CLIENT_SECRET,
+                "client_id": app_reg.client_id,
+                "client_secret": app_reg.client_secret,
                 "scope": "https://graph.microsoft.com/.default",
             }
         )

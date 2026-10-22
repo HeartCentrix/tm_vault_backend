@@ -16,6 +16,14 @@ class DrainResult:
     retried_count: int
 
 
+class DrainAborted(Exception):
+    """Operator aborted the toggle while the drain was still waiting.
+
+    Raised so the orchestrator stands down before any promote/DNS/worker
+    phase runs — previously the abort endpoint only rewrote the event row
+    and the worker drove the flip to completion anyway."""
+
+
 async def drain_inflight(db, event_id: str,
                          poll_interval_s: int = 5,
                          max_wait_s: int = 900) -> DrainResult:
@@ -23,6 +31,11 @@ async def drain_inflight(db, event_id: str,
     last_remaining = 0
 
     while datetime.now(timezone.utc) < deadline:
+        status = await db.fetchval(
+            "SELECT status FROM storage_toggle_events WHERE id=$1", event_id,
+        )
+        if status == "aborted":
+            raise DrainAborted()
         rows = await db.fetch(
             "SELECT id FROM jobs WHERE status IN ('RUNNING','QUEUED','PENDING')"
         )

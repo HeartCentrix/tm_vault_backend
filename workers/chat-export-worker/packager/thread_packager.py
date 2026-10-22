@@ -24,6 +24,28 @@ def _safe_name(name: str, fallback: str = "item") -> str:
     return (s[:120] or fallback)
 
 
+def _unique_in_dir(name: str, used: set[str]) -> str:
+    """Uniquify a sanitised filename within one ZIP directory.
+
+    Two attachments named 'contract.pdf' in the same thread used to become
+    two ZIP entries at the identical path — extractors keep only one, and
+    both messages' HTML chips then link to whichever file survived, silently
+    misrepresenting which document was attached to which message. Comparison
+    is case-insensitive because most extraction targets (Windows/macOS) are.
+    """
+    candidate = name
+    n = 2
+    while candidate.lower() in used:
+        stem, dot, ext = name.rpartition(".")
+        if dot and stem:
+            candidate = f"{stem} ({n}).{ext}"
+        else:
+            candidate = f"{name} ({n})"
+        n += 1
+    used.add(candidate.lower())
+    return candidate
+
+
 class AttachmentSource(Protocol):
     async def open(self, blob_path: str) -> tuple[AsyncIterator[bytes], str, int]: ...
 
@@ -98,6 +120,7 @@ class ThreadPackager:
                 return len(placeholder), True
 
         inline_count = 0; attachment_count = 0
+        used_att_names: dict[str, set] = {}  # att_dir -> lowercased names taken
         for m in messages:
             att_dir = (f"{tsafe}-attachments" if self.layout == "single_thread"
                        else f"per-message/{tsafe}/{_safe_name(m.external_id)}/attachments")
@@ -111,7 +134,10 @@ class ThreadPackager:
                 # placeholder under it — the operator can tell from
                 # the file size (and from manifest.json) that it's
                 # not the real attachment.
-                clean_name = _safe_name(att["name"])
+                clean_name = _unique_in_dir(
+                    _safe_name(att["name"]),
+                    used_att_names.setdefault(att_dir, set()),
+                )
                 target = f"{att_dir}/{clean_name}"
                 written, missing = await _add_stream(target, att["blob_path"])
                 if missing:

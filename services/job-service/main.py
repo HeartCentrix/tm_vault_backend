@@ -1,6 +1,7 @@
 """Job Service - Manages jobs, backup triggers, restore, and exports"""
 from contextlib import asynccontextmanager
 from typing import Optional, Dict, List
+import os
 import uuid
 from uuid import UUID, uuid4
 from datetime import datetime, timezone
@@ -12,6 +13,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select, func, text
 
 from shared.config import settings
+from shared.auth_enforcement import require_principal  # Ops/Data Check 17: guard unguarded routes
 from shared.database import get_db, close_db, AsyncSession, engine
 from shared.models import Job, JobLog, JobType, JobStatus, Resource, Snapshot, SnapshotItem, SnapshotStatus, SlaPolicy, ResourceType, ResourceStatus, BackupBatch
 from shared.schemas import (
@@ -19,9 +21,25 @@ from shared.schemas import (
 )
 from shared.message_bus import message_bus, create_backup_message, create_restore_message
 from shared.batch_pending import classify_scope, BatchPendingState
-from shared.audit import emit_backup_triggered
+from shared.audit import emit_backup_triggered, internal_audit_headers
+from shared.security import get_current_user_from_token
 from shared.sla_workloads import filter_resource_map_by_policy_flags
 from shared.tier2_discovery import chunk_user_ids
+
+
+def resolve_full_backup(requested, has_previous_backup: bool) -> bool:
+    """An explicit full-backup request is always honored.
+
+    History must never veto the caller: the old
+    `requested and not has_previous_backup` downgrade meant a resource
+    whose baseline walk failed (but which had junk incrementals) could
+    NEVER be fully re-captured — not even from the UI. First-backup
+    defaulting is the scheduler's job, not a veto here. The
+    `has_previous_backup` parameter is kept so call sites stay
+    self-documenting. Pinned by
+    tests/services/test_job_service_full_backup.py.
+    """
+    return bool(requested)
 
 
 def _parse_uuid(value: Optional[str], field_name: str) -> Optional[UUID]:
@@ -77,6 +95,7 @@ M365_RESOURCE_TYPES = [
     ResourceType.USER_CONTACTS,
     ResourceType.USER_ONEDRIVE,
     ResourceType.USER_CHATS,
+    ResourceType.USER_ARCHIVE,
     # Group + SharePoint resources.
     ResourceType.M365_GROUP,
     ResourceType.SHAREPOINT_SITE,
@@ -180,6 +199,30 @@ async def _create_batch_backup_jobs(
     if not resources_map:
         raise HTTPException(status_code=404, detail="No valid resources found")
 
+    # scope_ids represents the OPERATOR'S intent — what the user/operator
+    # clicked. Tier-2 child rows (USER_MAIL / USER_CHATS / USER_ONEDRIVE /
+    # USER_CALENDAR / USER_CONTACTS) are discovered automatically as
+    # children of ENTRA_USER and MUST NOT appear in the scope: putting
+    # them in inflates array_length(scope_user_ids,1) so the UI Activity
+    # row says "54 users" when in reality 9 ENTRA_USER + 45 Tier-2
+    # children are present. The batch finalizer gate-1 already expands
+    # ENTRA_USER scope entries into Tier-2 children at check time
+    # (shared/batch_rollup.py:_finalize_batch_if_complete), so excluding
+    # them here doesn't lose coverage. Computed up front because BOTH the
+    # debounce below and the backup_batches INSERT key on it.
+    _T2_EXCLUDE = {
+        ResourceType.USER_MAIL,
+        ResourceType.USER_CALENDAR,
+        ResourceType.USER_CONTACTS,
+        ResourceType.USER_ONEDRIVE,
+        ResourceType.USER_CHATS,
+        ResourceType.USER_ARCHIVE,
+    }
+    scope_ids = [
+        r.id for r in resources_map.values()
+        if r.type not in _T2_EXCLUDE
+    ]
+
     # ── Batch-level debounce — protects against rapid duplicate triggers.
     #
     # The existing G1 dedup (further below) checks for IN_PROGRESS
@@ -194,9 +237,16 @@ async def _create_batch_backup_jobs(
     # 64MB bytes_added.
     #
     # This guard runs BEFORE the batch INSERT. If a manual_bulk batch for
-    # the same tenant is IN_PROGRESS and was created in the last 30s,
-    # treat the new trigger as a duplicate and return a pointer to the
-    # existing batch instead of creating a parallel run.
+    # the same tenant with the SAME scope is IN_PROGRESS and was created
+    # in the last 30s, treat the new trigger as a duplicate and return a
+    # pointer to the existing batch instead of creating a parallel run.
+    #
+    # Scope match is set-equality on scope_user_ids (@> plus <@), NOT
+    # tenant-wide: every single-user "Backup now" also lands here with
+    # source='manual_bulk', so a tenant-wide window silently dropped the
+    # SECOND of two different-user clicks made within 30s (user B never
+    # backed up, API still said QUEUED). The 2026-05-17 duplicate batches
+    # carried identical scopes, so the incident protection is preserved.
     if not tier2:
         try:
             sample_res = next(iter(resources_map.values()))
@@ -212,11 +262,14 @@ async def _create_batch_backup_jobs(
                            AND status = 'IN_PROGRESS'
                            AND created_at > NOW() - INTERVAL '30 seconds'
                            AND (cast(:bid AS uuid) IS NULL OR id <> cast(:bid AS uuid))
+                           AND scope_user_ids @> cast(:scope AS uuid[])
+                           AND scope_user_ids <@ cast(:scope AS uuid[])
                          ORDER BY created_at DESC
                          LIMIT 1
                         """
                     ),
-                    {"tid": tenant_for_debounce, "bid": batch_id},
+                    {"tid": tenant_for_debounce, "bid": batch_id,
+                     "scope": [str(x) for x in scope_ids]},
                 )).first()
             if existing is not None:
                 existing_bid = str(existing[0])
@@ -258,28 +311,8 @@ async def _create_batch_backup_jobs(
         try:
             sample_res = next(iter(resources_map.values()))
             tenant_for_batch = sample_res.tenant_id
-            # scope_user_ids represents the OPERATOR'S intent — what the
-            # user/operator clicked. Tier-2 child rows (USER_MAIL /
-            # USER_CHATS / USER_ONEDRIVE / USER_CALENDAR / USER_CONTACTS)
-            # are discovered automatically as children of ENTRA_USER and
-            # MUST NOT appear in the scope: putting them in inflates
-            # array_length(scope_user_ids,1) so the UI Activity row says
-            # "54 users" when in reality 9 ENTRA_USER + 45 Tier-2 children
-            # are present. The batch finalizer gate-1 already expands
-            # ENTRA_USER scope entries into Tier-2 children at check
-            # time (shared/batch_rollup.py:_finalize_batch_if_complete),
-            # so excluding them here doesn't lose coverage.
-            _T2_EXCLUDE = {
-                ResourceType.USER_MAIL,
-                ResourceType.USER_CALENDAR,
-                ResourceType.USER_CONTACTS,
-                ResourceType.USER_ONEDRIVE,
-                ResourceType.USER_CHATS,
-            }
-            scope_ids = [
-                r.id for r in resources_map.values()
-                if r.type not in _T2_EXCLUDE
-            ]
+            # scope_user_ids = the operator-intent scope_ids computed at
+            # function entry (Tier-2 children excluded — see comment there).
             await db.execute(text("""
                 INSERT INTO backup_batches
                     (id, tenant_id, source, scope_user_ids, status, created_at)
@@ -316,16 +349,30 @@ async def _create_batch_backup_jobs(
         # Closes the 2026-05-15 incident where 45 of 54 SLA'd users
         # had no Tier-2 children at click time so their backup never
         # ran and the batch hung at IN_PROGRESS forever.
+        #
+        # Only ENTRA_USERs participate in the deferral machinery:
+        # discovery.tier2 materialises children for USERS only, and the
+        # discovery-worker skips non-user ids WITHOUT writing an outcome
+        # row. A deferred SHAREPOINT_SITE / M365_GROUP / AZURE_* entry
+        # would therefore sit WAITING_DISCOVERY until the watchdog flips
+        # it DISCOVERY_FAILED at deadline — pinning the Activity row
+        # "In Progress" for DISCOVERY_DEADLINE_MIN even though every job
+        # finished. Non-user resources are backed up directly by the
+        # fan-out below; they never need discovery-then-backup chaining.
         try:
+            user_scope_ids = [
+                r.id for r in resources_map.values()
+                if r.type == ResourceType.ENTRA_USER
+            ]
             tier2_rows = (await db.execute(text("""
                 SELECT DISTINCT parent_resource_id
                   FROM resources
                  WHERE parent_resource_id = ANY(cast(:ids AS uuid[]))
                    AND archived_at IS NULL
-            """), {"ids": [str(x) for x in scope_ids]})).all()
+            """), {"ids": [str(x) for x in user_scope_ids]})).all()
             tier2_owners = {row[0] for row in tier2_rows if row[0] is not None}
 
-            ready, deferred = classify_scope(scope_ids, tier2_owners)
+            ready, deferred = classify_scope(user_scope_ids, tier2_owners)
             deferred_discovery_count = len(deferred)
 
             if deferred:
@@ -609,7 +656,7 @@ async def _create_batch_backup_jobs(
 
     for (tenant_id, routing_key), resource_ids in tenant_queue_groups.items():
         has_previous_backup = any(resources_map[rid].last_backup_at is not None for rid in resource_ids)
-        effective_full_backup = (full_backup or False) and not has_previous_backup
+        effective_full_backup = resolve_full_backup(full_backup, has_previous_backup)
 
         job = Job(
             id=uuid4(), type=JobType.BACKUP,
@@ -717,12 +764,40 @@ async def lifespan(app: FastAPI):
         await close_db()
 
 
+from shared.audit_middleware import AuditMiddleware  # Ops/Data Check 3: mutation-audit backstop
 app = FastAPI(title="Job Service", version="1.0.0", lifespan=lifespan)
+app.add_middleware(AuditMiddleware, service_name="job-service")
 
 # Chat-export router — /api/v1/exports/chat/* (trigger, estimate, SSE, cancel, delete).
 # Imported after app creation so the module's router instance is registered.
 from chat_export import router as chat_export_router  # noqa: E402
 app.include_router(chat_export_router)
+
+# Same authorization rules the chat-export router uses — every route below
+# that creates, describes or serves an export artifact goes through these, so
+# no door into the pipeline can be laxer than another.
+from export_authz import (  # noqa: E402
+    AUTHORIZED_SCOPE_KEY,
+    SPEC_KEYS,
+    authorize_export_scope,
+    authorize_restore_destinations,
+    authorized_scope_stamp,
+    ensure_job_access,
+    ensure_resource_access,
+    spec_scope_ids,
+)
+
+# Request-body keys the export/restore pipeline actually consumes. Anything
+# else a caller sends is dropped instead of being merged into Job.spec: the
+# pre-fix `spec={..., **request}` let the caller write any spec field,
+# including the ones authorization used to read (`kind`, `userId`).
+#
+# The list lives in export_authz as the union of its destination / non-
+# destination classification, so a key cannot reach the worker without a
+# decision about whether it steers WHERE the restore writes (round-3 blocker:
+# `targetUserId` was in this allowlist and consumed by restore-worker, but no
+# gate authorized it).
+_EXPORT_SPEC_KEYS = SPEC_KEYS
 
 
 @app.get("/health")
@@ -821,7 +896,7 @@ def _build_job_response(job: "Job", roll: Optional[Dict]) -> JobResponse:
     )
 
 
-@app.get("/api/v1/jobs")
+@app.get("/api/v1/jobs", dependencies=[Depends(require_principal)])
 async def list_jobs(
     # ge=0 (not 1) so a frontend caller passing page=0 — natural
     # offset-style — gets the first page instead of a 422. Both 0 and 1
@@ -844,7 +919,15 @@ async def list_jobs(
 
     total = (await db.execute(select(func.count(Job.id)).where(*filters))).scalar() or 0
     offset = max(page - 1, 0) * size
-    stmt = select(Job).where(*filters).order_by(Job.created_at.desc()).offset(offset).limit(size)
+    # id tiebreak — a single "Backup all" click inserts every partition's Job
+    # row in one transaction, so created_at ties are routine (26 of the 28
+    # BACKUP rows in the last 24h on prod share two timestamps) and
+    # LIMIT/OFFSET over a non-unique key re-slices the tie group per request.
+    stmt = (
+        select(Job).where(*filters)
+        .order_by(Job.created_at.desc(), Job.id.desc())
+        .offset(offset).limit(size)
+    )
     result = await db.execute(stmt)
     jobs = result.scalars().all()
 
@@ -861,7 +944,7 @@ async def list_jobs(
     )
 
 
-@app.get("/api/v1/jobs/{job_id}", response_model=JobResponse)
+@app.get("/api/v1/jobs/{job_id}", response_model=JobResponse, dependencies=[Depends(require_principal)])
 async def get_job(job_id: str, db: AsyncSession = Depends(get_db)):
     stmt = select(Job).where(Job.id == _parse_uuid(job_id, "job_id"))
     result = await db.execute(stmt)
@@ -872,7 +955,7 @@ async def get_job(job_id: str, db: AsyncSession = Depends(get_db)):
     return _build_job_response(job, rollups.get(str(job.id)))
 
 
-@app.get("/api/v1/jobs/{job_id}/progress")
+@app.get("/api/v1/jobs/{job_id}/progress", dependencies=[Depends(require_principal)])
 async def get_job_progress(job_id: str, token: Optional[str] = Query(None)):
     async def event_stream():
         for i in range(300):
@@ -1019,7 +1102,7 @@ async def _revert_snapshot_storage(db: AsyncSession, snapshot) -> dict:
     }
 
 
-@app.post("/api/v1/jobs/{job_id}/cancel", status_code=204)
+@app.post("/api/v1/jobs/{job_id}/cancel", status_code=204, dependencies=[Depends(require_principal)])
 async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
     """Cancel a job and fully revert any partial work.
 
@@ -1201,10 +1284,17 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
                      "snapshots_reverted": 0}
 
     if resource_ids:
-        await db.execute(
-            text("UPDATE resources SET last_backup_status = 'CANCELLED', last_backup_job_id = :jid WHERE id = ANY(:ids)"),
-            {"jid": job.id, "ids": resource_ids},
-        )
+        # Only BACKUP jobs own the resource's backup bookkeeping. For a
+        # RESTORE/EXPORT job, job.resource_id is the SOURCE resource whose
+        # last backup is intact — stamping CANCELLED here dropped it out
+        # of the protection report (report-service counts
+        # last_backup_status == 'COMPLETED') and pointed
+        # last_backup_job_id at a restore job.
+        if job.type == JobType.BACKUP:
+            await db.execute(
+                text("UPDATE resources SET last_backup_status = 'CANCELLED', last_backup_job_id = :jid WHERE id = ANY(:ids)"),
+                {"jid": job.id, "ids": resource_ids},
+            )
         # Atomic flip — was destructive delete, caused two real prod
         # incidents:
         #
@@ -1449,7 +1539,7 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
         import httpx as _httpx
         action = "RESTORE_CANCELLED" if job.type == JobType.RESTORE else "BACKUP_CANCELLED"
         async with _httpx.AsyncClient(timeout=5.0) as _client:
-            await _client.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json={
+            await _client.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", headers=internal_audit_headers(), json={
                 "action": action,
                 "tenant_id": str(job.tenant_id) if job.tenant_id else None,
                 "actor_type": "USER",
@@ -1502,29 +1592,57 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
             pass
 
 
-@app.post("/api/v1/jobs/{job_id}/retry", response_model=JobResponse)
+@app.post("/api/v1/jobs/{job_id}/retry", dependencies=[Depends(require_principal)])
 async def retry_job(job_id: str, db: AsyncSession = Depends(get_db)):
+    """Re-run the work of a terminal job.
+
+    History (2026-08-18, "retry button is not working"): this used to flip
+    the OLD job row back to QUEUED and publish NOTHING — the work never
+    ran, and (post the outbox-reconciler fix) a phantom QUEUED job also
+    suppressed the AUTO_RETRY sweep's in-flight guard for the resource.
+    Re-queueing existing rows is the shape the 2026-08-07 review rejected;
+    the correct move is a FRESH dispatch. Single-resource jobs delegate to
+    the trigger-user path (inheriting its inaccessible guard, Teams-chat
+    redirect, and routing); bulk parents are pointed at the batch-retry
+    flow, which retries only the incomplete children.
+    """
     stmt = select(Job).where(Job.id == _parse_uuid(job_id, "job_id"))
     result = await db.execute(stmt)
     job = result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    job.status = JobStatus.QUEUED
-    job.attempts = 0
-    job.progress_pct = 0
-    await db.flush()
-    return JobResponse(
-        id=str(job.id), type=job.type.value if hasattr(job.type, 'value') else str(job.type),
-        status=job.status.value, progress=0,
-        resourceId=str(job.resource_id) if job.resource_id else None,
-        createdAt=job.created_at.isoformat(),
-        updatedAt=job.updated_at.isoformat(),
+    if job.status in (JobStatus.QUEUED, JobStatus.PENDING, JobStatus.RUNNING,
+                      JobStatus.RETRYING, JobStatus.CANCELLING):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job is {job.status.value} — retry applies to terminal jobs only",
+        )
+    if job.batch_resource_ids:
+        raise HTTPException(
+            status_code=409,
+            detail="This is a bulk batch job — use the batch retry flow "
+                   "(re-runs only the incomplete resources)",
+        )
+    if not job.resource_id:
+        raise HTTPException(
+            status_code=422,
+            detail="Job has no resource to re-run",
+        )
+    # Same code path as POST /backups/trigger-user/{id} — one behavior.
+    return await trigger_bulk_backup(
+        resource_id=str(job.resource_id), request=None, db=db,
     )
 
 
-@app.get("/api/v1/jobs/{job_id}/logs")
+@app.get("/api/v1/jobs/{job_id}/logs", dependencies=[Depends(require_principal)])
 async def get_job_logs(job_id: str, page: int = Query(1), size: int = Query(50), db: AsyncSession = Depends(get_db)):
-    stmt = select(JobLog).where(JobLog.job_id == _parse_uuid(job_id, "job_id")).order_by(JobLog.timestamp.desc()).offset((page-1)*size).limit(size)
+    # Log lines are written in bursts and `timestamp` collides constantly —
+    # without the id tiebreak paging a job's log repeats and drops lines.
+    stmt = (
+        select(JobLog).where(JobLog.job_id == _parse_uuid(job_id, "job_id"))
+        .order_by(JobLog.timestamp.desc(), JobLog.id.desc())
+        .offset((page-1)*size).limit(size)
+    )
     result = await db.execute(stmt)
     logs = result.scalars().all()
     return [
@@ -1532,6 +1650,30 @@ async def get_job_logs(job_id: str, page: int = Query(1), size: int = Query(50),
          "level": log.level, "message": log.message, "details": log.details}
         for log in logs
     ]
+
+
+async def _deduped_pollable_job_id(first: Dict, db: AsyncSession) -> Optional[str]:
+    """Resolve a pollable job id for a deduped batch-trigger result.
+
+    The batch debounce returns jobId=None with a duplicateBatchId
+    pointer. Single-resource callers MUST NOT fall through to the legacy
+    single-resource publish in that case: that path backs up only the
+    ENTRA_USER profile row, silently skipping every Tier-2 child
+    (mail/OneDrive/calendar/contacts/chats) while returning 200. Point
+    the caller at the newest job of the already-running batch instead.
+    """
+    dup_bid = first.get("duplicateBatchId")
+    if not dup_bid:
+        return None
+    row = (await db.execute(
+        text(
+            "SELECT id::text FROM jobs "
+            " WHERE spec->>'batch_id' = :bid "
+            " ORDER BY created_at DESC LIMIT 1"
+        ),
+        {"bid": str(dup_bid)},
+    )).first()
+    return str(row[0]) if row else None
 
 
 async def _route_single_trigger(
@@ -1570,6 +1712,7 @@ async def _route_single_trigger(
             ResourceType.USER_CONTACTS,
             ResourceType.USER_CALENDAR,
             ResourceType.USER_CHATS,
+            ResourceType.USER_ARCHIVE,
         ]),
         Resource.status.notin_(excluded_statuses),
         Resource.archived_at.is_(None),
@@ -1597,7 +1740,7 @@ async def _route_single_trigger(
     )
 
 
-@app.post("/api/v1/backups/trigger", response_model=JobResponse)
+@app.post("/api/v1/backups/trigger", response_model=JobResponse, dependencies=[Depends(require_principal)])
 async def trigger_backup(request: TriggerBackupRequest, db: AsyncSession = Depends(get_db)):
     # Fetch resource to get tenant info
     resource_uuid = _parse_uuid(request.resourceId, "resourceId")
@@ -1626,13 +1769,13 @@ async def trigger_backup(request: TriggerBackupRequest, db: AsyncSession = Depen
             detail="Resource must have an SLA policy assigned before triggering a backup"
         )
 
-    # If fullBackup is True but resource already has a backup, set to False
-    effective_full_backup = request.fullBackup or False
-    if effective_full_backup and resource.last_backup_at is not None:
-        print(f"[JOB_SERVICE] Resource {request.resourceId} has last_backup_at={resource.last_backup_at}, setting fullBackup=False")
-        effective_full_backup = False
-    else:
-        print(f"[JOB_SERVICE] Resource {request.resourceId} first backup (last_backup_at={resource.last_backup_at}), fullBackup={effective_full_backup}")
+    # Explicit fullBackup is honored even when prior backups exist — the
+    # old downgrade made a failed-baseline drive permanently unrecoverable
+    # from the UI (see resolve_full_backup).
+    effective_full_backup = resolve_full_backup(
+        request.fullBackup, resource.last_backup_at is not None,
+    )
+    print(f"[JOB_SERVICE] Resource {request.resourceId} last_backup_at={resource.last_backup_at}, fullBackup={effective_full_backup}")
 
     # Tier-2 gap-fill for ENTRA_USER targets: existing children join the
     # fan-out, missing ones get discovered + backed up via discovery.tier2.
@@ -1654,6 +1797,30 @@ async def trigger_backup(request: TriggerBackupRequest, db: AsyncSession = Depen
         # for status polling, so the BATCH job id is what it needs to
         # track — the per-resource fan-out lives under it.
         first = batched[0] if isinstance(batched, list) and batched else None
+        if isinstance(first, dict) and first.get("deduped") and not first.get("jobId"):
+            # Deduped/debounced against an in-flight batch. Never fall
+            # through to the legacy publish below — it would queue a
+            # profile-only duplicate. Track the existing batch, or 409
+            # if it has no pollable job.
+            poll_id = await _deduped_pollable_job_id(first, db)
+            if poll_id:
+                now_iso = datetime.now(timezone.utc).isoformat()
+                return JobResponse(
+                    id=poll_id,
+                    type="BACKUP",
+                    status="RUNNING",
+                    progress=0,
+                    resourceId=str(resource.id),
+                    createdAt=now_iso,
+                    updatedAt=now_iso,
+                )
+            raise HTTPException(
+                status_code=409,
+                detail=first.get("message") or (
+                    "A backup for this resource was just triggered and "
+                    "is still in flight."
+                ),
+            )
         if isinstance(first, dict) and first.get("jobId"):
             now_iso = datetime.now(timezone.utc).isoformat()
             return JobResponse(
@@ -1722,8 +1889,8 @@ async def trigger_backup(request: TriggerBackupRequest, db: AsyncSession = Depen
     )
 
 
-@app.post("/api/v1/backups/trigger-user/{resource_id}")
-@app.post("/api/v1/backups/trigger-bulk")
+@app.post("/api/v1/backups/trigger-user/{resource_id}", dependencies=[Depends(require_principal)])
+@app.post("/api/v1/backups/trigger-bulk", dependencies=[Depends(require_principal)])
 async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBackupRequest = None, db: AsyncSession = Depends(get_db)):
     if request and request.resourceIds:
         # Fetch all resources with tenant info
@@ -1803,6 +1970,24 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
         )
         if batched:
             first = batched[0] if isinstance(batched, list) and batched else None
+            if isinstance(first, dict) and first.get("deduped") and not first.get("jobId"):
+                # Same contract as /backups/trigger: a deduped result must
+                # not fall through to the profile-only legacy publish.
+                poll_id = await _deduped_pollable_job_id(first, db)
+                if poll_id:
+                    return {
+                        "jobId": poll_id,
+                        "status": "RUNNING",
+                        "resourceId": resource_id,
+                        "deduped": True,
+                    }
+                raise HTTPException(
+                    status_code=409,
+                    detail=first.get("message") or (
+                        "A backup for this resource was just triggered and "
+                        "is still in flight."
+                    ),
+                )
             if isinstance(first, dict) and first.get("jobId"):
                 return {
                     "jobId": str(first["jobId"]),
@@ -1847,7 +2032,7 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
     return {"error": "No resources provided"}
 
 
-@app.post("/api/v1/backups/trigger-datasource")
+@app.post("/api/v1/backups/trigger-datasource", dependencies=[Depends(require_principal)])
 async def trigger_datasource_backup(request: TriggerDatasourceBackupRequest, db: AsyncSession = Depends(get_db)):
     service_key = (request.serviceType or "").lower()
     resource_types = M365_RESOURCE_TYPES if service_key == "m365" else AZURE_RESOURCE_TYPES if service_key == "azure" else None
@@ -1989,22 +2174,189 @@ async def trigger_datasource_backup(request: TriggerDatasourceBackupRequest, db:
     return jobs
 
 
+# ── Empty-selection guard (TMV-001, QA sweep 2026-08-11, v0.1.371) ───────
+#
+# Reported: on Recovery › Calendar the toolbar's Download and Recover stay
+# enabled at zero selection (verified in the DOM —
+# `.recovery-toolbar-btn-recover` reports disabled === false while the
+# counter reads "0 selected"), and RestoreModal defaults to scope
+# "selected", so a stray click posts
+# `{restoreType: "IN_PLACE", snapshotIds: [snap], itemIds: []}`.
+# restore-worker reads an empty item list as "everything in the snapshot",
+# so that empty selection replays the WHOLE calendar (5,418 events for the
+# test resource) into the live mailbox. Nothing downstream re-checks.
+#
+# The catch, and why this guard is shaped the way it is: an empty `itemIds`
+# is ALSO how a legitimate whole-snapshot restore is expressed today.
+# RestoreModal's scope="full" radio and DownloadModal's scope="all" send
+# exactly the same three keys, and 16 tests in
+# tests/services/test_restore_destination_authz.py +
+# tests/services/test_export_scope_authz.py post that bare shape on purpose.
+# The two intents are byte-identical on the wire, so the SERVER CANNOT TELL
+# THEM APART. Only the client knows which radio is selected.
+#
+# Therefore: the caller declares its scope, and the guard enforces the
+# declaration.
+#
+#   selectionScope: "SELECTED"  → itemIds/folderPaths MUST be non-empty,
+#                                 else 400 SELECTION_EMPTY.
+#   selectionScope: "ALL"       → whole resource, empty itemIds is correct.
+#   (absent)                    → today's contract, unchanged: treated as a
+#                                 whole-snapshot operation.
+#
+# FRONTEND HALF (the other agent's, and the reason this alone does not close
+# the hole): RestoreModal and DownloadModal already hold the answer in their
+# `scope` state — they must forward it as
+# `selectionScope: scope === 'selected' ? 'SELECTED' : 'ALL'` on every
+# triggerRestore / triggerExport body. Once every client sends it, set
+# RESTORE_REQUIRE_EXPLICIT_SCOPE=true and an UNDECLARED empty selection
+# fails closed too, with no rebuild. That flag is off by default only
+# because flipping it before the SPA declares its scope would break the
+# whole-snapshot restore path those 16 tests cover.
+#
+# Pinned by tests/services/test_restore_empty_selection_guard.py.
+_SELECTED_SCOPE_DECLARATIONS = frozenset({"SELECTED", "SELECTION", "ITEMS"})
+_FULL_SCOPE_DECLARATIONS = frozenset({"ALL", "FULL", "EVERYTHING", "WHOLE"})
+_SCOPE_KEYS = ("selectionScope", "restoreScope", "exportScope")
+
+# Fail-closed switch for the undeclared case. See the migration note above.
+_REQUIRE_EXPLICIT_SCOPE = os.getenv(
+    "RESTORE_REQUIRE_EXPLICIT_SCOPE", "false",
+).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _declared_scope(body: Optional[dict]) -> Optional[str]:
+    """"SELECTED" | "ALL" | None (nothing declared)."""
+    for key in _SCOPE_KEYS:
+        value = str((body or {}).get(key) or "").strip().upper()
+        if value in _SELECTED_SCOPE_DECLARATIONS:
+            return "SELECTED"
+        if value in _FULL_SCOPE_DECLARATIONS:
+            return "ALL"
+    return None
+
+
+def _implies_full_scope(body: Optional[dict]) -> bool:
+    """Modes that legitimately carry no item ids and already say so.
+
+    These keys are how the SPA marks a whole-resource operation TODAY, so
+    RESTORE_REQUIRE_EXPLICIT_SCOPE does not break them when it is turned on:
+
+      workloads          RestoreModal / DownloadModal scope="full"|"all"
+                         (the modal already blocks submit on an empty set)
+      entraSections      Entra directory export
+      recoverMode        "directory" = whole-directory Entra restore
+      azureRestoreMode / azureRestoreParams
+                         Azure SQL / PostgreSQL / VM — a restore rebuilds the
+                         whole resource, and Recovery.tsx deliberately does
+                         not require ticked items for those kinds
+      folderPaths        Files folder-select v2 (server-side expansion)
+      newSiteName        SharePoint "recover to a new site"
+      scope == "site"    the deprecated /api/v1/sharepoint/{id}/download
+                         wrapper's own whole-site marker
+    """
+    body = body or {}
+    if str(body.get("recoverMode") or "").strip().lower() in (
+        "directory", "all", "full",
+    ):
+        return True
+    if str(body.get("scope") or "").strip().lower() == "site":
+        return True
+    for key in (
+        "workloads", "entraSections", "folderPaths",
+        "azureRestoreParams", "azureRestoreMode", "newSiteName",
+    ):
+        value = body.get(key)
+        if value is None:
+            continue
+        if isinstance(value, (str, bytes, dict, list, tuple, set)):
+            if len(value) > 0:
+                return True
+        else:
+            return True
+    return False
+
+
+def assert_selection_not_empty(body: Optional[dict], item_ids, *, action: str) -> None:
+    """400 when a destructive request resolves to nothing the caller picked.
+
+    Same rule and same wording family as the guard
+    `files_export_or_restore` has carried since Files folder-select v2
+    ("Select at least one item or folder") — applied here to the two routes
+    that actually persist the Job and publish to the restore queues.
+    """
+    if item_ids:
+        return
+    body = body or {}
+    if body.get("folderPaths"):
+        return
+    scope = _declared_scope(body)
+    if scope == "ALL":
+        return
+    # A body that marks itself whole-resource some OTHER way is exempt
+    # regardless of what it declared. This check used to sit only in the
+    # `scope is None` branch, which 400'd two real, shipping flows: the Entra
+    # directory restore (RestoreModal's Entra branch returns early and never
+    # touches `scope`, so a blanket client-side `selectionScope: 'SELECTED'`
+    # would reach here with entraSections set and no itemIds) and the Entra
+    # directory export (DownloadModal posts itemIds: [] with no scope at all).
+    # Refusing to restore is the second-worst outcome for a backup product,
+    # so the whole-resource signals win over a mis-declared scope rather than
+    # the other way round.
+    if _implies_full_scope(body):
+        return
+    if scope is None:
+        # Undeclared: today's contract says "whole snapshot" — 16 existing
+        # authz tests post exactly this shape deliberately. Only the
+        # fail-closed switch overrides it.
+        if not _REQUIRE_EXPLICIT_SCOPE:
+            return
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "error": "SELECTION_EMPTY",
+            "message": (
+                f"Select at least one item to {action}, or declare a "
+                "whole-resource operation with selectionScope=ALL."
+            ),
+        },
+    )
+
+
 @app.post("/api/v1/jobs/restore")
 @app.post("/api/v1/jobs/restore/mailbox")
 @app.post("/api/v1/jobs/restore/onedrive")
 @app.post("/api/v1/jobs/restore/sharepoint")
 @app.post("/api/v1/jobs/restore/entra-object")
-async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_db)):
-    """Trigger a restore job and publish to RabbitMQ"""
+async def trigger_restore(
+    request: dict = None,
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(get_current_user_from_token),
+):
+    """Trigger a restore job and publish to RabbitMQ
+
+    Authorization (see export_authz): this is an export-producing path too —
+    `files_export_or_restore` forwards restoreType=EXPORT_ZIP here and
+    `/api/v1/jobs/export/{id}/download` serves any COMPLETED job that has a
+    blob_path regardless of Job.type. So it takes the same gate: every
+    requested snapshot/item, plus EVERY destination the restore engines steer
+    by, must resolve to a resource the caller is entitled to and owns (or holds
+    an operator role for). Internal callers (`files_export_or_restore`) pass
+    their own verified user through."""
     if not request:
         raise HTTPException(status_code=400, detail="Request body is required")
 
     restore_type = request.get("restoreType", "IN_PLACE")
     snapshot_ids = request.get("snapshotIds", [])
     item_ids = request.get("itemIds", [])
-    target_user_id = request.get("targetUserId")
+
+    # BEFORE anything is built, authorized, or queued: an empty selection is
+    # not a restore of everything unless the caller said so. See
+    # _declares_full_scope above for why this cannot be inferred.
+    assert_selection_not_empty(request, item_ids, action="recover")
+
     spec = {
-        "targetUserId": target_user_id,
+        "targetUserId": request.get("targetUserId"),
         "targetResourceId": request.get("targetResourceId"),
         "targetEnvironmentId": request.get("targetEnvironmentId"),
         "exportFormat": request.get("exportFormat"),
@@ -2050,6 +2402,24 @@ async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_d
         "newSiteAlias": request.get("newSiteAlias"),
         "newSiteOwnerEmail": request.get("newSiteOwnerEmail"),
     }
+
+    # BOTH ENDS. The source scope is what gets read; the destination is where
+    # the bytes get WRITTEN, and restore-worker resolves it from
+    # `spec.targetUserId` first (main.py:1507) — the OneDrive engine reads only
+    # that key (:3070) — so authorizing `targetResourceId` alone left a rename
+    # away from writing into a colleague's OneDrive. `authorize_restore_
+    # destinations` authorizes every classified destination key and fails closed
+    # on one it does not recognize; it is handed the built spec (not the raw
+    # body) so it sees exactly what the worker will read.
+    scope_targets = await authorize_export_scope(
+        db, user, snapshot_ids=snapshot_ids, item_ids=item_ids,
+    )
+    dest_targets = await authorize_restore_destinations(db, user, spec)
+    for _dest_key, _dest_res in dest_targets.items():
+        # Persist the canonical Resource.id we authorized, so the worker's own
+        # lookup (which also accepts a Graph external_id) cannot land on a
+        # different row than the gate cleared.
+        spec[_dest_key] = str(_dest_res.id)
 
     # Fetch tenant/resource info — try snapshot first, then fall back to item lookup.
     # Without this, item-driven restores (no snapshot_ids passed) end up with
@@ -2107,6 +2477,25 @@ async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_d
         spec["totalBytes"] = 0
         print(f"[JOB_SERVICE] totalBytes estimate failed (non-fatal): {size_exc}")
 
+    job_spec = {
+        "restore_type": restore_type,
+        "snapshot_ids": snapshot_ids,
+        "item_ids": item_ids,
+        **spec,
+        # Server-derived attribution, stamped last (see trigger_export).
+        "userId": str(user.get("id") or ""),
+        "userEmail": user.get("email") or "",
+    }
+    # Record the scope this request authorized so the polled /status + download
+    # routes re-check the same resources instead of re-walking snapshot_items
+    # on every tick (see export_authz.AUTHORIZED_SCOPE_KEY). Server-written,
+    # not in the body allowlist, and ignored unless it still matches the spec's
+    # own ids — so it can never narrow the check.
+    job_spec[AUTHORIZED_SCOPE_KEY] = authorized_scope_stamp(
+        job_spec,
+        resource_id=resource_id,
+        resource_ids=[*scope_targets.keys(), *(r.id for r in dest_targets.values())],
+    )
     job = Job(
         id=uuid4(),
         type=JobType.RESTORE,
@@ -2114,12 +2503,7 @@ async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_d
         resource_id=UUID(resource_id) if resource_id else None,
         status=JobStatus.QUEUED,
         priority=1,
-        spec={
-            "restore_type": restore_type,
-            "snapshot_ids": snapshot_ids,
-            "item_ids": item_ids,
-            **spec,
-        }
+        spec=job_spec,
     )
     db.add(job)
     await db.flush()
@@ -2180,10 +2564,12 @@ async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_d
     try:
         import httpx as _httpx
         async with _httpx.AsyncClient(timeout=5.0) as _client:
-            await _client.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json={
+            await _client.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", headers=internal_audit_headers(), json={
                 "action": "RESTORE_TRIGGERED",
                 "tenant_id": tenant_id,
                 "actor_type": "USER",
+                "actor_id": str(user.get("id")) if user.get("id") else None,
+                "actor_email": user.get("email"),
                 "resource_id": resource_id,
                 "resource_type": resource_type,
                 "outcome": "PENDING",
@@ -2208,35 +2594,72 @@ async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_d
 
 
 @app.get("/api/v1/jobs/restore/{job_id}/status")
-async def get_restore_status(job_id: str, db: AsyncSession = Depends(get_db)):
+async def get_restore_status(
+    job_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(get_current_user_from_token),
+):
     stmt = select(Job).where(Job.id == _parse_uuid(job_id, "job_id"))
     result = await db.execute(stmt)
     job = result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    # Job ids are enumerable, and this route describes any job — including the
+    # EXPORT_ZIP jobs `files_export_or_restore` files as RESTORE. Same gate as
+    # /jobs/export/{id}/status so one spelling of "status" is not laxer than
+    # the other.
+    await ensure_job_access(db, user, job)
     return {"jobId": str(job.id), "status": job.status.value if hasattr(job.status, 'value') else str(job.status), "progress": job.progress_pct or 0}
 
 
-@app.get("/api/v1/jobs/restore/history")
+@app.get("/api/v1/jobs/restore/history", dependencies=[Depends(require_principal)])
 async def get_restore_history(page: int = 1, size: int = 50, db: AsyncSession = Depends(get_db)):
-    stmt = select(Job).where(Job.type == JobType.RESTORE).order_by(Job.created_at.desc()).offset((page-1)*size).limit(size)
+    stmt = (
+        select(Job).where(Job.type == JobType.RESTORE)
+        .order_by(Job.created_at.desc(), Job.id.desc())
+        .offset((page-1)*size).limit(size)
+    )
     result = await db.execute(stmt)
     jobs = result.scalars().all()
     return {"content": [{"id": str(j.id), "status": j.status.value, "createdAt": j.created_at.isoformat()} for j in jobs], "totalPages": 1, "totalElements": len(jobs), "size": size, "number": page}
 
 
 @app.post("/api/v1/jobs/export")
-async def trigger_export(request: dict, db: AsyncSession = Depends(get_db)):
+async def trigger_export(
+    request: dict,
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(get_current_user_from_token),
+):
     """Queue an export job: persist the Job row, publish to RabbitMQ so
     the restore-worker picks it up, and fire an EXPORT_TRIGGERED audit.
 
     Scope fields (tenant_id / resource_id / resource_type) are derived by
     walking snapshot → resource in the DB rather than trusting whatever
     the frontend happened to send on the request body — gives us reliable
-    audit scoping even when the caller omits those fields."""
+    audit scoping even when the caller omits those fields.
+
+    Authorization (see export_authz): this route was anonymous, which made it
+    the second door into the chat-export pipeline — restore-worker packages
+    Teams message bodies into the generic EXPORT_ZIP artifact, so an
+    unauthenticated POST here plus a download was the reported breach with an
+    extra step. The gate resolves every requested snapshot/item to its owning
+    resource in the DB and requires entitlement + ownership (or an operator
+    role) on all of them, so the caller cannot widen the scope past what they
+    may read. Internal callers (`sharepoint_download`) pass their own verified
+    user through."""
     restore_type = request.get("restoreType", "EXPORT_ZIP")
     snapshot_ids = request.get("snapshotIds", [])
     item_ids = request.get("itemIds", [])
+
+    # Same guard as trigger_restore: `POST /jobs/export` reaches the same
+    # restore.* queues and the same worker dispatch table, so an empty
+    # selection here exports (or, with restoreType=CROSS_USER, writes) the
+    # whole snapshot just as silently.
+    assert_selection_not_empty(request, item_ids, action="download")
+
+    scope_targets = await authorize_export_scope(
+        db, user, snapshot_ids=snapshot_ids, item_ids=item_ids
+    )
 
     tenant_id = None
     resource_id = None
@@ -2261,6 +2684,36 @@ async def trigger_export(request: dict, db: AsyncSession = Depends(get_db)):
             tenant_id = str(resource.tenant_id)
             resource_type = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
 
+    # Allowlisted body keys only, then server-derived attribution stamped
+    # LAST so no request key can shadow it. Authorization never reads these
+    # (see export_authz) — the audit trail and support do.
+    spec = {
+        "restore_type": restore_type,
+        "snapshot_ids": snapshot_ids,
+        "item_ids": item_ids,
+        **{k: request[k] for k in _EXPORT_SPEC_KEYS if k in request},
+        "userId": str(user.get("id") or ""),
+        "userEmail": user.get("email") or "",
+    }
+
+    # This route is not read-only either: `restoreType` is taken from the body
+    # verbatim and the message goes to restore.normal / restore.heavy, which
+    # restore-worker consumes and dispatches off `message.restoreType` (:626,
+    # handler table :723). So `POST /jobs/export` with restoreType=CROSS_USER
+    # reaches the same write path as /jobs/restore and needs the same
+    # destination gate.
+    dest_targets = await authorize_restore_destinations(db, user, spec)
+    for _dest_key, _dest_res in dest_targets.items():
+        spec[_dest_key] = str(_dest_res.id)
+
+    # Resolved+authorized scope, so the polled status/download routes do not
+    # re-walk snapshot_items per request (export_authz.AUTHORIZED_SCOPE_KEY).
+    spec[AUTHORIZED_SCOPE_KEY] = authorized_scope_stamp(
+        spec,
+        resource_id=resource_id,
+        resource_ids=[*scope_targets.keys(), *(r.id for r in dest_targets.values())],
+    )
+
     job = Job(
         id=uuid4(),
         type=JobType.EXPORT,
@@ -2268,12 +2721,7 @@ async def trigger_export(request: dict, db: AsyncSession = Depends(get_db)):
         resource_id=UUID(resource_id) if resource_id else None,
         status=JobStatus.QUEUED,
         priority=5,
-        spec={
-            "restore_type": restore_type,
-            "snapshot_ids": snapshot_ids,
-            "item_ids": item_ids,
-            **request,
-        },
+        spec=spec,
     )
     db.add(job)
     await db.commit()  # commit before publish so worker finds job
@@ -2290,7 +2738,9 @@ async def trigger_export(request: dict, db: AsyncSession = Depends(get_db)):
             item_ids=item_ids,
             resource_id=resource_id,
             tenant_id=tenant_id,
-            spec=request,
+            # The persisted spec, not the raw body — the worker must see the
+            # same allowlisted, server-stamped scope the Job row carries.
+            spec=spec,
             resource_type=resource_type,
         )
 
@@ -2314,7 +2764,7 @@ async def trigger_export(request: dict, db: AsyncSession = Depends(get_db)):
         from shared.export_routing import pick_export_queue
         queue = pick_export_queue(
             total_bytes=total_bytes,
-            include_attachments=bool(request.get("includeAttachments", True)),
+            include_attachments=bool(spec.get("includeAttachments", True)),
         )
         await message_bus.publish(queue, restore_message, priority=restore_message.get("priority", 5))
     else:
@@ -2327,10 +2777,14 @@ async def trigger_export(request: dict, db: AsyncSession = Depends(get_db)):
     try:
         import httpx as _httpx
         async with _httpx.AsyncClient(timeout=5.0) as _c:
-            await _c.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json={
+            await _c.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", headers=internal_audit_headers(), json={
                 "action": "EXPORT_TRIGGERED",
                 "tenant_id": tenant_id,
                 "actor_type": "USER",
+                # The route is authenticated now, so the trail can name who
+                # asked instead of recording an anonymous export.
+                "actor_id": str(user.get("id")) if user.get("id") else None,
+                "actor_email": user.get("email"),
                 "resource_id": resource_id,
                 "resource_type": resource_type,
                 "outcome": "SUCCESS",
@@ -2376,6 +2830,7 @@ async def files_export_or_restore(
     resource_id: str,
     request: dict,
     db: AsyncSession = Depends(get_db),
+    user: dict = Depends(get_current_user_from_token),
 ):
     """Unified entry point for Files folder-select v2.
 
@@ -2391,7 +2846,13 @@ async def files_export_or_restore(
 
     Delegates to ``trigger_restore`` so queueing / auditing / size-cap
     logic stays in one place.
+
+    Authorization (see export_authz): the path resource is gated here so an
+    unauthorized caller gets a 403 before any of the body validation below
+    runs; ``trigger_restore`` then authorizes the full resolved scope
+    (snapshot / items / CROSS_RESOURCE target) under the same rules.
     """
+    await ensure_resource_access(db, user, resource_id)
     resource = await db.get(Resource, _parse_uuid(resource_id, "resourceId"))
     if not resource:
         raise HTTPException(status_code=404, detail="Resource not found")
@@ -2459,11 +2920,16 @@ async def files_export_or_restore(
         "exportFormat": request.get("exportFormat")
             or ("ZIP" if restore_type == "EXPORT_ZIP" else None),
     }
-    return await trigger_restore(body, db)
+    return await trigger_restore(body, db, user)
 
 
 @app.post("/api/v1/sharepoint/{resource_id}/download")
-async def sharepoint_download(resource_id: str, request: dict, db: AsyncSession = Depends(get_db)):
+async def sharepoint_download(
+    resource_id: str,
+    request: dict,
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(get_current_user_from_token),
+):
     """DEPRECATED — use ``POST /api/v1/resources/{resource_id}/export-or-restore``.
 
     This endpoint predates the Files folder-select v2 payload. It
@@ -2479,11 +2945,17 @@ async def sharepoint_download(resource_id: str, request: dict, db: AsyncSession 
 
     Returns ``{jobId}``; poll ``/api/v1/jobs/export/{jobId}/status`` and
     then GET ``/api/v1/jobs/export/{jobId}/download`` to pull the bytes.
+
+    Authorization (see export_authz): gated on the path resource here, and on
+    the full resolved scope by ``trigger_export`` below. A SharePoint site has
+    no owning UPN, so this route now needs an operator role — the documented
+    grant in export_authz.
     """
     scope = (request.get("scope") or "").lower()
     if scope not in ("site", "folder", "file"):
         raise HTTPException(status_code=400, detail="scope must be site, folder, or file")
 
+    await ensure_resource_access(db, user, resource_id)
     resource = await db.get(Resource, _parse_uuid(resource_id, "resourceId"))
     if not resource:
         raise HTTPException(status_code=404, detail="Resource not found")
@@ -2547,21 +3019,32 @@ async def sharepoint_download(resource_id: str, request: dict, db: AsyncSession 
         "exportFormat": export_format,
         "scope": scope,
     }
-    return await trigger_export(body, db)
+    return await trigger_export(body, db, user)
 
 
 @app.get("/api/v1/jobs/export/{job_id}/status")
-async def get_export_status(job_id: str, db: AsyncSession = Depends(get_db)):
+async def get_export_status(
+    job_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(get_current_user_from_token),
+):
     stmt = select(Job).where(Job.id == _parse_uuid(job_id, "job_id"))
     result = await db.execute(stmt)
     job = result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    # Job ids are enumerable (GET /api/v1/jobs), so this route leaked the
+    # existence and progress of anyone's export until it grew a gate.
+    await ensure_job_access(db, user, job)
     return {"jobId": str(job.id), "status": job.status.value if hasattr(job.status, 'value') else str(job.status), "progress": job.progress_pct or 0}
 
 
 @app.get("/api/v1/jobs/export/{job_id}/download")
-async def download_export_zip(job_id: str, db: AsyncSession = Depends(get_db)):
+async def download_export_zip(
+    job_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(get_current_user_from_token),
+):
     """Stream the export ZIP back to the user.
 
     Restore-worker uploads the built ZIP to the `exports` Azure container at
@@ -2572,11 +3055,18 @@ async def download_export_zip(job_id: str, db: AsyncSession = Depends(get_db)):
       3. Stream them back as a ZIP attachment
 
     Without this, the frontend gets a 404 when it tries to download — what was
-    happening on Recovery exports."""
+    happening on Recovery exports.
+
+    Authorization (see export_authz): this route had none, and it is the one
+    that actually hands over the bytes — chat-export-worker publishes this URL
+    as `Job.result.signed_url`, so a bare job id was a download token for
+    anyone. The gate runs before the readiness check so probing a foreign job
+    cannot distinguish "not ready" from "not yours"."""
     from fastapi.responses import StreamingResponse
     job = await db.get(Job, _parse_uuid(job_id, "job_id"))
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    await ensure_job_access(db, user, job)
     status_val = job.status.value if hasattr(job.status, "value") else str(job.status)
     if status_val != "COMPLETED":
         raise HTTPException(status_code=409, detail=f"Export not ready (status={status_val})")
@@ -2648,21 +3138,38 @@ async def download_export_zip(job_id: str, db: AsyncSession = Depends(get_db)):
             seen.add(c); _uniq.append(c)
     candidate_containers = _uniq
 
-    content = None
+    # Probe with get_blob_properties instead of download_blob: exports are
+    # routed as whales up to HEAVY_EXPORT_THRESHOLD_BYTES (20 GB), and
+    # materializing the ZIP as one bytes object OOM-killed the pod on
+    # multi-GB downloads. The body is streamed chunk-by-chunk below.
+    found_container = None
+    blob_size = 0
     last_err: Exception | None = None
     for cand in candidate_containers:
         try:
-            content = await shard.download_blob(cand, blob_path)
-            if content is not None:
+            props = await shard.get_blob_properties(cand, blob_path)
+            if props is not None:
+                found_container = cand
+                blob_size = int(props.get("size") or 0)
                 print(f"[JOB_SERVICE] export download: found in container={cand}")
                 break
         except Exception as exc:
             last_err = exc
-            print(f"[JOB_SERVICE] container={cand} download failed: {exc}")
-    if content is None:
+            print(f"[JOB_SERVICE] container={cand} probe failed: {exc}")
+    if found_container is None:
         if last_err:
             raise HTTPException(status_code=500, detail=f"Failed to fetch export blob: {last_err}")
         raise HTTPException(status_code=404, detail=f"Export blob not found in any of: {candidate_containers}")
+
+    # Prime the stream before sending headers so a blob deleted between
+    # the probe and the download still surfaces as 404, not an empty 200.
+    zip_stream = shard.download_blob_stream(found_container, blob_path)
+    try:
+        first_chunk = await zip_stream.__anext__()
+    except StopAsyncIteration:
+        first_chunk = None
+    if first_chunk is None and blob_size > 0:
+        raise HTTPException(status_code=404, detail=f"Export blob vanished from container {found_container}")
 
     fname = blob_path.rsplit("/", 1)[-1] or f"export_{job_id}.zip"
 
@@ -2673,11 +3180,20 @@ async def download_export_zip(job_id: str, db: AsyncSession = Depends(get_db)):
     try:
         import httpx as _httpx
         spec = job.spec or {}
+        # Both spellings: snake from the triggers, camel from the chat router
+        # and from rows the pre-fix build wrote by merging the raw body.
+        audit_snapshot_ids = spec_scope_ids(spec, "snapshot_ids", "snapshotIds")
+        audit_item_ids = spec_scope_ids(spec, "item_ids", "itemIds")
         async with _httpx.AsyncClient(timeout=5.0) as _c:
-            await _c.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json={
+            await _c.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", headers=internal_audit_headers(), json={
                 "action": "EXPORT_DOWNLOADED",
                 "tenant_id": str(job.tenant_id) if job.tenant_id else spec.get("tenantId"),
                 "actor_type": "USER",
+                # The route is authenticated now, so the trail can name who
+                # pulled the bytes. Attribution is the compensating control
+                # for generic export jobs, which carry no owner to enforce.
+                "actor_id": str(user.get("id")) if user.get("id") else None,
+                "actor_email": user.get("email"),
                 "resource_id": str(job.resource_id) if job.resource_id else spec.get("resourceId"),
                 "resource_type": spec.get("resourceType"),
                 "outcome": "SUCCESS",
@@ -2685,24 +3201,33 @@ async def download_export_zip(job_id: str, db: AsyncSession = Depends(get_db)):
                 "details": {
                     "blobPath": blob_path,
                     "filename": fname,
-                    "byteSize": len(content),
-                    "restoreType": spec.get("restoreType") or "EXPORT_ZIP",
-                    "snapshotIds": spec.get("snapshotIds") or [],
-                    "itemIds": spec.get("itemIds") or [],
-                    "itemCount": len(spec.get("itemIds") or []),
+                    "byteSize": blob_size,
+                    "restoreType": spec.get("restore_type") or spec.get("restoreType") or "EXPORT_ZIP",
+                    "snapshotIds": audit_snapshot_ids,
+                    "itemIds": audit_item_ids,
+                    "itemCount": len(audit_item_ids),
                 },
             })
     except Exception:
         pass
 
+    async def _iter_zip():
+        if first_chunk:
+            yield first_chunk
+        async for chunk in zip_stream:
+            yield chunk
+
+    zip_headers = {"Content-Disposition": f'attachment; filename="{fname}"'}
+    if blob_size:
+        zip_headers["Content-Length"] = str(blob_size)
     return StreamingResponse(
-        iter([content]),
+        _iter_zip(),
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        headers=zip_headers,
     )
 
 
-@app.get("/api/v1/dlq/stats")
+@app.get("/api/v1/dlq/stats", dependencies=[Depends(require_principal)])
 async def get_dlq_stats():
     return [
         {"dlqName": "backup.urgent.dlq", "messageCount": 0},
@@ -2711,7 +3236,7 @@ async def get_dlq_stats():
     ]
 
 
-@app.post("/api/v1/dlq/{dlq_name}/purge", status_code=204)
-@app.post("/api/v1/dlq/{dlq_name}/requeue", status_code=204)
+@app.post("/api/v1/dlq/{dlq_name}/purge", status_code=204, dependencies=[Depends(require_principal)])
+@app.post("/api/v1/dlq/{dlq_name}/requeue", status_code=204, dependencies=[Depends(require_principal)])
 async def dlq_action(dlq_name: str):
     pass

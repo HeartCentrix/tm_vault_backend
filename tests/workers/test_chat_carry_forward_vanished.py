@@ -22,6 +22,7 @@ pattern as test_chat_sparse_incremental.py.
 """
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import asyncio
 import importlib.util
 import os
@@ -89,7 +90,10 @@ def _fk_integrity_error():
 
 def test_carry_forward_raises_snapshot_vanished_on_fk_violation(monkeypatch):
     fake = _FakeSession(_fk_integrity_error())
-    monkeypatch.setattr(_bw, "async_session_factory", lambda: fake)
+    @asynccontextmanager
+    async def slot(*args, **kwargs):
+        yield fake
+    monkeypatch.setattr(_bw, "carry_forward_slot_session", slot)
 
     with pytest.raises(_bw.SnapshotVanishedError):
         asyncio.run(
@@ -111,7 +115,10 @@ def test_carry_forward_reraises_unrelated_integrity_error(monkeypatch):
         {},
         Exception("uq_snapshot_items_snap_ext_type"),
     )
-    monkeypatch.setattr(_bw, "async_session_factory", lambda: _FakeSession(dup))
+    @asynccontextmanager
+    async def slot(*args, **kwargs):
+        yield _FakeSession(dup)
+    monkeypatch.setattr(_bw, "carry_forward_slot_session", slot)
 
     with pytest.raises(IntegrityError):
         asyncio.run(

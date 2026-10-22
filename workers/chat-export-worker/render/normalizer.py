@@ -169,6 +169,25 @@ def _rewrite_inline_imgs(html: str, hosted_for_msg: list[dict]) -> str:
     return re.sub(r'src="([^"]+hostedContents[^"]+)"', _one, html or "")
 
 
+def _strip_remote_img_src(html: str) -> str:
+    """Defence in depth against SSRF-via-PDF-render: after inline images
+    have been rewritten to offline local paths, drop any <img> whose src
+    still points at a remote resource (has a URL scheme other than the
+    inline data: URI). Only schemeless/relative local paths and data:
+    URIs survive, so no remote fetch can reach the PDF renderer even if
+    the deny-by-default url_fetcher were bypassed."""
+    def _one(match: re.Match) -> str:
+        src = (match.group(1) or "").strip()
+        low = src.lower()
+        # Keep inline data: URIs and schemeless relative local paths;
+        # reject anything with a URL scheme (http:, https:, file:, ...)
+        # or a protocol-relative //host reference.
+        if low.startswith("//") or (re.match(r"[a-z][a-z0-9+.-]*:", low) and not low.startswith("data:")):
+            return '<img alt="[remote image removed]">'
+        return match.group(0)
+    return re.sub(r'<img\b[^>]*?\bsrc="([^"]*)"[^>]*>', _one, html or "")
+
+
 def _sanitize(html: str) -> str:
     return bleach.clean(
         html or "",
@@ -238,7 +257,7 @@ def normalize_messages(
         body_is_html = (raw.get("body") or {}).get("contentType") == "html" or meta.get("body", {}).get("content_type") == "html"
         hosted = hosted_by_msg.get(meta.get("message_id") or g(it, "external_id"), [])
         if body_is_html:
-            body_safe = _sanitize(_rewrite_inline_imgs(body_raw, hosted))
+            body_safe = _sanitize(_strip_remote_img_src(_rewrite_inline_imgs(body_raw, hosted)))
         else:
             body_safe = _plaintext_to_html(body_raw)
 

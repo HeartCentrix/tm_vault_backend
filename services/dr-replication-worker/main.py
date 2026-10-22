@@ -1,7 +1,8 @@
 """
 DR Replication Worker — Asynchronous cross-region backup replication
 
-Scans for completed snapshots with dr_replication_status=pending,
+Scans for real recovery points (COMPLETED *or* PARTIAL, excluding
+skipped_concurrent placeholders) with dr_replication_status=pending, and
 initiates blob-to-blob server-side copy from primary to DR region.
 Azure handles the actual transfer over Microsoft's backbone fiber.
 
@@ -13,6 +14,7 @@ Key principles:
 """
 import asyncio
 import logging
+import os
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
@@ -21,11 +23,11 @@ from uuid import UUID
 
 from azure.storage.blob.aio import BlobClient
 from azure.storage.blob import generate_blob_sas, BlobSasPermissions
-from sqlalchemy import select, or_, text
+from sqlalchemy import and_, func, select
 
 from shared.config import settings
 from shared.database import async_session_factory, init_db
-from shared.models import Tenant, Resource, Snapshot, SnapshotItem, SlaPolicy
+from shared.models import Tenant, Resource, Snapshot, SnapshotItem, SlaPolicy, SnapshotStatus
 from shared.azure_storage import (
     azure_storage_manager, apply_legal_hold, apply_lifecycle_policy, AzureStorageShard,
     RESOURCE_TYPE_TO_WORKLOADS,
@@ -55,6 +57,74 @@ def _primary_workload(resource_type: str) -> str:
 
 MAX_REPLICATION_ATTEMPTS = 10
 COPY_TIMEOUT_SECONDS = 1800  # 30 min per blob
+SCAN_BATCH_LIMIT = 500
+
+# Snapshot states that hold real, restorable data. Mirrors
+# snapshot-service's _real_restore_point() / _READABLE_SNAPSHOT_STATES —
+# keep the two in step.
+#
+# PARTIAL belongs here. A PARTIAL snapshot lost some shards but still holds
+# every item it DID capture, so it is a real recovery point: in production
+# the only backup of Jason Rue's 1,114,848-item / 152 GB Exchange Online
+# Archive is PARTIAL, and the lossy-shard derivation deployed 2026-08-04
+# makes PARTIAL the normal outcome for any SharePoint/OneDrive run with
+# files_failed > 0. Replicating COMPLETED only meant every one of those
+# recovery points had NO DR copy at all.
+_DR_REPLICABLE_SNAPSHOT_STATES = (SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL)
+
+# How far back the scan looks. Bounded by default so a deploy of this fix
+# can't turn the whole history of never-replicated PARTIAL snapshots into
+# one enormous copy storm. Set DR_SCAN_LOOKBACK_DAYS=0 to disable the
+# window entirely and deliberately drain the historical backlog (see the
+# backlog WARNING this scan logs each pass).
+try:
+    _DR_SCAN_LOOKBACK_DAYS = int(os.getenv("DR_SCAN_LOOKBACK_DAYS", "2"))
+except ValueError:
+    # A typo'd env var must not crash-loop the worker into replicating nothing.
+    logger.error(
+        "[config] DR_SCAN_LOOKBACK_DAYS=%r is not an integer — using 2",
+        os.getenv("DR_SCAN_LOOKBACK_DAYS"),
+    )
+    _DR_SCAN_LOOKBACK_DAYS = 2
+
+
+def _dr_replicable_snapshot():
+    """SQL predicate: terminal-with-data, and not a concurrency placeholder.
+
+    Two halves, both load-bearing:
+
+    * ``status IN (COMPLETED, PARTIAL)`` — a PARTIAL snapshot is a real
+      recovery point holding real data and MUST get a DR copy.
+    * ``skipped_concurrent`` rejection — backup-worker's cross-job
+      concurrency guard (SKIP_CONCURRENT in workers/backup-worker/main.py)
+      creates 0-item snapshot rows purely so a skipped job's
+      FANOUT/FINALIZE counters balance, then marks them COMPLETED in
+      ~19 ms. Those are fake successes holding no data; replicating them
+      burns DR work and registers an empty DR copy.
+
+    ``extra_data`` is a Postgres **json** column (not jsonb), so
+    json_extract_path_text is the correct accessor — it is NULL-safe for
+    absent keys, and jsonb_extract_path_text would raise at runtime.
+    COALESCE is required: rows written before the flag existed hold NULL,
+    and a bare ``NOT IN`` over NULL yields NULL, which would silently
+    filter out every real snapshot. Compared as text so a non-boolean
+    value can't raise the way an ->>::boolean cast would.
+    """
+    return and_(
+        Snapshot.status.in_(_DR_REPLICABLE_SNAPSHOT_STATES),
+        func.coalesce(
+            func.json_extract_path_text(Snapshot.extra_data, "skipped_concurrent"),
+            "false",
+        ).notin_(("true", "t", "1")),
+    )
+
+
+def _dr_pending_retryable():
+    """SQL predicate: DR-side state says this snapshot still needs a copy."""
+    return and_(
+        Snapshot.dr_replication_status.in_(("pending", "failed")),
+        Snapshot.dr_replication_attempts < MAX_REPLICATION_ATTEMPTS,
+    )
 
 
 async def scan_and_replicate():
@@ -66,19 +136,51 @@ async def scan_and_replicate():
 
     async with async_session_factory() as session:
         try:
-            snapshots: List[Snapshot] = (
-                await session.execute(
-                    select(Snapshot).where(
-                        text("status = 'COMPLETED'"),
-                        or_(
-                            text("dr_replication_status = 'pending'"),
-                            text("dr_replication_status = 'failed'"),
-                        ),
-                        text("dr_replication_attempts < 10"),
-                        text("created_at > NOW() - INTERVAL '2 days'"),
-                    ).limit(500)
+            # Snapshot.created_at is a naive-UTC column (default=utcnow),
+            # so bind a naive-UTC cutoff. The old `NOW() - INTERVAL '2 days'`
+            # compared it against timestamptz NOW(), which PG resolves using
+            # the session TimeZone — a non-UTC session skewed the window.
+            cutoff = None
+            if _DR_SCAN_LOOKBACK_DAYS > 0:
+                cutoff = (
+                    datetime.now(timezone.utc).replace(tzinfo=None)
+                    - timedelta(days=_DR_SCAN_LOOKBACK_DAYS)
                 )
-            ).scalars().all()
+
+            stmt = select(Snapshot).where(
+                _dr_replicable_snapshot(),
+                _dr_pending_retryable(),
+            )
+            if cutoff is not None:
+                stmt = stmt.where(Snapshot.created_at > cutoff)
+            # Newest recovery points get their DR copy first; also makes the
+            # batch deterministic when the candidate set exceeds the limit.
+            stmt = stmt.order_by(Snapshot.created_at.desc()).limit(SCAN_BATCH_LIMIT)
+
+            snapshots: List[Snapshot] = (await session.execute(stmt)).scalars().all()
+
+            # Anything real and unreplicated that has already aged out of the
+            # window will NEVER be reconsidered while the window is in force —
+            # the gap is permanent, not just delayed. Surface the number so the
+            # backlog is a decision rather than a silent hole. Draining it is an
+            # explicit operator act (DR_SCAN_LOOKBACK_DAYS=0), not a side effect
+            # of deploying this fix.
+            if cutoff is not None:
+                backlog = (await session.execute(
+                    select(func.count(Snapshot.id)).where(
+                        _dr_replicable_snapshot(),
+                        _dr_pending_retryable(),
+                        Snapshot.created_at <= cutoff,
+                    )
+                )).scalar() or 0
+                if backlog:
+                    logger.warning(
+                        "[scan_and_replicate] BACKLOG: %d real recovery point(s) "
+                        "older than the %d-day look-back have no DR copy and will "
+                        "never be retried while the window stands. Set "
+                        "DR_SCAN_LOOKBACK_DAYS=0 to drain them.",
+                        backlog, _DR_SCAN_LOOKBACK_DAYS,
+                    )
 
             if not snapshots:
                 logger.info("[scan_and_replicate] No pending snapshots to replicate — scan complete")
@@ -187,6 +289,23 @@ async def replicate_snapshot(snapshot: Snapshot, tenant: Tenant, session):
         "[replicate_snapshot] START — snapshot=%s, tenant=%s, container_source=%s",
         snapshot.id, tenant.id, snapshot.id,
     )
+
+    # Defense in depth: the scan predicate already excludes concurrency
+    # placeholders, but this function is also reachable directly. A
+    # placeholder has zero items, so it would fall through to the
+    # "metadata-only" branch below and be marked `replicated` with a
+    # dr_blob_path — registering an empty DR copy that looks like a real
+    # recovery point. Mark it skipped instead, and set no dr_blob_path /
+    # dr_replicated_at. Nothing is deleted or overwritten either way.
+    if (getattr(snapshot, "extra_data", None) or {}).get("skipped_concurrent"):
+        snapshot.dr_replication_status = "skipped"
+        snapshot.dr_error = "Concurrency placeholder (skipped_concurrent) — no data to replicate"
+        logger.info(
+            "[replicate_snapshot] Snapshot %s is a skipped_concurrent placeholder "
+            "(0 items) — not replicating",
+            snapshot.id,
+        )
+        return
 
     snapshot.dr_replication_status = "in_progress"
     snapshot.dr_replication_attempts = (snapshot.dr_replication_attempts or 0) + 1

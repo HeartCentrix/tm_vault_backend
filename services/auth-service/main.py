@@ -14,6 +14,8 @@ from shared.config import settings
 from shared.database import get_db, init_db, close_db, AsyncSession, async_session_factory
 from shared.models import PlatformUser, UserRoleMapping, Organization, UserRole, Tenant, TenantType, TenantStatus, AdminConsentToken, Resource, ResourceType
 from shared.power_bi_client import PowerBIClient
+from shared.tenant_entitlement import entitled_tenant_ids_for_user
+from shared.audit import emit_audit_event_bg  # Ops/Data Check 3: auth-event audit (fire-and-forget, no hot-path latency)
 from shared.security import (
     create_access_token,
     create_refresh_token,
@@ -43,7 +45,9 @@ async def lifespan(app: FastAPI):
     await close_db()
 
 
+from shared.audit_middleware import AuditMiddleware  # Ops/Data Check 3: mutation-audit backstop
 app = FastAPI(title="Auth Service", version="1.0.0", lifespan=lifespan)
+app.add_middleware(AuditMiddleware, service_name="auth-service")
 
 
 def _power_bi_error_detail(exc: Exception) -> str:
@@ -90,12 +94,17 @@ async def _load_token_claims_from_db(db: AsyncSession, user_id: UUID) -> Optiona
             select(UserRoleMapping).where(UserRoleMapping.user_id == user.id)
         )
     ).scalars().all()
+    # tenantIds must come from data the product actually populates.
+    # PlatformUser.tenant_id is never written by any code path, so reading it
+    # alone produced an empty claim for every real user and left every
+    # tenant-scoping check downstream dead. See shared.tenant_entitlement.
+    tenant_ids = await entitled_tenant_ids_for_user(db, user)
     return {
         "sub": str(user.id),
         "email": user.email,
         "roles": [r.role.value for r in roles],
         "orgId": str(user.org_id) if user.org_id else None,
-        "tenantIds": [str(user.tenant_id)] if user.tenant_id else [],
+        "tenantIds": [str(t) for t in tenant_ids],
     }
 
 
@@ -284,27 +293,41 @@ async def get_power_bi_url(
 
 @app.post("/api/v1/auth/callback", response_model=LoginResponse)
 async def oauth_callback(callback: OAuthCallbackRequest, response: Response, db: AsyncSession = Depends(get_db)):
-    async with httpx.AsyncClient() as client:
-        token_response = await client.post(
-            settings.MICROSOFT_TOKEN_URL,
-            data={
-                "client_id": settings.MICROSOFT_CLIENT_ID,
-                "client_secret": settings.MICROSOFT_CLIENT_SECRET,
-                "code": callback.code,
-                "redirect_uri": f"{settings.FRONTEND_URL}/auth/callback",
-                "grant_type": "authorization_code",
-            },
+    # Audit the failure path too: a bad/expired code or a Graph error used to
+    # bubble as an unlogged 500. Emit LOGIN_FAILED before re-raising so a burst
+    # of failed sign-ins is visible in the audit trail (Ops/Data Check 3).
+    try:
+        async with httpx.AsyncClient() as client:
+            token_response = await client.post(
+                settings.MICROSOFT_TOKEN_URL,
+                data={
+                    "client_id": settings.MICROSOFT_CLIENT_ID,
+                    "client_secret": settings.MICROSOFT_CLIENT_SECRET,
+                    "code": callback.code,
+                    "redirect_uri": f"{settings.FRONTEND_URL}/auth/callback",
+                    "grant_type": "authorization_code",
+                },
+            )
+            token_response.raise_for_status()
+            tokens = token_response.json()
+
+            graph_response = await client.get(
+                "https://graph.microsoft.com/v1.0/me",
+                headers={"Authorization": f"Bearer {tokens['access_token']}"},
+            )
+            graph_response.raise_for_status()
+            profile = graph_response.json()
+    except Exception as exc:
+        emit_audit_event_bg(
+            action="LOGIN_FAILED",
+            actor_type="UNKNOWN",
+            outcome="FAILURE",
+            details={"method": "microsoft_oauth",
+                     "stage": "code_exchange_or_profile",
+                     "error": type(exc).__name__},
         )
-        token_response.raise_for_status()
-        tokens = token_response.json()
-        
-        graph_response = await client.get(
-            "https://graph.microsoft.com/v1.0/me",
-            headers={"Authorization": f"Bearer {tokens['access_token']}"},
-        )
-        graph_response.raise_for_status()
-        profile = graph_response.json()
-    
+        raise
+
     email = profile.get("mail") or profile.get("userPrincipalName")
     name = profile.get("displayName", email.split("@")[0])
     external_id = profile.get("id")
@@ -353,6 +376,16 @@ async def oauth_callback(callback: OAuthCallbackRequest, response: Response, db:
     expires_in = settings.JWT_EXPIRATION_HOURS * 3600
 
     _set_auth_cookies(response, access_token, refresh_token)
+
+    emit_audit_event_bg(
+        action="LOGIN_SUCCESS",
+        actor_type="USER",
+        actor_id=str(user.id),
+        actor_email=user.email,
+        org_id=str(user.org_id) if user.org_id else None,
+        outcome="SUCCESS",
+        details={"method": "microsoft_oauth", "roles": user_roles},
+    )
 
     return LoginResponse(
         accessToken=access_token,
@@ -921,6 +954,66 @@ async def power_bi_callback(
 
 
 # ============ Admin Consent Status Endpoints ============
+#
+# QA-01 (2026-08-11, build v0.1.371): "opening Settings > Admin Consent
+# force-logs the user out". Measured against prod the same day:
+#   * with a valid bearer all three reads are healthy — m365 200 (the
+#     2026-06-16 consent row), azure 200/null, power-bi 200/action_required;
+#   * the QA 401s carried `{"detail":"Not authenticated"}`, which is
+#     shared.security._HTTPBearer401 firing because NO credential reached the
+#     service — not an authz decision by these handlers, and not a Graph /
+#     Power BI 401 leaking through (every upstream call below is already
+#     wrapped and degraded into a `check`);
+#   * the gateway forwards Authorization fine, and translates the
+#     `access_token` cookie into a bearer for this route exactly as it does
+#     for /auth/me (verified: cookie-only call through api-gateway -> 200).
+# The session death is downstream of the 401: the SPA refreshes, the refresh
+# 401s, and main.tsx's _redirectToSignIn() wipes the session. The refresh
+# 401s because the *deployed* gateway still comma-joins Set-Cookie
+# (`response.headers.items()`), so `refresh_token` never lands in the browser
+# — proved live: one merged Set-Cookie header out of the gateway vs three out
+# of auth-service. That is already fixed on this branch (multi_items(), see
+# api-gateway/main.py) and only needs deploying.
+#
+# 401-on-no-credential is deliberate here and is NOT changed: it is what
+# drives the SPA's silent re-auth (see _HTTPBearer401's docstring), and
+# answering 403/200 instead would make these reads *lie* — a 200 with a null
+# body renders "consent not granted" and invites an admin to re-run a
+# state-changing consent grant against an already-consented tenant. What IS
+# changed below is that no OTHER failure mode of a status read may look like
+# an auth failure, or 500.
+
+
+def _consent_read_org_id(current_user: dict) -> UUID:
+    """Org scope for an admin-consent STATUS read, or 403.
+
+    Previously `UUID(current_user["org_id"]) if current_user.get("org_id")
+    else None`. A caller whose token carries no orgId therefore got
+    `org_id = None`, which silently degraded the filters to `org_id IS NULL`
+    and — in the readiness read — dropped the org filter from the tenant
+    lookup altogether, so any tenant in any org was readable by anyone signed
+    in. A malformed claim raised ValueError straight out of the handler (500).
+
+    403 is the right answer for both: the caller is authenticated but not
+    authorised, and 403 is also the one status the SPA's global fetch shim
+    deliberately leaves alone ("403 = role denied (refresh doesn't help)"),
+    so a status read can never take the session down with it.
+    Pinned by tests/services/test_admin_consent_status_session_safety.py.
+    """
+    raw = current_user.get("org_id")
+    if not raw:
+        raise HTTPException(
+            status_code=403,
+            detail="Your account is not attached to an organization, so consent status is unavailable.",
+        )
+    try:
+        return UUID(str(raw))
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=403,
+            detail="Your account is not attached to a valid organization, so consent status is unavailable.",
+        )
+
 
 @app.get("/api/v1/admin-consent/m365/status", response_model=Optional[AdminConsentResponse])
 async def get_m365_admin_consent_status(
@@ -928,8 +1021,8 @@ async def get_m365_admin_consent_status(
     db: AsyncSession = Depends(get_db),
 ):
     """Get the current M365 admin consent status for the organization."""
-    org_id = UUID(current_user["org_id"]) if current_user.get("org_id") else None
-    
+    org_id = _consent_read_org_id(current_user)
+
     stmt = select(AdminConsentToken).where(
         AdminConsentToken.org_id == org_id,
         AdminConsentToken.consent_type == "M365",
@@ -951,8 +1044,8 @@ async def get_azure_admin_consent_status(
     db: AsyncSession = Depends(get_db),
 ):
     """Get the current Azure admin consent status for the organization."""
-    org_id = UUID(current_user["org_id"]) if current_user.get("org_id") else None
-    
+    org_id = _consent_read_org_id(current_user)
+
     stmt = select(AdminConsentToken).where(
         AdminConsentToken.org_id == org_id,
         AdminConsentToken.consent_type == "AZURE",
@@ -992,11 +1085,25 @@ async def get_power_bi_readiness(
     db: AsyncSession = Depends(get_db),
 ):
     """Summarize whether Power BI backup onboarding is ready for this tenant."""
-    org_id = UUID(current_user["org_id"]) if current_user.get("org_id") else None
+    org_id = _consent_read_org_id(current_user)
 
-    tenant_stmt = select(Tenant).where(Tenant.id == UUID(tenant_id))
-    if org_id:
-        tenant_stmt = tenant_stmt.where(Tenant.org_id == org_id)
+    # `UUID(tenant_id)` on a non-UUID query param raised ValueError out of the
+    # handler and uvicorn answered 500 — a status read must not 500 on caller
+    # input. 400 keeps it a client error and, like 403, never reaches the
+    # SPA's 401 path.
+    try:
+        tenant_uuid = UUID(tenant_id)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "tenantId must be a UUID")
+
+    # Org filter is now unconditional (see _consent_read_org_id): it used to be
+    # skipped whenever org_id resolved to None, which made every tenant's
+    # readiness — including the connected Power BI service-user email —
+    # readable by any signed-in user without an org.
+    tenant_stmt = select(Tenant).where(
+        Tenant.id == tenant_uuid,
+        Tenant.org_id == org_id,
+    )
     tenant = (await db.execute(tenant_stmt)).scalar_one_or_none()
     if tenant is None:
         raise HTTPException(404, "Tenant not found")
@@ -1082,11 +1189,15 @@ async def get_power_bi_readiness(
     admin_api_ok = False
 
     if creds_configured:
-        client = PowerBIClient(
-            tenant.external_tenant_id or settings.EFFECTIVE_POWER_BI_TENANT_ID,
-            refresh_token=delegated_refresh_token,
-        )
         try:
+            # Construction is inside the try on purpose: a bad/missing
+            # POWER_BI_* value makes PowerBIClient.__init__ raise, and that
+            # used to escape as a 500 from a read whose whole job is to
+            # report "your Power BI setup is misconfigured".
+            client = PowerBIClient(
+                tenant.external_tenant_id or settings.EFFECTIVE_POWER_BI_TENANT_ID,
+                refresh_token=delegated_refresh_token,
+            )
             workspaces = await client.list_workspaces()
             accessible_workspace_count = len(workspaces)
             api_access_ok = True
@@ -1269,6 +1380,16 @@ async def refresh_token(
 
     _set_auth_cookies(response, access_token, new_refresh_token)
 
+    emit_audit_event_bg(
+        action="TOKEN_REFRESHED",
+        actor_type="USER",
+        actor_id=str(user_uuid),
+        actor_email=token_data.get("email"),
+        org_id=token_data.get("orgId"),
+        outcome="SUCCESS",
+        details={"jti_rotated": bool(old_jti)},
+    )
+
     return RefreshTokenResponse(accessToken=access_token, refreshToken=new_refresh_token, expiresIn=expires_in)
 
 
@@ -1279,9 +1400,11 @@ async def logout(response: Response, http_request: Request):
     # is malformed, still clear the cookies and return success so the client
     # transitions to the signed-out state.
     cookie_token = http_request.cookies.get("refresh_token")
+    logout_sub = None
     if cookie_token:
         try:
             payload = decode_token(cookie_token, expected_type="refresh")
+            logout_sub = payload.get("sub")
             jti = payload.get("jti")
             exp = payload.get("exp")
             if jti:
@@ -1304,6 +1427,15 @@ async def logout(response: Response, http_request: Request):
             pass
 
     _clear_auth_cookies(response)
+
+    emit_audit_event_bg(
+        action="LOGOUT",
+        actor_type="USER",
+        actor_id=logout_sub,
+        outcome="SUCCESS",
+        details={},
+    )
+
     return {"message": "Logged out successfully"}
 
 

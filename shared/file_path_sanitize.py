@@ -28,13 +28,15 @@ def sanitize_arcname(
 
     path = raw_path.replace("\\", "/")
 
+    _BAD = {"", ".", ".."}
     sanitized_segments = []
     for seg in path.split("/"):
-        if not seg:
+        if seg.strip() in _BAD:
             continue
         cleaned = "".join("_" if c in replace_chars else c for c in seg)
-        cleaned = cleaned.replace("/", "_")
-        sanitized_segments.append(cleaned)
+        cleaned = cleaned.replace("/", "_").rstrip(". ")
+        if cleaned:
+            sanitized_segments.append(cleaned)
 
     arcname = "/".join(sanitized_segments)
 

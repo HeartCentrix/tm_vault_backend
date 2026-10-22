@@ -1,0 +1,112 @@
+# 30-migrate-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata: { name: tmvault-migrate, namespace: itops, labels: { stack: tmvault, app: tmvault-migrate } }
+spec:
+  backoffLimit: 2
+  template:
+    metadata: { labels: { stack: tmvault, app: tmvault-migrate } }
+    spec:
+      restartPolicy: Never
+      imagePullSecrets: [ { name: harbor-creds } ]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: migrate
+          # IMAGE MUST BE RE-PINNED BEFORE THIS JOB IS RUN.
+          # The digest below predates the 2026-07-31 integration and its tree
+          # contains none of revisions 0007-0010, so `alembic upgrade head`
+          # inside it stops at 0006 and reports success. Re-pin to the
+          # job-service digest from 40-services.yaml on the lineage being
+          # shipped (job-service deploys on integrate/archive) — the alembic
+          # chain is identical in both lineages, so either is correct, but it
+          # has to be a CURRENT one.
+          image: harbor.taylormorrison.com/library/tmvault-job-service@sha256:30ee97e5e64283947f77345d200278e2b520fb9d4ba491d5bdea75fa98e29b75
+          # TWO PATHS, decided from the database — never guessed.
+          #
+          # FRESH (no alembic_version row): init_db() builds the full schema
+          # the app's models expect (jobs, snapshot_items, ...) and
+          # `alembic stamp head` records every revision as applied WITHOUT
+          # running it. Revision 0001 is an explicit stamp baseline; 0002/0003
+          # are destructive prod-scale partition conversions (gated behind
+          # backup/disk/WAL checks) meant for upgrading an existing large DB —
+          # not needed for a fresh install, and partitioning is transparent to
+          # the ORM either way. This is the original behaviour, unchanged.
+          #
+          # EXISTING (alembic_version has a row): `alembic upgrade head` ONLY.
+          # A bare `stamp head` here is the trap this branch exists to close:
+          # prod sits at 0006 with 0007-0010 pending, and stamping would jump
+          # the row to 0010 so the Tier-2 unique index (0009) and the
+          # blob-guard indexes (0010) are never created, while every later
+          # `alembic current` claims the database is fully migrated. init_db()
+          # is deliberately NOT run on this path — its create_all/index batch
+          # on the ~87GB live schema is what froze prod for ~5 minutes.
+          #
+          # The pending revisions are safe to run online: 0007/0008 are
+          # CREATE TABLE IF NOT EXISTS; 0009 refuses (RuntimeError) rather
+          # than deleting rows if duplicate Tier-2 children still exist, and
+          # builds its unique index CONCURRENTLY; 0010 builds only the small
+          # chat_url_cache index inline and SKIPS the snapshot_items one with
+          # a printed CREATE INDEX CONCURRENTLY runbook. Nothing here takes a
+          # long ACCESS EXCLUSIVE lock, so running backups are not stalled.
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              # Probe stderr is deliberately NOT silenced: if this cannot read
+              # alembic_version the operator needs the traceback. The marker
+              # prefix makes the parse immune to anything else on stdout.
+              STATE=$(python - <<'PY' | sed -n 's/^TMVAULT_MIGRATE_STATE=//p' | tail -n1
+              import asyncio, os
+              from sqlalchemy import text
+              from shared.database import engine
+              SCHEMA = os.getenv("DB_SCHEMA", "tm_vault")
+
+              async def state() -> str:
+                  async with engine.connect() as conn:
+                      reg = await conn.scalar(
+                          text("SELECT to_regclass(:t)"),
+                          {"t": f"{SCHEMA}.alembic_version"},
+                      )
+                      if reg is None:
+                          return "FRESH"
+                      n = await conn.scalar(
+                          text(f"SELECT count(*) FROM {SCHEMA}.alembic_version")
+                      )
+                  return "EXISTING" if n else "FRESH"
+
+              print("TMVAULT_MIGRATE_STATE=" + asyncio.run(state()))
+              PY
+              )
+              echo "tmvault-migrate: database state = ${STATE:-<undetermined>}"
+              case "$STATE" in
+                FRESH)
+                  python -c "import asyncio; from shared.database import init_db; asyncio.run(init_db())"
+                  alembic stamp head
+                  ;;
+                EXISTING)
+                  alembic current
+                  alembic upgrade head
+                  alembic current
+                  ;;
+                *)
+                  echo "tmvault-migrate: could not read ${DB_SCHEMA:-tm_vault}.alembic_version — refusing to migrate. Neither branch is safe to guess: stamping a populated database silently skips pending revisions, and init_db() on a populated database does heavy DDL." >&2
+                  exit 1
+                  ;;
+              esac
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+          envFrom:
+            - configMapRef: { name: tmvault-config }
+          env:
+            - name: DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: DB_PASSWORD } }
+            - name: JWT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: JWT_SECRET } }

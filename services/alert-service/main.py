@@ -8,12 +8,15 @@ from uuid import UUID, uuid4
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, HttpUrl, field_validator
 from sqlalchemy import select, func
 
+from shared.auth_enforcement import require_admin_principal
 from shared.database import get_db, init_db, close_db, AsyncSession
 from shared.models import Alert, AccessGroup
 from shared.security import get_current_user_from_token
+from shared.auth_enforcement import require_principal  # user JWT OR X-Internal-Api-Key
 
 
 # ============ Webhook URL SSRF guard ============
@@ -88,7 +91,9 @@ async def lifespan(app: FastAPI):
     await close_db()
 
 
+from shared.audit_middleware import AuditMiddleware  # Ops/Data Check 3: mutation-audit backstop
 app = FastAPI(title="Alert Service", version="1.0.0", lifespan=lifespan)
+app.add_middleware(AuditMiddleware, service_name="alert-service")
 
 
 @app.get("/health")
@@ -137,6 +142,39 @@ def _authorize_tenant_filter(user: dict, tenant_id_str: Optional[str]) -> List[U
     if requested not in user_tenants:
         raise HTTPException(status_code=403, detail="Not authorized for tenant")
     return [requested]
+
+
+# Elevated roles, spelled as they appear in the `roles` claim
+# (`UserRoleMapping.role`). "tenant_admin" is a legacy lowercase spelling from
+# older token builds. Duplicated rather than shared with job-service because
+# the two services deploy independently.
+_ADMIN_ROLES = frozenset({"SUPER_ADMIN", "ORG_ADMIN", "TENANT_ADMIN", "tenant_admin"})
+
+
+def _require_admin(user: dict) -> None:
+    """Gate for access-group administration.
+
+    Until 2026-07-31 the `tenantIds` claim was always empty, so
+    `_user_tenant_uuids` returned [] and every route in this service 403/404'd
+    for every caller — access-group CRUD has never actually been reachable.
+    Populating the claim would have opened it, `DELETE /access-groups/{id}`
+    (a real `db.delete`) included, to any authenticated employee. Editing who
+    may see which backups is an administrative act, so it needs a role.
+
+    No user has an elevated role until an operator grants one; the exact SQL
+    is in services/job-service/export_authz.py. Fail closed until then — that
+    is the same reachability as today, not a regression.
+
+    Deploy order: this service must ship BEFORE auth-service (the rollout
+    order is alert-service, job-service, auth-service — see
+    deploy/taylor-morrison/k8s/40-services.yaml). The check is order-safe in
+    that direction because it reads only the token's `roles`, which
+    auth-service has always minted, and it runs ahead of the tenant checks
+    that the empty claim currently blocks on: shipping it early changes
+    nothing, shipping it late leaves DELETE /access-groups/{id} open.
+    """
+    if not any(r in _ADMIN_ROLES for r in (user.get("roles") or [])):
+        raise HTTPException(status_code=403, detail="Administrator role required")
 
 
 def _ensure_tenant_member(user: dict, resource_tenant_id) -> None:
@@ -195,6 +233,20 @@ class WebhookCreate(BaseModel):
         return value
 
 
+class AlertCreate(BaseModel):
+    """Exactly what backup-scheduler's send_violations_to_alert_service
+    POSTs. tenant_id / resource_id arrive as strings and are validated as
+    UUIDs here because Alert keeps both in UUID columns."""
+    model_config = ConfigDict(extra="forbid")
+    type: str
+    message: str
+    severity: str = "WARNING"
+    tenant_id: Optional[UUID] = None
+    resource_id: Optional[UUID] = None
+    resource_type: Optional[str] = None
+    details: Optional[dict] = None
+
+
 # ============ Alerts ============
 
 @app.get("/api/v1/alerts")
@@ -232,6 +284,81 @@ async def list_alerts(
         "size": size,
         "number": page,
     }
+
+
+def _alert_row(a: Alert) -> dict:
+    """One alert in the shape ``list_alerts`` returns, so a POST reply can
+    be read by the same client code as a list row."""
+    return {
+        "id": str(a.id), "severity": a.severity, "title": a.message[:100] if a.message else "Alert",
+        "description": a.message or "", "status": "RESOLVED" if a.resolved else "ACTIVE",
+        "createdAt": a.created_at.isoformat() if a.created_at else "",
+        "resolved": a.resolved, "tenantId": str(a.tenant_id) if a.tenant_id else None,
+        "type": a.type, "message": a.message,
+    }
+
+
+@app.post("/api/v1/alerts")
+async def create_alert(
+    payload: AlertCreate,
+    db: AsyncSession = Depends(get_db),
+    principal: dict = Depends(require_admin_principal),
+):
+    """Store an alert raised by another service (backup-scheduler's SLA
+    check is the caller today).
+
+    Auth: the internal-services key (X-Internal-Api-Key) OR an admin user
+    token — shared.auth_enforcement.require_admin_principal, the gate the
+    other machine-to-machine routes use. backup-scheduler has POSTed here
+    since the SLA check shipped, but this route did not exist: every POST
+    was answered 405 and 0 SLA_VIOLATION alerts were ever stored.
+
+    Dedupe: an UNRESOLVED alert with the same (tenant_id, type,
+    resource_id) is refreshed in place — severity, message, details,
+    updated_at — and answered 200, so a resource that stays overdue is
+    one row that escalates rather than a new row every scheduler tick.
+    Otherwise a row is inserted and answered 201. Both replies are the
+    list_alerts row shape.
+    """
+    existing = (await db.execute(
+        select(Alert)
+        .where(
+            Alert.tenant_id == payload.tenant_id,
+            Alert.type == payload.type,
+            Alert.resource_id == payload.resource_id,
+            Alert.resolved == False,  # noqa: E712 — SQLAlchemy expression
+        )
+        .order_by(Alert.created_at.desc())
+        .limit(1)
+    )).scalars().first()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    details = payload.details if payload.details is not None else {}
+    if existing is not None:
+        existing.severity = payload.severity
+        existing.message = payload.message
+        existing.details = details
+        if payload.resource_type:
+            existing.resource_type = payload.resource_type
+        existing.updated_at = now
+        await db.flush()
+        return JSONResponse(status_code=200, content=_alert_row(existing))
+    alert = Alert(
+        id=uuid4(),
+        tenant_id=payload.tenant_id,
+        type=payload.type,
+        severity=payload.severity,
+        message=payload.message,
+        resource_id=payload.resource_id,
+        resource_type=payload.resource_type,
+        triggered_by=principal.get("email") or "internal-service",
+        resolved=False,
+        details=details,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(alert)
+    await db.flush()
+    return JSONResponse(status_code=201, content=_alert_row(alert))
 
 
 @app.get("/api/v1/alerts/{alert_id}")
@@ -360,9 +487,11 @@ async def create_access_group(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user_from_token),
 ):
-    # New groups land in the caller's *first* assigned tenant. If a tenant
-    # selector is needed in the UI later, accept it as a typed field on
-    # AccessGroupCreate and validate it via _authorize_tenant_filter.
+    _require_admin(current_user)
+    # New groups land in the caller's *first* assigned tenant — deterministic
+    # since shared.tenant_entitlement orders the claim. If a tenant selector is
+    # needed in the UI later, accept it as a typed field on AccessGroupCreate
+    # and validate it via _authorize_tenant_filter.
     user_tenants = _user_tenant_uuids(current_user)
     if not user_tenants:
         raise HTTPException(status_code=403, detail="No tenant access")
@@ -385,6 +514,7 @@ async def update_access_group(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user_from_token),
 ):
+    _require_admin(current_user)
     try:
         group_uuid = UUID(group_id)
     except (TypeError, ValueError):
@@ -418,6 +548,7 @@ async def delete_access_group(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user_from_token),
 ):
+    _require_admin(current_user)
     try:
         group_uuid = UUID(group_id)
     except (TypeError, ValueError):
@@ -521,16 +652,18 @@ class ExportNotification(BaseModel):
 @app.post("/api/v1/alerts/notify/export-completed", status_code=202)
 async def notify_export_completed(
     payload: ExportNotification,
-    current_user: dict = Depends(get_current_user_from_token),
+    current_user: dict = Depends(require_principal),
 ):
     """Send the export-completed email. Delegates to the existing email helper
     when one is available; otherwise logs for audit. Fire-and-forget from the
     caller's perspective — we return 202 before the email physically leaves.
 
-    Auth note (B-H2): this endpoint is called by worker services after an
-    export job finishes. Workers must present a valid JWT (issued by the
-    auth-service for a service principal) — anonymous invocation is no
-    longer accepted.
+    Auth note (B-H2): this endpoint is called by the restore-worker after an
+    export job finishes. The caller must present EITHER a valid user JWT OR
+    the internal-services shared secret (X-Internal-Api-Key) — the machine
+    path audit-service / delta-token already use. Workers hold no user JWT,
+    so the JWT-only gate in place until 2026-10-14 rejected every
+    notification with 401. Anonymous invocation is still refused.
     """
     subject = f"Your TMvault export is ready — {payload.exported_count} items"
     if payload.status != "COMPLETED":

@@ -19,3 +19,4 @@ prometheus_client>=0.20.0
 
 # Alembic for prod-safe schema migrations
 alembic>=1.13.0,<2
+python-jose[cryptography]==3.3.0

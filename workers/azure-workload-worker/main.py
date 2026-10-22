@@ -127,15 +127,37 @@ class AzureWorkloadWorker:
                 except Exception as e:
                     logger.exception("[%s] Error processing message from %s: %s", self.worker_id, queue_name, e)
                     try:
-                        headers = message.headers or {}
+                        headers = dict(message.headers or {})
                         retry_count = int(headers.get("x-retry-count", 0))
                         if retry_count >= 5:
                             logger.error("[%s] Message exceeded max retries (5), routing to DLQ", self.worker_id)
                             await message.reject(requeue=False)
                         else:
-                            await message.nack(requeue=True)
+                            # RabbitMQ does NOT increment custom headers on
+                            # nack/requeue and no publisher sets x-retry-count,
+                            # so a plain nack left the counter at 0 forever: a
+                            # poison message hot-looped at the head of the
+                            # queue and starved everything behind it.
+                            # Republish a copy with the counter bumped (lands
+                            # at the tail) and ack the original so the 5-retry
+                            # DLQ cap is actually reachable.
+                            headers["x-retry-count"] = retry_count + 1
+                            await message_bus.exchange.publish(
+                                aio_pika.Message(
+                                    message.body,
+                                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                                    priority=message.priority,
+                                    headers=headers,
+                                ),
+                                routing_key=queue_name,
+                            )
+                            await message.ack()
                     except Exception:
-                        pass
+                        # Broker hiccup mid-recovery — leave the message
+                        # unacked so RabbitMQ redelivers it with the original
+                        # retry count intact.
+                        logger.exception("[%s] Failed to requeue/reject message from %s",
+                                         self.worker_id, queue_name)
 
     async def process_restore_message(self, queue_name: str, message: Dict[str, Any]):
         """Dispatch an Azure restore message to the matching handler.
@@ -286,6 +308,7 @@ class AzureWorkloadWorker:
         Audit-service downtime never blocks the restore."""
         try:
             import httpx as _httpx
+            from shared.audit import internal_audit_headers
             from shared.config import settings as _settings
             payload = {
                 "action": action,
@@ -304,7 +327,7 @@ class AzureWorkloadWorker:
                 },
             }
             async with _httpx.AsyncClient(timeout=5.0) as _client:
-                await _client.post(f"{_settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json=payload)
+                await _client.post(f"{_settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json=payload, headers=internal_audit_headers())
         except Exception:
             pass
 
@@ -400,6 +423,7 @@ class AzureWorkloadWorker:
                 )
                 if result.get("success"):
                     snapshot.status = SnapshotStatus.COMPLETED
+                    snapshot.completed_at = datetime.utcnow()
                     snapshot.item_count = (
                         result.get("disks_copied")
                         or result.get("tables_exported")
@@ -445,20 +469,32 @@ class AzureWorkloadWorker:
 
             except Exception as e:
                 error_str = str(e).lower()
-                # Detect 404/423 errors — resource no longer exists or is locked
+                # Only flag INACCESSIBLE on ARM error codes that prove the
+                # RESOURCE ITSELF is gone. The flag is permanent (nothing
+                # re-probes it), so matching transient conditions — an
+                # AuthorizationFailed during SP secret rotation, or a
+                # mid-pipeline blob/restore-point "not found" — silently
+                # excluded healthy resources from all future backups after
+                # one bad night.
                 is_inaccessible = any(kw in error_str for kw in [
-                    "not found", "404", "resourcenotfound", "parentresourcenotfound",
-                    "locked", "423", "authorizationfailed",
+                    "resourcenotfound", "parentresourcenotfound",
+                    "resourcegroupnotfound",
                 ])
-                
+
                 if is_inaccessible:
-                    logger.warning("[%s] Resource %s is INACCESSIBLE (404/423) — marking to skip future backups",
+                    logger.warning("[%s] Resource %s is INACCESSIBLE (deleted in Azure) — marking to skip future backups",
                                    self.worker_id, resource_id)
                     resource.status = "INACCESSIBLE"
-                
+
                 snapshot.status = SnapshotStatus.FAILED
                 job.status = JobStatus.FAILED
                 job.error_message = str(e)
+                # RUNNING was committed at pickup; without this reset the
+                # Protection page showed the resource "RUNNING" forever
+                # after a failed backup. (last_backup_at intentionally NOT
+                # set here — it is the incremental watermark and advancing
+                # it on failure would skip unexported rows.)
+                resource.last_backup_status = "FAILED"
                 await session.commit()
 
 
@@ -468,7 +504,7 @@ async def main():
     from shared.graph_rate_limiter import graph_rate_limiter
     core_metrics.init()
     await graph_rate_limiter.maybe_init_redis()
-    await startup_router()
+    await startup_router(required=True)
     try:
         worker = AzureWorkloadWorker()
         await worker.start()

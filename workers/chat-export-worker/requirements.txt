@@ -9,13 +9,10 @@ pydantic==2.6.3
 redis==5.0.3
 sqlalchemy[asyncio]==2.0.29
 asyncpg==0.29.0
-weasyprint==61.2
-# weasyprint 61.2 calls pydyf.PDF(version, identifier) — the pre-0.11
-# 3-arg signature. Newer pydyf (0.11+) is a `PDF()` no-arg ctor and
-# breaks at write_pdf() with "takes 1 positional argument but 3 were
-# given". Pin until weasyprint is upgraded to a release that matches
-# the new pydyf API.
-pydyf>=0.8.0,<0.11.0
+weasyprint>=68.0,<69
+# weasyprint>=68 (CVE-2025-68616 / GHSA-983w-rhvv-gwmv, SSRF via the
+# default_url_fetcher, fixed in 68.0) ships against the new pydyf
+# no-arg PDF() ctor, so pydyf is left unpinned (resolves to 0.11+).
 opentelemetry-api==1.24.0
 opentelemetry-sdk==1.24.0
 opentelemetry-instrumentation-aiohttp-client==0.45b0

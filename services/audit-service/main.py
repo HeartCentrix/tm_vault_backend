@@ -12,16 +12,19 @@ Responsibilities:
 - SIEM webhook integration for external log forwarding
 """
 import csv
+from shared.csv_safe import SafeCsvWriter  # Check 17: CSV formula-injection
 import io
+import logging
 import os
 import json
+import secrets
 import uuid
 import json as json_lib
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional, List, Dict, Set, Tuple
-from fastapi import FastAPI, Depends, HTTPException, Query
+from typing import Any, NamedTuple, Optional, List, Dict, Set, Tuple
+from fastapi import FastAPI, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, func, desc, and_, or_, text
+from sqlalchemy import select, func, asc, desc, and_, or_, text
 from sqlalchemy.ext.asyncio import AsyncSession
 import asyncio
 import httpx
@@ -52,7 +55,10 @@ shape_activity_row = _ab_mod.shape_activity_row
 merge_backup_batch_rows = _ab_mod.merge_backup_batch_rows
 prune_unrun_terminal_children = _ab_mod.prune_unrun_terminal_children
 
+from shared.auth_enforcement import require_principal, require_admin_principal  # Ops/Data Check 17
+from shared.audit_middleware import AuditMiddleware  # Ops/Data Check 3: mutation-audit backstop
 app = FastAPI(title="Audit Log Service", version="1.0.0")
+app.add_middleware(AuditMiddleware, service_name="audit-service")
 
 # Action codes
 
@@ -345,8 +351,35 @@ async def _refresh_running_jobs():
 # a fresh full re-drain. This is the self-healing path that catches
 # silent drops from pagination races, F6 in the plan.
 #
-# Cost: 1 throttled Graph call per chat per day per tenant. With chat
-# sharding across 12 GraphClient apps this stays well under throttle.
+# Cost — measured, NOT "1 call per chat" (2026-07-31): Graph does not
+# support $count on chat messages, so count_chat_messages WALKS the whole
+# message list, and `$top` is hard-capped at 50 on chatMessage collections
+# (999 is a 400). Pages for a chat of m messages = ceil(m/50), so a sweep
+# costs ~total_messages/50 + n_chats requests. This tenant's two
+# chats-bearing accounts hold ~713k and ~285k distinct messages:
+#
+#   $top=999 (in theory)   998k/999 + n_chats  ~=  1.0k-5.2k calls/night
+#   $top=999 (in fact)     n_chats calls, every one a 400 -> the verifier
+#                          silently verified NOTHING
+#   $top=50, unbounded     998k/50  + n_chats  ~= 20.0k-24.2k calls/night
+#   $top=50 + this budget  <= CHAT_INTEGRITY_MAX_GRAPH_CALLS_PER_RUN (1500)
+#
+# 20k+ sequential requests overnight against a SIX-app registration pool
+# (graph_client.py's "currently 20" comment is stale) can throttle straight
+# into the 02:07 Gold run, so the sweep is bounded per run and switchable
+# from the ConfigMap:
+#
+#   CHAT_INTEGRITY_ENABLED                  kill switch (default true)
+#   CHAT_INTEGRITY_MAX_GRAPH_CALLS_PER_RUN  hard per-run request ceiling
+#   CHAT_INTEGRITY_MAX_CHATS_PER_RUN        LIMIT on the candidate set
+#   CHAT_INTEGRITY_MAX_PAGES_PER_CHAT       one chat cannot eat the budget
+#
+# Bounding costs coverage, so the candidate set is a per-night rotating
+# sample (ORDER BY md5(date || chat_id)) rather than always the same first N
+# chats, and every run prints checked / gaps / unverified / budget so a
+# truncated sweep is never silent.
+#
+# Bounded by tests/services/test_chat_integrity_budget.py.
 # ============================================================================
 
 _CHAT_INTEGRITY_INTERVAL_S = int(
@@ -356,27 +389,152 @@ _CHAT_INTEGRITY_TOLERANCE_PCT = float(
     os.getenv("CHAT_INTEGRITY_TOLERANCE_PCT", "1.0"),
 )
 
+# Graph's hard $top cap for chatMessage collections. Keep in lockstep with
+# shared/graph_client.py's chatMessage readers.
+CHAT_MESSAGE_PAGE_SIZE = 50
+
+CHAT_INTEGRITY_CANDIDATE_SQL = (
+    "SELECT id, tenant_id, chat_id "
+    "  FROM chat_threads "
+    " WHERE last_drained_at > NOW() - INTERVAL '24 hours' "
+    "   AND (drain_failure_state IS NULL "
+    "        OR (drain_failure_state->>'class') IS NULL "
+    "        OR (drain_failure_state->>'class') NOT IN "
+    "             ('PERMISSION','GONE')) "
+    " ORDER BY md5(:salt || chat_id) "
+    " LIMIT :max_chats"
+)
+
+
+class ChatIntegrityLimits(NamedTuple):
+    enabled: bool
+    max_chats: int
+    max_graph_calls: int
+    max_pages_per_chat: int
+    page_size: int
+
+
+def _chat_integrity_int(env, key: str, default: int) -> int:
+    """Env int with a floor of 1; garbage falls back to the default rather
+    than crashing a nightly sweep on a typo in the ConfigMap."""
+    try:
+        return max(1, int(str(env.get(key, default)).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+def chat_integrity_limits(env=None) -> ChatIntegrityLimits:
+    """Per-run limits for the chat-integrity sweep, from the environment.
+
+    Read per run (not at import) so a ConfigMap edit + rollout restart is
+    enough to disable or throttle the sweep — no image rebuild.
+    """
+    env = os.environ if env is None else env
+    return ChatIntegrityLimits(
+        enabled=str(
+            env.get("CHAT_INTEGRITY_ENABLED", "true"),
+        ).strip().lower() in ("1", "true", "yes", "on"),
+        max_chats=_chat_integrity_int(env, "CHAT_INTEGRITY_MAX_CHATS_PER_RUN", 500),
+        max_graph_calls=_chat_integrity_int(
+            env, "CHAT_INTEGRITY_MAX_GRAPH_CALLS_PER_RUN", 1500,
+        ),
+        max_pages_per_chat=_chat_integrity_int(
+            env, "CHAT_INTEGRITY_MAX_PAGES_PER_CHAT", 40,
+        ),
+        page_size=CHAT_MESSAGE_PAGE_SIZE,
+    )
+
+
+def plan_chat_integrity_check(
+    *,
+    db_count: int,
+    calls_used: int,
+    limits: ChatIntegrityLimits,
+) -> Tuple[str, int]:
+    """Return ``(decision, pages_allowed)`` for one candidate chat.
+
+    ``STOP_BUDGET`` ends the sweep (the run's request ceiling is spent);
+    ``CHECK`` walks at most ``pages_allowed`` pages. The allowance is the
+    smallest of the per-chat cap, what is left in the run budget, and what a
+    healthy chat would actually need (``ceil(db_count/50) + 1`` — the +1 is
+    the page that would reveal Graph holding MORE than the DB), so a small
+    chat can never be charged the per-chat maximum.
+
+    Pure function.
+    """
+    remaining = int(limits.max_graph_calls) - max(0, int(calls_used or 0))
+    if remaining <= 0:
+        return "STOP_BUDGET", 0
+    n = max(0, int(db_count or 0))
+    needed = (n + limits.page_size - 1) // limits.page_size + 1
+    return "CHECK", max(1, min(limits.max_pages_per_chat, remaining, needed))
+
+
+def chat_integrity_verdict(
+    *,
+    db_count: int,
+    graph_total: Optional[int],
+    partial_total: int,
+    capped: bool,
+    tolerance_pct: float,
+) -> Tuple[str, Optional[int], Optional[float]]:
+    """Return ``(verdict, graph_count_used, miss_pct)``.
+
+    ``OK`` / ``GAP`` come from an exact Graph total. A walk truncated by the
+    page cap yields only a LOWER BOUND, which can prove a gap
+    (``GAP_LOWER_BOUND`` — we saw more messages than the DB stored) but can
+    never disprove one: a truncated walk on a healthy 100k-message chat also
+    "sees" fewer than the DB holds, and flagging that would force a nightly
+    full re-drain of the largest mailbox in the tenant. Anything unproven is
+    ``UNVERIFIED`` — explicitly not a clean bill of health.
+
+    Pure function.
+    """
+    n = max(0, int(db_count or 0))
+    if graph_total is not None:
+        g = int(graph_total)
+        if g <= 0:
+            return "UNVERIFIED", None, None
+        miss = abs(g - n) / float(g) * 100.0
+        return ("OK" if miss <= tolerance_pct else "GAP"), g, miss
+    lower = max(0, int(partial_total or 0))
+    if capped and lower > 0 and n < lower:
+        miss = (lower - n) / float(lower) * 100.0
+        if miss > tolerance_pct:
+            return "GAP_LOWER_BOUND", lower, miss
+    return "UNVERIFIED", None, None
+
 
 async def _verify_chat_integrity_once():
-    """One sweep of all chats that drained successfully in the last 24h.
-    For each, fetch Graph's `$count=true` for the chat's message list and
-    compare to chat_thread_messages COUNT(*). Mark gaps."""
+    """One BOUNDED sweep over a rotating sample of the chats that drained in
+    the last 24h. For each, walk Graph's message list (page-capped) and
+    compare to chat_thread_messages COUNT(*). Mark gaps.
+
+    Bounded by CHAT_INTEGRITY_* — see the cost note above."""
+    limits = chat_integrity_limits()
+    if not limits.enabled:
+        # Kill switch: checked before any DB session or Graph client so
+        # flipping it off in the ConfigMap really does stop the sweep.
+        print(
+            "[CHAT-INTEGRITY] sweep DISABLED via CHAT_INTEGRITY_ENABLED "
+            "— chat drop detection is off",
+        )
+        return
     try:
         from shared.graph_client import GraphClient as _GraphClient
     except Exception:
         # If GraphClient import fails (dev env without secrets), skip.
         return
     try:
+        # Rotating sample: the LIMIT means one run cannot cover every chat,
+        # so shuffle by (UTC date, chat_id) instead of leaving the same
+        # first N chats as the only ones ever verified.
+        _salt = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         async with async_session_factory() as db:
-            chats = (await db.execute(text(
-                "SELECT id, tenant_id, chat_id "
-                "  FROM chat_threads "
-                " WHERE last_drained_at > NOW() - INTERVAL '24 hours' "
-                "   AND (drain_failure_state IS NULL "
-                "        OR (drain_failure_state->>'class') IS NULL "
-                "        OR (drain_failure_state->>'class') NOT IN "
-                "             ('PERMISSION','GONE'))"
-            ))).all()
+            chats = (await db.execute(
+                text(CHAT_INTEGRITY_CANDIDATE_SQL),
+                {"salt": _salt, "max_chats": limits.max_chats},
+            )).all()
         if not chats:
             return
         # GraphClient(client_id, client_secret, tenant_id) — needs per-tenant
@@ -408,6 +566,10 @@ async def _verify_chat_integrity_once():
                 return None
 
         gaps_found = 0
+        checked = 0
+        unverified = 0
+        calls_used = 0
+        truncated = False
         for c in chats:
             try:
                 # Local DB count.
@@ -422,14 +584,49 @@ async def _verify_chat_integrity_once():
                 gc = await _gc_for_tenant(str(c.tenant_id))
                 if gc is None:
                     continue
-                graph_total = await gc.count_chat_messages(c.chat_id)
-                if graph_total is None:
+            except Exception:
+                # Per-chat failure: skip and continue. Don't let one chat
+                # tank the whole nightly sweep.
+                continue
+            # Budget gate is OUTSIDE the per-chat try so an exhausted run
+            # ends the sweep instead of walking the rest of the sample.
+            decision, pages_allowed = plan_chat_integrity_check(
+                db_count=int(n), calls_used=calls_used, limits=limits,
+            )
+            if decision == "STOP_BUDGET":
+                truncated = True
+                break
+            try:
+                _st: Dict[str, Any] = {}
+                graph_total = await gc.count_chat_messages(
+                    c.chat_id, max_pages=pages_allowed, stats=_st,
+                )
+                calls_used += int(_st.get("pages") or 1)
+                checked += 1
+                verdict, graph_count, miss_pct = chat_integrity_verdict(
+                    db_count=int(n),
+                    graph_total=graph_total,
+                    partial_total=int(_st.get("partial_total") or 0),
+                    capped=bool(_st.get("capped")),
+                    tolerance_pct=_CHAT_INTEGRITY_TOLERANCE_PCT,
+                )
+                if verdict == "UNVERIFIED":
+                    # Not a clean bill of health — Graph refused, or the walk
+                    # was page-capped without proving anything. Counted and
+                    # reported, never silently treated as OK.
+                    unverified += 1
+                    if _st.get("capped"):
+                        print(
+                            f"[CHAT-INTEGRITY] chat={str(c.chat_id)[:12]} "
+                            f"unverified: walk capped at {pages_allowed} page(s)"
+                            f" (~{int(_st.get('partial_total') or 0)} msgs seen,"
+                            f" db={int(n)}); raise "
+                            f"CHAT_INTEGRITY_MAX_PAGES_PER_CHAT to verify it",
+                        )
                     continue
-                if graph_total <= 0:
+                if verdict == "OK":
                     continue
-                miss_pct = abs(graph_total - int(n)) / float(graph_total) * 100.0
-                if miss_pct <= _CHAT_INTEGRITY_TOLERANCE_PCT:
-                    continue
+                _lower_bound = verdict == "GAP_LOWER_BOUND"
                 # Flag gap.
                 async with async_session_factory() as db3:
                     await db3.execute(text(
@@ -444,7 +641,8 @@ async def _verify_chat_integrity_once():
                         "fs": json.dumps({
                             "integrity_gap": True,
                             "db_count": int(n),
-                            "graph_count": int(graph_total),
+                            "graph_count": int(graph_count),
+                            "graph_count_is_lower_bound": _lower_bound,
                             "detected_at": datetime.now(timezone.utc).isoformat(),
                         }),
                     })
@@ -461,19 +659,30 @@ async def _verify_chat_integrity_once():
                         "details": {
                             "chat_id": c.chat_id,
                             "db_count": int(n),
-                            "graph_count": int(graph_total),
-                            "miss_pct": round(miss_pct, 2),
+                            "graph_count": int(graph_count),
+                            "graph_count_is_lower_bound": _lower_bound,
+                            "miss_pct": round(miss_pct or 0.0, 2),
                         },
                     })
                 except Exception:
                     pass
-            except Exception as e:
+            except Exception:
                 # Per-chat failure: skip and continue. Don't let one chat
                 # tank the whole nightly sweep.
                 continue
-        if gaps_found:
-            print(f"[CHAT-INTEGRITY] sweep found {gaps_found} gap(s) "
-                  f"across {len(chats)} chats — backups will re-drain")
+        # Always summarise: a bounded sweep that covered 40 of 900 chats must
+        # not read like a clean bill of health for the other 860.
+        print(
+            f"[CHAT-INTEGRITY] sweep done: checked={checked}/{len(chats)} "
+            f"gaps={gaps_found} unverified={unverified} "
+            f"graph_calls={calls_used}/{limits.max_graph_calls}"
+            + (
+                " — BUDGET EXHAUSTED, sample truncated (raise "
+                "CHAT_INTEGRITY_MAX_GRAPH_CALLS_PER_RUN or lower "
+                "CHAT_INTEGRITY_INTERVAL_S)" if truncated else ""
+            )
+            + (" — backups will re-drain" if gaps_found else "")
+        )
     except Exception as e:
         print(f"[CHAT-INTEGRITY] sweep failed: {type(e).__name__}: {e}")
 
@@ -572,6 +781,12 @@ ACTIONS = {
     "BACKUP_CANCELLED": "Backup cancelled by user",
     "BACKUP_PREEMPTIVE": "Preemptive backup triggered (AI detection)",
     "BACKUP_SKIPPED_SLA_SCOPE": "Scheduled backup skipped because the assigned SLA does not cover the resource workload",
+    "BACKUP_CYCLE_SKIPPED_OVERLAP": "Scheduled backup cycle skipped because the previous cycle for this SLA policy was still running",
+    "BACKUP_CYCLE_OVERLAP_OVERRIDE": "Previous backup cycle exceeded the overlap horizon — a new cycle was dispatched anyway (investigate the stuck cycle)",
+    "BACKUP_CYCLE_PARTIAL_OVERLAP": "Previous backup cycle was still draining — the resources actually running were held and the rest of the policy dispatched",
+    "BACKUP_DEFERRED_CONCURRENCY_CAP": "Resources held back from this backup cycle by the SLA policy's max_concurrent_backups cap",
+    "BACKUP_CYCLE_WAVE_DISPATCHED": "Backup cycle wave dispatched — resources the concurrency cap had deferred were released as in-flight work finished",
+    "BACKUP_CYCLE_INCOMPLETE": "Backup cycle closed with eligible resources never dispatched — the concurrency cap was never free long enough (raise max_concurrent_backups or shorten the cadence)",
     "RESTORE_TRIGGERED": "Restore job triggered",
     "RESTORE_RUNNING": "Restore job picked up by worker",
     "RESTORE_COMPLETED": "Restore completed",
@@ -608,13 +823,45 @@ AUDIT_PRESETS = [
                  "CHAT_EXPORT_DOWNLOADED", "CHAT_EXPORT_FORCE_DELETED"]},
 ]
 
-WARNING_ACTIVITY_ACTIONS = {"BACKUP_SKIPPED_SLA_SCOPE"}
+WARNING_ACTIVITY_ACTIONS = {
+    "BACKUP_SKIPPED_SLA_SCOPE",
+    # Cycle-level dispatch decisions (2026-08-05). These MUST be visible:
+    # a skipped cycle or a silently-trimmed resource is a coverage gap,
+    # and the original trim had no log line and no event at all — which
+    # is how Gold missed its 8h SLA with no trace. Emitted once per tick
+    # (not per resource) so a 33-resource deferral doesn't flood the feed;
+    # per-resource detail lives in details.resource_ids.
+    "BACKUP_CYCLE_SKIPPED_OVERLAP",
+    "BACKUP_CYCLE_OVERLAP_OVERRIDE",
+    # A partial dispatch is still a coverage gap for the held resources, so it
+    # must surface as a warning too — silently holding a resource is how the
+    # 2026-08-06 02:07Z loss went unnoticed.
+    "BACKUP_CYCLE_PARTIAL_OVERLAP",
+    "BACKUP_DEFERRED_CONCURRENCY_CAP",
+    # 2026-09-03: deferral is routine now that the drain re-dispatches it
+    # in waves; the real coverage gap is a cycle that CLOSES with work
+    # never dispatched. Waves themselves are progress, not warnings.
+    "BACKUP_CYCLE_INCOMPLETE",
+}
 # RANSOMWARE_SIGNAL deliberately excluded — it belongs in the Audit + Risk
 # tabs, not the Tasks/Activity feed (it isn't a job outcome).
 
 # Discovery events (run start + completion, per-tenant) are surfaced in the
 # activity feed so users can see auto- and manual-triggered discoveries.
 DISCOVERY_ACTIVITY_ACTIONS = {"DISCOVERY_STARTED", "DISCOVERY_RUN"}
+
+# Two DISCOVERY_STARTED events for the same (tenant, resource_type) within
+# this window and with no DISCOVERY_RUN between them are one logical start
+# (historically: manual trigger double-emit, ~1s apart). Used by both
+# discovery-pairing sites below.
+_DUP_STARTED_WINDOW_S = 120
+
+# How many candidate rows per source the Activity feed scans before it stops
+# counting. Must NOT depend on page/size — that dependency is what made
+# `total` vary with the request (2026-08-12). Sized well above the live feed
+# (~1.6k batches + ~125 discovery events) so `total` is exact in practice;
+# raise it if a tenant ever legitimately exceeds it, and watch `total_capped`.
+ACTIVITY_SCAN_CAP = int(os.environ.get("ACTIVITY_SCAN_CAP", "5000"))
 
 M365_RESOURCE_TYPES = {
     ResourceType.MAILBOX,
@@ -736,7 +983,24 @@ async def _list_activities_batch(
     elif status in ("Done", "In Progress", "Failed", "Canceled"):
         include_warnings = False
 
-    fetch_limit = max(size, page * size)
+    # Scan window is a FIXED cap, deliberately not derived from page/size.
+    #
+    # It used to be ``max(size, page * size)``, which made ``total`` below —
+    # computed as ``len(items)`` — report "rows I happened to fetch" rather
+    # than "rows that match". Measured 2026-08-12 on prod, same filter set:
+    #   size=10 -> total=25    size=50  -> total=93    size=200 -> total=280
+    #   page=2  -> total=168   page=4   -> total=280
+    # The UI trusts total for its page count, so Next died at page 2 of ~6
+    # and roughly two thirds of the activity history was unreachable.
+    #
+    # A single COUNT(*) is not available here: `items` is a UNION of three
+    # sources (batch rollup, discovery audit events, warnings) that are then
+    # de-duplicated and status-filtered in Python, so a SQL count would drift
+    # from the list it claims to describe. Scanning a fixed window and
+    # counting the merged result keeps total EXACT up to the cap and, above
+    # all, STABLE across page and size. `total_capped` tells the caller when
+    # the number is a floor rather than a count.
+    fetch_limit = ACTIVITY_SCAN_CAP
     items: List[Dict[str, Any]] = []
 
     async with async_session_factory() as db:
@@ -829,6 +1093,28 @@ async def _list_activities_batch(
                 (e for e in dev if e.action == "DISCOVERY_RUN"),
                 key=lambda e: e.occurred_at or datetime.min,
             )
+            # Collapse duplicate STARTEDs (same key, ≤120s apart, no RUN
+            # between) — see the identical block in list_activities' legacy
+            # branch for the full failure story (orphan STARTED steals the
+            # next run's terminal event; feed wedges at "In Progress").
+            _dedup_started: List[AuditEvent] = []
+            _last_started_at: Dict[Any, datetime] = {}
+            for s in started_sorted:
+                key = (s.tenant_id, s.resource_type)
+                s_at = s.occurred_at or datetime.min
+                prev_at = _last_started_at.get(key)
+                if prev_at is not None and (s_at - prev_at).total_seconds() <= _DUP_STARTED_WINDOW_S:
+                    run_between = any(
+                        (r.tenant_id, r.resource_type) == key
+                        and prev_at <= (r.occurred_at or datetime.min) <= s_at
+                        for r in run_sorted
+                    )
+                    if not run_between:
+                        _last_started_at[key] = s_at
+                        continue
+                _last_started_at[key] = s_at
+                _dedup_started.append(s)
+            started_sorted = _dedup_started
             run_buckets: Dict[Any, List[AuditEvent]] = {}
             for r in run_sorted:
                 run_buckets.setdefault((r.tenant_id, r.resource_type), []).append(r)
@@ -903,11 +1189,14 @@ async def _list_activities_batch(
     # Merge + sort + paginate.
     items.sort(key=lambda it: it.get("start_time") or "", reverse=True)
     total = len(items)
+    # Any source hitting the scan cap means `total` is a floor, not a count.
+    capped = total >= ACTIVITY_SCAN_CAP
     start_idx = (page - 1) * size
     page_items = items[start_idx:start_idx + size]
     return {
         "items": page_items,
         "total": total,
+        "total_capped": capped,
         "page":  page,
         "size":  size,
         "has_more": (page * size) < total,
@@ -1022,7 +1311,7 @@ async def _list_activities_batch_v2(
         return out
 
 
-@app.get("/api/v1/activity")
+@app.get("/api/v1/activity", dependencies=[Depends(require_principal)])
 async def list_activities(
     tenantId: Optional[str] = Query(None),
     serviceType: Optional[str] = Query(None),
@@ -1056,7 +1345,10 @@ async def list_activities(
             tenantId=tenantId, serviceType=serviceType,
             start_date=start_date, end_date=end_date,
             operation=operation, status=status,
-            page=page, size=size,
+            # Merge the fixed candidate set before slicing the final page.
+            # Slicing legacy first loses rows and makes total request-dependent.
+            page=1 if settings.BATCH_ROW_REDESIGN_ENABLED else page,
+            size=ACTIVITY_SCAN_CAP if settings.BATCH_ROW_REDESIGN_ENABLED else size,
         )
         if not settings.BATCH_ROW_REDESIGN_ENABLED:
             return legacy
@@ -1067,7 +1359,9 @@ async def list_activities(
             tenantId=tenantId,
             start_date=start_date, end_date=end_date,
             operation=operation, status=status,
-            limit=max(size, page * size),
+            # Same fixed cap as the legacy slice — deriving this from
+            # page/size is what made `total` grow with the request.
+            limit=ACTIVITY_SCAN_CAP,
         )
         legacy_items = legacy.get("items", []) if isinstance(legacy, dict) else []
         merged: List[Dict[str, Any]] = merge_backup_batch_rows(legacy_items, v2_rows)
@@ -1077,6 +1371,7 @@ async def list_activities(
         return {
             "items": merged[start_idx:start_idx + size],
             "total": total,
+            "total_capped": bool(legacy.get("total_capped")) or total >= ACTIVITY_SCAN_CAP,
             "page": page,
             "size": size,
             "has_more": (page * size) < total,
@@ -1477,6 +1772,33 @@ async def list_activities(
             (e for e in discovery_events if e.action == "DISCOVERY_RUN"),
             key=lambda e: e.occurred_at or datetime.min,
         )
+
+        # Collapse duplicate STARTED events. One logical discovery can emit
+        # two STARTED rows (historically: manual trigger → tenant-service
+        # pre-emit + discovery-worker emit, ~1s apart). Greedy pairing then
+        # binds the run's single terminal event to the first STARTED and the
+        # orphan second STARTED steals the NEXT run's terminal event — every
+        # discovery row after the duplicate shows "In Progress" forever.
+        # Two STARTEDs for the same (tenant, resource_type) within 120s with
+        # no RUN between them are one logical start.
+        deduped_started: List[AuditEvent] = []
+        _last_started_at: Dict[Any, datetime] = {}
+        for s in started_sorted:
+            key = (s.tenant_id, s.resource_type)
+            s_at = s.occurred_at or datetime.min
+            prev_at = _last_started_at.get(key)
+            if prev_at is not None and (s_at - prev_at).total_seconds() <= _DUP_STARTED_WINDOW_S:
+                run_between = any(
+                    (r.tenant_id, r.resource_type) == key
+                    and prev_at <= (r.occurred_at or datetime.min) <= s_at
+                    for r in run_sorted
+                )
+                if not run_between:
+                    _last_started_at[key] = s_at
+                    continue
+            _last_started_at[key] = s_at
+            deduped_started.append(s)
+        started_sorted = deduped_started
         run_buckets: Dict[Any, List[AuditEvent]] = {}
         for r in run_sorted:
             run_buckets.setdefault((r.tenant_id, r.resource_type), []).append(r)
@@ -1572,7 +1894,7 @@ async def list_activities(
         }
 
 
-@app.get("/api/v1/activity/export")
+@app.get("/api/v1/activity/export", dependencies=[Depends(require_admin_principal)])
 async def export_activity_csv(
     tenantId: Optional[str] = Query(None),
     serviceType: Optional[str] = Query(None),
@@ -1599,7 +1921,7 @@ async def export_activity_csv(
             page=1, size=5000,
         )
         output = io.StringIO()
-        writer = csv.writer(output)
+        writer = SafeCsvWriter(csv.writer(output))
         writer.writerow([
             "Batch ID", "Start Time", "Operation", "Object",
             "Status", "Finish Time", "Details",
@@ -1684,7 +2006,7 @@ async def export_activity_csv(
         jobs = result.scalars().all()
 
         output = io.StringIO()
-        writer = csv.writer(output)
+        writer = SafeCsvWriter(csv.writer(output))
         writer.writerow([
             "ID", "Start Time", "Operation", "Object",
             "Status", "Finish Time", "Details"
@@ -1708,7 +2030,7 @@ async def export_activity_csv(
         )
 
 
-@app.get("/api/v1/activity/batches/{batch_id}/children")
+@app.get("/api/v1/activity/batches/{batch_id}/children", dependencies=[Depends(require_principal)])
 async def get_batch_children(batch_id: str):
     """Per-resource drilldown for one Activity batch row.
 
@@ -1966,8 +2288,92 @@ async def get_batch_children(batch_id: str):
     return {"batchId": batch_id, "resources": tier1}
 
 
+_audit_log = logging.getLogger("audit-service.internal-auth")
+
+# Headers that only a reverse proxy adds: ingress-nginx sets X-Forwarded-*
+# on everything it routes, and any additional proxy in front appends to
+# them. A pod-to-pod call to audit-service:8080 carries none of them.
+# Used ONLY by the unconfigured degraded mode below, to tell "emitter in
+# this cluster" from "someone who came in through the front door".
+_PROXY_MARKER_HEADERS = (
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+    "x-real-ip",
+    "forwarded",
+    "via",
+)
+
+# Degraded-mode log throttle: loud, but not one line per audit row.
+_UNCONFIGURED_ALLOWS = 0
+_UNCONFIGURED_LOG_EVERY = 500
+
+
+def require_internal_api_key(
+    request: Request,
+    x_internal_api_key: Optional[str] = Header(default=None, alias="X-Internal-Api-Key"),
+) -> None:
+    """Gate the audit-write route on the internal-services shared secret.
+
+    This route writes the audit trail from an unvalidated request body —
+    action, outcome, actor_*, resource_*, details — so an anonymous caller
+    could forge or bury compliance records (and the forged `details` also
+    drives _detect_risk_signals).
+
+    Two modes, because INTERNAL_API_KEY does not exist in any deploy
+    manifest yet (shared/config.py reads it with a "" default and no
+    ConfigMap/Secret sets it):
+
+    CONFIGURED (INTERNAL_API_KEY non-empty) — the end state. Every caller
+    must present a matching X-Internal-Api-Key or get 401. Same gate, same
+    semantics as services/delta-token.
+
+    UNCONFIGURED (INTERNAL_API_KEY empty) — a bounded, self-clearing
+    degraded mode so shipping this code before the Secret lands does not
+    black-hole the audit trail. delta-token's plain 503 would 100%-drop
+    every audit row on today's deploy. Instead:
+      * requests carrying reverse-proxy markers are REJECTED (401) — those
+        are the anonymous-from-the-ingress writers the finding is about;
+      * unproxied pod-to-pod requests are allowed and logged loudly, so
+        in-cluster emitters keep writing while operators wire the Secret.
+    Setting INTERNAL_API_KEY flips this to CONFIGURED with no code change,
+    which is the documented operator action. Note the gateway no longer
+    proxies this route at all, so the ingress path is already closed —
+    the marker check is defence in depth for any future proxy route.
+    """
+    expected = settings.INTERNAL_API_KEY
+    if expected:
+        if not x_internal_api_key or not secrets.compare_digest(
+            x_internal_api_key, expected
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or missing internal API key",
+            )
+        return
+
+    # Ops/Data Check 17: fail CLOSED. INTERNAL_API_KEY is now provisioned in
+    # tmvault-secrets and referenced by audit-service and every emitter, so an
+    # empty value here is a misconfiguration — refuse the write rather than
+    # accept an unauthenticated (forgeable) audit record. (The prior
+    # "degraded mode" allowed unauthenticated in-cluster writes; removed.)
+    _audit_log.error(
+        "audit-write REFUSED: INTERNAL_API_KEY is empty on audit-service. The "
+        "gate fails closed — set INTERNAL_API_KEY (same value) on audit-service "
+        "and every emitter."
+    )
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="audit gate not configured (INTERNAL_API_KEY unset); write refused",
+    )
+
+
 @app.post("/api/v1/audit/log")
-async def create_audit_event(event: dict):
+async def create_audit_event(
+    event: dict,
+    _internal: None = Depends(require_internal_api_key),
+):
     """
     Internal endpoint for services/workers to log events.
     Enriches events with SLA context, resource metadata, and risk signals.
@@ -2176,9 +2582,13 @@ def _normalize_event(event: dict) -> dict:
     action = event.get("action", "UNKNOWN")
     details = event.get("details", {})
 
-    # Normalize actor_type
+    # Normalize actor_type. UNKNOWN is a first-class value (not coerced to
+    # SYSTEM) so an unauthenticated / unverifiable-token mutation attempt —
+    # e.g. a LOGIN_FAILED or an anonymous write caught by the audit
+    # middleware — is stored truthfully rather than mislabelled as the system
+    # having acted.
     actor_type = event.get("actor_type", "SYSTEM")
-    if actor_type not in ("USER", "SYSTEM", "WORKER"):
+    if actor_type not in ("USER", "SYSTEM", "WORKER", "UNKNOWN"):
         actor_type = "SYSTEM"
 
     # Normalize outcome based on action context. IN_PROGRESS covers the
@@ -2228,7 +2638,7 @@ def _normalize_event(event: dict) -> dict:
     }
 
 
-@app.get("/api/v1/audit/events")
+@app.get("/api/v1/audit/events", dependencies=[Depends(require_principal)])
 async def list_audit_events(
     tenantId: Optional[str] = Query(None),
     action: Optional[str] = Query(None),
@@ -2286,7 +2696,7 @@ async def list_audit_events(
         }
 
 
-@app.get("/api/v1/audit/resource/{resource_id}")
+@app.get("/api/v1/audit/resource/{resource_id}", dependencies=[Depends(require_principal)])
 async def get_resource_audit_log(
     resource_id: str,
     page: int = Query(1, ge=1),
@@ -2318,7 +2728,7 @@ async def get_resource_audit_log(
         }
 
 
-@app.get("/api/v1/audit/events/{event_id}")
+@app.get("/api/v1/audit/events/{event_id}", dependencies=[Depends(require_principal)])
 async def get_audit_event(event_id: str):
     """Get a single audit event by ID"""
     async with async_session_factory() as db:
@@ -2328,7 +2738,7 @@ async def get_audit_event(event_id: str):
         return _format_event(event)
 
 
-@app.get("/api/v1/audit/risk-signals")
+@app.get("/api/v1/audit/risk-signals", dependencies=[Depends(require_principal)])
 async def get_high_risk_events(
     tenantId: Optional[str] = Query(None),
     from_date: Optional[str] = Query(None),
@@ -2337,6 +2747,8 @@ async def get_high_risk_events(
     risk_level: Optional[str] = Query(None),  # CRITICAL, HIGH, MEDIUM
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=500),
+    sort: str = Query("date", pattern="^(date|risk_score)$"),
+    order: str = Query("desc", pattern="^(asc|desc)$"),
 ):
     """
     Query high-risk audit events based on risk signal analysis.
@@ -2362,9 +2774,43 @@ async def get_high_risk_events(
         if tenantId:
             filters.append(AuditEvent.tenant_id == uuid.UUID(tenantId))
         if risk_level:
-            filters.append(text(f"details->'risk_signals'->>'risk_level' = '{risk_level}'"))
+            # Bound parameter, never an f-string. This was interpolating a raw
+            # query-string value straight into SQL — `risk_level` is attacker
+            # controlled, so `' OR '1'='1` and worse went to the planner
+            # verbatim. Found 2026-08-12 while fixing the sort below.
+            filters.append(
+                text("details->'risk_signals'->>'risk_level' = :risk_level")
+                .bindparams(risk_level=risk_level)
+            )
 
-        stmt = select(AuditEvent).where(and_(*filters)).order_by(desc(AuditEvent.occurred_at))
+        # Ordering happens in SQL so it agrees with pagination. It used to be
+        # applied in Python AFTER the page was fetched, which sorted only the
+        # 50 rows already on screen: the grid showed risk-score order while
+        # the pages were cut by date, so "highest risk" really meant "highest
+        # risk among the 50 most recent" and the DATE header's indicator
+        # described an order the table wasn't in (BUG-009).
+        #
+        # RANSOMWARE_SIGNAL rows carry no risk_signals payload — their score
+        # is synthesised from drop_pct below — so the same derivation is
+        # mirrored here to keep one ordering across every page.
+        score_sql = text(
+            "COALESCE("
+            "  NULLIF(details->'risk_signals'->>'risk_score','')::int,"
+            "  CASE WHEN action = 'RANSOMWARE_SIGNAL' THEN"
+            "    CASE WHEN COALESCE((details->>'drop_pct')::float, 0) >= 90 THEN 90"
+            "         WHEN COALESCE((details->>'drop_pct')::float, 0) >= 70 THEN 70"
+            "         WHEN COALESCE((details->>'drop_pct')::float, 0) >= 50 THEN 50"
+            "         ELSE 30 END"
+            "  END,"
+            "  0)"
+        )
+        sort_expr = score_sql if sort == "risk_score" else AuditEvent.occurred_at
+        primary = desc(sort_expr) if order == "desc" else asc(sort_expr)
+        # occurred_at is the tiebreaker so equal scores have a stable,
+        # meaningful order instead of whatever the heap returns.
+        order_by = [primary] if sort == "date" else [primary, desc(AuditEvent.occurred_at)]
+
+        stmt = select(AuditEvent).where(and_(*filters)).order_by(*order_by)
         count_stmt = select(func.count()).select_from(AuditEvent).where(and_(*filters))
 
         total_result = await db.execute(count_stmt)
@@ -2411,19 +2857,21 @@ async def get_high_risk_events(
             item["risk_level"] = risk_signals.get("risk_level", "UNKNOWN")
             enriched_items.append(item)
 
-        # Sort by risk_score descending
-        enriched_items.sort(key=lambda x: x.get("risk_score", 0), reverse=True)
-
+        # NO re-sort here. The page was cut in SQL in the requested order;
+        # re-ordering it in Python is what made the visible order disagree
+        # with the pagination (BUG-009).
         return {
             "items": enriched_items,
             "total": total,
             "page": page,
             "size": size,
+            "sort": sort,
+            "order": order,
             "has_more": (page * size) < total,
         }
 
 
-@app.get("/api/v1/audit/export")
+@app.get("/api/v1/audit/export", dependencies=[Depends(require_admin_principal)])
 async def export_audit_csv(
     tenantId: Optional[str] = Query(None),
     action: Optional[str] = Query(None),
@@ -2451,7 +2899,7 @@ async def export_audit_csv(
         events = result.scalars().all()
 
         output = io.StringIO()
-        writer = csv.writer(output)
+        writer = SafeCsvWriter(csv.writer(output))
         writer.writerow([
             "Timestamp", "Action", "Outcome", "Resource Type",
             "Resource Name", "Actor Type", "Actor Email",
@@ -2479,13 +2927,13 @@ async def export_audit_csv(
         )
 
 
-@app.get("/api/v1/audit/presets")
+@app.get("/api/v1/audit/presets", dependencies=[Depends(require_principal)])
 async def list_presets():
     """List built-in audit filter presets for the UI (e.g. 'Chat exports')."""
     return {"presets": AUDIT_PRESETS}
 
 
-@app.get("/api/v1/audit/actions")
+@app.get("/api/v1/audit/actions", dependencies=[Depends(require_principal)])
 async def list_actions():
     """List all available audit action codes"""
     # Get distinct actions from DB
@@ -2501,7 +2949,7 @@ async def list_actions():
     }
 
 
-@app.get("/api/v1/audit/stats")
+@app.get("/api/v1/audit/stats", dependencies=[Depends(require_principal)])
 async def get_audit_stats(
     tenantId: Optional[str] = Query(None),
     days: int = Query(7),
@@ -2541,7 +2989,32 @@ async def get_audit_stats(
 
 # ==================== SIEM Webhook Integration ====================
 
-@app.get("/api/v1/audit/siem/stream")
+def _cef_header_value(value: Any) -> str:
+    """Escape a value for a CEF header (prefix) field.
+
+    CEF escapes backslash and the pipe separator inside header fields. CR/LF
+    cannot be represented there at all — they'd end the record — so they
+    collapse to a space.
+    """
+    s = "" if value is None else str(value)
+    s = s.replace("\\", "\\\\").replace("|", "\\|")
+    return s.replace("\r", " ").replace("\n", " ")
+
+
+def _cef_extension_value(value: Any) -> str:
+    """Escape a value for a CEF extension (key=value) field.
+
+    CEF escapes backslash and `=` in extension values, and CR/LF must become
+    the literal \\r / \\n sequences so one event can never split into two SIEM
+    records. Pipe is escaped too because this stream separates extensions with
+    ' | ' — an unescaped pipe in a value would otherwise forge a whole field.
+    """
+    s = "" if value is None else str(value)
+    s = s.replace("\\", "\\\\").replace("=", "\\=").replace("|", "\\|")
+    return s.replace("\r", "\\r").replace("\n", "\\n")
+
+
+@app.get("/api/v1/audit/siem/stream", dependencies=[Depends(require_admin_principal)])
 async def stream_audit_events_for_siem(
     tenantId: Optional[str] = Query(None),
     from_date: Optional[str] = Query(None),
@@ -2578,22 +3051,26 @@ async def stream_audit_events_for_siem(
             elif event.outcome == "PARTIAL":
                 severity = 5
 
+            # Every value below is event data (attacker-influenced in the
+            # general case) — escape each one so it can't introduce a
+            # separator, a new key, or a record break.
+            action = event.action or ""
             cef_fields = [
                 "CEF:0",
                 "TMVault",  # Device Vendor
                 "BackupPlatform",  # Device Product
                 "1.0",  # Device Version
-                event.action,  # Signature ID
-                event.action.replace("_", " ").title(),  # Name
+                _cef_header_value(action),  # Signature ID
+                _cef_header_value(action.replace("_", " ").title()),  # Name
                 str(severity),
-                f"rt={event.occurred_at.isoformat() if event.occurred_at else ''}",
-                f"act={event.action}",
-                f"outcome={event.outcome}",
-                f"destination={event.resource_name or ''}",
-                f"deviceExternalId={event.resource_id or ''}",
-                f"requester={event.actor_email or ''}",
-                f"externalId={event.job_id or ''}",
-                f"flexString1={event.tenant_id or ''}",
+                f"rt={_cef_extension_value(event.occurred_at.isoformat() if event.occurred_at else '')}",
+                f"act={_cef_extension_value(action)}",
+                f"outcome={_cef_extension_value(event.outcome or '')}",
+                f"destination={_cef_extension_value(event.resource_name or '')}",
+                f"deviceExternalId={_cef_extension_value(event.resource_id or '')}",
+                f"requester={_cef_extension_value(event.actor_email or '')}",
+                f"externalId={_cef_extension_value(event.job_id or '')}",
+                f"flexString1={_cef_extension_value(event.tenant_id or '')}",
             ]
             return " | ".join(cef_fields)
 
@@ -2622,7 +3099,7 @@ async def stream_audit_events_for_siem(
         )
 
 
-@app.post("/api/v1/audit/siem/webhook")
+@app.post("/api/v1/audit/siem/webhook", dependencies=[Depends(require_admin_principal)])
 async def register_siem_webhook(webhook: dict):
     """
     Register a SIEM webhook URL for real-time event forwarding.
@@ -2651,7 +3128,7 @@ async def register_siem_webhook(webhook: dict):
     }
 
 
-@app.post("/api/v1/audit/siem/webhook/{webhook_id}/test")
+@app.post("/api/v1/audit/siem/webhook/{webhook_id}/test", dependencies=[Depends(require_admin_principal)])
 async def test_siem_webhook(webhook_id: str):
     """Test a registered SIEM webhook by sending a sample event"""
     # In production: fetch webhook config from DB
@@ -2671,7 +3148,7 @@ async def test_siem_webhook(webhook_id: str):
     }
 
 
-@app.get("/api/v1/audit/graph-apps")
+@app.get("/api/v1/audit/graph-apps", dependencies=[Depends(require_principal)])
 async def get_graph_apps():
     """Get multi-app registration status and usage stats"""
     return {
@@ -2680,7 +3157,7 @@ async def get_graph_apps():
     }
 
 
-@app.post("/api/v1/audit/ingest/graph/{tenant_id}")
+@app.post("/api/v1/audit/ingest/graph/{tenant_id}", dependencies=[Depends(require_admin_principal)])
 async def ingest_graph_audit_logs(
     tenant_id: str,
     days: int = Query(7),
@@ -2844,6 +3321,10 @@ async def consume_audit_events():
                 await db.commit()
         except Exception as e:
             print(f"[AUDIT_CONSUMER] Error processing message: {e}")
-            # In production: send to DLQ
+            # Re-raise: swallowing here made the message bus treat the
+            # message as handled and ACK it, so the audit event was gone.
+            # shared.message_bus.consume requeues once and then routes to
+            # audit.events.dlq, which is recoverable; a silent ACK is not.
+            raise
 
     await message_bus.consume("audit.events", callback)

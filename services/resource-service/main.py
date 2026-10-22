@@ -54,6 +54,116 @@ def format_bytes(bytes_val: int) -> str:
     return f"{bytes_val / 1024**3:.1f} GB"
 
 
+# ── Recovery-point predicate, raw-SQL form ────────────────────────────────
+#
+# Raw-SQL twin of snapshot-service's _real_restore_point() and
+# dr-replication-worker's _dr_replicable_snapshot(). Every query in this
+# module that COUNTS or DATES recovery points routes through this one
+# constant so the surfaces cannot drift apart again.
+#
+# PARTIAL belongs here. A PARTIAL snapshot lost some shards but still holds
+# every item it DID capture, so it is a real recovery point: in production
+# the only backup of Jason Rue's 1,114,848-item / 152 GB Exchange Online
+# Archive is PARTIAL, and the lossy-shard derivation deployed 2026-08-04
+# makes PARTIAL the normal outcome for any SharePoint/OneDrive run with
+# files_failed > 0. Counting COMPLETED only meant those recovery points did
+# not exist as far as the Protection table's backup count was concerned.
+#
+# skipped_concurrent is rejected. backup-worker's cross-job concurrency
+# guard (SKIP_CONCURRENT in workers/backup-worker/main.py) creates a snapshot
+# row purely so a skipped job's FANOUT/FINALIZE counters balance, then marks
+# it COMPLETED with item_count=0 in ~19 ms; six exist in production. Those
+# are fake successes holding nothing — they must never add to a backup count
+# or become a resource's "last backup" time.
+#
+# NOT a health signal: `last_backup_status` is derived independently from the
+# latest BACKUP Job's status (see the LATERAL join in the list queries), so
+# widening these counts to PARTIAL cannot make a degraded run look clean.
+#
+# extra_data is a Postgres **json** column (not jsonb), so
+# json_extract_path_text is the correct accessor and is NULL-safe for absent
+# keys — jsonb_extract_path_text would raise at runtime. COALESCE is
+# load-bearing: rows written before the flag existed hold NULL, and a bare
+# NOT IN over NULL yields NULL, which would silently filter out every real
+# snapshot. Compared as text so a non-boolean value can't raise the way an
+# ->>::boolean cast would.
+#
+# Assumes the surrounding query aliases the snapshots table as `s`.
+_REAL_RESTORE_POINT_SQL = (
+    "(s.status IN ('COMPLETED', 'PARTIAL')"
+    " AND COALESCE("
+    "json_extract_path_text(s.extra_data, 'skipped_concurrent'), 'false'"
+    ") NOT IN ('true', 't', '1'))"
+)
+
+
+# ── Canonical Protection-universe scope ───────────────────────────────────
+#
+# ONE definition of "which `resources` rows the Protection surfaces count".
+# The Protection tab lists (this module) and the Overview > Protection Status
+# cards (dashboard-service) MUST agree; before 2026-08-11 they were two
+# independent queries and had drifted on every single bucket. Measured live
+# against prod tenant 163c487b-14b9-4105-bf06-3494cf11190d on 2026-08-11
+# (card total vs tab item_number):
+#
+#     Users              6,680 vs 13,812
+#     Shared mailboxes     120 vs  1,293
+#     Rooms                132 vs    154
+#     SharePoint sites     752 vs  4,239
+#     Groups & Teams    10,109 vs 10,142
+#
+# Both causes were on the dashboard side:
+#
+#   1. dashboard filtered `status IN (DISCOVERED, ACTIVE)`; the tab applies
+#      no status filter at all. That hid 8,373 INACCESSIBLE rows (7,132
+#      ENTRA_USER, 1,173 SHARED_MAILBOX, 22 ROOM_MAILBOX, 13 SHAREPOINT_SITE,
+#      8 ENTRA_GROUP, 25 M365_GROUP) from the card while the tab listed them.
+#      The tab is right: shared/tier2_discovery.py:168 states the product
+#      rule — "readers (UI, audit) want the full list" — and a terminated
+#      user whose mailbox we still hold has to stay listed or there is no UI
+#      path to recover it. The status filter also cost the NUMERATOR: 2 of
+#      the 13 SLA-assigned resources on that tenant are INACCESSIBLE (1
+#      ENTRA_USER, 1 SHARED_MAILBOX), so the card under-reported protected
+#      resources as well as total ones.
+#
+#   2. dashboard still excluded SharePoint sites whose display name collides
+#      with a group's. /by-type stopped excluding those on 2026-07-15 — group
+#      backups capture profile+members only, NOT the group's site content, so
+#      hiding the site left no way to protect 3,465 of 4,204 sites — and now
+#      only annotates them (`group_connected`). The dashboard's copy of the
+#      rule was never updated, so the card denominator was 752 against a tab
+#      showing 4,239.
+#
+# Hence: the scope excludes NO status, and excludes exactly UI_HIDDEN_TYPES.
+# Expressed as data (not as an inline WHERE clause) so dashboard-service can
+# mirror it verbatim and
+# tests/services/test_protection_scope_single_definition.py can fail the
+# build the moment the two copies diverge again. The right long-term home is
+# shared/models.py next to UI_HIDDEN_TYPES; that file is out of scope for
+# this change, so the drift test is the guard.
+PROTECTION_SCOPE_EXCLUDED_STATUSES: frozenset = frozenset()
+PROTECTION_SCOPE_EXCLUDED_TYPES: frozenset = frozenset(UI_HIDDEN_TYPES)
+
+
+def protection_scope_clause(alias: str = "r", include_hidden_types: bool = False) -> str:
+    """`AND …` SQL fragment restricting a `resources` scan to the Protection
+    universe, for interpolation into an f-string query.
+
+    Values are enum member names from shared.models (never user input), so
+    inlining them as literals is safe and keeps the fragment bind-free —
+    callers can drop it into any query without threading extra params.
+    Returns "" when the scope excludes nothing.
+    """
+    parts: List[str] = []
+    if PROTECTION_SCOPE_EXCLUDED_STATUSES:
+        vals = ", ".join(f"'{s}'" for s in sorted(PROTECTION_SCOPE_EXCLUDED_STATUSES))
+        parts.append(f"AND {alias}.status::text NOT IN ({vals})")
+    if PROTECTION_SCOPE_EXCLUDED_TYPES and not include_hidden_types:
+        vals = ", ".join(f"'{t}'" for t in sorted(PROTECTION_SCOPE_EXCLUDED_TYPES))
+        parts.append(f"AND {alias}.type::text NOT IN ({vals})")
+    return "\n        ".join(parts)
+
+
 async def notify_scheduler_reschedule():
     """Notify the backup Scheduler to reschedule all SLA policy jobs"""
     try:
@@ -252,6 +362,14 @@ async def _apply_policy_to_matching(db: AsyncSession, policy: "SlaPolicy") -> in
          the SQL driver's safe limit and lets the DB reuse the index
          lookup plan instead of one big WHERE id IN (25k uuids).
 
+    Binds UNASSIGNED resources only (sla_policy_id IS NULL). The sweep
+    must never override an existing assignment: a resource explicitly
+    pinned to a long-retention policy that also matches a broad group
+    would silently move to the group's policy, and the next
+    retention_cleanup pass would delete snapshots the operator believed
+    were kept — permanent data loss with no audit trail. Reassignment
+    is an explicit operator workflow, not a side effect of a group edit.
+
     No-op when auto_apply_to_matching=False or no enabled groups attached.
     """
     if not policy.auto_apply_to_matching:
@@ -280,6 +398,7 @@ async def _apply_policy_to_matching(db: AsyncSession, policy: "SlaPolicy") -> in
     stream = await db.stream(
         select(Resource)
         .where(Resource.tenant_id == policy.tenant_id)
+        .where(Resource.sla_policy_id.is_(None))
         .execution_options(yield_per=CHUNK)
     )
     async for res in stream.scalars():
@@ -288,21 +407,25 @@ async def _apply_policy_to_matching(db: AsyncSession, policy: "SlaPolicy") -> in
                 matched_buffer.append(res.id)
                 break
         if len(matched_buffer) >= CHUNK:
-            await db.execute(
+            # Re-check IS NULL inside the UPDATE too — an assignment that
+            # landed between the streamed read and this write must win.
+            chunk_result = await db.execute(
                 sa_update(Resource)
                 .where(Resource.id.in_(matched_buffer))
+                .where(Resource.sla_policy_id.is_(None))
                 .values(sla_policy_id=policy.id)
             )
-            total_bound += len(matched_buffer)
+            total_bound += max(getattr(chunk_result, "rowcount", None) or 0, 0)
             matched_buffer.clear()
 
     if matched_buffer:
-        await db.execute(
+        tail_result = await db.execute(
             sa_update(Resource)
             .where(Resource.id.in_(matched_buffer))
+            .where(Resource.sla_policy_id.is_(None))
             .values(sla_policy_id=policy.id)
         )
-        total_bound += len(matched_buffer)
+        total_bound += max(getattr(tail_result, "rowcount", None) or 0, 0)
 
     return total_bound
 
@@ -348,7 +471,11 @@ async def _auto_bind_new_resource(db: AsyncSession, resource: "Resource") -> Opt
     return best_policy
 
 
+from shared.audit_middleware import AuditMiddleware  # Ops/Data Check 3: mutation-audit backstop
 app = FastAPI(title="Resource Service", version="1.0.0", lifespan=lifespan)
+app.add_middleware(AuditMiddleware, service_name="resource-service")
+from shared.auth_enforcement import AuthMiddleware  # Ops/Data Check 17: verified principal required
+app.add_middleware(AuthMiddleware, service_name="resource-service", require_admin_for_mutations=True, enforce_tenant_scope=True)
 
 
 USER_LINKED_TYPES = {
@@ -458,20 +585,55 @@ def _resource_group_key(resource: Resource) -> Optional[str]:
     return None
 
 
-async def expand_linked_policy_scope(db: AsyncSession, seed_resources: Iterable[Resource]) -> list[Resource]:
+async def fetch_linked_scope_candidates(
+    db: AsyncSession,
+    tenant_ids: Iterable[UUID],
+    *,
+    exclude_torn_down: bool = True,
+) -> list[Resource]:
+    """All rows of the tenant(s) that could be pulled in by linked-scope
+    expansion (user-/group-linked types). This is a tenant-wide scan — a
+    caller that expands many seed chunks in one request MUST fetch this
+    once and pass it to expand_linked_policy_scope(candidates=...), not
+    once per chunk (see _bulk_assign_by_filter)."""
+    candidate_types = list(USER_LINKED_TYPES | GROUP_LINKED_TYPES)
+    filters = [
+        Resource.tenant_id.in_(list(tenant_ids)),
+        Resource.type.in_(candidate_types),
+    ]
+    if exclude_torn_down:
+        # Assignment only: assign paths flip every expanded row to ACTIVE, so
+        # pulling in a PENDING_DELETION/ARCHIVED sibling silently undoes the
+        # operator's delete/archive and re-enrolls it in scheduled backups.
+        # Seeds are unaffected — an explicit operator action on the resource
+        # itself still passes through. Unassign paths must NOT set this: a
+        # torn-down sibling that keeps sla_policy_id is undetachable and
+        # blocks DELETE /policies/{id} with an FK IntegrityError.
+        filters.append(
+            Resource.status.notin_(
+                [ResourceStatus.PENDING_DELETION, ResourceStatus.ARCHIVED]
+            )
+        )
+    result = await db.execute(select(Resource).where(*filters))
+    return result.scalars().all()
+
+
+async def expand_linked_policy_scope(
+    db: AsyncSession,
+    seed_resources: Iterable[Resource],
+    *,
+    exclude_torn_down: bool = True,
+    candidates: Optional[list[Resource]] = None,
+) -> list[Resource]:
     seed_resources = list(seed_resources)
     if not seed_resources:
         return []
 
-    tenant_ids = {resource.tenant_id for resource in seed_resources}
-    candidate_types = list(USER_LINKED_TYPES | GROUP_LINKED_TYPES)
-    result = await db.execute(
-        select(Resource).where(
-            Resource.tenant_id.in_(tenant_ids),
-            Resource.type.in_(candidate_types),
+    if candidates is None:
+        tenant_ids = {resource.tenant_id for resource in seed_resources}
+        candidates = await fetch_linked_scope_candidates(
+            db, tenant_ids, exclude_torn_down=exclude_torn_down,
         )
-    )
-    candidates = result.scalars().all()
 
     user_keys = {
         (resource.tenant_id, key)
@@ -555,6 +717,27 @@ def _merge_unbackable(child_derived, parent_derived):
     return merged
 
 
+# Deterministic total order for EVERY LIMIT/OFFSET page over `resources`.
+# `created_at` alone is not unique — discovery bulk-commits its rows under a
+# single timestamp, so a tie group is the whole tenant, not a handful of
+# rows. Measured on prod tenant 163c487b (2026-08-11): 39,782 resources
+# share only 88 distinct created_at values, and the largest single tie group
+# is 32,360 rows. With a non-unique sort key Postgres is free to return a
+# different permutation of that group on every execution, so LIMIT/OFFSET
+# slices it arbitrarily — rows repeat across pages and others are
+# unreachable.
+#
+# Measured live against /api/v1/resources BEFORE this fix (same request run
+# twice, size=50, in-cluster): page 1 held only 33/50 of the same ids on the
+# second run, page 2 only 23/50, and the union of the first four pages was
+# 167 ids one run and 179 the next where 200 were expected. Appending the
+# primary key makes the order total. Same defect and same fix as ITO-9652 on
+# /by-type, which is why BY_TYPE_ORDER_BY below is now an alias of this one
+# constant rather than a second copy of the string.
+# Pinned by tests/services/test_resource_list_stable_pagination.py.
+RESOURCE_PAGE_ORDER_BY = "ORDER BY r.created_at DESC, r.id DESC"
+
+
 @app.get("/api/v1/resources")
 async def list_resources(
     tenantId: str = Query(...),
@@ -563,9 +746,22 @@ async def list_resources(
     status: Optional[str] = Query(None),
     types: Optional[str] = Query(None),  # comma-separated resource types
     includeHidden: bool = Query(False),  # opt-in to include UI_HIDDEN_TYPES like POWER_BI
+    # 2026-08-11 (QA-04): `query` and `sla` were NOT declared here, so
+    # FastAPI silently dropped them. The Protection page's "all" tab hits
+    # this endpoint and appends `&query=<term>` — the response came back
+    # with every row in the tenant AND `item_number` = the whole-tenant
+    # count (measured live: 29,641 for query=aaron, query=zzzzznotathing
+    # and sla=none alike, when the real match count for "aaron" is 28).
+    # That is a denominator computed from an unfiltered total: the page
+    # count it feeds says "1 / 593" for a 28-row search, so Next stays
+    # enabled and lands the operator on an empty page. Same failure mode,
+    # same fix, as ITO-9652 on /by-type — and it routes through the SAME
+    # filter builder so the two endpoints cannot answer a filter differently.
+    query: Optional[str] = Query(None),
+    sla: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
-    status_clause = "AND r.status = :rstatus" if status else ""
+    search_clause, search_params = build_by_type_search_filters(query, status, sla)
     type_clause = ""
     hidden_clause = ""
     if types:
@@ -579,17 +775,21 @@ async def list_resources(
             return {"items": [], "item_number": 0, "page_number": page, "next_page_token": None}
         placeholders = ", ".join([f":rt{i}" for i in range(len(type_list))])
         type_clause = f"AND r.type IN ({placeholders})"
-    elif not includeHidden and UI_HIDDEN_TYPES:
-        # No explicit filter — exclude hidden by default.
-        hidden_placeholders = ", ".join([f":hidden{i}" for i in range(len(UI_HIDDEN_TYPES))])
-        hidden_clause = f"AND r.type NOT IN ({hidden_placeholders})"
+    elif not includeHidden:
+        # No explicit filter — fall back to the canonical Protection scope
+        # (see protection_scope_clause above). Shared with the Overview
+        # cards so an unfiltered list and an unfiltered card count the same
+        # universe.
+        hidden_clause = protection_scope_clause("r")
 
     # `last_backup_status` is derived from the latest Job rather than the
     # denormalized resources.last_backup_status column so it stays in lockstep
     # with the Activity page (which reads Job.status). The lateral join picks
     # up the most recent BACKUP job touching this resource — either as the
     # single resource_id or as a member of a batch.
-    query = text(f"""
+    # NB: named `list_query`, not `query` — `query` is now the caller's
+    # search term and must survive to the count below.
+    list_query = text(f"""
         SELECT r.id, r.tenant_id, r.type, r.external_id, r.display_name, r.email, r.metadata, r.sla_policy_id,
                r.status, r.storage_bytes, r.last_backup_at,
                COALESCE(latest_job.status::text, r.last_backup_status) AS last_backup_status,
@@ -602,26 +802,24 @@ async def list_resources(
             ORDER BY j.created_at DESC
             LIMIT 1
         ) latest_job ON TRUE
-        WHERE r.tenant_id = :rtenant {status_clause} {type_clause} {hidden_clause}
-        ORDER BY r.created_at DESC
+        WHERE r.tenant_id = :rtenant {search_clause} {type_clause} {hidden_clause}
+        {RESOURCE_PAGE_ORDER_BY}
         LIMIT :rlimit OFFSET :roffset
     """)
-    params = {"rtenant": tenantId, "rlimit": size, "roffset": (page - 1) * size}
-    if status:
-        params["rstatus"] = status
+    params = {"rtenant": tenantId, "rlimit": size, "roffset": (page - 1) * size,
+              **search_params}
     if types:
         for i, t in enumerate(type_list):
             params[f"rt{i}"] = t
-    if hidden_clause:
-        for i, t in enumerate(sorted(UI_HIDDEN_TYPES)):
-            params[f"hidden{i}"] = t
 
-    result = await db.execute(query, params)
+    result = await db.execute(list_query, params)
     rows = result.fetchall()
 
-    # Count
+    # Count. Same WHERE as the page above, built from the same
+    # `search_clause` — an item_number that disagrees with the filter is how
+    # the Protection pager ends up offering a page that renders empty.
     count_query = text(f"""
-        SELECT count(*) FROM resources r WHERE r.tenant_id = :rtenant {status_clause} {type_clause} {hidden_clause}
+        SELECT count(*) FROM resources r WHERE r.tenant_id = :rtenant {search_clause} {type_clause} {hidden_clause}
     """)
     count_result = await db.execute(count_query, params)
     total = count_result.scalar() or 0
@@ -638,12 +836,12 @@ async def list_resources(
     resource_ids = [r[0] for r in rows]
     backup_counts = {}
     if resource_ids:
-        counts_query = text("""
-            SELECT resource_id, COUNT(*) as backup_count
-            FROM snapshots
-            WHERE resource_id = ANY(:resource_ids)
-            AND status = 'COMPLETED'
-            GROUP BY resource_id
+        counts_query = text(f"""
+            SELECT s.resource_id, COUNT(*) as backup_count
+            FROM snapshots s
+            WHERE s.resource_id = ANY(:resource_ids)
+              AND {_REAL_RESTORE_POINT_SQL}
+            GROUP BY s.resource_id
         """)
         counts_result = await db.execute(counts_query, {"resource_ids": resource_ids})
         backup_counts = {str(row[0]): row[1] for row in counts_result.fetchall()}
@@ -737,16 +935,17 @@ async def list_resources(
                 "size_delta_year": int(row[4] or 0),
             }
 
-    # Likewise, treat a completed snapshot on ANY child as "the parent was
-    # backed up" so the UI chip flips to "protected" for parents whose only
-    # completed snapshots live on their children.
+    # Likewise, roll a recovery point on ANY child up into the parent's
+    # backup count, so a parent whose only recovery points live on its
+    # Tier-2 children still reports them. Same recovery-point semantics as
+    # the direct count above — PARTIAL counts, placeholders do not.
     if resource_ids:
-        child_backup_query = text("""
+        child_backup_query = text(f"""
             SELECT r.parent_resource_id, COUNT(*) AS child_backups
             FROM snapshots s
             JOIN resources r ON r.id = s.resource_id
             WHERE r.parent_resource_id = ANY(:resource_ids)
-              AND s.status = 'COMPLETED'
+              AND {_REAL_RESTORE_POINT_SQL}
             GROUP BY r.parent_resource_id
         """)
         child_backup_result = await db.execute(child_backup_query, {"resource_ids": resource_ids})
@@ -901,6 +1100,78 @@ async def search_resources(
     ]
 
 
+# Deterministic pagination for /by-type. created_at alone is NOT unique —
+# bulk discovery commits thousands of rows with one timestamp (10,841 of
+# 11,190 ENTRA_USERs share created_at on the pilot tenant), so LIMIT/OFFSET
+# without a unique tiebreaker slices the tie group in arbitrary, per-query
+# order and rows randomly vanish from the Protection page.
+BY_TYPE_ORDER_BY = RESOURCE_PAGE_ORDER_BY
+
+_BY_TYPE_ALLOWED_STATUS = {s.value for s in ResourceStatus}
+
+
+def _escape_ilike(term: str) -> str:
+    return (
+        term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    )
+
+
+def build_by_type_search_filters(
+    query: Optional[str], status: Optional[str], sla: Optional[str] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    """WHERE-fragment + bind params for the by-type search/status/SLA filters.
+
+    The Protection page has always sent `query=` and `status=`; before
+    ITO-9652 the handler didn't declare them, so FastAPI silently dropped
+    both and "search" returned the entire tenant.
+
+    `sla` (2026-07-15): "none" → resources with no SLA policy; a policy
+    UUID → resources assigned that policy. The UI's SLA filter used to be
+    client-side over the fetched page only — after the 4,204-site
+    SharePoint discovery, newest-first pagination pushed every SLA'd
+    resource out of the fetched window and the filter matched nothing.
+    """
+    clauses: List[str] = []
+    params: Dict[str, Any] = {}
+    if query and query.strip():
+        params["rquery"] = f"%{_escape_ilike(query.strip())}%"
+        # web_url: SharePoint site titles often differ from the URL slug
+        # ("IT OPS NOTES" lives at /sites/ITOPS) — users search the slug
+        # they see in the browser. metadata->>'web_url' is NULL for types
+        # without one, so the extra OR is a no-op outside SharePoint.
+        clauses.append(
+            "AND (r.display_name ILIKE :rquery ESCAPE '\\' "
+            "OR r.email ILIKE :rquery ESCAPE '\\' "
+            "OR r.metadata->>'web_url' ILIKE :rquery ESCAPE '\\')"
+        )
+    if status and status.strip():
+        normalized = status.strip().upper()
+        if normalized not in _BY_TYPE_ALLOWED_STATUS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid status filter: {status}",
+            )
+        params["rstatus"] = normalized
+        # ::text — comparing the resourcestatus enum column to a text bind
+        # param directly fails with "operator does not exist".
+        clauses.append("AND r.status::text = :rstatus")
+    if sla and sla.strip():
+        sla_norm = sla.strip()
+        if sla_norm.lower() == "none":
+            clauses.append("AND r.sla_policy_id IS NULL")
+        else:
+            try:
+                UUID(sla_norm)
+            except (ValueError, TypeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid sla filter (expect 'none' or a policy UUID): {sla}",
+                )
+            params["rsla"] = sla_norm
+            clauses.append("AND r.sla_policy_id = CAST(:rsla AS uuid)")
+    return "\n        ".join(clauses), params
+
+
 @app.get("/api/v1/resources/by-type")
 async def get_resources_by_type(
     type: str = Query(...),
@@ -908,6 +1179,9 @@ async def get_resources_by_type(
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1),
     includeHidden: bool = Query(False),
+    query: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    sla: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
     # Hidden types return an empty page unless the caller explicitly opts in.
@@ -940,19 +1214,20 @@ async def get_resources_by_type(
                 ),
             )
 
-    # SharePoint sub-section filter: exclude sites whose name+email
-    # collides with a Microsoft 365 group / Entra group / Teams channel.
-    # Those appear under the Groups & Teams tab instead, so showing them
-    # here duplicates the row. Match is case-insensitive on display_name
-    # AND identical on email (NULL treated equal).
-    sp_exclude_clause = ""
+    # SharePoint group-connected annotation. A SP site backed by an M365
+    # group / Entra group / Teams channel shares the group's display name
+    # (the admin API surfaces the group's name as the site title). These
+    # used to be EXCLUDED from the SharePoint tab to avoid duplicating the
+    # Groups & Teams row — but group backups capture profile+members only,
+    # NOT the group's site content, so hiding the site left no UI path to
+    # protect it (3,465 of 4,204 pilot sites, 2026-07-15 /sites/ITOPS
+    # investigation). Sites are now always listed; group-connected ones
+    # carry a flag the frontend renders as a badge. When both the SP site
+    # and the group have a mail address, require it to match; when the SP
+    # site has no email (the common case), match on name alone.
+    sp_group_connected_col = ", FALSE AS group_connected"
     if type == "SHAREPOINT_SITE":
-        # A SP site backed by an M365 group / Entra group / Teams channel
-        # shares the group's display name (the admin API surfaces the
-        # group's name as the site title). When both the SP site and the
-        # group also have a mail address, require it to match; when the
-        # SP site has no email (the common case), match on name alone.
-        sp_exclude_clause = """AND NOT EXISTS (
+        sp_group_connected_col = """, EXISTS (
             SELECT 1 FROM resources g
             WHERE g.tenant_id = r.tenant_id
               AND g.type IN ('M365_GROUP', 'ENTRA_GROUP', 'TEAMS_CHANNEL')
@@ -961,7 +1236,16 @@ async def get_resources_by_type(
                     COALESCE(r.email, '') = ''
                  OR LOWER(COALESCE(g.email, '')) = LOWER(COALESCE(r.email, ''))
               )
-        )"""
+        ) AS group_connected"""
+
+    search_clause, search_params = build_by_type_search_filters(query, status, sla)
+
+    # Canonical Protection scope, shared with dashboard-service's Overview
+    # cards. `type = :rtype` plus the hidden-type early-return above already
+    # cover the type half, so today this only carries the status half (empty
+    # by design) — it is interpolated anyway so that widening the scope in
+    # one place cannot leave the tab and the card disagreeing again.
+    scope_clause = protection_scope_clause("r", include_hidden_types=True)
 
     # Same lateral join as the main list — derive last_backup_status from
     # the latest BACKUP job touching this resource so Protection mirrors
@@ -971,6 +1255,7 @@ async def get_resources_by_type(
                r.status, r.storage_bytes, r.last_backup_at,
                COALESCE(latest_job.status::text, r.last_backup_status) AS last_backup_status,
                r.azure_region, r.azure_subscription_id, r.azure_resource_group, r.created_at
+               {sp_group_connected_col}
         FROM resources r
         LEFT JOIN LATERAL (
             SELECT j.status FROM jobs j
@@ -981,11 +1266,13 @@ async def get_resources_by_type(
         ) latest_job ON TRUE
         WHERE r.type = :rtype
         {'AND r.tenant_id = :rtenant' if tenantId else ''}
-        {sp_exclude_clause}
-        ORDER BY r.created_at DESC
+        {scope_clause}
+        {search_clause}
+        {BY_TYPE_ORDER_BY}
         LIMIT :rlimit OFFSET :roffset
     """)
-    params = {"rtype": type, "rlimit": size, "roffset": (page - 1) * size}
+    params = {"rtype": type, "rlimit": size, "roffset": (page - 1) * size,
+              **search_params}
     if tenantId:
         params["rtenant"] = tenantId
 
@@ -995,7 +1282,8 @@ async def get_resources_by_type(
     count_query = text(f"""
         SELECT count(*) FROM resources r WHERE r.type = :rtype
         {'AND r.tenant_id = :rtenant' if tenantId else ''}
-        {sp_exclude_clause}
+        {scope_clause}
+        {search_clause}
     """)
     count_result = await db.execute(count_query, params)
     total = count_result.scalar() or 0
@@ -1047,12 +1335,12 @@ async def get_resources_by_type(
     resource_ids = [row[0] for row in rows]
     backup_counts = {}
     if resource_ids:
-        counts_query = text("""
-            SELECT resource_id, COUNT(*) as backup_count
-            FROM snapshots
-            WHERE resource_id = ANY(:resource_ids)
-            AND status = 'COMPLETED'
-            GROUP BY resource_id
+        counts_query = text(f"""
+            SELECT s.resource_id, COUNT(*) as backup_count
+            FROM snapshots s
+            WHERE s.resource_id = ANY(:resource_ids)
+              AND {_REAL_RESTORE_POINT_SQL}
+            GROUP BY s.resource_id
         """)
         counts_result = await db.execute(counts_query, {"resource_ids": resource_ids})
         backup_counts = {str(r[0]): r[1] for r in counts_result.fetchall()}
@@ -1151,13 +1439,15 @@ async def get_resources_by_type(
                 "size_delta_year": int(row[4] or 0),
             }
 
+    # Roll child recovery points up into the parent's backup count (same
+    # recovery-point semantics as the direct count above).
     if resource_ids:
-        child_backup_query = text("""
+        child_backup_query = text(f"""
             SELECT r.parent_resource_id, COUNT(*) AS child_backups
             FROM snapshots s
             JOIN resources r ON r.id = s.resource_id
             WHERE r.parent_resource_id = ANY(:resource_ids)
-              AND s.status = 'COMPLETED'
+              AND {_REAL_RESTORE_POINT_SQL}
             GROUP BY r.parent_resource_id
         """)
         child_backup_result = await db.execute(child_backup_query, {"resource_ids": resource_ids})
@@ -1168,14 +1458,23 @@ async def get_resources_by_type(
     # Also bring in the latest child snapshot timestamp so a parent with
     # no direct snapshots still flips to "protected" / shows a last-backup
     # time when one of its children has been backed up.
+    #
+    # Recovery-point semantics, deliberately: this answers "when was data
+    # last captured", so a PARTIAL run counts — its items are restorable and
+    # excluding it reported "never backed up" for a resource holding real
+    # data. It is not a cleanliness claim; the clean/degraded distinction is
+    # carried by last_backup_status, which comes from the latest BACKUP Job.
+    # A 0-item skipped_concurrent placeholder must NOT set this: it captured
+    # nothing, so dating a backup from it is a fake success that would make a
+    # stalled resource look freshly protected.
     child_last_backup_map: dict = {}
     if resource_ids:
-        child_last_query = text("""
+        child_last_query = text(f"""
             SELECT r.parent_resource_id, MAX(s.created_at) AS last_backup
             FROM snapshots s
             JOIN resources r ON r.id = s.resource_id
             WHERE r.parent_resource_id = ANY(:resource_ids)
-              AND s.status = 'COMPLETED'
+              AND {_REAL_RESTORE_POINT_SQL}
             GROUP BY r.parent_resource_id
         """)
         child_last_result = await db.execute(child_last_query, {"resource_ids": resource_ids})
@@ -1199,6 +1498,7 @@ async def get_resources_by_type(
             "provider": "azure" if "AZURE" in (row[2] or "") else "o365",
             "external_id": row[3], "name": row[4], "email": row[5],
             "data": row[6] or {},
+            "group_connected": bool(row[16]),
             "archived": row[8] == "ARCHIVED", "deleted": row[8] == "PENDING_DELETION",
             "protections": [{"policy_id": str(row[7])}] if row[7] else None,
             "usage": {"resource_id": rid, "tenant_id": str(row[1]), "backups": backup_count,
@@ -1309,7 +1609,9 @@ async def unassign_policy(resource_id: str, db: AsyncSession = Depends(get_db)):
     resource = result.scalar_one_or_none()
     if not resource:
         raise HTTPException(status_code=404, detail="Resource not found")
-    resources = await expand_linked_policy_scope(db, [resource])
+    # Torn-down siblings must be detachable too, or their sla_policy_id
+    # outlives every unassign path and blocks the policy delete.
+    resources = await expand_linked_policy_scope(db, [resource], exclude_torn_down=False)
     for target in resources:
         target.sla_policy_id = None
     await db.commit()
@@ -1349,23 +1651,286 @@ async def delete_resource(resource_id: str, db: AsyncSession = Depends(get_db)):
     await db.commit()
 
 
+async def _bulk_assign_by_filter(
+    db: AsyncSession, request: BulkAssignRequest,
+) -> Dict[str, Any]:
+    """Filter-driven bulk assign/unassign.
+
+    Resolves the match set server-side with the SAME predicates
+    GET /api/v1/resources/by-type applies — shared
+    build_by_type_search_filters + type IN filter.types + tenantId + the
+    canonical Protection scope (protection_scope_clause carries the
+    hidden-type exclusion the listing gets via its early-return) — so the
+    match set equals exactly the rows the UI lists across all pages, with
+    ONE deliberate assign-only narrowing: unless filter.status explicitly
+    names a status, ARCHIVED/PENDING_DELETION rows are excluded from
+    assign seeds (the write flips rows to ACTIVE; a broad filter must not
+    silently resurrect archived resources). A valid-but-unknown tenantId
+    404s, same as /by-type's stale-cache guard.
+
+    Then applies the id-list path's assignment semantics (linked-scope
+    expansion, validate_policy_scope, override existing sla_policy_id)
+    with CHUNKED writes: ids are streamed server-side (yield_per) and
+    written via bulk UPDATE in 1000-id chunks — asyncpg caps a statement
+    at 32767 bind params, and a single per-row-ORM transaction over a 10k
+    match set courted the gateway's 60s read timeout.
+
+    dryRun=true: resolve + validate + counts. ZERO writes, no
+    notifications — assigned (and unassigned, on the unassign form) are 0
+    because they count writes performed; `matched` is the preview number.
+    """
+    from types import SimpleNamespace
+    from sqlalchemy import update as sa_update
+
+    flt = request.filter
+    dry_run = bool(request.dryRun)
+
+    if not flt.types:
+        raise HTTPException(status_code=400, detail="filter.types must be a non-empty list")
+    try:
+        tenant_uuid = UUID(flt.tenantId)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail=f"Invalid tenantId: {flt.tenantId}")
+
+    # Same stale-cache guard as GET /resources/by-type: a valid-but-unknown
+    # tenantId must 404, not 200 {matched: 0} — the silent no-op is exactly
+    # what the by-type 404 was added to eliminate. The assign form would
+    # incidentally 404 inside validate_policy_scope's tenant fetch, but the
+    # unassign form runs no validation, so check explicitly for both.
+    exists = (await db.execute(
+        text("SELECT 1 FROM tenants WHERE id = :tid LIMIT 1"),
+        {"tid": tenant_uuid},
+    )).first()
+    if not exists:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Tenant {flt.tenantId} not found — "
+                "cached id may be stale; refresh tenants"
+            ),
+        )
+
+    unassign = not request.policyId or request.policyId.strip() == ""
+    policy_id: Optional[UUID] = None
+    if not unassign:
+        try:
+            policy_id = UUID(request.policyId)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid policy ID format: '{request.policyId}'. Must be a valid UUID.",
+            )
+        # Same validation the id-list path runs (single tenant +
+        # service-type compatibility), via the same function. The filter
+        # pins tenant and types up-front, so validate on lightweight type
+        # probes BEFORE touching any row: a mismatch must 400 with zero
+        # writes, never after a partial chunk.
+        probes = []
+        for type_name in flt.types:
+            try:
+                probes.append(
+                    SimpleNamespace(tenant_id=tenant_uuid, type=ResourceType(type_name))
+                )
+            except ValueError:
+                continue  # unknown type strings match no rows
+        await validate_policy_scope(
+            db, policy_id=policy_id, tenant_id=tenant_uuid, resources=probes,
+        )
+
+    search_clause, search_params = build_by_type_search_filters(
+        flt.query, flt.status, flt.sla,
+    )
+    scope_clause = protection_scope_clause("r")
+    # Assign form only: a broad filter is NOT "an explicit operator action
+    # on the resource itself" (the justification that lets torn-down SEEDS
+    # through on the id-list path — see fetch_linked_scope_candidates), and
+    # the assign write flips every row to ACTIVE. Without this, assigning to
+    # {types: [SHAREPOINT_SITE]} silently un-archives every ARCHIVED site
+    # and re-enrolls it in scheduled backups. An EXPLICIT filter.status
+    # (e.g. "ARCHIVED") is the operator naming those rows and is honored —
+    # build_by_type_search_filters already pins exact status equality then.
+    # Unassign never sets status and must keep reaching torn-down rows.
+    torn_down_seed_clause = ""
+    if not unassign and not (flt.status and flt.status.strip()):
+        vals = ", ".join(
+            f"'{s}'" for s in sorted(
+                (ResourceStatus.ARCHIVED.value,
+                 ResourceStatus.PENDING_DELETION.value)
+            )
+        )
+        torn_down_seed_clause = f"AND r.status::text NOT IN ({vals})"
+    match_from = f"""
+        FROM resources r
+        WHERE r.tenant_id = :rtenant
+          AND r.type::text = ANY(:rtypes)
+        {scope_clause}
+        {torn_down_seed_clause}
+        {search_clause}
+    """
+    params: Dict[str, Any] = {
+        "rtenant": str(tenant_uuid),
+        "rtypes": [str(t) for t in flt.types],
+        **search_params,
+    }
+
+    matched = (
+        await db.execute(text("SELECT count(*)" + match_from), params)
+    ).scalar() or 0
+
+    if dry_run:
+        response = {"matched": int(matched), "assigned": 0, "dryRun": True}
+        if unassign:
+            # Mirror the execute unassign shape — a client reading
+            # `unassigned` off the dry-run must get a defined 0 (counts
+            # report writes PERFORMED; `matched` is the preview number).
+            response["unassigned"] = 0
+        return response
+
+    CHUNK = 1000
+    written_ids: set = set()
+    affected = 0
+    tier2_users: List[Any] = []
+    # Linked-scope expansion candidates are a tenant-wide scan of the 11
+    # user-/group-linked types. Fetch them ONCE per request (lazily, so a
+    # zero-match run never pays for it) and reuse across every chunk —
+    # per-chunk fetching is O(chunks × tenant) ORM hydrations, which on the
+    # pilot tenant (13,812 users → 14 chunks) re-reads ~200k rows inside
+    # one request and courts the same 60s gateway timeout the chunked
+    # writes exist to avoid.
+    expansion_candidates: Optional[List[Resource]] = None
+
+    async def _flush(seed_ids: List[Any]) -> None:
+        nonlocal affected, expansion_candidates
+        if not seed_ids:
+            return
+        seeds = (
+            await db.execute(select(Resource).where(Resource.id.in_(seed_ids)))
+        ).scalars().all()
+        if expansion_candidates is None:
+            # exclude_torn_down semantics per path: unassign must reach
+            # torn-down siblings, or their sla_policy_id outlives every
+            # detach path (see fetch_linked_scope_candidates' docstring).
+            expansion_candidates = await fetch_linked_scope_candidates(
+                db, [tenant_uuid], exclude_torn_down=not unassign,
+            )
+        expanded = await expand_linked_policy_scope(
+            db, seeds,
+            exclude_torn_down=not unassign,
+            candidates=expansion_candidates,
+        )
+        # Expansion can resolve the same linked sibling from seeds in two
+        # different chunks — write each row once.
+        new_ids = [r.id for r in expanded if r.id not in written_ids]
+        new_id_set = set(new_ids)
+        written_ids.update(new_id_set)
+        if not unassign:
+            # Detached copies: enqueued after commit, when ORM rows may be
+            # expired; the tier-2 helper only reads id/tenant_id/type.
+            tier2_users.extend(
+                SimpleNamespace(id=r.id, tenant_id=r.tenant_id, type=r.type)
+                for r in expanded
+                if r.type == ResourceType.ENTRA_USER and r.id in new_id_set
+            )
+        for i in range(0, len(new_ids), CHUNK):
+            sub = new_ids[i:i + CHUNK]
+            if unassign:
+                result = await db.execute(
+                    sa_update(Resource)
+                    .where(Resource.id.in_(sub))
+                    .values(sla_policy_id=None)
+                )
+            else:
+                # No IS NULL guard, deliberately: explicit bulk assignment
+                # is the operator's reassignment workflow and overrides an
+                # existing sla_policy_id (contrast _apply_policy_to_matching,
+                # where the retro-sweep must never stomp a pinned policy).
+                result = await db.execute(
+                    sa_update(Resource)
+                    .where(Resource.id.in_(sub))
+                    .values(sla_policy_id=policy_id, status=ResourceStatus.ACTIVE)
+                )
+            affected += max(getattr(result, "rowcount", None) or 0, 0)
+
+    # Stream matched ids server-side — same yield_per pattern as
+    # _apply_policy_to_matching, same FROM/WHERE as the count above.
+    seed_buffer: List[Any] = []
+    stream = await db.stream(
+        text("SELECT r.id" + match_from).execution_options(yield_per=CHUNK),
+        params,
+    )
+    async for rid in stream.scalars():
+        seed_buffer.append(rid)
+        if len(seed_buffer) >= CHUNK:
+            await _flush(seed_buffer)
+            seed_buffer = []
+    await _flush(seed_buffer)
+
+    await db.commit()
+    if tier2_users:
+        await _enqueue_tier2_for_entra_users(tier2_users)
+    # Parity with update_policy: nudge the scheduler so the assignment
+    # takes effect now instead of at the next daily cron tick. Best-effort
+    # (the helper swallows failures).
+    await notify_scheduler_reschedule()
+
+    response: Dict[str, Any] = {
+        "matched": int(matched),
+        "assigned": 0 if unassign else affected,
+        "dryRun": False,
+    }
+    if unassign:
+        response["unassigned"] = affected
+    return response
+
+
 @app.post("/api/v1/resources/bulk-assign-policy", status_code=200)
 async def bulk_assign_policy(request: BulkAssignRequest, db: AsyncSession = Depends(get_db)):
     """
     Assign an SLA policy to multiple resources at once.
 
-    Body:
+    Two mutually exclusive forms (exactly one must be present):
+
+    Id-list form (unchanged):
     {
         "resourceIds": ["uuid1", "uuid2", ...],
-        "policyId": "uuid-of-policy"
+        "policyId": "uuid-of-policy"        // '' = unassign
     }
+    Returns: { "assigned": 10, "not_found": [...] }
+    (unassign form returns {"assigned": 0, "unassigned": n, "not_found": []})
+    dryRun combined with resourceIds is a 400 — this branch has no dry-run
+    implementation, and ignoring the flag would write for real.
 
-    Returns:
+    Filter form — server-side match set, same predicates as
+    GET /api/v1/resources/by-type (see _bulk_assign_by_filter):
     {
-        "assigned": 10,
-        "not_found": ["uuid-of-missing-resource", ...]
+        "policyId": "uuid-of-policy",       // '' = unassign
+        "filter": {"tenantId": "...", "types": ["SHAREPOINT_SITE", ...],
+                    "query": "...", "status": "...", "sla": "..."},
+        "dryRun": false
     }
+    Returns: { "matched": n, "assigned": n, "dryRun": bool }
+    (plus "unassigned" on the unassign form — including dryRun=true, where
+    assigned/unassigned are 0 and zero writes happen; 404 for an unknown
+    tenantId, mirroring /by-type's stale-cache guard)
     """
+    has_ids = request.resourceIds is not None
+    has_filter = request.filter is not None
+    if has_ids == has_filter:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide exactly one of resourceIds or filter",
+        )
+    if has_ids and request.dryRun:
+        # The id-list branch has no dry-run implementation; silently
+        # ignoring the flag would perform REAL writes on what the client
+        # believes is a preview call. Refuse loudly instead.
+        raise HTTPException(
+            status_code=400,
+            detail="dryRun is only supported with filter",
+        )
+    if has_filter:
+        return await _bulk_assign_by_filter(db, request)
+
     print(f"[BULK_ASSIGN] Received policyId: '{request.policyId}', resourceIds: {request.resourceIds}")
 
     # Validate policyId
@@ -1383,11 +1948,15 @@ async def bulk_assign_policy(request: BulkAssignRequest, db: AsyncSession = Depe
         result = await db.execute(stmt)
         resources = result.scalars().all()
 
-        expanded_resources = await expand_linked_policy_scope(db, resources)
+        expanded_resources = await expand_linked_policy_scope(
+            db, resources, exclude_torn_down=False
+        )
 
         for resource in expanded_resources:
             resource.sla_policy_id = None
         await db.commit()
+        # Parity with update_policy: without this, the removal only takes
+        # effect at the next daily cron tick.
         await notify_scheduler_reschedule()
 
         return {
@@ -1438,6 +2007,8 @@ async def bulk_assign_policy(request: BulkAssignRequest, db: AsyncSession = Depe
 
     await db.commit()
     await _enqueue_tier2_for_entra_users(expanded_resources)
+    # Parity with update_policy: nudge the scheduler so the assignment is
+    # scheduled now instead of at the next daily cron tick. Best-effort.
     await notify_scheduler_reschedule()
 
     return {
@@ -1470,11 +2041,13 @@ async def bulk_unassign_policy(request: BulkUnassignRequest, db: AsyncSession = 
     found_ids = {str(r.id) for r in resources}
     not_found = [rid for rid in request.resourceIds if rid not in found_ids]
     
-    expanded_resources = await expand_linked_policy_scope(db, resources)
+    expanded_resources = await expand_linked_policy_scope(
+        db, resources, exclude_torn_down=False
+    )
 
     for resource in expanded_resources:
         resource.sla_policy_id = None
-    
+
     await db.commit()
     await notify_scheduler_reschedule()
     
@@ -1552,7 +2125,13 @@ async def list_policies(
         count_stmt = count_stmt.where(f)
     total = (await db.execute(count_stmt)).scalar() or 0
 
-    page_stmt = select(SlaPolicy).order_by(SlaPolicy.created_at.desc())
+    # `created_at` is not unique here either — _apply_policy_to_matching and
+    # the SLA wizard insert several policies in one transaction, so a tie
+    # group can straddle an offset boundary and drop / duplicate a policy on
+    # page 2. Primary key as tiebreak, same as RESOURCE_PAGE_ORDER_BY.
+    page_stmt = select(SlaPolicy).order_by(
+        SlaPolicy.created_at.desc(), SlaPolicy.id.desc(),
+    )
     for f in base_filter:
         page_stmt = page_stmt.where(f)
     page_stmt = page_stmt.offset(offset).limit(limit)
@@ -1708,6 +2287,45 @@ async def create_policy(
     return response
 
 
+# SLA-policy columns where an explicit JSON null in a PUT means "clear the
+# value" (NULL = unlimited retention / no legal hold / no customer key).
+# update_policy used to apply a value only when it was non-None, so clearing
+# legalHoldUntil or retentionArchiveDays silently kept the old bound while
+# the save appeared to succeed — retention_cleanup then kept deleting
+# snapshots the operator had just marked keep-forever.
+NULLABLE_POLICY_COLUMNS = {
+    "retention_days",
+    "retention_archive_days",
+    "gfs_daily_count",
+    "gfs_weekly_count",
+    "gfs_monthly_count",
+    "gfs_yearly_count",
+    "item_retention_days",
+    "archived_retention_days",
+    "legal_hold_until",
+    "key_vault_uri",
+    "key_name",
+    "key_version",
+    "backup_window_start",
+}
+
+
+def apply_policy_field_updates(policy, request: dict, field_map: Dict[str, str]) -> None:
+    """Apply a PUT payload onto a policy row, honoring explicit nulls.
+
+    Absent key → column untouched; present non-null → set; present null →
+    clear, but only for NULLABLE_POLICY_COLUMNS (a null name/boolean stays
+    ignored rather than poisoning a NOT NULL column).
+    """
+    for camel_key, snake_key in field_map.items():
+        present = camel_key in request or snake_key in request
+        val = request.get(camel_key, request.get(snake_key))
+        if val is not None:
+            setattr(policy, snake_key, val)
+        elif present and snake_key in NULLABLE_POLICY_COLUMNS:
+            setattr(policy, snake_key, None)
+
+
 @app.put(
     "/api/v1/policies/{policy_id}",
     response_model=SlaPolicyResponse,
@@ -1849,10 +2467,7 @@ async def update_policy(
         )
         await db.flush()
 
-    for camel_key, snake_key in field_map.items():
-        val = get_val(camel_key, snake_key)
-        if val is not None:
-            setattr(policy, snake_key, val)
+    apply_policy_field_updates(policy, request, field_map)
 
     policy.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
     # Mark dirty so the 5-min sweeper picks this change up if the HTTP

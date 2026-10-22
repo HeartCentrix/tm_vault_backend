@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 import asyncpg
 
-from services.storage_toggle_worker.drain import drain_inflight
+from services.storage_toggle_worker.drain import DrainAborted, drain_inflight
 from services.storage_toggle_worker.dns_flip import flip_dns_to
 from services.storage_toggle_worker.pg_promote import promote_target
 from services.storage_toggle_worker.preflight import run_preflight
@@ -55,6 +55,40 @@ async def _set_transition(db, state: str) -> None:
     )
 
 
+async def _release_transition_if_dirty(db, event_id) -> None:
+    """Return system_config to 'stable' when no live toggle owns it.
+
+    Only fires while the transition is mid-flight ('draining' /
+    'promoting'); a 'stable' row is left alone, and the guard on
+    storage_toggle_events keeps this from stealing a transition that a
+    DIFFERENT, still-running toggle owns (the reason the abort endpoint
+    itself must not reset the state: doing so let submit_toggle admit a
+    second concurrent toggle while the first worker was promoting).
+    """
+    tag = await db.execute(
+        "UPDATE system_config sc SET transition_state='stable', updated_at=NOW() "
+        " WHERE sc.id = 1 "
+        "   AND sc.transition_state <> 'stable' "
+        # No other toggle is live. Enumerated as "NOT terminal" rather
+        # than a list of in-flight values: the in-flight set has seven
+        # members (started, drain_started, drain_completed, db_promoted,
+        # dns_flipped, smoke_passed, workers_restarted) and listing them
+        # positively already missed four, which would have let this
+        # release steal a transition from a mid-promote toggle.
+        "   AND NOT EXISTS ("
+        "         SELECT 1 FROM storage_toggle_events e "
+        "          WHERE e.id <> $1 "
+        "            AND e.status NOT IN ('completed','failed','aborted')"
+        "       )",
+        event_id,
+    )
+    if tag != "UPDATE 0":
+        log.info(
+            "event %s: released stuck transition_state -> stable "
+            "(backup writes were blocked)", event_id,
+        )
+
+
 async def _set_active(db, backend_id: str) -> None:
     """Cutover: point system_config at ``backend_id``.
 
@@ -100,6 +134,25 @@ async def run_toggle(payload: dict) -> None:
 
     db = await _open_db()
     try:
+        # The operator may have aborted while the message sat in the
+        # queue — honor it before touching anything.
+        ev_status = await db.fetchval(
+            "SELECT status FROM storage_toggle_events WHERE id=$1", event_id,
+        )
+        if ev_status == "aborted":
+            # Redelivery of an aborted toggle. This path is reached exactly
+            # when a previous attempt died mid-run (pod OOMKilled/evicted
+            # during the 900s drain leaves the message un-acked), so
+            # transition_state may still be 'draining' — and while it is,
+            # router.get_active_store() raises TransitionInProgressError for
+            # EVERY backup write and submit_toggle 409s, so the operator has
+            # no way back without manual SQL. Standing down means releasing
+            # the transition too; the aborted event row already prevents
+            # this worker from promoting anything.
+            log.info("event %s already aborted — skipping toggle", event_id)
+            await _release_transition_if_dirty(db, event_id)
+            return
+
         # Phase 1 — preflight
         log.info("phase 1: preflight for event %s", event_id)
         sc = await db.fetchrow(
@@ -128,18 +181,45 @@ async def run_toggle(payload: dict) -> None:
                 error_message="preflight failed",
                 completed_at=datetime.now(timezone.utc),
             )
+            # THIS is the path a mid-drain pod death actually takes.
+            # Nothing ever writes 'drain_started', so a worker killed
+            # during the 900s drain leaves the event at 'started' with
+            # transition_state='draining'; the redelivered message lands
+            # here (preflight's no_inflight_transition check fails on the
+            # dirty state) rather than in the already-aborted branch
+            # above. Returning without releasing left every backup write
+            # failing with TransitionInProgressError and submit_toggle
+            # 409ing — recoverable only by manual SQL.
+            await _release_transition_if_dirty(db, event_id)
             return
 
         # Phase 2 — drain
         log.info("phase 2: drain")
         await _set_transition(db, "draining")
-        drain_result = await drain_inflight(db, event_id=event_id)
-        await _update_event(
-            db, event_id, status="drain_completed",
-            drain_completed_at=datetime.now(timezone.utc),
-            drained_job_count=drain_result.drained_count,
-            retried_job_count=drain_result.retried_count,
+        try:
+            drain_result = await drain_inflight(db, event_id=event_id)
+        except DrainAborted:
+            log.info("event %s aborted during drain — standing down", event_id)
+            await _set_transition(db, "stable")
+            return
+        # Guarded write: the abort endpoint flips status to 'aborted' only
+        # while it is still 'started'/'drain_started', so whichever UPDATE
+        # commits first wins. Without the guard this write clobbered a
+        # just-committed abort and the worker promoted a toggle the
+        # operator had cancelled — while system_config already claimed
+        # 'stable' and admitted a second concurrent toggle.
+        tag = await db.execute(
+            "UPDATE storage_toggle_events "
+            "SET status='drain_completed', drain_completed_at=$2, "
+            "    drained_job_count=$3, retried_job_count=$4 "
+            "WHERE id=$1 AND status <> 'aborted'",
+            event_id, datetime.now(timezone.utc),
+            drain_result.drained_count, drain_result.retried_count,
         )
+        if tag == "UPDATE 0":
+            log.info("event %s aborted during drain — standing down", event_id)
+            await _set_transition(db, "stable")
+            return
 
         # Phase 3 — DB promote
         log.info("phase 3: promote db")

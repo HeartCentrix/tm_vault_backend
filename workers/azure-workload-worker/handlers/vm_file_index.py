@@ -22,6 +22,7 @@ Design rationale
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
@@ -180,6 +181,7 @@ def walk_and_index_blob(
     sync_blob_client, blob_path: str, blob_size: int,
     snapshot_id: str, volume_item_id: str,
     max_entries: Optional[int] = None,
+    loop: Optional[asyncio.AbstractEventLoop] = None,
 ) -> WalkStats:
     """Open the VHD at `blob_path`, walk every filesystem we find, and
     insert batched `vm_file_index` rows via the shared async session
@@ -189,11 +191,22 @@ def walk_and_index_blob(
     because TSK is blocking; the worker runs this whole function
     inside asyncio.to_thread so the event loop isn't starved.
 
+    `loop` must be the event loop that owns the shared async DB engine
+    (capture asyncio.get_running_loop() BEFORE handing off to the
+    thread). asyncpg connections are loop-bound, so the inserts have
+    to hop back to that loop.
+
     `max_entries` is primarily a safety cap during first-time rollout
     — a 200k-file VM will take noticeable time, so set a limit while
     you trust-but-verify. Pass None in production."""
     import pytsk3  # noqa: F401 (imported for side effects + version check)
     import uuid as _uuid
+
+    if loop is None:
+        raise ValueError(
+            "walk_and_index_blob requires the engine-owning event loop "
+            "(pass loop=asyncio.get_running_loop() before to_thread)"
+        )
 
     stats = WalkStats()
     logger.info("[vm-index] start blob=%s size=%sMB", blob_path, blob_size // (1024 * 1024))
@@ -212,19 +225,15 @@ def walk_and_index_blob(
     rows_buf: list[dict] = []
 
     def _flush():
-        """Bulk insert using raw SQLAlchemy Core for speed — ORM
-        object creation for 100k rows would dominate the walk time."""
+        """Bulk insert on the engine-owning loop. We're inside a worker
+        thread and asyncpg connections are bound to the loop they were
+        created on — running the insert on a throwaway new_event_loop()
+        seeded the shared pool with dead-loop connections, and the NEXT
+        checkout on the main loop (job/snapshot finalize) crashed with
+        'Event loop is closed', failing an otherwise-good backup."""
         if not rows_buf:
             return
-        # Run the insert on a fresh session (async factory is thread-
-        # safe per-call). We're inside a thread so we have to make
-        # the async call via asyncio.run_coroutine_threadsafe.
-        import asyncio
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(_insert_rows(rows_buf))
-        finally:
-            loop.close()
+        asyncio.run_coroutine_threadsafe(_insert_rows(list(rows_buf)), loop).result()
         rows_buf.clear()
 
     async def _insert_rows(rows: list[dict]) -> None:

@@ -104,6 +104,14 @@ async def consume_thread(message: aio_pika.IncomingMessage) -> None:
                 await _update_job(sess, job_id, status=JobStatus.CANCELLED)
                 await publish(job_id, "cancelled", {})
                 return
+            if job.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
+                # Terminal already — e.g. a broker redelivery after a crash
+                # that landed between the COMPLETED commit and the ack, or a
+                # job an operator/reclaim already failed. Re-running would
+                # resurrect it (FAILED -> COMPLETED flip-flop) and duplicate
+                # the export.
+                log.info("job_skipped_terminal id=%s status=%s", job_id, job.status)
+                return
 
             spec = job.spec or {}
             try:
@@ -132,10 +140,24 @@ async def consume_thread(message: aio_pika.IncomingMessage) -> None:
                 await _run_pipeline(sess, job_id, spec, scope, job)
             except Exception as exc:
                 log.exception("job_failed id=%s", job_id)
-                await _update_job(
-                    sess, job_id, status=JobStatus.FAILED,
-                    result={"error": {"code": "pipeline_error", "message": str(exc)}},
+                # Discard whatever the pipeline left uncommitted so the
+                # session is usable again (a DB error mid-pipeline poisons
+                # the transaction), then write FAILED — but never over a
+                # terminal state: the pipeline may already have committed
+                # COMPLETED (a late completion-publish blip lands here) and
+                # clobbering it erases result.blob_path, stranding the
+                # uploaded ZIP with no DB row pointing at it.
+                await sess.rollback()
+                await sess.execute(
+                    update(Job)
+                    .where(Job.id == job_id)
+                    .where(Job.status.notin_([JobStatus.COMPLETED, JobStatus.CANCELLED]))
+                    .values(
+                        status=JobStatus.FAILED,
+                        result={"error": {"code": "pipeline_error", "message": str(exc)}},
+                    )
                 )
+                await sess.commit()
                 await publish(job_id, "error", {"code": "pipeline_error", "message": str(exc)})
 
 
@@ -281,22 +303,44 @@ async def _run_pipeline(sess, job_id, spec, scope, job) -> None:
         if _api_base else f"/api/v1/jobs/export/{job_id}/download"
     )
 
-    await _update_job(
-        sess, job_id, status=JobStatus.COMPLETED,
-        result={
-            "export_zip_blob_path": f"{account}/{container}/{blob_path}",
-            "blob_path": blob_path,
-            "container": container,
-            "signed_url": download_url,
-            "total_msgs": len(render_messages),
-            "total_bytes": summary["total_bytes"],
-            "sha256": summary["sha256"],
-        },
+    # Fence the final write against a cancel that landed between the
+    # post-upload check and here — an unconditional update would silently
+    # overwrite CANCELLING with COMPLETED.
+    upd = await sess.execute(
+        update(Job)
+        .where(Job.id == job_id)
+        .where(Job.status != JobStatus.CANCELLING)
+        .values(
+            status=JobStatus.COMPLETED,
+            result={
+                "export_zip_blob_path": f"{account}/{container}/{blob_path}",
+                "blob_path": blob_path,
+                "container": container,
+                "signed_url": download_url,
+                "total_msgs": len(render_messages),
+                "total_bytes": summary["total_bytes"],
+                "sha256": summary["sha256"],
+            },
+        )
     )
-    await publish(
-        job_id, "complete",
-        {"url": download_url,
-         "sizeBytes": summary["total_bytes"],
-         "sha256": summary["sha256"]},
-    )
+    await sess.commit()
+    if (upd.rowcount or 0) == 0:
+        await _update_job(sess, job_id, status=JobStatus.CANCELLED)
+        await publish(job_id, "cancelled", {})
+        return
+    try:
+        await publish(
+            job_id, "complete",
+            {"url": download_url,
+             "sizeBytes": summary["total_bytes"],
+             "sha256": summary["sha256"]},
+        )
+    except Exception:
+        # The job IS completed and the row already says so. Letting a Redis
+        # blip propagate from here used to flip the committed COMPLETED row
+        # back to FAILED, erasing blob_path/container and orphaning the
+        # uploaded ZIP. SSE clients miss one event; polling still sees
+        # COMPLETED.
+        log.warning("completion publish failed id=%s (job remains COMPLETED)",
+                    job_id, exc_info=True)
     log.info("job_completed id=%s bytes=%d", job_id, summary["total_bytes"])

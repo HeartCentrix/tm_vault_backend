@@ -4,6 +4,7 @@ __pycache__/
 .env
 venv/
 .venv/
+.venv-test/
 *.egg-info/
 .pytest_cache/
 .git/

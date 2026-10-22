@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
 from datetime import datetime
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -48,6 +49,9 @@ def _record_blob_write(encrypted: bool) -> None:
         sla_metrics.record_blob_write(encrypted)
     except Exception:
         pass
+
+
+logger = logging.getLogger(__name__)
 
 
 _MODE_TMVAULT_TO_S3 = {"Locked": "COMPLIANCE", "Unlocked": "GOVERNANCE"}
@@ -289,13 +293,21 @@ class SeaweedStore:
             buf = bytearray()
 
             async def _send_part(pn: int, data: bytes):
-                async with sem:
+                # The producer acquires `sem` BEFORE creating this task —
+                # acquiring it here instead would only throttle upload_part
+                # calls while letting task creation (each holding a full
+                # part's bytes) run unbounded, so a Graph download that
+                # outpaces the backend buffers toward whole-file size and
+                # OOMs the worker.
+                try:
                     resp = await s3.upload_part(
                         Bucket=bucket, Key=key,
                         PartNumber=pn, UploadId=upload_id,
                         Body=data,
                     )
                     return {"PartNumber": pn, "ETag": resp["ETag"]}
+                finally:
+                    sem.release()
 
             try:
                 async for chunk in byte_stream:
@@ -307,6 +319,10 @@ class SeaweedStore:
                         part_number += 1
                         part_data = bytes(buf[:chunk_size])
                         del buf[:chunk_size]
+                        # Back-pressure: block the stream until a slot
+                        # frees so at most max_parallel_parts parts are
+                        # buffered in memory at any moment.
+                        await sem.acquire()
                         inflight.append(asyncio.create_task(
                             _send_part(part_number, part_data),
                         ))
@@ -315,6 +331,7 @@ class SeaweedStore:
                 # EXCEPT the last one — any size is fine there.
                 if buf or part_number == 0:
                     part_number += 1
+                    await sem.acquire()
                     inflight.append(asyncio.create_task(
                         _send_part(part_number, bytes(buf)),
                     ))

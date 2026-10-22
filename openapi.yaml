@@ -839,7 +839,21 @@ paths:
       tags:
         - Resources
       summary: Bulk assign policy
-      description: Assigns SLA policy to multiple resources
+      description: >-
+        Assigns an SLA policy to multiple resources. Two mutually exclusive
+        request forms: an explicit id list (resourceIds), or a server-side
+        filter that matches exactly the rows GET /api/v1/resources/by-type
+        lists across all pages — except that the ASSIGN filter form skips
+        ARCHIVED/PENDING_DELETION rows unless filter.status names one
+        explicitly (assignment flips rows to ACTIVE; a broad filter must
+        not silently resurrect archived resources). policyId '' unassigns
+        on either form; unassign applies no such status narrowing. dryRun
+        (filter form only) resolves and validates without writing. 400
+        when both or neither of resourceIds/filter are present, when
+        dryRun is combined with resourceIds, when filter.types is empty,
+        or when the policy's service type is incompatible with the
+        targeted resources. 404 when filter.tenantId matches no tenant
+        (same stale-cache signal as GET /api/v1/resources/by-type).
       operationId: bulkAssignPolicy
       requestBody:
         required: true
@@ -849,7 +863,13 @@ paths:
               $ref: '#/components/schemas/BulkAssignRequest'
       responses:
         '200':
-          description: Bulk assignment result
+          description: >-
+            Bulk assignment result. Id-list form returns assigned +
+            not_found (plus unassigned when policyId was ''); filter form
+            returns matched + assigned + dryRun (plus unassigned when
+            policyId was '', on dry runs too). assigned/unassigned count
+            writes performed, so dryRun=true always reports them as 0 —
+            matched carries the preview count.
           content:
             application/json:
               schema:
@@ -857,8 +877,26 @@ paths:
                 properties:
                   assigned:
                     type: integer
-                  not_found:
+                  unassigned:
                     type: integer
+                    description: Present on the unassign (policyId '') form
+                  not_found:
+                    type: array
+                    description: >-
+                      Id-list form only — request ids that matched no
+                      resource. (Previously mis-documented as an integer;
+                      the service has always returned a list.)
+                    items:
+                      type: string
+                      format: uuid
+                  matched:
+                    type: integer
+                    description: >-
+                      Filter form only — resources matching the filter
+                      (the same rows the by-type listing shows)
+                  dryRun:
+                    type: boolean
+                    description: Filter form only — echoes the request flag
 
   /api/v1/resources/bulk-unassign-policy:
     post:
@@ -3663,8 +3701,11 @@ components:
     BulkAssignRequest:
       type: object
       required:
-        - resourceIds
         - policyId
+      description: >-
+        Exactly one of resourceIds / filter must be provided (400
+        otherwise). policyId '' means unassign. dryRun is filter-form
+        only; combining it with resourceIds is a 400.
       properties:
         resourceIds:
           type: array
@@ -3673,7 +3714,47 @@ components:
             format: uuid
         policyId:
           type: string
+          description: Target policy UUID, or '' to unassign
+        filter:
+          $ref: '#/components/schemas/BulkAssignFilter'
+        dryRun:
+          type: boolean
+          default: false
+          description: >-
+            Filter form only — resolve the match set and validate, but
+            write nothing. 400 when combined with resourceIds.
+
+    BulkAssignFilter:
+      type: object
+      required:
+        - tenantId
+        - types
+      description: >-
+        Server-side match criteria. Applies the same predicates as
+        GET /api/v1/resources/by-type (query/status/sla filters plus the
+        hidden-type exclusions), so the match set equals exactly the rows
+        that listing shows across all pages — with one assign-only
+        narrowing: when status is omitted, ARCHIVED/PENDING_DELETION rows
+        are excluded from assignment (naming a status explicitly is
+        honored; unassign matches every status). Unknown tenantId → 404.
+      properties:
+        tenantId:
+          type: string
           format: uuid
+        types:
+          type: array
+          minItems: 1
+          items:
+            type: string
+        query:
+          type: string
+          description: Search over display name / email / SharePoint web_url
+        status:
+          type: string
+          description: Resource status filter (e.g. ACTIVE, DISCOVERED)
+        sla:
+          type: string
+          description: "'none' (no policy assigned) or a policy UUID"
 
     BulkUnassignRequest:
       type: object

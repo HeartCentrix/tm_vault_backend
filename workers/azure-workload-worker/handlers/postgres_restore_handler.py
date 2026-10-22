@@ -93,17 +93,19 @@ class PostgresRestoreHandler:
 
             schema_applied = 0
             if mode in ("FULL", "SCHEMA_ONLY"):
-                if schema_blob:
+                # The backup dumps the schema across a folder of
+                # per-object files (schema/sql/<schema>/Tables/...,
+                # Sequences/..., Other/grants etc). Older snapshots
+                # stored schema_blobs[db] = the FIRST of those files,
+                # so trusting it rebuilt exactly one table and every
+                # data insert after it failed. Always try the schema
+                # tree first; the stored blob is only a fallback for
+                # genuinely monolithic pre-tree dumps.
+                schema_applied = await self._apply_schema_tree(
+                    conn, tenant, data_prefix,
+                )
+                if schema_applied == 0 and schema_blob:
                     schema_applied = await self._apply_schema(conn, tenant, schema_blob)
-                else:
-                    # Newer backups dump the schema across a folder of
-                    # per-object files (schema/sql/<schema>/Tables/...,
-                    # Sequences/..., Other/grants etc) instead of one
-                    # monolithic .sql blob. Fall back to applying every
-                    # file under the schema/ prefix in dependency order.
-                    schema_applied = await self._apply_schema_tree(
-                        conn, tenant, data_prefix,
-                    )
                 await update_job_pct(job_id, 50)
 
             tables_applied = 0

@@ -37,6 +37,18 @@ ENV/
 *.swo
 *~
 
+# Private keys / certificates with keys / keytabs — never commit
+*.key
+*.pem
+*.pfx
+*.p12
+*.pvk
+*.keytab
+*.jks
+id_rsa
+id_ed25519
+id_ecdsa
+
 # Environment files
 .env
 .env.local
@@ -73,3 +85,9 @@ skills-lock.json
 
 # Client hand-off setup doc (local reference; content lives in-app Help Centre)
 ARCHIVE_MAILBOX_SETUP.md
+
+# Test virtualenv bootstrapped by scripts/run-tests.sh
+.venv-test/
+
+# Local agent reports may contain customer operational evidence.
+.superpowers/

@@ -11,7 +11,7 @@ import uuid
 import zipfile
 import io
 from datetime import datetime
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple, NamedTuple
 from pathlib import Path
 import aio_pika
 from aio_pika import Message, IncomingMessage
@@ -21,6 +21,8 @@ from sqlalchemy import select, update, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from shared.audit import internal_audit_headers
+from shared.csv_safe import SafeDictWriter  # Check 17: CSV formula-injection
 from shared.database import async_session_factory
 from shared.models import (
     Resource, Tenant, Job, Snapshot, SnapshotItem,
@@ -29,6 +31,7 @@ from shared.models import (
 from shared.message_bus import message_bus
 from shared.config import settings
 from shared.graph_client import GraphClient
+from shared.worker_logging import ensure_worker_stdout_logging
 from shared.multi_app_manager import multi_app_manager
 from shared.power_bi_client import PowerBIClient
 from shared.power_platform_client import PowerPlatformClient
@@ -41,6 +44,31 @@ from contact_restore import (
     MODE_SEPARATE as CONTACT_MODE_SEPARATE,
 )
 
+# This worker logs via print(); shared.* modules log via logging — without a
+# handler their INFO lines (carry-forward waits, storage ops) are dropped.
+ensure_worker_stdout_logging()
+
+# Snapshot states whose rows must never contribute to a restore or export.
+#
+# The sibling union below gathers every snapshot of the resource with
+# created_at <= the picked one and dedupes by external_id with newest-wins
+# DISTINCT ON. Two states poison that dedup:
+#
+#   FAILED            — the run died mid-upload, so its snapshot_items rows
+#                       can point at blobs that were never written.
+#   PENDING_DELETION  — the retention sweep has claimed the snapshot and is
+#                       deleting its items and blobs right now.
+#
+# Either kind is often the NEWEST row for an external_id, so it wins the
+# dedup and shadows a good older copy — the restore then writes a missing
+# or empty file and still reports success. snapshot-service already excludes
+# both in _resolve_sibling_snapshot_ids, which this union's own docstring
+# claims to mirror; it did not actually filter on status at all.
+_SIBLING_EXCLUDED_STATES = (
+    SnapshotStatus.FAILED,
+    SnapshotStatus.PENDING_DELETION,
+)
+
 # Per-worker shared semaphores — bound Graph pressure across every
 # in-flight contact restore job on this process. Sized off settings so
 # operators can tune without a code change.
@@ -48,6 +76,37 @@ _CONTACT_GLOBAL_SEM: Optional[asyncio.Semaphore] = None
 # user_id -> Semaphore. Lazily seeded so a cold worker doesn't allocate
 # 5k semaphores up front; evicted with the module lifetime.
 _CONTACT_PER_USER_SEMS: Dict[str, asyncio.Semaphore] = {}
+
+
+def restore_queue_plan(settings) -> list:
+    """(queue, prefetch) pairs this worker consumes.
+
+    ITO-10275: job-service routes >HEAVY_RESTORE_THRESHOLD_BYTES (~20 GiB)
+    restores and >HEAVY_EXPORT_THRESHOLD_BYTES (~100 GiB) exports to
+    HEAVY_EXPORT_QUEUE, but the k8s deploy never ported the compose
+    restore-worker-heavy — with no consumer those jobs hang silently. The
+    regular worker therefore consumes the heavy queue too, unless
+    RESTORE_HEAVY_CONSUME_ENABLED is off (the switch for a future dedicated
+    heavy pool). NOTE: the prefetch values are historical decoration —
+    channel QoS is set globally in MessageBus.connect; the real bound on
+    concurrent heavy work is the export semaphore.
+    """
+    queues = [
+        ("restore.urgent", 10),
+        (settings.RESTORE_WORKER_QUEUE, 30),
+        ("restore.low", 50),
+    ]
+    if getattr(settings, "RESTORE_HEAVY_CONSUME_ENABLED", True):
+        queues.append((settings.HEAVY_EXPORT_QUEUE, 1))
+    # Order-preserving dedup: RESTORE_WORKER_QUEUE may name any of the
+    # fixed queues (a dedicated heavy worker sets it to the heavy queue) —
+    # two iterators on one queue just split messages confusingly.
+    seen, plan = set(), []
+    for q, p in queues:
+        if q and q not in seen:
+            seen.add(q)
+            plan.append((q, p))
+    return plan
 
 
 def _contact_global_sem() -> asyncio.Semaphore:
@@ -504,6 +563,93 @@ def _event_to_csv_row(event: dict) -> dict:
     }
 
 
+# Restore types whose output is a downloadable artifact rather than a
+# write-back into M365. Their success signal is exported_count; for every
+# other type it is restored_count.
+_EXPORT_RESTORE_TYPES = frozenset({"EXPORT_ZIP", "EXPORT_PST", "DOWNLOAD"})
+
+
+class RestoreOutcome(NamedTuple):
+    """Terminal decision for one restore/export job — see
+    decide_restore_terminal_status."""
+    status: JobStatus
+    audit_outcome: str          # SUCCESS | PARTIAL | FAILURE
+    audit_action: str           # RESTORE_COMPLETED | RESTORE_FAILED
+    error_message: Optional[str]
+    done_with_errors: bool
+    succeeded: int
+    failed: int
+
+
+def decide_restore_terminal_status(restore_type: str, result: Dict) -> RestoreOutcome:
+    """Map a handler's result counts onto the job's terminal state.
+
+    Until 2026-10-14 only the export types could FAIL here (exported == 0);
+    every live restore (IN_PLACE / CROSS_USER / CROSS_RESOURCE) was marked
+    COMPLETED with audit outcome SUCCESS even when restored_count == 0 and
+    every item had failed — `failed` was computed and never read. Rules now,
+    for every type:
+
+      succeeded == 0 and (failed > 0 or export) -> FAILED,    audit FAILURE
+      succeeded  > 0 and failed > 0             -> COMPLETED, audit PARTIAL,
+                                                   done_with_errors=True
+      otherwise                                 -> COMPLETED, audit SUCCESS
+
+    An export that produced nothing stays FAILED even with failed == 0 —
+    there is no file to download (the pre-existing rule). A live restore
+    with nothing restored AND nothing failed (e.g. only Teams messages,
+    all skipped with a manual_actions note) stays COMPLETED: nothing broke.
+    PARTIAL is in audit-service's accepted outcome set (_normalize_event).
+    """
+    is_export = restore_type in _EXPORT_RESTORE_TYPES
+    exported = int(result.get("exported_count", 0) or 0)
+    if is_export:
+        succeeded = exported
+    else:
+        succeeded = int(result.get("restored_count", exported) or 0)
+    failed = int(result.get("failed_count", 0) or 0)
+    verb = "exported" if is_export else "restored"
+
+    if succeeded == 0 and (failed > 0 or is_export):
+        counts = f"{succeeded} {verb}, {failed} failed"
+        err = result.get("error")
+        error_message = (
+            f"{err} ({counts})" if err
+            else f"{'Export' if is_export else 'Restore'} finished with no items {verb} ({counts})"
+        )
+        return RestoreOutcome(
+            JobStatus.FAILED, "FAILURE", "RESTORE_FAILED", error_message, False, succeeded, failed,
+        )
+    if failed > 0:
+        return RestoreOutcome(
+            JobStatus.COMPLETED, "PARTIAL", "RESTORE_COMPLETED", None, True, succeeded, failed,
+        )
+    return RestoreOutcome(
+        JobStatus.COMPLETED, "SUCCESS", "RESTORE_COMPLETED", None, False, succeeded, failed,
+    )
+
+
+async def _post_export_notification(url: str, payload: Dict) -> None:
+    """POST the export-completed notification to alert-service.
+
+    That route is gated like every other internal route: a user JWT OR the
+    X-Internal-Api-Key shared secret (shared.auth_enforcement.require_principal).
+    Until 2026-10-14 this POST carried no headers at all, so alert-service
+    answered 401 to every notification and, because the caller swallowed the
+    response, no export e-mail was ever sent. httpx does not raise on 4xx,
+    so a rejected POST is logged here instead of vanishing. Raises on
+    transport errors; the caller's try/except keeps the export non-fatal.
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(url, headers=internal_audit_headers(), json=payload)
+    if resp.status_code >= 300:
+        print(
+            f"[restore-worker] export-completed notify rejected (non-fatal): "
+            f"HTTP {resp.status_code} {resp.text[:200]}",
+            flush=True,
+        )
+
+
 class RestoreWorker:
     """Main restore worker that processes restore jobs from RabbitMQ queues"""
 
@@ -528,6 +674,14 @@ class RestoreWorker:
         # messages wait on this semaphore. See docs/superpowers/specs/2026-04-19-mbox-mail-export-design.md §8.
         from shared.config import settings as _s
         self._export_semaphore = asyncio.Semaphore(_s.MAX_CONCURRENT_EXPORTS_PER_WORKER)
+        # site_id → default document-library drive id, resolved once per
+        # site for the streaming SharePoint restore path (ITO-10282).
+        self._sp_default_drive_ids: Dict[str, str] = {}
+        # Cap concurrent streaming uploadSessions — the job semaphore
+        # above admits 30 items, and 30 parallel multi-GB streams would
+        # still pressure the single-replica pod's RAM.
+        self._sp_stream_semaphore = asyncio.Semaphore(
+            _s.SHAREPOINT_RESTORE_STREAM_CONCURRENCY)
 
     async def initialize(self):
         """Initialize connections and clients"""
@@ -571,12 +725,7 @@ class RestoreWorker:
                     raise
 
         from shared.config import settings as _s
-        queue_name = _s.RESTORE_WORKER_QUEUE
-        queues = [
-            ("restore.urgent", 10),
-            (queue_name, 30),
-            ("restore.low", 50),
-        ]
+        queues = restore_queue_plan(_s)
 
         tasks = []
         for queue_name, prefetch in queues:
@@ -736,41 +885,58 @@ class RestoreWorker:
                     result = await handler(session, items_to_restore, message, spec)
                     print(f"[{self.worker_id}] handler returned job={job_id}", flush=True)
 
-                    # Decide terminal status from the handler's actual outcome.
-                    # Without this, exports that produced zero files (e.g. the
-                    # PST converter binary was missing or the wrong arch) were
-                    # marked COMPLETED and the UI offered a download for a
-                    # non-existent file. The download endpoint then returned
-                    # 500 when it couldn't find blob_path. Now:
-                    #   - exported>0, failed=0  → COMPLETED (full success)
-                    #   - exported>0, failed>0  → COMPLETED with status flag
-                    #     "done_with_errors" preserved in result; download
-                    #     endpoint serves the partial file as before.
-                    #   - exported=0 (any failed) → FAILED. UI hides Download.
-                    exported = int(result.get("exported_count", 0) or 0)
-                    failed = int(result.get("failed_count", 0) or 0)
-                    is_export_type = restore_type in {"EXPORT_ZIP", "EXPORT_PST", "DOWNLOAD"}
-                    if is_export_type and exported == 0:
-                        terminal_status = JobStatus.FAILED
-                        outcome = "FAILURE"
-                        action = "RESTORE_FAILED"
-                    else:
-                        terminal_status = JobStatus.COMPLETED
-                        outcome = "SUCCESS"
-                        action = "RESTORE_COMPLETED"
+                    # Decide terminal status from the handler's actual outcome
+                    # — decide_restore_terminal_status holds the rules. Until
+                    # 2026-10-14 only exports could FAIL here (exported == 0);
+                    # a live restore with restored_count == 0 and every item
+                    # failed was still COMPLETED / audit SUCCESS because the
+                    # computed `failed` was never read. Partial runs now carry
+                    # done_with_errors on job.result; the download endpoint
+                    # serves a partial export file as before.
+                    decision = decide_restore_terminal_status(restore_type, result)
+                    # Surface the counts + partial flag on the persisted
+                    # result (job.result) so the UI / audit row can tell a
+                    # clean run from "done with errors".
+                    result["failed_count"] = decision.failed
+                    if decision.done_with_errors:
+                        result["done_with_errors"] = True
+                    terminal_status = decision.status
+                    outcome = decision.audit_outcome
+                    action = decision.audit_action
 
-                    await self.update_job_status(session, job_id, terminal_status, result)
+                    await self.update_job_status(
+                        session, job_id, terminal_status, result,
+                        error_message=decision.error_message,
+                    )
                     await session.commit()
 
                     await self.log_audit_event(
                         job_id, message, result, action=action, outcome=outcome,
                     )
 
-                    print(f"[{self.worker_id}] Restore job {job_id} completed: {restore_type}")
+                    print(
+                        f"[{self.worker_id}] Restore job {job_id} {terminal_status.value}: "
+                        f"{restore_type} succeeded={decision.succeeded} failed={decision.failed}"
+                        f"{' done_with_errors' if decision.done_with_errors else ''}",
+                        flush=True,
+                    )
 
                 except Exception as e:
                     await session.rollback()
-                    await self.handle_restore_failure(session, job_id, e)
+                    try:
+                        await self.handle_restore_failure(session, job_id, e)
+                        # This commit is what actually lands the FAILED
+                        # status + error_message. Without it the mutations
+                        # are discarded when the `async with` session
+                        # closes on the re-raise below, and the job shows
+                        # RUNNING/progress=5 forever.
+                        await session.commit()
+                    except Exception as persist_exc:
+                        print(
+                            f"[{self.worker_id}] could not persist FAILED "
+                            f"status for job {job_id}: {persist_exc}",
+                            flush=True,
+                        )
                     # Failure audit so the Audit feed shows the FAILED
                     # transition alongside the original TRIGGERED event.
                     await self.log_audit_event(
@@ -856,6 +1022,7 @@ class RestoreWorker:
                         select(Snapshot.id).where(
                             Snapshot.resource_id == picked.resource_id,
                             Snapshot.created_at <= picked.created_at,
+                            Snapshot.status.notin_(_SIBLING_EXCLUDED_STATES),
                         )
                     )
                 ).all()
@@ -874,7 +1041,7 @@ class RestoreWorker:
 
         # Apply folder/item filters on top of the sibling-unioned base.
         if folder_paths or item_ids:
-            from shared.folder_resolver import _prefix_and_exact_for
+            from shared.folder_resolver import LIKE_ESCAPE, _prefix_and_exact_for
             from sqlalchemy import or_
 
             clauses = []
@@ -884,7 +1051,9 @@ class RestoreWorker:
                 )
             prefixes, exacts = _prefix_and_exact_for(folder_paths)
             for prefix in prefixes:
-                clauses.append(SnapshotItem.folder_path.like(prefix))
+                # ESCAPE must be declared: the prefix carries escaped
+                # LIKE metacharacters from the ticked folder name.
+                clauses.append(SnapshotItem.folder_path.like(prefix, escape=LIKE_ESCAPE))
             if exacts:
                 clauses.append(SnapshotItem.folder_path.in_(exacts))
 
@@ -945,6 +1114,7 @@ class RestoreWorker:
                     select(Snapshot.id).where(
                         Snapshot.resource_id == picked.resource_id,
                         Snapshot.created_at <= picked.created_at,
+                        Snapshot.status.notin_(_SIBLING_EXCLUDED_STATES),
                     )
                 )).all()
                 sibling_ids.update(r[0] for r in rows)
@@ -961,13 +1131,15 @@ class RestoreWorker:
         )
 
         if folder_paths or item_ids:
-            from shared.folder_resolver import _prefix_and_exact_for
+            from shared.folder_resolver import LIKE_ESCAPE, _prefix_and_exact_for
             clauses = []
             if item_ids:
                 clauses.append(SnapshotItem.id.in_([uuid.UUID(iid) for iid in item_ids]))
             prefixes, exacts = _prefix_and_exact_for(folder_paths)
             for prefix in prefixes:
-                clauses.append(SnapshotItem.folder_path.like(prefix))
+                # Same escaped-pattern contract as fetch_snapshot_items —
+                # the count must match the rows the restore will write.
+                clauses.append(SnapshotItem.folder_path.like(prefix, escape=LIKE_ESCAPE))
             if exacts:
                 clauses.append(SnapshotItem.folder_path.in_(exacts))
             if clauses:
@@ -1018,6 +1190,7 @@ class RestoreWorker:
                         select(Snapshot.id).where(
                             Snapshot.resource_id == picked.resource_id,
                             Snapshot.created_at <= picked.created_at,
+                            Snapshot.status.notin_(_SIBLING_EXCLUDED_STATES),
                         )
                     )).all()
                     sibling_ids.update(r[0] for r in rows)
@@ -1090,7 +1263,7 @@ class RestoreWorker:
         # Keyset pagination on (external_id, snapshot_id) — DISTINCT ON
         # external_id with newest-wins means we always get one row per
         # logical item, so external_id alone is a stable cursor.
-        from shared.folder_resolver import _prefix_and_exact_for
+        from shared.folder_resolver import LIKE_ESCAPE, _prefix_and_exact_for
         prefixes, exacts = _prefix_and_exact_for(folder_paths or [])
 
         last_ext = ""
@@ -1110,7 +1283,9 @@ class RestoreWorker:
                 if item_ids:
                     clauses.append(SnapshotItem.id.in_([uuid.UUID(i) for i in item_ids]))
                 for prefix in prefixes:
-                    clauses.append(SnapshotItem.folder_path.like(prefix))
+                    # Escaped pattern — declare the ESCAPE char so a
+                    # folder like /HR_2026 can't sweep in /HRX2026.
+                    clauses.append(SnapshotItem.folder_path.like(prefix, escape=LIKE_ESCAPE))
                 if exacts:
                     clauses.append(SnapshotItem.folder_path.in_(exacts))
                 if clauses:
@@ -1371,13 +1546,17 @@ class RestoreWorker:
                     + od_summary.get("overwritten", 0)
                     + od_summary.get("renamed", 0)
                 )
-                failed_count += od_summary.get("failed", 0)
+                # 'skipped' = selected but not restored (blob missing /
+                # unreadable). Fold into failed_count so the job result
+                # reflects the full selection instead of silently
+                # under-reporting the restore.
+                failed_count += od_summary.get("failed", 0) + od_summary.get("skipped", 0)
                 for o in od_summary.get("items", []):
-                    if o.get("outcome") == "failed":
+                    if o.get("outcome") in ("failed", "skipped"):
                         print(
                             f"[{self.worker_id}] [ONEDRIVE-RESTORE FAIL] "
                             f"ext_id={o.get('external_id')} name={o.get('name')} "
-                            f"reason={o.get('reason')}",
+                            f"outcome={o.get('outcome')} reason={o.get('reason')}",
                             flush=True,
                         )
 
@@ -1685,13 +1864,15 @@ class RestoreWorker:
                 + od_summary.get("overwritten", 0)
                 + od_summary.get("renamed", 0)
             )
-            failed_count += od_summary.get("failed", 0)
+            # 'skipped' = selected but not restored (blob missing /
+            # unreadable) — counted as failed, same as the in-place path.
+            failed_count += od_summary.get("failed", 0) + od_summary.get("skipped", 0)
             for o in od_summary.get("items", []):
-                if o.get("outcome") == "failed":
+                if o.get("outcome") in ("failed", "skipped"):
                     print(
                         f"[{self.worker_id}] [ONEDRIVE-RESTORE FAIL] "
                         f"ext_id={o.get('external_id')} name={o.get('name')} "
-                        f"reason={o.get('reason')}",
+                        f"outcome={o.get('outcome')} reason={o.get('reason')}",
                         flush=True,
                     )
 
@@ -2425,7 +2606,6 @@ class RestoreWorker:
             # Task 25 — user notification on non-trivial or non-clean exports.
             if _duration >= 60 or result.get("status", "COMPLETED") != "COMPLETED":
                 try:
-                    import httpx as _httpx
                     from shared.config import settings as _cfg_ns
 
                     user_email, user_display_name = "", "User"
@@ -2447,21 +2627,22 @@ class RestoreWorker:
                             pass
 
                     download_url = f"{_cfg_ns.FRONTEND_URL}/recovery?job={job_id}"
-                    async with _httpx.AsyncClient(timeout=10.0) as _c:
-                        await _c.post(
-                            f"{_cfg_ns.ALERT_SERVICE_URL}/api/v1/alerts/notify/export-completed",
-                            json={
-                                "user_email": user_email,
-                                "user_display_name": user_display_name,
-                                "job_id": job_id,
-                                "status": result.get("status", "COMPLETED"),
-                                "download_url": download_url,
-                                "exported_count": result.get("exported_count", 0),
-                                "failed_count": result.get("failed_count", 0),
-                                "duration_seconds": _duration,
-                                "size_bytes": 0,
-                            },
-                        )
+                    # Carries X-Internal-Api-Key and logs a non-2xx reply —
+                    # the bare POST used until 2026-10-14 was 401'd every time.
+                    await _post_export_notification(
+                        f"{_cfg_ns.ALERT_SERVICE_URL}/api/v1/alerts/notify/export-completed",
+                        {
+                            "user_email": user_email,
+                            "user_display_name": user_display_name,
+                            "job_id": job_id,
+                            "status": result.get("status", "COMPLETED"),
+                            "download_url": download_url,
+                            "exported_count": result.get("exported_count", 0),
+                            "failed_count": result.get("failed_count", 0),
+                            "duration_seconds": _duration,
+                            "size_bytes": 0,
+                        },
+                    )
                 except Exception as _notify_err:
                     print(f"[restore-worker] export-completed notify failed (non-fatal): {_notify_err}")
 
@@ -2589,6 +2770,7 @@ class RestoreWorker:
 
         zip_buffer = io.BytesIO()
         exported_count = 0
+        failed_count = 0
 
         # Power Platform package items are binary ZIPs — pack them as .zip inside the
         # outer export ZIP so the user can extract and re-import via the Power Platform
@@ -2622,17 +2804,21 @@ class RestoreWorker:
 
                     # Binary-backed items (package ZIPs) bypass the JSON-assuming loader
                     if item.item_type in PACKAGE_TYPES:
-                        pkg_bytes = self._load_snapshot_item_bytes(item, _workload_for_item(item.item_type))
+                        pkg_bytes = await self._load_snapshot_item_bytes(item, _workload_for_item(item.item_type))
                         if pkg_bytes:
                             subdir = "power_apps" if item.item_type == "POWER_APP_PACKAGE" else "power_automate"
-                            zip_file.writestr(
-                                f"{subdir}/{item.name or item.external_id}.zip",
-                                pkg_bytes,
-                            )
+                            _arc = f"{subdir}/{_safe_name(item.name or item.external_id)}.zip"
+                            assert ".." not in _arc.split("/") and not _arc.startswith("/"), f"unsafe arcname: {_arc!r}"
+                            zip_file.writestr(_arc, pkg_bytes)
                             exported_count += 1
+                        else:
+                            # Package blob missing — the export ZIP would
+                            # silently lack this app/flow; count it.
+                            print(f"[{self.worker_id}] Failed to export item {item.id}: package blob missing ({item.blob_path})")
+                            failed_count += 1
                         continue
 
-                    raw_data = self._load_snapshot_item_payload(
+                    raw_data = await self._load_snapshot_item_payload(
                         item, _workload_for_item(item.item_type),
                     )
 
@@ -2640,15 +2826,16 @@ class RestoreWorker:
                     if item.item_type in ("EMAIL",):
                         # Create EML file
                         eml_content = self._create_eml_from_json(raw_data)
-                        zip_file.writestr(
-                            f"emails/{item.name or item.external_id}.eml",
-                            eml_content
-                        )
+                        _arc = f"emails/{_safe_name(item.name or item.external_id)}.eml"
+                        assert ".." not in _arc.split("/") and not _arc.startswith("/"), f"unsafe arcname: {_arc!r}"
+                        zip_file.writestr(_arc, eml_content)
                     elif item.item_type in ("FILE", "ONEDRIVE_FILE", "SHAREPOINT_FILE"):
                         # Add file content if available
                         content = raw_data.get("content", json.dumps(raw_data, indent=2))
+                        _arc = f"files/{_safe_name(item.name or item.external_id)}.json"
+                        assert ".." not in _arc.split("/") and not _arc.startswith("/"), f"unsafe arcname: {_arc!r}"
                         zip_file.writestr(
-                            f"files/{item.name or item.external_id}.json",
+                            _arc,
                             content if isinstance(content, str) else json.dumps(content, indent=2)
                         )
                     elif item.item_type == "CALENDAR_EVENT":
@@ -2667,7 +2854,7 @@ class RestoreWorker:
                             self._calendar_csv_rows.append(_event_to_csv_row(raw_data))
                         else:
                             zip_file.writestr(
-                                f"calendar/{item.external_id}.json",
+                                f"calendar/{_safe_name(item.external_id)}.json",
                                 json.dumps(raw_data, indent=2),
                             )
                     elif item.item_type == "USER_CONTACT":
@@ -2693,18 +2880,18 @@ class RestoreWorker:
                     elif item.item_type in ("TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY", "TEAMS_CHAT_MESSAGE"):
                         # Export Teams message as JSON
                         zip_file.writestr(
-                            f"teams_messages/{item.external_id}.json",
+                            f"teams_messages/{_safe_name(item.external_id)}.json",
                             json.dumps(raw_data, indent=2)
                         )
                     elif item.item_type.startswith("POWER_BI"):
                         zip_file.writestr(
-                            f"power_bi/{item.item_type}/{item.external_id}.json",
+                            f"power_bi/{_safe_name(item.item_type)}/{_safe_name(item.external_id)}.json",
                             json.dumps(raw_data, indent=2),
                         )
                     elif item.item_type.startswith("POWER_APP"):
                         # Non-package Power App items (e.g. POWER_APP_DEFINITION)
                         zip_file.writestr(
-                            f"power_apps/{item.item_type}/{item.external_id}.json",
+                            f"power_apps/{_safe_name(item.item_type)}/{_safe_name(item.external_id)}.json",
                             json.dumps(raw_data, indent=2),
                         )
                     elif item.item_type.startswith("POWER_FLOW"):
@@ -2727,6 +2914,7 @@ class RestoreWorker:
                     exported_count += 1
                 except Exception as e:
                     print(f"[{self.worker_id}] Failed to export item {item.id}: {e}")
+                    failed_count += 1
 
             # Flush the accumulated CSV rows as a single calendar.csv.
             csv_rows = getattr(self, "_calendar_csv_rows", None)
@@ -2734,7 +2922,7 @@ class RestoreWorker:
                 import io as _io
                 import csv as _csv
                 buf = _io.StringIO()
-                writer = _csv.DictWriter(
+                writer = SafeDictWriter(_csv.DictWriter(
                     buf,
                     fieldnames=[
                         "subject", "start", "end", "isAllDay",
@@ -2742,7 +2930,7 @@ class RestoreWorker:
                         "bodyPreview", "webLink", "id",
                     ],
                     extrasaction="ignore",
-                )
+                ))
                 writer.writeheader()
                 for row in csv_rows:
                     writer.writerow(row)
@@ -2755,7 +2943,7 @@ class RestoreWorker:
                 import io as _io2
                 import csv as _csv2
                 buf2 = _io2.StringIO()
-                writer2 = _csv2.DictWriter(
+                writer2 = SafeDictWriter(_csv2.DictWriter(
                     buf2,
                     fieldnames=[
                         "displayName", "givenName", "surname", "companyName", "jobTitle",
@@ -2763,7 +2951,7 @@ class RestoreWorker:
                         "imAddresses", "categories", "personalNotes", "birthday", "folder",
                     ],
                     extrasaction="ignore",
-                )
+                ))
                 writer2.writeheader()
                 for row in contacts_csv_rows:
                     writer2.writerow(row)
@@ -2792,9 +2980,10 @@ class RestoreWorker:
             err = (upload_result or {}).get("error", "unknown") if isinstance(upload_result, dict) else upload_result
             raise RuntimeError(f"export ZIP upload failed: {err}")
 
-        print(f"[{self.worker_id}] export ZIP uploaded: {blob_name} ({zip_size} bytes, {exported_count} items)")
+        print(f"[{self.worker_id}] export ZIP uploaded: {blob_name} ({zip_size} bytes, {exported_count} items, {failed_count} failed)")
         return {
             "exported_count": exported_count,
+            "failed_count": failed_count,
             "export_type": "ZIP",
             "download_url": f"/api/v1/jobs/export/{message.get('jobId')}/download",
             "blob_path": blob_name,
@@ -2945,12 +3134,20 @@ class RestoreWorker:
     ) -> Dict:
         """Export items as direct download (JSON)"""
         export_data = []
+        failed_count = 0
         for item in items:
             metadata = self._get_item_metadata(item)
-            raw_data = self._load_snapshot_item_payload(
-                item,
-                "power-bi" if item.item_type.startswith("POWER_BI") else "files",
-            )
+            try:
+                raw_data = await self._load_snapshot_item_payload(
+                    item,
+                    "power-bi" if item.item_type.startswith("POWER_BI") else "files",
+                )
+            except Exception as e:
+                # Missing/unreadable blob — count it instead of shipping
+                # an empty content body as success.
+                print(f"[{self.worker_id}] Failed to export item {item.id}: {e}")
+                failed_count += 1
+                continue
             export_data.append({
                 "id": str(item.id),
                 "type": item.item_type,
@@ -2962,6 +3159,7 @@ class RestoreWorker:
 
         return {
             "exported_count": len(export_data),
+            "failed_count": failed_count,
             "export_type": "JSON",
             "data": export_data,
         }
@@ -3196,8 +3394,110 @@ class RestoreWorker:
             is_cross_user=False,
         )
         outcome = await engine.upload_one(item)
-        if outcome.outcome == "failed":
+        # 'skipped' (blob missing) must raise too — the per-item caller
+        # counts restored_count on a clean return, which would report a
+        # not-restored file as success.
+        if outcome.outcome in ("failed", "skipped"):
             raise RuntimeError(outcome.reason or "onedrive restore failed")
+
+    async def _read_sharepoint_file_bytes(self, item: SnapshotItem) -> Optional[bytes]:
+        """Fetch a SharePoint item's captured bytes from object storage.
+
+        Mirrors ``OneDriveRestoreEngine._read_blob_bytes``. SharePoint
+        bytes have shipped under two containers: drive-walked files go
+        through ``backup_single_file`` → the "files" container, while
+        REST-walked catalog/list files land in "sharepoint" — so both
+        are tried. Returns None when the item has no blob or the blob
+        is unreadable in either container.
+        """
+        blob_path = getattr(item, "blob_path", None)
+        if not blob_path:
+            return None
+        tenant_id = str(item.tenant_id)
+        shard = azure_storage_manager.get_shard_for_item(item)
+        for workload in ("files", "sharepoint"):
+            container = azure_storage_manager.get_container_name(tenant_id, workload)
+            try:
+                data = await shard.download_blob(container, blob_path)
+            except Exception as exc:
+                print(
+                    f"[{self.worker_id}] [SP-RESTORE] blob read "
+                    f"{container}/{blob_path} failed: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                continue
+            if data is not None:
+                return data
+        return None
+
+    async def _sharepoint_blob_location(
+        self, item: SnapshotItem,
+    ) -> Optional[Tuple[str, int]]:
+        """Probe which container holds the item's captured bytes and the
+        blob's authoritative size — WITHOUT downloading it. Same
+        two-container search as ``_read_sharepoint_file_bytes``.
+
+        Returns ``(container, size)``, or None only when the blob is
+        CONFIRMED absent in both containers. A probe error with no hit
+        RAISES: treating "probe failed" as "blob missing" would silently
+        route a multi-GB file back onto the fully-buffered fallback —
+        the exact OOM this path exists to prevent (ITO-10282). Uses the
+        strict ``head_blob`` (None only on 404) where the shard provides
+        it.
+        """
+        blob_path = getattr(item, "blob_path", None)
+        if not blob_path:
+            return None
+        tenant_id = str(item.tenant_id)
+        shard = azure_storage_manager.get_shard_for_item(item)
+        probe = getattr(shard, "head_blob", None) or shard.get_blob_properties
+        probe_errors: List[str] = []
+        for workload in ("files", "sharepoint"):
+            container = azure_storage_manager.get_container_name(tenant_id, workload)
+            try:
+                props = await probe(container, blob_path)
+            except Exception as exc:
+                print(
+                    f"[{self.worker_id}] [SP-RESTORE] blob head "
+                    f"{container}/{blob_path} failed: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                probe_errors.append(f"{container}: {type(exc).__name__}: {exc}")
+                continue
+            if props is not None:
+                return container, int(props.get("size") or 0)
+        if probe_errors:
+            raise RuntimeError(
+                f"blob HEAD failed for {item.item_type} {item.external_id} "
+                f"({blob_path}) — cannot pick a size regime safely: "
+                + " | ".join(probe_errors)
+            )
+        return None
+
+    async def _iter_sharepoint_blob_stream(
+        self, item: SnapshotItem, container: str, chunk_size: int,
+    ):
+        """Async-iterate a SharePoint item's captured bytes in bounded
+        chunks, feeding the streaming uploadSession so a multi-GB file
+        never materialises in worker RAM (ITO-10282)."""
+        shard = azure_storage_manager.get_shard_for_item(item)
+        async for chunk in shard.download_blob_stream(
+            container, item.blob_path, chunk_size=chunk_size,
+        ):
+            if chunk:
+                yield chunk
+
+    async def _sharepoint_default_drive_id(
+        self, graph_client: GraphClient, site_id: str,
+    ) -> str:
+        """Resolve (and cache per site) the default drive id needed by
+        the streaming createUploadSession path."""
+        cached = self._sp_default_drive_ids.get(site_id)
+        if cached:
+            return cached
+        drive_id = await graph_client.get_sharepoint_site_default_drive_id(site_id)
+        self._sp_default_drive_ids[site_id] = drive_id
+        return drive_id
 
     async def _restore_file_to_sharepoint(
         self,
@@ -3213,12 +3513,39 @@ class RestoreWorker:
         restored files land in their original location instead of the drive
         root. ``target_site_id`` overrides the source site — used by the
         cross-resource and new-site restore modes.
+
+        Two size regimes (ITO-10282): files at or below the streaming
+        threshold keep the simple buffered PUT; larger blobs stream from
+        object storage straight into a Graph uploadSession — the simple
+        PUT caps out at 250 MB and buffering a multi-GB body OOM-kills
+        the single-replica worker. The blob's HEAD size is authoritative
+        (``content_size`` can be stale) — the uploadSession fails loudly
+        on any declared/streamed mismatch.
         """
         metadata = self._get_item_metadata(item)
         raw_data = metadata.get("raw", {})
 
         site_id = target_site_id or resource.external_id
-        file_content = raw_data.get("content", "")
+        # Backup-worker stores SHAREPOINT_FILE bytes in object storage
+        # (item.blob_path) — there is no raw.content key. Read the blob
+        # like the OneDrive engine does; a missing blob must FAIL the
+        # item (the caller counts the raise), because PUTting the empty
+        # fallback body under OVERWRITE replaced live documents with
+        # 0-byte files while the job reported success.
+        file_content = raw_data.get("content")
+        stream_plan: Optional[Tuple[str, int]] = None
+        if not file_content and getattr(item, "blob_path", None):
+            loc = await self._sharepoint_blob_location(item)
+            if loc and loc[1] > settings.SHAREPOINT_RESTORE_STREAMING_THRESHOLD_BYTES:
+                stream_plan = loc
+        if stream_plan is None and not file_content:
+            file_content = await self._read_sharepoint_file_bytes(item)
+            if file_content is None:
+                raise RuntimeError(
+                    f"no captured content for {item.item_type} {item.external_id} "
+                    f"(blob_path={getattr(item, 'blob_path', None)!r}) — "
+                    "refusing to upload an empty body"
+                )
         file_name = raw_data.get("name", item.name or f"restored_{item.external_id}")
 
         # Preserve the original folder tree. folder_path for SharePoint
@@ -3234,13 +3561,60 @@ class RestoreWorker:
         prefix = self._conflict_path_prefix(conflict_mode)
         parts = [p for p in (prefix.strip("/"), folder_trail, file_name) if p]
         target_path = "/".join(parts)
-        url = f"{graph_client.GRAPH_URL}/sites/{site_id}/drive/root:/{target_path}:/content"
 
-        result = await graph_client._put(
-            url,
-            content=file_content,
-            headers={"Content-Type": "application/octet-stream"}
-        )
+        if stream_plan is not None:
+            container, total_size = stream_plan
+            drive_id = await self._sharepoint_default_drive_id(graph_client, site_id)
+            print(
+                f"[{self.worker_id}] [SP-RESTORE] streaming {file_name} "
+                f"({total_size} bytes) via uploadSession to drive {drive_id}",
+                flush=True,
+            )
+            # conflict_behavior="replace" matches the simple PUT's
+            # overwrite-at-path semantics in both conflict modes —
+            # SEPARATE_FOLDER already diverts via the path prefix.
+            async with self._sp_stream_semaphore:
+                result = await graph_client.upload_large_file_stream_to_drive(
+                    drive_id=drive_id,
+                    drive_path=target_path,
+                    byte_iter=self._iter_sharepoint_blob_stream(
+                        item, container, settings.SHAREPOINT_RESTORE_CHUNK_BYTES,
+                    ),
+                    total_size=total_size,
+                    chunk_size=settings.SHAREPOINT_RESTORE_CHUNK_BYTES,
+                    conflict_behavior="replace",
+                )
+            if not result:
+                # A final chunk that resolved through the 416/409
+                # nextExpectedRanges resync (or a 202) returns {} —
+                # the file IS committed but ACL replay needs the real
+                # driveItem. Recover it by path.
+                result = await graph_client.get_drive_item_by_path(
+                    drive_id, target_path,
+                )
+                if not result:
+                    print(
+                        f"[{self.worker_id}] [SP-RESTORE] WARNING: streamed "
+                        f"{file_name} committed but driveItem lookup failed — "
+                        "skipping ACL replay for this item",
+                        flush=True,
+                    )
+        else:
+            # Quote each path segment exactly like the streaming helper
+            # does (spaces / unicode / '#' / '%' in SharePoint filenames
+            # break Graph routing or land at a decoded-differently path
+            # unescaped) — both size regimes must target the SAME item.
+            from urllib.parse import quote as _q
+            graph_site_id = site_id.replace("/", ",")
+            quoted_path = "/".join(
+                _q(seg, safe="") for seg in target_path.split("/") if seg
+            )
+            url = f"{graph_client.GRAPH_URL}/sites/{graph_site_id}/drive/root:/{quoted_path}:/content"
+            result = await graph_client._put(
+                url,
+                content=file_content,
+                headers={"Content-Type": "application/octet-stream"}
+            )
 
         # Round 1.1 — replay captured ACLs onto the restored item.
         await self._replay_file_permissions(graph_client, item, result)
@@ -3885,7 +4259,7 @@ class RestoreWorker:
                 continue
 
             try:
-                payload = self._load_snapshot_item_payload(item, "power-bi")
+                payload = await self._load_snapshot_item_payload(item, "power-bi")
                 definition = payload.get("definition")
                 artifact = payload.get("artifact", {})
                 fabric_item_type = metadata.get("fabric_item_type")
@@ -3995,7 +4369,7 @@ class RestoreWorker:
 
             try:
                 if item.item_type == "POWER_APP_PACKAGE":
-                    zip_bytes = self._load_snapshot_item_bytes(item, "power-apps")
+                    zip_bytes = await self._load_snapshot_item_bytes(item, "power-apps")
                     if not zip_bytes:
                         manual_actions.append(f"{item.name}: package blob is missing or empty.")
                         failed += 1
@@ -4065,7 +4439,7 @@ class RestoreWorker:
 
             try:
                 if package_item:
-                    zip_bytes = self._load_snapshot_item_bytes(package_item, "power-automate")
+                    zip_bytes = await self._load_snapshot_item_bytes(package_item, "power-automate")
                     if not zip_bytes:
                         manual_actions.append(f"{chosen.name}: flow package blob missing.")
                         failed += 1
@@ -4107,7 +4481,7 @@ class RestoreWorker:
             if item.item_type != "POWER_DLP_POLICY":
                 continue
             try:
-                payload = self._load_snapshot_item_payload(item, "power-dlp")
+                payload = await self._load_snapshot_item_payload(item, "power-dlp")
                 if not payload:
                     manual_actions.append(f"{item.name}: policy definition is empty, cannot restore.")
                     failed += 1
@@ -4222,7 +4596,14 @@ class RestoreWorker:
             # Build HTML body — prefer the captured content blob, else a title-only placeholder
             html_bytes: Optional[bytes] = None
             if content_item:
-                html_bytes = self._load_snapshot_item_bytes(content_item, "onenote")
+                try:
+                    html_bytes = await self._load_snapshot_item_bytes(content_item, "onenote")
+                except Exception as exc:
+                    # Object-store read errors are per-page: they must not
+                    # unwind into restore_in_place and fail the whole job.
+                    manual_actions.append(f"{title}: page content blob unreadable — {str(exc)[:200]}")
+                    failed += 1
+                    continue
             if not html_bytes:
                 html_bytes = (f"<html><head><title>{title}</title></head>"
                               f"<body><h1>{title}</h1><p>(content not captured)</p></body></html>").encode()
@@ -4446,7 +4827,12 @@ class RestoreWorker:
                 continue
             sub_path = "checklistItems" if item.item_type == "TODO_TASK_CHECKLIST" else "linkedResources"
             # Blob stores {"value": [...]} — re-create each entry on the new task
-            blob = self._load_snapshot_item_payload(item, "todo")
+            try:
+                blob = await self._load_snapshot_item_payload(item, "todo")
+            except Exception as exc:
+                manual_actions.append(f"{sub_path} for task {new_task_id}: payload unreadable — {str(exc)[:200]}")
+                failed += 1
+                continue
             values = (blob.get("value") if isinstance(blob, dict) else None) or []
             for entry in values:
                 # Strip fields Graph assigns (id, etag, timestamps) so POST accepts the body
@@ -4516,26 +4902,40 @@ class RestoreWorker:
     def _get_item_metadata(self, item: SnapshotItem) -> Dict[str, Any]:
         return getattr(item, "extra_data", None) or getattr(item, "metadata", None) or {}
 
-    def _load_snapshot_item_payload(self, item: SnapshotItem, resource_type: str) -> Dict[str, Any]:
+    async def _load_snapshot_item_payload(self, item: SnapshotItem, resource_type: str) -> Dict[str, Any]:
+        """Load a snapshot item's JSON payload — inline ``raw`` metadata
+        first, else its blob via the storage facade. Routed through
+        azure_storage_manager (not the Azure-only blob_service_client)
+        so SeaweedFS/Wasabi deployments read real bytes instead of
+        silently exporting ``{}`` as success. A row that advertises a
+        blob_path but whose blob is unreadable raises so per-item
+        handlers count the failure."""
         metadata = self._get_item_metadata(item)
         if metadata.get("raw"):
             return metadata["raw"]
 
-        if not self.blob_service_client or not item.blob_path:
+        if not item.blob_path:
             return {}
 
         container_name = azure_storage_manager.get_container_name(str(item.tenant_id), resource_type)
-        blob_client = self.blob_service_client.get_blob_client(container=container_name, blob=item.blob_path)
-        payload_bytes = blob_client.download_blob().readall()
+        shard = azure_storage_manager.get_shard_for_item(item)
+        payload_bytes = await shard.download_blob(container_name, item.blob_path)
+        if payload_bytes is None:
+            raise RuntimeError(
+                f"snapshot item blob missing: {container_name}/{item.blob_path}"
+            )
         return json.loads(payload_bytes.decode("utf-8"))
 
-    def _load_snapshot_item_bytes(self, item: SnapshotItem, workload: str) -> Optional[bytes]:
-        """Download a snapshot item's blob as raw bytes (for ZIP packages etc.)."""
-        if not self.blob_service_client or not item.blob_path:
+    async def _load_snapshot_item_bytes(self, item: SnapshotItem, workload: str) -> Optional[bytes]:
+        """Download a snapshot item's blob as raw bytes (for ZIP packages
+        etc.) via the storage facade — backend-agnostic, unlike the old
+        Azure-pinned blob_service_client path. Returns None when the item
+        has no blob or the blob is gone; callers count that as a failure."""
+        if not item.blob_path:
             return None
         container_name = azure_storage_manager.get_container_name(str(item.tenant_id), workload)
-        blob_client = self.blob_service_client.get_blob_client(container=container_name, blob=item.blob_path)
-        return blob_client.download_blob().readall()
+        shard = azure_storage_manager.get_shard_for_item(item)
+        return await shard.download_blob(container_name, item.blob_path)
 
     def get_power_platform_client(self, tenant: Tenant) -> PowerPlatformClient:
         """Build a Power Platform Admin API client using the tenant's Graph app credentials."""
@@ -4585,7 +4985,8 @@ class RestoreWorker:
         session: AsyncSession,
         job_id: uuid.UUID,
         status: JobStatus,
-        result: Optional[Dict] = None
+        result: Optional[Dict] = None,
+        error_message: Optional[str] = None,
     ):
         """Update job status"""
         job = await session.get(Job, job_id)
@@ -4594,6 +4995,12 @@ class RestoreWorker:
             if status == JobStatus.COMPLETED:
                 job.completed_at = datetime.utcnow()
                 job.progress_pct = 100
+            elif status == JobStatus.FAILED:
+                # Terminal too — stamp completed_at the way
+                # handle_restore_failure does on the exception path.
+                job.completed_at = datetime.utcnow()
+            if error_message:
+                job.error_message = error_message
             if result:
                 job.result = result
             await session.flush()
@@ -4610,11 +5017,12 @@ class RestoreWorker:
             job.attempts += 1
             job.error_message = str(error)
 
-            if job.attempts >= job.max_attempts:
-                job.status = JobStatus.FAILED
-                job.completed_at = datetime.utcnow()
-            else:
-                job.status = JobStatus.RETRYING
+            # Always terminal: consume_queue ACKs the RMQ message even on
+            # failure, so nothing ever redelivers a restore — RETRYING
+            # would be a dead-end state the UI shows forever with no
+            # retry actually coming.
+            job.status = JobStatus.FAILED
+            job.completed_at = datetime.utcnow()
 
     async def log_audit_event(
         self, job_id: uuid.UUID, message: Dict, result: Dict,
@@ -4625,7 +5033,7 @@ class RestoreWorker:
         existing call sites that don't pass action/outcome explicitly."""
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json={
+                await client.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", headers=internal_audit_headers(), json={
                     "action": action,
                     "tenant_id": message.get("tenantId"),
                     "org_id": None,
@@ -4638,6 +5046,7 @@ class RestoreWorker:
                         "restore_type": message.get("restoreType", "IN_PLACE"),
                         "restored_count": result.get("restored_count", result.get("exported_count", 0)),
                         "failed_count": result.get("failed_count", 0),
+                        **({"done_with_errors": True} if result.get("done_with_errors") else {}),
                         **({"error": result["error"]} if result.get("error") else {}),
                     },
                 })
@@ -4657,7 +5066,7 @@ async def main():
     core_metrics.init()
     await graph_rate_limiter.maybe_init_redis()
     print("Starting restore worker...")
-    await startup_router()
+    await startup_router(required=True)
     # At-rest encryption hook so restores can decrypt encrypted blobs on read
     # (no-op unless BACKUP_ENCRYPTION_* env is configured).
     from shared.crypto import bootstrap as _enc_bootstrap

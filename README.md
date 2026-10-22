@@ -45,6 +45,18 @@ Python FastAPI backend built with a microservices architecture for the TM Vault 
 | **RabbitMQ** | Async job queue (backup, restore, discovery) |
 | **Redis** | Caching (optional) |
 
+### Databases / SQL Connections
+
+Every SQL server and database the application connects to:
+
+| Server (host) | Database | Driver / access | Purpose |
+|---|---|---|---|
+| `tmvault-pooler-rw.databases.svc.cluster.local:5432` (pgbouncer, transaction pooling → shared CNPG `postgres-ha` cluster) | `tmvault_prod` | `asyncpg` via SQLAlchemy (`DB_HOST`) | Primary application database for **all** services (tenants, resources, snapshots, jobs, `audit_events`, settings). |
+| `postgres-ha-rw.databases.svc.cluster.local:5432` (CNPG primary, direct — bypasses the pooler) | `tmvault_prod` | `asyncpg` (`DB_DIRECT_HOST`) | LISTEN/NOTIFY only — the pgbouncer transaction pooler does not support LISTEN/NOTIFY, so the notify path connects directly. |
+| Per-tenant **Azure SQL** databases (customer-owned; server + database resolved dynamically per backup workload from the tenant's Azure configuration) | (customer databases) | `pyodbc` (`workers/azure-workload-worker/handlers/sql_handler.py` for backup, `sql_restore_handler.py` for restore), `Encrypt=yes` + `TrustServerCertificate=no` | Backing up and restoring customer Azure SQL workloads. Not a fixed connection — one per protected Azure SQL resource. |
+
+Local development uses a single-container `postgres` (see the Configuration block below); production is the shared HA cluster above.
+
 ## Quick Start
 
 ### Docker Compose (Recommended)
@@ -137,10 +149,10 @@ DB_HOST=postgres
 DB_PORT=5432
 DB_NAME=tm_vault_db
 DB_USERNAME=tm_vault_admin
-DB_PASSWORD=admin123
+DB_PASSWORD=<set-a-strong-password>
 
-# JWT
-JWT_SECRET=your-secret-key
+# JWT — generate with: python -c "import secrets; print(secrets.token_hex(32))"
+JWT_SECRET=<set-a-strong-random-secret>
 
 # Microsoft OAuth
 MICROSOFT_CLIENT_ID=your-client-id
@@ -289,3 +301,36 @@ export const environment = {
   apiUrl: 'http://localhost:8000/api/v1'
 };
 ```
+
+
+## Customer code integration (October 2026)
+
+The customer backend snapshot `98e1398e9bf52a7be87cac905f326bf5c62b1c52`
+was reconciled with the existing HeartCentrix code. Customer file comparisons
+were review aids; the export does not supply verified Git ancestry.
+
+The integration retains customer scheduled drain waves, overlap/outbox fences,
+Graph paging and cursor repairs, bounded database writes, and honest partial
+failure accounting. It also retains local envelope encryption and KEK rotation,
+archive enrichment/export, licensing, sparse chat paths, and the default-off
+retention deletion switch. A committed inner FAILED content backup now raises
+through the outer single-resource wrapper instead of being reported COMPLETED.
+
+Compatibility decisions:
+
+- Archive writes retain decoded opaque bytes and existing local metadata,
+  deduplication, enriched attachment rows, and forced-full behavior, while using
+  the customer traversal/coverage/stall safeguards. Existing customer-only
+  base64-text archive blobs are not converted by this integration.
+- Archive pilot UPN restrictions are optional configuration, with no
+  customer-specific account in the default. Whole-user chat skipping remains
+  opt-in; per-chat sparse writes retain the prior-inventory gate.
+- Full mail baselines may use date buckets. Saved incremental cursors remain
+  authoritative; large mailbox growth does not replace them with a fresh census.
+- Customer deployment manifests are reference configuration, not an instruction
+  to apply them. Existing local deployment settings are retained.
+
+Run the backend tests with `./scripts/run-tests.sh`. For the cross-repository
+frontend coverage assertion, set `TM_VAULT_FRONTEND_PATH` to the frontend checkout.
+Production Graph/SSO/backup validation and diagnosis of the live copy-slot holder
+remain deployment checks; offline tests cannot establish those outcomes.

@@ -540,8 +540,33 @@ class AzureStorageShard:
             }
         except AzureError:
             return None
-    
-    async def wait_for_copy_complete(self, container_name: str, blob_path: str, 
+
+    async def head_blob(self, container_name: str, blob_path: str) -> Optional[Dict]:
+        """Strict existence/size probe: returns the same dict as
+        ``get_blob_properties`` but None ONLY when the blob is confirmed
+        absent (404). Every other error RAISES — callers that pick a
+        size regime from this probe (SharePoint restore streaming,
+        ITO-10282) must never mistake a transient storage error for
+        'blob missing' and silently fall back to a RAM-buffered read.
+        """
+        async_client = self.get_async_client()
+        blob_client = async_client.get_blob_client(container=container_name, blob=blob_path)
+        try:
+            props = await blob_client.get_blob_properties()
+        except ResourceNotFoundError:
+            return None
+        return {
+            "name": props.name,
+            "size": props.size,
+            "etag": getattr(props, "etag", None),
+            "content_type": props.content_settings.content_type if props.content_settings else None,
+            "last_modified": props.last_modified,
+            "copy_status": props.copy.status if props.copy else None,
+            "copy_progress": props.copy.progress if props.copy else None,
+            "metadata": props.metadata,
+        }
+
+    async def wait_for_copy_complete(self, container_name: str, blob_path: str,
                                      timeout_seconds: int = 3600, poll_interval: int = 5) -> Dict:
         """
         Wait for a server-side copy to complete.
@@ -696,6 +721,13 @@ class _StoreFacade:
             "metadata": p.metadata,
         }
 
+    async def head_blob(self, container_name, blob_path):
+        """Strict probe: None only on confirmed-absent; store errors
+        (e.g. BackendUnreachableError) propagate. The underlying
+        ``get_properties`` already has these semantics — this alias
+        keeps parity with AzureStorageShard.head_blob."""
+        return await self.get_blob_properties(container_name, blob_path)
+
     async def delete_blob(self, container_name, blob_path):
         await self._store.delete(container_name, blob_path)
 
@@ -768,6 +800,14 @@ class _StoreFacade:
             await close()
 
 
+class StorageRouterNotReadyError(RuntimeError):
+    """The DB-driven storage router never loaded in this process (Postgres
+    was unreachable at boot) and no raw Azure shards exist to fall back
+    to. Raised instead of the misleading "No storage shards configured"
+    so operators see the real cause; the router keeps retrying in the
+    background (shared.storage.startup) and workers gate on it."""
+
+
 class AzureStorageManager:
     """
     Manages multiple Azure Storage Accounts for sharding.
@@ -833,6 +873,25 @@ class AzureStorageManager:
         else:
             print("[AzureStorage] WARNING: No Azure Storage configured")
     
+    def _no_shards_error(self, detail: str = "") -> RuntimeError:
+        """Build the error for "no usable shard". Distinguishes a router
+        that never loaded (the 2026-10-13 silent-zombie case) from a
+        genuinely unconfigured Azure fallback."""
+        try:
+            from shared.storage.router import router as _router
+            loaded = bool(_router.active_backend_id())
+        except Exception:
+            loaded = False
+        if not loaded:
+            return StorageRouterNotReadyError(
+                "storage router not loaded (storage_backends/system_config "
+                "could not be read from Postgres at startup) and no raw "
+                "Azure shards are configured — refusing the legacy raw-shard "
+                "fallback; the router keeps retrying in the background and "
+                "this work must be retried once it has loaded"
+            )
+        return RuntimeError("No storage shards configured" + detail)
+
     def _router_facade(self, tenant_id: str, resource_id: str):
         """Return a _StoreFacade over the router's active backend, if loaded.
 
@@ -894,7 +953,7 @@ class AzureStorageManager:
         if facade is not None:
             return facade
         if not self.shards:
-            raise RuntimeError("No storage shards configured")
+            raise self._no_shards_error()
         hash_input = f"{tenant_id}:{resource_id}"
         hash_value = int(hashlib.md5(hash_input.encode()).hexdigest(), 16)
         shard_index = hash_value % len(self.shards)
@@ -923,7 +982,7 @@ class AzureStorageManager:
             # write streams on the facade's underlying bucket(s).
             return facade
         if not self.shards:
-            raise RuntimeError("No storage shards configured")
+            raise self._no_shards_error()
         return self.shards[index % len(self.shards)]
 
     def get_default_shard(self):
@@ -932,7 +991,7 @@ class AzureStorageManager:
         if facade is not None:
             return facade
         if not self.shards:
-            raise RuntimeError("No storage shards configured — set AZURE_STORAGE_ACCOUNT_NAME and AZURE_STORAGE_ACCOUNT_KEY")
+            raise self._no_shards_error(" — set AZURE_STORAGE_ACCOUNT_NAME and AZURE_STORAGE_ACCOUNT_KEY")
         return self.shards[0]
 
     def get_shard_for_item(self, item):

@@ -5,14 +5,19 @@ python-jose>=3.3.0
 azure-storage-blob>=12.19
 azure-mgmt-storage>=21.0
 azure-identity>=1.15
-azure-keyvault-keys>=4.9,<5  # KEK provider for envelope encryption (azure.keyvault.keys.crypto)
-httpx>=0.26
+azure-keyvault-keys>=4.9,<5  # Envelope encryption KEK provider
+# <0.28: httpx 0.28.0 changed `params=` to REPLACE the URL query instead of
+# merging — that stripped token=… from every resumed deltaLink and turned
+# all SP/OneDrive incrementals into silent full re-transfers (ITO-10277).
+# requirements.base.txt pins ==0.26.0; this float shipped 0.28.1 to prod.
+httpx>=0.26,<0.28
 # h2: HTTP/2 client lib for httpx — enabled when GRAPHCLIENT_HTTP2=true
 # is set. HTTP/2 multiplexes 100+ concurrent streams on one TCP connection
 # so per-mailbox concurrent /$value MIME fetches don't queue behind each
 # other. Without h2 installed, httpx raises ImportError on http2=True.
 h2>=4.1.0,<5.0
-sqlalchemy>=2.0
+sqlalchemy[asyncio]==2.0.52
+greenlet>=3.0
 asyncpg>=0.29
 pydantic>=2.5
 pydantic-settings>=2.1

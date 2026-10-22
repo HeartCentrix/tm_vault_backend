@@ -111,8 +111,10 @@ def test_onedrive_ids_endpoint_aggregates_siblings(parsed):
 def test_onedrive_endpoints_do_not_filter_single_snapshot_id(parsed):
     """Belt-and-braces: ensure neither endpoint still contains a
     'SnapshotItem.snapshot_id == UUID(snapshot_id)' pattern (which
-    would override the sibling list). The aggregating endpoints use
-    'SnapshotItem.snapshot_id.in_(sibling_ids)' instead.
+    would override the sibling list). Aggregation is wired either as
+    'SnapshotItem.snapshot_id.in_(sibling_ids)' (ORM path) or by
+    handing sibling_ids to _paged_latest_items (SQL-side path,
+    2026-07-21 OOM fix).
     """
     for route in ("/onedrive", "/onedrive/ids"):
         fn = _find_endpoint(parsed, route)
@@ -121,7 +123,10 @@ def test_onedrive_endpoints_do_not_filter_single_snapshot_id(parsed):
             f"endpoint {route} still filters by single snapshot_id — "
             f"this re-introduces the 2026-05-15 empty-OneDrive bug."
         )
-        assert "snapshot_id.in_(sibling_ids)" in source, (
-            f"endpoint {route} is missing snapshot_id.in_(sibling_ids) — "
+        assert (
+            "snapshot_id.in_(sibling_ids)" in source
+            or "_paged_latest_items(db, sibling_ids" in source
+        ), (
+            f"endpoint {route} does not aggregate over sibling_ids — "
             f"sibling aggregation isn't wired up correctly."
         )

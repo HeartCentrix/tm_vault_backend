@@ -1,14 +1,14 @@
 """Shared database models"""
 import uuid
 from datetime import datetime, timezone
-from typing import Tuple
+from typing import Optional, Tuple
 from sqlalchemy import (
     Column, String, DateTime, Boolean, Integer, BigInteger,
     Text, ForeignKey, Enum as SAEnum, JSON, ARRAY, func, LargeBinary,
     Index, text as sql_text,
 )
 from sqlalchemy.ext.mutable import MutableDict
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, synonym
 from sqlalchemy.dialects.postgresql import UUID
 import enum
 
@@ -685,7 +685,30 @@ class SnapshotPartition(Base):
     #   MAIL_FOLDERS     → {"folder_ids": [...]}
     #   SHAREPOINT_DRIVES→ {"drive_ids": [...]}
     payload = Column(JSON, nullable=True)
-    total_files = Column(Integer, nullable=False, default=0)
+    # Size of THIS shard's work-set — and the unit is NOT files except
+    # for ONEDRIVE_FILES. Every fanout helper writes the length of the
+    # id list it just bin-packed, which per partition_type means:
+    #     ONEDRIVE_FILES    → files          (the original, honest case)
+    #     MAIL_FOLDERS      → mail folders
+    #     CHATS             → chats
+    #     SHAREPOINT_DRIVES → document libraries (drives)
+    #     GROUPS_CHANNELS   → channels
+    #     ENTRA_CATEGORIES  → directory object categories
+    # while `files_uploaded` counts snapshot_items. The two are not
+    # comparable, which is why 140 of the 147 partitions enqueued in the
+    # 24h to 2026-08-11 read files_uploaded > total_files — e.g. the four
+    # SHAREPOINT "IT OPS NOTES" shards each carry 1 library and
+    # 1,270 / 1,271 / 1,273 / 11,142 items.
+    #
+    # Renamed to an honest attribute name against the SAME DB column
+    # (`total_files`) — no migration, and cheap because nothing reads it
+    # as a denominator: no UI, no API, and no completion / requeue /
+    # rollup predicate in either deploy lineage consults it (verified by
+    # grep, 2026-08-11). `total_files` is kept as a synonym so any
+    # reader outside this repo's search path still resolves, and so an
+    # ORM query on the old name cannot become a production AttributeError.
+    shard_unit_count = Column("total_files", Integer, nullable=False, default=0)
+    total_files = synonym("shard_unit_count")
     total_bytes_est = Column(BigInteger, nullable=False, default=0)
     # QUEUED | IN_PROGRESS | COMPLETED | FAILED
     status = Column(String, nullable=False, default="QUEUED")
@@ -1411,6 +1434,98 @@ class OneDriveFileRetry(Base):
     # DDL in shared/database.py; mirrored here is not necessary.
 
 
+# ── Item-C detached-drain recovery (2026-08-11) ──────────────────────────
+# `hc_drain_status='PENDING'` is stamped by the USER_CHATS handler just
+# BEFORE it detaches the hostedContent finalizer, and exactly ONE write
+# clears it again: that finalizer's own fire-and-forget
+# `UPDATE snapshots SET hc_drain_status=...`. On 2026-08-11 02:20:50 that
+# UPDATE died — the same asyncpg ConnectionDoesNotExistError, from the
+# same pool saturation, that cost CHATS/4 of snapshot 6807df97 its
+# partition row — and the except arm around it only prints. Nothing in the
+# system re-derives the column, so the value is PENDING forever, which:
+#   * makes shared/retention_cleanup.py skip the snapshot in BOTH of its
+#     guards (`_is_snapshot_live` and the `_delete_snapshots` SELECT), so
+#     its blobs are never reclaimed — an unbounded storage leak; and
+#   * makes `snapshot_is_restore_ready` below refuse that recovery point
+#     forever. (Latent today: verified by grep 2026-08-11, no restore path
+#     calls that function yet — it bites the moment one does.)
+# One prod snapshot was found stuck this way during the 2026-08-11 review.
+#
+# The finalizer is an asyncio task inside the worker process, so it cannot
+# outlive that process: a PENDING older than this horizon is not "still in
+# flight", it is abandoned. The honest re-derivation is NOT "COMPLETE" —
+# whether every inline image landed is unknowable from the row, because
+# the finalizer records its evidence (degraded_reason, COMPLETED→PARTIAL)
+# in the very statement that failed. It is "FAILED", i.e. "this point may
+# be missing hostedContent, do not claim it is whole", which is precisely
+# what FAILED already means to every reader of the column — and which
+# unsticks retention.
+#
+# 6h is 12x the 30-min ONEDRIVE_PARTITION_STALE_SWEEP_MIN window this
+# codebase already treats as "a drain may legitimately take this long",
+# and 36x LEASE_TTL_S. Nothing here deletes or rewrites anything — the
+# horizon only decides which of two REASONS an already-blocked restore
+# reports, and what a (future) sweep should re-derive.
+HC_DRAIN_PENDING_STALE_AFTER_S = 6 * 3600
+
+
+def _as_naive_utc(ts):
+    """Snapshot timestamps are naive UTC (`utcnow()`), but a few rows are
+    read back tz-aware via DateTime(timezone=True) columns. Normalise so
+    a comparison can never raise offset-naive vs offset-aware."""
+    if ts is None:
+        return None
+    if getattr(ts, "tzinfo", None) is not None:
+        return ts.astimezone(timezone.utc).replace(tzinfo=None)
+    return ts
+
+
+def hc_drain_pending_is_stale(
+    snapshot: "Snapshot",
+    *,
+    now=None,
+    stale_after_s: int = HC_DRAIN_PENDING_STALE_AFTER_S,
+) -> bool:
+    """True when this snapshot's hc_drain_status=PENDING can no longer be
+    a drain in flight — the detached finalizer's status write was lost.
+
+    False for every other status, and False when the row carries no
+    timestamp to judge by: an unknown age is never treated as stale.
+    """
+    status = getattr(snapshot, "hc_drain_status", None) or "NOT_APPLICABLE"
+    if status != "PENDING":
+        return False
+    ref = _as_naive_utc(
+        getattr(snapshot, "completed_at", None)
+        or getattr(snapshot, "started_at", None)
+        or getattr(snapshot, "created_at", None)
+    )
+    if ref is None:
+        return False
+    now = _as_naive_utc(now) or utcnow()
+    return (now - ref).total_seconds() > stale_after_s
+
+
+def rederive_stale_hc_drain_status(
+    snapshot: "Snapshot",
+    *,
+    now=None,
+    stale_after_s: int = HC_DRAIN_PENDING_STALE_AFTER_S,
+) -> Optional[str]:
+    """The value a sweep should WRITE to `hc_drain_status`, or None to
+    leave the row alone.
+
+    Pure so it can be unit-tested and so the deciding logic lives in one
+    place no matter who runs the sweep (reconciler tick, retention
+    pre-pass, or an ops one-liner).
+    """
+    if hc_drain_pending_is_stale(
+        snapshot, now=now, stale_after_s=stale_after_s,
+    ):
+        return "FAILED"
+    return None
+
+
 def snapshot_is_restore_ready(snapshot: "Snapshot") -> Tuple[bool, str]:
     """Return (is_ready, reason). Restore paths should call this and
     refuse to proceed when is_ready is False.
@@ -1418,7 +1533,11 @@ def snapshot_is_restore_ready(snapshot: "Snapshot") -> Tuple[bool, str]:
     Currently checks Item-C's hc_drain_status:
       - NOT_APPLICABLE / COMPLETE → ready.
       - PENDING → background HC drain still in flight; reject with a
-        retryable error so callers can poll-and-retry.
+        retryable error so callers can poll-and-retry. Unless it is a
+        STALE pending (see HC_DRAIN_PENDING_STALE_AFTER_S), in which case
+        "retry later" is a lie — the finalizer that would have cleared it
+        died hours ago — and the reason must say so instead of pointing
+        the operator at a poll loop that never ends.
       - FAILED → at least one HC task raised; restore is unsafe because
         inline images may be missing. Caller should surface to the user.
     """
@@ -1426,6 +1545,15 @@ def snapshot_is_restore_ready(snapshot: "Snapshot") -> Tuple[bool, str]:
     if status in ("NOT_APPLICABLE", "COMPLETE"):
         return True, ""
     if status == "PENDING":
+        if hc_drain_pending_is_stale(snapshot):
+            return False, (
+                "hc_drain_status=PENDING is stale (older than "
+                f"{HC_DRAIN_PENDING_STALE_AFTER_S // 3600}h) — the detached "
+                "hostedContent finalizer's status write was lost, so this "
+                "point may be missing inline images. Re-run the backup; "
+                "the value must be re-derived to FAILED "
+                "(shared.models.rederive_stale_hc_drain_status)"
+            )
         return False, "hc_drain_status=PENDING — hostedContent drain still in flight; retry later"
     if status == "FAILED":
         return False, "hc_drain_status=FAILED — at least one hostedContent task raised; restore unsafe"
@@ -1463,3 +1591,25 @@ class EncryptionConfig(Base):
     verify_readback = Column(Boolean, nullable=False, default=True)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
     updated_by = Column(String, nullable=True)
+
+
+from sqlalchemy import CheckConstraint
+
+
+class AppSettings(Base):
+    """Global single-row application settings (daily discovery schedule).
+
+    Guarded to a single row via CHECK(id = 1); always read/written as id=1.
+    """
+    __tablename__ = "app_settings"
+    id = Column(Integer, primary_key=True)
+    discovery_time = Column(Text, nullable=False, server_default="02:00")
+    timezone = Column(Text, nullable=False, server_default="America/Phoenix")
+    # Automatic retry of failed backup jobs (Configuration tab, 2026-08-18):
+    # after a resource's backup run fails, the scheduler re-dispatches it up
+    # to job_retry_max times, waiting job_retry_delay_minutes after each
+    # failure. 0 retries disables the sweep.
+    job_retry_max = Column(Integer, nullable=False, server_default="3")
+    job_retry_delay_minutes = Column(Integer, nullable=False, server_default="5")
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    __table_args__ = (CheckConstraint("id = 1", name="ck_app_settings_singleton"),)

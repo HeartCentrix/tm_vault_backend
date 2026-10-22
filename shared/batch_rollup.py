@@ -28,6 +28,20 @@ from typing import Any, Dict, Optional, Tuple
 
 from sqlalchemy import text
 
+# Operations that may be inlined into the SQL by ``build_batch_rollup_query``.
+#
+# Deliberately a literal set rather than ``frozenset(m.value for m in JobType)``:
+# importing shared.models pulls in shared.config, which validates JWT_SECRET at
+# import time and raises without it. This module is a pure SQL builder with no
+# other heavy imports, and coupling it to config validation would make it
+# unimportable in exactly the lightweight contexts that use it.
+#
+# Drift against JobType is caught by
+# tests/shared/test_batch_rollup.py::test_allowed_operations_matches_jobtype_enum.
+_ALLOWED_OPERATIONS = frozenset(
+    {"BACKUP", "RESTORE", "EXPORT", "DISCOVERY", "DELETE"}
+)
+
 
 @dataclass
 class RollupCounts:
@@ -48,6 +62,10 @@ class RollupCounts:
     parts_pending: int
     missing_t2: int
     expected_total: int = 0
+    # Concurrency placeholders: COMPLETED rows that captured nothing
+    # because another job held the resource's lease. Tracked separately
+    # so they neither inflate snap_done nor read as a failure.
+    snap_skipped: int = 0
     # Tier-1 vs Tier-2 split for the weighted progress bar. The data
     # volume between the two tiers is wildly skewed: a Tier-1
     # ENTRA_USER snapshot is ~1 KB of metadata, while one Tier-2
@@ -60,10 +78,28 @@ class RollupCounts:
     # split the bar jumps to 99 % after Tier-1 finishes, then collapses
     # back to ~30 % once Tier-2 discovery spawns its real children —
     # the exact non-monotone behaviour we're fixing.
+    #
+    # UNITS (2026-08-11): all four counters are DISTINCT RESOURCES, and
+    # numerator/denominator of each tier count the SAME population.
+    #   tier1_* — ENTRA_USER members of the click-time scope.
+    #   tier2_* — every other resource of the batch's expected work
+    #             (non-ENTRA_USER scope members ∪ expected Tier-2
+    #             children).
+    # They used to disagree: tier1_total was the whole click-time SCOPE
+    # RESOURCE count while tier1_terminal counted only ENTRA_USER
+    # snapshots, and the tier2 denominator was floored at
+    # scope_resources × 5. On Gold (50 scope resources, 7 users, ~34
+    # real children) that produced 10*(7/50) + 90*(38/250) = 15 — a bar
+    # frozen at 15 % while 44 of 50 snapshots were already done.
     tier1_total: int = 0
     tier1_terminal: int = 0
     tier2_total: int = 0
     tier2_terminal: int = 0
+    # True when at least one Job in the batch reached COMPLETED. Only
+    # consulted by the retention-pruned fallback below -- when every
+    # snapshot row has been deleted by retention, job statuses are the
+    # only durable record of the outcome.
+    any_job_completed: bool = False
     # True while *any* user in this batch is still WAITING_DISCOVERY in
     # ``batch_pending_users``. Without this gate, a batch whose Tier-1
     # jobs finished before Tier-2 gap-fill discovery completes briefly
@@ -86,6 +122,15 @@ class RollupCounts:
     # license_missing when a license later appears, so the workload
     # rejoins the expected set on the next fire automatically.
     skipped_no_license: int = 0
+    # Did at least one Tier-2 job spawn in this batch? Arbitrates
+    # past-horizon missing_t2 (see derive_batch_status): missing
+    # children WITH Tier-2 jobs = expectation drift; missing children
+    # WITHOUT any Tier-2 job = the fan-out trigger was lost.
+    any_tier2_jobs: bool = False
+    # False once the batch is older than the missing_t2 freshness
+    # horizon (48h). Defaults True (conservative: unknown age behaves
+    # like a fresh batch and keeps the anti-flicker wedge).
+    batch_recent: bool = True
 
 
 def derive_batch_status(
@@ -130,19 +175,77 @@ def derive_batch_status(
     #                                zero (Tier-2 resources don't exist
     #                                in the DB yet) and the batch would
     #                                falsely report Done.
+    # missing_t2 is computed against the CURRENT resources table, so it
+    # may only WEDGE a batch while the batch is recent — the gate exists
+    # for the minutes-scale post-click flicker, and letting it judge
+    # settled history means a later resource-status flip (2026-08-03: a
+    # discovery reset revived long-INACCESSIBLE children) retroactively
+    # turns every old batch "In Progress". Past the horizon it is
+    # arbitrated by any_tier2_jobs below instead: drift is ignored, a
+    # genuinely lost fan-out surfaces as a warning — never as a wedge,
+    # and never as a silent clean Done.
     if (
         not r.all_jobs_terminal
         or r.snap_pending > 0
         or r.parts_pending > 0
-        or r.missing_t2 > 0
+        or (r.missing_t2 > 0 and r.batch_recent)
         or r.discovery_pending
     ):
         return ("In Progress", None)
+
+    # Past-horizon fan-out audit: expected children exist but NO Tier-2
+    # job ever spawned in this batch — the fan-out trigger was lost
+    # (e.g. the fire-and-forget trigger-bulk POST failed after
+    # batch_pending_users was already committed BACKUP_ENQUEUED). Only
+    # Tier-1 metadata was captured; a clean "Done" here would be a
+    # false success on a backup product. Surfaced via the warnings chip
+    # in the mixed-outcome branch below.
+    missing_unspawned = (
+        r.missing_t2 if (r.missing_t2 > 0 and not r.any_tier2_jobs) else 0
+    )
+
+    # 1.5 Retention-pruned history: every Job settled but not one
+    # snapshot row remains -- retention deleted them (their blobs may
+    # still be referenced by newer snapshots). Judging success by
+    # snap_done would flip aged-out Done batches to "Failed" as
+    # retention advances (2026-07-14: every pre-7/13 scheduled
+    # dispatch). With zero snapshot rows, the terminal Job statuses
+    # are the durable record -- trust them. A batch that genuinely
+    # never wrote anything still fails below: its jobs are FAILED /
+    # CANCELLED, never COMPLETED.
+    if r.snap_total == 0:
+        if r.skipped_no_license > 0 and not r.any_job_failed and not missing_unspawned:
+            return ("Done", {"skipped_no_license": r.skipped_no_license})
+        if r.any_job_completed:
+            return ("Done", None)
+        if r.any_cancelled:
+            return ("Canceled", None)
+        return ("Failed", None) if r.any_job_failed else ("Expired", None)
 
     # 2. Cancellation: if operator cancelled and NOTHING got persisted,
     # show Canceled. If some snapshots completed before the cancel
     # landed, treat those as a partial-success backup so the operator
     # can still see (and recover) what we managed to capture.
+    # 1.6 Deferred-only: every snapshot in this batch is a
+    # `skipped_concurrent` placeholder. Nothing broke and nothing was
+    # captured — another run still held the resource's lease. Without
+    # this arm the (correct) exclusion of placeholders from snap_done
+    # would drop straight through to "no successes -> Failed", which
+    # is a worse lie than the one we are fixing: it reports breakage
+    # where there is none. Report Done WITH a warning so the operator
+    # can see the run captured nothing and why.
+    if (
+        r.snap_skipped > 0
+        and r.snap_done == 0
+        and r.snap_partial == 0
+        and r.snap_failed == 0
+    ):
+        return (
+            "Done",
+            "no data captured — another run held the resource lease "
+            "(skipped_concurrent)",
+        )
+
     has_successes = r.snap_done > 0 or r.snap_partial > 0
     if r.any_cancelled and not has_successes:
         return ("Canceled", None)
@@ -173,17 +276,14 @@ def derive_batch_status(
     # 4. Mixed outcome → Done with warnings chip. Cancellation that
     # landed AFTER some snapshots completed is also a "not-clean" Done
     # — we surface a warning so the operator sees the truncation even
-    # if every committed snapshot itself was clean. License-skipped
-    # workloads are additive: they render a separate neutral chip and
-    # never suppress a partial/failed warning.
+    # if every committed snapshot itself was clean. Missing fan-out counts
+    # as failed; license skips remain a separate informational count.
     warnings: Dict[str, int] = {}
-    if r.snap_partial > 0 or r.snap_failed > 0 or r.any_cancelled:
+    if r.snap_partial > 0 or r.snap_failed > 0 or r.any_cancelled or missing_unspawned > 0:
         warnings["partial"] = r.snap_partial
-        warnings["failed"] = r.snap_failed
+        warnings["failed"] = r.snap_failed + missing_unspawned
     if r.skipped_no_license > 0:
         warnings["skipped_no_license"] = r.skipped_no_license
-
-    # 5. Everything clean (and nothing skipped) → no chip.
     return ("Done", warnings or None)
 
 
@@ -197,6 +297,102 @@ def archive_backup_enabled() -> bool:
     return _os.getenv("ARCHIVE_BACKUP_ENABLED", "true").strip().lower() in (
         "1", "true", "yes", "on",
     )
+
+
+def _withheld_children_cte(cte_name: str, spec_key: str, comment: str) -> str:
+    """SQL for one "the dispatcher DECLARED these resources withheld" CTE.
+
+    The rollup has to tell two indistinguishable things apart:
+
+      * a Tier-2 child whose fan-out was LOST — real data was never
+        captured, the operator must see it; and
+      * a child the dispatcher deliberately held back this cycle — the
+        next tick picks it up, nothing is missing.
+
+    The only safe discriminator is a RECORDED FACT written by the
+    dispatcher at dispatch time. Inferring the hold from job coverage +
+    timing was tried and rejected on 2026-08-11: measured over full prod
+    history, 597 (batch, resource) pairs matched a "some other job
+    covered this resource around then" heuristic, but 452 of them (76 %)
+    had NO snapshot from the covering job and 331 of those covering jobs
+    had FAILED. Erasing those children from missing_t2 would have turned
+    batches that never captured the data into a clean "Done" — strictly
+    worse than the cosmetic phantom it set out to fix.
+
+    Two defences so a bad row can never take down the rollup for EVERY
+    other batch (same posture as the stale-snapshot sweep's
+    failure_state handling):
+      * jsonb_typeof — j.spec is plain JSON; a scalar or object value
+        makes jsonb_array_elements raise.
+      * UUID shape filter before the cast — a non-UUID string would
+        raise on ::uuid.
+
+    Absent key ⇒ zero rows ⇒ the LEFT JOIN in ``fanout`` leaves the child
+    counted as missing, i.e. EXACTLY today's behaviour for every batch
+    dispatched before the writer shipped. Never "expect nothing".
+    """
+    return f"""
+    {cte_name} AS (
+{comment}
+        SELECT DISTINCT
+            COALESCE(j.spec->>'batch_id', j.id::text) AS batch_id,
+            (d.value #>> '{{}}')::uuid                AS child_resource_id
+        FROM filtered_jobs j
+        CROSS JOIN LATERAL jsonb_array_elements(
+            CASE
+                WHEN jsonb_typeof(
+                        COALESCE((j.spec->'{spec_key}')::jsonb,
+                                 '[]'::jsonb)
+                     ) = 'array'
+                THEN COALESCE((j.spec->'{spec_key}')::jsonb,
+                              '[]'::jsonb)
+                ELSE '[]'::jsonb
+            END
+        ) AS d(value)
+        WHERE (d.value #>> '{{}}') ~*
+              '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$'
+    )"""
+
+
+# The two withhold REASONS are stamped under separate spec keys and read
+# by separate CTEs on purpose. Conflating them into one list would lose
+# the information an operator needs to answer "why did this resource not
+# run this cycle?" — a concurrency-cap deferral is a capacity signal
+# (raise max_concurrent_backups), an overlap hold is a duration signal
+# (the previous cycle is still walking that resource).
+_DEFERRED_COMMENT = """\
+        -- Children the backup-scheduler's max_concurrent_backups cap
+        -- DELIBERATELY held back this cycle (spec.deferred_resource_ids,
+        -- stamped on every job in the batch).
+        --
+        -- Without this, a deferral is indistinguishable from a LOST
+        -- fan-out: the child exists and is dispatchable, so expected_t2
+        -- wants it, but no job ever carried it — missing_t2 > 0 wedges
+        -- the row at "In Progress" for the whole 48h batch_recent
+        -- horizon even though every job and snapshot already settled.
+        -- That produced the ghost "previous run still going" row the
+        -- operator hit on 2026-08-05 (Gold, Aug 4 02:07 UTC: the cap
+        -- trimmed exactly one resource — John Lucas USER_MAIL — because
+        -- Gold has 50 resources and a cap of 50, and one in-flight job
+        -- dropped the budget to 49)."""
+
+_OVERLAP_HELD_COMMENT = """\
+        -- Children the backup-scheduler's run-overlap guard DELIBERATELY
+        -- withheld this cycle (spec.overlap_held_resource_ids, stamped on
+        -- every job in the batch by dispatch_backups_for_policy).
+        --
+        -- Same failure mode as the concurrency cap above, different
+        -- cause: partition_overlap_holds drops any resource that still
+        -- has a backup in flight from the PREVIOUS cycle. Measured on
+        -- prod 2026-08-11, batch 667734c3 (Gold, 10:07 UTC): all 8 jobs
+        -- COMPLETED, 0 pending snapshots, 0 pending partitions — and
+        -- missing_t2 = 7. The 7 were the scope users' USER_CHATS
+        -- children, withheld because the 02:07 cycle still held them
+        -- ("held 10 busy resource(s) and dispatched 40"). Those chats
+        -- were dispatched under a DIFFERENT batch_id at the 18:07 tick
+        -- (batch 2123e84f, 8 USER_CHATS snapshots), so batch 667734c3
+        -- could never go terminal and its Activity row read
+        -- "BACKUP · In Progress · 15 %" forever."""
 
 
 def build_batch_rollup_query(
@@ -226,8 +422,6 @@ def build_batch_rollup_query(
     Measured at ~80 ms on a 10 k-job tenant in similar audit-service
     aggregate queries.
     """
-    op_filter = "AND j.type::text = :op" if operation else ""
-
     # Online Archive (USER_ARCHIVE) counts toward batch completion only WHILE
     # archive backup is enabled. Gating the EXPECTED / terminal type-list on the
     # flag at query-BUILD time is what makes the flag safely reversible: turn it
@@ -241,6 +435,45 @@ def build_batch_rollup_query(
         _t2_types.append("USER_ARCHIVE")
     t2_types_sql = ", ".join(f"'{t}'" for t in _t2_types)
 
+    # Compare the enum column directly against an enum literal.
+    #
+    # This used to be ``AND j.type::text = :op``. Casting the COLUMN to text
+    # is non-sargable against idx_jobs_tenant_type_status, and it also throws
+    # away the planner's selectivity estimate for filtered_jobs — the ~10
+    # materialized CTEs below then plan on rows=1 and nest-loop, which is
+    # exactly the O(N^2) rescan the page-cap comment further down describes.
+    # Measured on prod 2026-08-13, same query, only this predicate differing:
+    #   operation=None   cap=200 -> 0.25s
+    #   operation=BACKUP cap=20  -> 2.68s
+    #   operation=BACKUP cap=200 -> >60s (statement timeout)
+    # /api/v1/activity held a connection per request for 70+ min until the
+    # 40+40 pool exhausted and every audit endpoint 500'd.
+    #
+    # The value is inlined rather than bound because a bound parameter would
+    # need an explicit ``CAST(:op AS jobtype)``, hardcoding the Postgres enum
+    # type name into shared SQL. Inlining is safe ONLY because the value is
+    # allow-listed against JobType first — never relax that check.
+    op_filter = ""
+    if operation:
+        op = str(operation).strip().upper()
+        if op not in _ALLOWED_OPERATIONS:
+            raise ValueError(
+                f"unknown operation {operation!r}; "
+                f"expected one of {sorted(_ALLOWED_OPERATIONS)}"
+            )
+        op_filter = f"AND j.type = '{op}'"
+    # One generator for both withhold reasons: the CTEs are structurally
+    # identical and a hand-copied second one is exactly how the jsonb_typeof
+    # guard would silently go missing from the newer of the two.
+    withheld_ctes = ",".join((
+        _withheld_children_cte(
+            "deferred_t2", "deferred_resource_ids", _DEFERRED_COMMENT,
+        ),
+        _withheld_children_cte(
+            "overlap_held_t2", "overlap_held_resource_ids",
+            _OVERLAP_HELD_COMMENT,
+        ),
+    ))
     sql = f"""
     WITH filtered_jobs AS (
         SELECT *
@@ -251,7 +484,7 @@ def build_batch_rollup_query(
           {op_filter}
           AND j.type = 'BACKUP'
     ),
-    batches AS (
+    batches_all AS (
         SELECT
             COALESCE(j.spec->>'batch_id', j.id::text)              AS batch_id,
             j.tenant_id                                            AS tenant_id,
@@ -260,6 +493,7 @@ def build_batch_rollup_query(
             ARRAY_AGG(j.id ORDER BY j.created_at)                  AS job_ids,
             BOOL_OR(j.status::text = 'CANCELLED')                  AS any_cancelled,
             BOOL_OR(j.status::text = 'FAILED')                     AS any_job_failed,
+            BOOL_OR(j.status::text = 'COMPLETED')                  AS any_job_completed,
             BOOL_AND(j.status::text IN ('COMPLETED','FAILED','CANCELLED'))
                                                                     AS all_jobs_terminal,
             -- For non-bulk single-Job batches (no batch_resource_ids),
@@ -275,9 +509,29 @@ def build_batch_rollup_query(
             -- the operator sees "Preemptive — <resource>" instead of
             -- a generic "1 resource Done" that looks like a phantom
             -- duplicate of their manual click.
-            BOOL_OR(j.spec->>'triggered_by' = 'PREEMPTIVE')        AS any_preemptive
+            BOOL_OR(j.spec->>'triggered_by' = 'PREEMPTIVE')        AS any_preemptive,
+            -- Did Tier-2 fan-out actually spawn for this batch? Feeds
+            -- the derive's past-horizon missing_t2 arbitration: absent
+            -- Tier-2 jobs + expected children = the fan-out trigger was
+            -- lost (visible warning), whereas present Tier-2 jobs +
+            -- missing children = expectation drift from later resource
+            -- status changes (ignore).
+            BOOL_OR(COALESCE(j.spec->>'tier2', 'false') = 'true')  AS any_tier2_jobs
         FROM filtered_jobs j
         GROUP BY 1, 2
+    ),
+    batches AS (
+        -- Page-scoped cap (2026-07-13 perf fix). The final SELECT joins
+        -- ~10 materialized CTEs on batch_id; CTE stats are opaque to the
+        -- planner (rows=1 estimates) so it nests loops — O(N^2) CTE
+        -- rescans across ALL history: 79s at 475 batches, growing with
+        -- every scheduled job. Downstream CTEs only ever contribute to
+        -- rows the final LIMIT/OFFSET keeps, so restricting to the
+        -- newest size+offset batches here is semantics-preserving and
+        -- makes the whole rollup O(page).
+        SELECT * FROM batches_all
+        ORDER BY started_at DESC NULLS LAST
+        LIMIT :batch_cap
     ),
     batch_res AS (
         -- Flatten batch_resource_ids per batch via lateral unnest.
@@ -319,10 +573,42 @@ def build_batch_rollup_query(
         WHERE b.job_count = 1
     ),
     snap_roll AS (
+        -- `skipped_concurrent` placeholders are NOT successes.
+        --
+        -- backup-worker's cross-job concurrency guard writes a 0-item
+        -- snapshot with status=COMPLETED when another job already holds
+        -- a live lease on the resource. Counting those as done makes a
+        -- resource that captured NOTHING read green — and the failure
+        -- mode that produces them is exactly the one where you most need
+        -- the truth: a partition stranded IN_PROGRESS renews its lease
+        -- forever, so every subsequent cycle for that resource is a
+        -- placeholder (2026-08-17, `Chats — Corp_Esplanade`).
+        --
+        -- retention_cleanup.py:202, dr-replication-worker/main.py:300,
+        -- the restore-point filter and the scheduler all already reject
+        -- them; this rollup was the last consumer that did not.
+        --
+        -- Deliberately counted as a THIRD category rather than folded
+        -- into failed: nothing is broken, the work was legitimately
+        -- deferred. But it is not progress, so it must not inflate
+        -- snap_done. NB `extra_data` is json, not jsonb — use
+        -- json_extract_path_text, matching dr-replication-worker.
         SELECT
             b.batch_id,
             COUNT(s.id)                                             AS snap_total,
-            COUNT(*) FILTER (WHERE s.status::text = 'COMPLETED')    AS snap_done,
+            COUNT(*) FILTER (
+                WHERE s.status::text = 'COMPLETED'
+                  AND COALESCE(
+                        json_extract_path_text(s.extra_data, 'skipped_concurrent'),
+                        'false'
+                      ) <> 'true'
+            )                                                       AS snap_done,
+            COUNT(*) FILTER (
+                WHERE COALESCE(
+                        json_extract_path_text(s.extra_data, 'skipped_concurrent'),
+                        'false'
+                      ) = 'true'
+            )                                                       AS snap_skipped,
             COUNT(*) FILTER (WHERE s.status::text = 'PARTIAL')      AS snap_partial,
             COUNT(*) FILTER (WHERE s.status::text = 'FAILED')       AS snap_failed,
             COUNT(*) FILTER (WHERE s.status::text IN ('QUEUED','IN_PROGRESS'))
@@ -381,45 +667,59 @@ def build_batch_rollup_query(
             ts.batch_id,
             r2.id AS child_resource_id
         FROM tier1_scope ts
+        JOIN batches b ON b.batch_id = ts.batch_id
         CROSS JOIN LATERAL unnest(ts.scope_ids) AS bid
         JOIN resources r1 ON r1.id = bid AND r1.type::text = 'ENTRA_USER'
         JOIN resources r2 ON r2.parent_resource_id = r1.id
                          AND r2.type::text IN ({t2_types_sql})
-                         -- Exclude workloads the user has NO M365 license
-                         -- for: they can never produce a snapshot, so
-                         -- counting them as "missing" pins the batch at
-                         -- In Progress forever and inflates the progress
-                         -- denominator. Discovery sets metadata.license_
-                         -- missing=true and auto-clears it when a license
-                         -- appears, so the workload rejoins EXPECTED on the
-                         -- next fire with no manual action.
                          AND COALESCE(
                              (r2.metadata->>'license_missing')::boolean,
                              false
                          ) = false
+                         -- Only children the scheduler will actually
+                         -- dispatch (mirrors backup-scheduler's
+                         -- ResourceStatus.in_([DISCOVERED, ACTIVE]) and
+                         -- its INACCESSIBLE/SUSPENDED/PENDING_DELETION
+                         -- refusal). Unlicensed identity accounts get
+                         -- INACCESSIBLE USER_CHATS/USER_ONEDRIVE children
+                         -- from discovery; expecting those wedges every
+                         -- batch containing the parent at "In Progress"
+                         -- forever — including retroactively, because
+                         -- expectations are computed against the current
+                         -- resources table.
+                         AND r2.status::text IN ('DISCOVERED', 'ACTIVE')
+                         -- ...and only children that EXISTED when the
+                         -- batch was dispatched. Expectations are
+                         -- evaluated against the current resources
+                         -- table, so a later discovery run that adds
+                         -- children under a user retroactively wedges
+                         -- every finished batch containing that user
+                         -- (2026-07-14 18:07 batch vs children created
+                         -- 23:38). Children discovered mid-run by
+                         -- Tier-2 gap-fill get Jobs immediately (they
+                         -- land in the observed set below) and the
+                         -- discovery_pending gate covers the insert→job
+                         -- window, so excluding them here is safe.
+                         AND r2.created_at <= b.started_at + INTERVAL '5 minutes'
     ),
     license_skip AS (
-        -- Per batch, the count of Tier-2 children in the Tier-1 scope that
-        -- ARE license_missing — the mirror of ``expected_t2``'s exclusion.
-        -- Surfaced as ``skipped_no_license`` so the Activity row can show a
-        -- neutral "N skipped (no license)" chip, and used below to keep the
-        -- pre-discovery progress floor honest.
-        SELECT
-            ts.batch_id,
-            COUNT(*) AS skipped_no_license
+        SELECT ts.batch_id, COUNT(*) AS skipped_no_license
         FROM tier1_scope ts
+        JOIN batches b ON b.batch_id = ts.batch_id
         CROSS JOIN LATERAL unnest(ts.scope_ids) AS bid
         JOIN resources r1 ON r1.id = bid AND r1.type::text = 'ENTRA_USER'
         JOIN resources r2 ON r2.parent_resource_id = r1.id
                          AND r2.type::text IN (
-                             'USER_MAIL','USER_ONEDRIVE','USER_CHATS',
-                             'USER_CALENDAR','USER_CONTACTS')
+                             'USER_MAIL', 'USER_ONEDRIVE', 'USER_CHATS',
+                             'USER_CALENDAR', 'USER_CONTACTS')
                          AND COALESCE(
                              (r2.metadata->>'license_missing')::boolean,
                              false
                          ) = true
+                         AND r2.created_at <= b.started_at + INTERVAL '5 minutes'
         GROUP BY 1
     ),
+    {withheld_ctes},
     observed_t2 AS (
         SELECT DISTINCT
             br.batch_id,
@@ -428,13 +728,27 @@ def build_batch_rollup_query(
         CROSS JOIN LATERAL unnest(br.all_res_ids) AS bid
     ),
     fanout AS (
+        -- A child counts as MISSING only when no job carried it AND no
+        -- dispatcher recorded withholding it. Both withhold reasons are
+        -- recorded facts (see _withheld_children_cte); neither is
+        -- inferred from coverage or timing.
         SELECT
             e.batch_id,
-            COUNT(*) FILTER (WHERE o.child_resource_id IS NULL) AS missing_t2
+            COUNT(*) FILTER (
+                WHERE o.child_resource_id IS NULL
+                  AND df.child_resource_id IS NULL
+                  AND oh.child_resource_id IS NULL
+            ) AS missing_t2
         FROM expected_t2 e
         LEFT JOIN observed_t2 o
                ON o.batch_id = e.batch_id
               AND o.child_resource_id = e.child_resource_id
+        LEFT JOIN deferred_t2 df
+               ON df.batch_id = e.batch_id
+              AND df.child_resource_id = e.child_resource_id
+        LEFT JOIN overlap_held_t2 oh
+               ON oh.batch_id = e.batch_id
+              AND oh.child_resource_id = e.child_resource_id
         GROUP BY 1
     ),
     entra_count AS (
@@ -460,74 +774,129 @@ def build_batch_rollup_query(
         GROUP BY 1
         HAVING COUNT(*) = 1
     ),
-    tier_split AS (
-        -- Split per-batch snapshot terminal counts by tier so
-        -- ``shape_batch_row`` can weight the progress bar
-        -- (Tier-1 = 10 %, Tier-2 = 90 %). Tier-1 = ENTRA_USER
-        -- metadata snapshot (~1 KB); Tier-2 = the heavy workloads
-        -- under each user.
+    tier1_users AS (
+        -- The ENTRA_USER members of the click-time scope — i.e. the
+        -- Tier-1 progress DENOMINATOR, in the same unit as the
+        -- numerator.
         --
-        -- ``tier1_total`` comes from the click-time scope so it's
-        -- stable as Tier-2 jobs spawn (mirrors the rationale on
-        -- ``total_expected`` below). ``tier2_total`` falls back to
-        -- a per-user × workloads estimate while discovery is still
-        -- running — without this fallback the denominator would be
-        -- zero between Tier-1 completion and Tier-2 discovery, the
-        -- bar would briefly read 100 %, then collapse when the real
-        -- children land.
+        -- 2026-08-11: tier1_total used to be
+        -- ``COALESCE(array_length(ts.scope_ids,1),0)`` — the click-time
+        -- SCOPE RESOURCE count — while tier1_terminal counted only
+        -- ENTRA_USER snapshots. Different units. On the scheduled path
+        -- the scope is the whole policy (Gold: 50 resources = 7
+        -- ENTRA_USER + 8 USER_MAIL + 8 USER_CALENDAR + 8 USER_CONTACTS
+        -- + 8 USER_CHATS + 6 USER_ONEDRIVE + 2 SHAREPOINT_SITE + 1
+        -- USER_ARCHIVE + 1 ROOM_MAILBOX + 1 ENTRA_GROUP), so the
+        -- fraction was 7/50 forever — it could not reach 1.0 even with
+        -- every user done.
+        SELECT ts.batch_id, COUNT(*) AS users_total
+        FROM tier1_scope ts
+        JOIN batches b ON b.batch_id = ts.batch_id
+        CROSS JOIN LATERAL unnest(ts.scope_ids) AS bid
+        JOIN resources r ON r.id = bid AND r.type::text = 'ENTRA_USER'
+        GROUP BY 1
+    ),
+    tier2_content AS (
+        -- The CONTENT expectation: every NON-ENTRA_USER resource in the
+        -- click-time scope, UNIONed with every expected Tier-2 child.
+        --
+        -- UNION, not "+": the two overlap. On the UI click path the
+        -- scope is users only and the children are disjoint from it; on
+        -- the SCHEDULED path the children are policy-assigned resources
+        -- and are dispatched IN the scope, so adding the two double-
+        -- counts (that is why ``total_expected`` reads 84 for a Gold
+        -- batch that really has 50 distinct resources).
+        --
+        -- Non-user scope members (SHAREPOINT_SITE, ROOM_MAILBOX,
+        -- ENTRA_GROUP, POWER_BI …) belong here too: they are real
+        -- content work, and the old USER_*-only type list left them out
+        -- of BOTH tiers, so a SharePoint-heavy batch could never move
+        -- the bar at all.
+        SELECT batch_id, COUNT(*) AS content_total
+        FROM (
+            SELECT ts.batch_id, bid AS rid
+              FROM tier1_scope ts
+              JOIN batches b ON b.batch_id = ts.batch_id
+              CROSS JOIN LATERAL unnest(ts.scope_ids) AS bid
+              JOIN resources r ON r.id = bid
+                              AND r.type::text <> 'ENTRA_USER'
+            UNION
+            SELECT e.batch_id, e.child_resource_id FROM expected_t2 e
+        ) u
+        GROUP BY 1
+    ),
+    tier_split AS (
+        -- Split per-batch progress by tier so ``shape_batch_row`` can
+        -- weight the bar (Tier-1 = 10 %, Tier-2 = 90 %). Tier-1 =
+        -- ENTRA_USER identity metadata (~1 KB); Tier-2 = the heavy
+        -- content workloads.
+        --
+        -- Both tiers are counted in DISTINCT RESOURCES, matching their
+        -- denominators. Counting snapshot ROWS overcounts a resource the
+        -- worker retried, which is how the numerator used to be able to
+        -- outrun the denominator (2026-05-16: denom 45, terminal 68).
+        --
+        -- Monotonicity (the 2026-05-15 "16 % → 90 % → 30 % → 99 %"
+        -- incident) holds because every input only grows during a
+        -- healthy run: scope_ids never mutates after insert, expected_t2
+        -- is pinned to children that existed at dispatch, and a resource
+        -- that has a terminal snapshot keeps it.
         SELECT
             b.batch_id,
-            COALESCE(array_length(ts.scope_ids, 1), 0)    AS tier1_total,
-            COUNT(*) FILTER (
+            COALESCE(u.users_total, 0)                     AS tier1_total,
+            COUNT(DISTINCT s.resource_id) FILTER (
                 WHERE r.type::text = 'ENTRA_USER'
                   AND s.status::text IN ('COMPLETED','PARTIAL','FAILED')
             )                                              AS tier1_terminal,
-            -- Tier-2 expected count: must always be ≥
-            -- (terminal + in_flight) so the progress fraction
-            -- can't exceed 1.0. Previously this used only
-            -- ``GREATEST(expected_t2_count, users × 5)`` as a
-            -- pre-discovery floor — but the worker spawns more
-            -- Tier-2 snapshots than the canonical 5 per user when
-            -- it issues retries OR when a workload type is split
-            -- across multiple snapshots (e.g. shared mailbox, extra
-            -- OneDrives). Result (2026-05-16): denom stuck at 45
-            -- while terminal hit 68 → bar overshoots and gets
-            -- clamped to 99 % when only ~80 % of the work is done.
-            --
-            -- Fix: bound the denominator below by the actual count
-            -- of Tier-2 snapshots ever observed (terminal +
-            -- in_flight). Keeps the bar honest: it can only hit
-            -- 100 % once every Tier-2 snapshot is terminal.
+            -- Tier-2 denominator: must always be ≥ the numerator so the
+            -- fraction can't exceed 1.0.
+            --   * content_total        — the real expectation.
+            --   * users_total * 5      — pre-discovery floor. Between
+            --     Tier-1 completion and Tier-2 discovery the real
+            --     expectation is 0; without the floor tier2_total would
+            --     be 0, shape_batch_row would take the Tier-1-only
+            --     branch, the bar would read 100 % and then collapse
+            --     when the children land. 5 = the canonical per-user
+            --     workload count (mail/onedrive/chats/calendar/
+            --     contacts). NOTE the multiplier is per USER now — it
+            --     used to be per SCOPE RESOURCE, which on Gold made the
+            --     floor 50×5 = 250 against ~39 real children and pinned
+            --     the bar at 15 % (2026-08-11 RCA).
+            --   * observed distinct non-ENTRA_USER resources — the
+            --     worker can spawn more Tier-2 work than expected
+            --     (extra OneDrives, shared mailboxes, mid-run gap-fill
+            --     children). Counting resources that have ANY snapshot
+            --     (not just terminal ones) keeps the bar from reading
+            --     100 % while such a resource is still in flight.
             GREATEST(
-                COALESCE((
-                    SELECT COUNT(*) FROM expected_t2 e
-                     WHERE e.batch_id = b.batch_id
-                ), 0),
-                -- Pre-discovery floor (users × 5 canonical workloads),
-                -- minus the license-skipped children so a partially-
-                -- licensed user's bar isn't stuck below 100 % (e.g. a
-                -- 2-licensed user must not be measured against 5).
+                COALESCE(c.content_total, 0),
                 GREATEST(
-                    COALESCE(array_length(ts.scope_ids, 1), 0) * 5
-                    - COALESCE((
-                        SELECT ls.skipped_no_license FROM license_skip ls
-                         WHERE ls.batch_id = b.batch_id
-                    ), 0),
+                    COALESCE(u.users_total, 0) * 5
+                    - COALESCE(ls.skipped_no_license, 0),
                     0
                 ),
-                COUNT(*) FILTER (
-                    WHERE r.type::text IN ({t2_types_sql})
+                COUNT(DISTINCT s.resource_id) FILTER (
+                    WHERE r.type IS NOT NULL
+                      AND r.type::text <> 'ENTRA_USER'
                 )
             )                                              AS tier2_total,
-            COUNT(*) FILTER (
-                WHERE r.type::text IN ({t2_types_sql})
+            -- Every non-ENTRA_USER resource with a terminal snapshot in
+            -- this batch. Type-list-free on purpose: the old explicit
+            -- list had to be edited every time a workload was added
+            -- (USER_ARCHIVE was bolted on exactly that way) and silently
+            -- under-counted anything not on it.
+            COUNT(DISTINCT s.resource_id) FILTER (
+                WHERE r.type IS NOT NULL
+                  AND r.type::text <> 'ENTRA_USER'
                   AND s.status::text IN ('COMPLETED','PARTIAL','FAILED')
             )                                              AS tier2_terminal
         FROM batches b
-        LEFT JOIN tier1_scope ts ON ts.batch_id = b.batch_id
+        LEFT JOIN tier1_users   u ON u.batch_id = b.batch_id
+        LEFT JOIN tier2_content c ON c.batch_id = b.batch_id
+        LEFT JOIN license_skip ls ON ls.batch_id = b.batch_id
         LEFT JOIN snapshots s    ON s.job_id = ANY(b.job_ids)
         LEFT JOIN resources r    ON r.id = s.resource_id
-        GROUP BY b.batch_id, ts.scope_ids
+        GROUP BY b.batch_id, u.users_total, c.content_total, ls.skipped_no_license
     ),
     total_expected AS (
         -- Stable progress denominator. Computed from click-time scope
@@ -603,8 +972,20 @@ def build_batch_rollup_query(
         b.all_jobs_terminal,
         b.any_cancelled,
         b.any_job_failed,
+        b.any_job_completed,
+        b.any_tier2_jobs,
+        -- Freshness horizon for the missing_t2 gate (see
+        -- derive_batch_status): expectations are computed against the
+        -- CURRENT resources table, so they may only WEDGE a batch at
+        -- "In Progress" while it is recent — a later resource-status
+        -- flip must not rewrite settled history (2026-08-03: a per-user
+        -- discovery reset flipped long-INACCESSIBLE children back to
+        -- DISCOVERED and every Gold batch since 7/27 turned
+        -- "In Progress" retroactively).
+        (b.started_at > NOW() - INTERVAL '48 hours') AS batch_recent,
         COALESCE(sr.snap_total, 0)          AS snap_total,
         COALESCE(sr.snap_done, 0)           AS snap_done,
+        COALESCE(sr.snap_skipped, 0)        AS snap_skipped,
         COALESCE(sr.snap_partial, 0)        AS snap_partial,
         COALESCE(sr.snap_failed, 0)         AS snap_failed,
         COALESCE(sr.snap_pending, 0)        AS snap_pending,
@@ -641,11 +1022,11 @@ def build_batch_rollup_query(
         end_date=end_date,
         size=size,
         off=offset,
+        batch_cap=size + offset,
     )
-    # Only bind :op when the SQL string actually references it,
-    # otherwise SQLAlchemy raises ArgumentError on the unused param.
-    if operation:
-        binds["op"] = operation
+    # No :op bind — the operation is allow-listed and inlined as an enum
+    # literal above, so binding it here would raise ArgumentError on an
+    # unused parameter.
     return text(sql).bindparams(**binds)
 
 
@@ -659,8 +1040,10 @@ def shape_batch_row(row: Any) -> Dict[str, Any]:
         all_jobs_terminal=bool(row.all_jobs_terminal),
         any_cancelled=bool(row.any_cancelled),
         any_job_failed=bool(row.any_job_failed),
+        any_job_completed=bool(getattr(row, "any_job_completed", False)),
         snap_total=int(row.snap_total or 0),
         snap_done=int(row.snap_done or 0),
+        snap_skipped=int(getattr(row, "snap_skipped", 0) or 0),
         snap_partial=int(row.snap_partial or 0),
         snap_failed=int(row.snap_failed or 0),
         snap_pending=int(row.snap_pending or 0),
@@ -668,6 +1051,8 @@ def shape_batch_row(row: Any) -> Dict[str, Any]:
         missing_t2=int(row.missing_t2 or 0),
         expected_total=int(getattr(row, "expected_count", 0) or 0),
         discovery_pending=bool(getattr(row, "discovery_pending", False)),
+        any_tier2_jobs=bool(getattr(row, "any_tier2_jobs", False)),
+        batch_recent=bool(getattr(row, "batch_recent", True)),
         tier1_total=int(getattr(row, "tier1_total", 0) or 0),
         tier1_terminal=int(getattr(row, "tier1_terminal", 0) or 0),
         tier2_total=int(getattr(row, "tier2_total", 0) or 0),

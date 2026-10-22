@@ -173,12 +173,8 @@ def test_scheduler_json_filters_use_json_extract_path_text():
 
 
 def test_select_resources_for_dispatch_covers_all_regardless_of_count(monkeypatch):
-    """Coverage MUST be complete every fire. The old max_concurrent_backups
-    budget did enabled_resources[:budget], silently DROPPING the rest — at
-    scale (e.g. 65k resources / 50-per-fire ≈ 430 days per full pass) that is
-    a silent SLA breach. select_resources_for_dispatch must return EVERY
-    enabled resource; simultaneity is bounded downstream (worker semaphores +
-    Graph pacing), never by capping how many resources get backed up."""
+    """Eligibility filtering keeps the complete candidate set. The caller's
+    wave budget dispatches part now; the cycle drain dispatches the rest."""
     module = _load_scheduler(monkeypatch)
     enabled = [SimpleNamespace(id=i) for i in range(500)]
     out = module.select_resources_for_dispatch(enabled, set())
@@ -250,3 +246,53 @@ def test_select_resources_for_dispatch_also_skips_license_missing(monkeypatch):
     ]
     out = module.select_resources_for_dispatch(enabled, {2})
     assert {r.id for r in out} == {0, 3}
+
+
+@pytest.mark.parametrize("cap,recent_under_lock,expected_dispatches", [
+    (50, 0, 0),  # the within-cycle drain owns capped policies
+    (0, 1, 0),   # cron won after the catch-up scan
+    (0, 0, 1),   # an uncapped policy really missed its fire
+])
+def test_catchup_coordinates_with_drain_and_cron(monkeypatch, cap, recent_under_lock, expected_dispatches):
+    from unittest.mock import AsyncMock
+    from uuid import UUID
+
+    module = _load_scheduler(monkeypatch)
+    policy = SimpleNamespace(
+        id=UUID("09378695-3437-4242-a041-22ff5b9a1d7b"), name="Daily",
+        frequency="DAILY", created_at=None, max_concurrent_backups=cap,
+        backup_sharepoint=True,
+    )
+    resource = SimpleNamespace(type="SHAREPOINT_SITE", extra_data={})
+    answers = [[policy]] if cap else [[policy], [resource], 0, 0, recent_under_lock]
+
+    class Result:
+        def __init__(self, value):
+            self.value = value
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return self.value
+
+        def scalar(self):
+            return self.value
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def execute(self, stmt):
+            return Result(answers.pop(0))
+
+    dispatch = AsyncMock()
+    monkeypatch.setattr(module, "async_session_factory", Session)
+    monkeypatch.setattr(module, "_dispatch_policy_backups_impl", dispatch)
+    monkeypatch.setattr(module, "_policy_fire_times_between", lambda policy, start, now: [now])
+    asyncio.run(module.catch_up_missed_policy_runs())
+    assert dispatch.await_count == expected_dispatches
+    assert not answers

@@ -25,6 +25,16 @@ if os.path.isdir(_SHARED) and _SHARED not in sys.path:
 
 from shared.mime_builder import AttachmentRef, build_eml, build_eml_streaming  # noqa: E402
 from shared.mbox_writer import MboxWriter  # noqa: E402
+from shared.file_path_sanitize import sanitize_arcname  # noqa: E402
+
+# Reserved chars forbidden in Windows path components, reused for arcname confinement.
+_ARCNAME_RESERVED = '<>:"/\\|?*'
+
+
+def _confine_arcname(raw: str) -> str:
+    """Confine an attacker-influenced ZIP arcname: drop ``..``/``.``/empty
+    segments and reserved chars so no traversal or absolute path survives."""
+    return sanitize_arcname(raw, max_len=4096, replace_chars=_ARCNAME_RESERVED)
 
 
 @dataclass
@@ -330,7 +340,10 @@ class FolderExportTask:
                         )
                     continue
                 safe_name = "".join(c if c.isalnum() or c in "-._" else "_" for c in (it.name or it.external_id))
-                arcname = f"{self.folder_name}/{safe_name}-{it.external_id}.eml"
+                arcname = _confine_arcname(f"{self.folder_name}/{safe_name}-{it.external_id}.eml")
+                assert arcname and ".." not in arcname.split("/") and not arcname.startswith("/"), (
+                    f"unsafe arcname: {arcname!r}"
+                )
                 result.produced_inline_members.append((arcname, eml_bytes))
                 result.exported_count += 1
                 if self.manifest:
@@ -447,6 +460,10 @@ async def stream_zip_to_block_blob(
                 container, path, chunk_size=block_size
             ):
                 chunks.append(chunk)
+        arcname = _confine_arcname(arcname)
+        assert arcname and ".." not in arcname.split("/") and not arcname.startswith("/"), (
+            f"unsafe arcname: {arcname!r}"
+        )
         zs.add(iter(chunks), arcname=arcname)
         del chunks
 
@@ -715,7 +732,7 @@ class MailExportOrchestrator:
 
         out: dict = defaultdict(list)
         for it in self.items:
-            folder = (getattr(it, "folder_path", None) or "Inbox").strip("/")
+            folder = _confine_arcname((getattr(it, "folder_path", None) or "Inbox").strip("/")) or "Inbox"
             out[folder].append(it)
         return dict(out)
 
@@ -726,7 +743,7 @@ class MailExportOrchestrator:
 
         out: dict = defaultdict(list)
         for it in self.items:
-            folder = (getattr(it, "folder_path", None) or "Inbox").strip("/")
+            folder = _confine_arcname((getattr(it, "folder_path", None) or "Inbox").strip("/")) or "Inbox"
             shard_index = getattr(it, "shard_index", 0) if self.shard_manager else 0
             out[(folder, shard_index)].append(it)
         return dict(out)
@@ -839,7 +856,10 @@ class MailExportOrchestrator:
                     content = await self.shard.download_blob(
                         self.dest_container, blob_path
                     )
-                    arcname = blob_path.split(f"{self.job_id}/", 1)[-1]
+                    arcname = _confine_arcname(blob_path.split(f"{self.job_id}/", 1)[-1])
+                    assert arcname and ".." not in arcname.split("/") and not arcname.startswith("/"), (
+                        f"unsafe arcname: {arcname!r}"
+                    )
                     zf.writestr(arcname, content or b"")
             if self.manifest:
                 zf.writestr("_MANIFEST.json", self.manifest.to_json())

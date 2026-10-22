@@ -263,3 +263,26 @@ def test_regression_legacy_dict_does_not_poison_shard_when_table_authoritative()
     assert set(drain) == {SENT, DRAFTS}
     assert skipped == []
     assert fallback == 0
+
+
+def test_folder_without_a_saved_cursor_is_never_fingerprint_skipped():
+    """An evicted cursor (410, carry rewind, force-full) must force a
+    re-walk even when the folder fingerprint is unchanged — otherwise the
+    eviction is silently deferred a full rescan window."""
+    now = datetime(2026, 9, 4, 12, 0, 0)
+    fp_table = {
+        INBOX: {"fp": "100|10|1000", "baseline_at": now - timedelta(minutes=5)},
+        SENT: {"fp": "50|0|500", "baseline_at": now - timedelta(minutes=5)},
+    }
+    drain, skipped, _ = _decide(
+        all_folder_ids=[INBOX, SENT],
+        fp_table=fp_table,
+        legacy_fps={},
+        legacy_baseline_dt=None,
+        fingerprints_now={INBOX: "100|10|1000", SENT: "50|0|500"},
+        rescan_seconds=_RESCAN_SECS,
+        now_dt=now,
+        saved_tokens={SENT: "tok"},  # INBOX has no cursor
+    )
+    assert drain == [INBOX]
+    assert skipped == [SENT]

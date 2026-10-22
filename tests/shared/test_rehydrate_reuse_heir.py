@@ -8,8 +8,8 @@ resolves to a dead pointer and loses its inventory (exactly the July-2 failure).
 
 Two layers of coverage:
   * THIS file — a characterization test with a fake session that locks the
-    ORCHESTRATION invariants (no-op when there's no heir; the copy → repoint →
-    promote sequence; and P4b: the promote step carries the doomed row's delta
+    ORCHESTRATION invariants (no-op when there's no heir; the copy → promote →
+    repoint sequence; and P4b: the promote step carries the doomed row's delta
     cursor forward). Runs everywhere, no DB.
   * test_rehydrate_reuse_heir_pg.py — real Postgres SQL semantics (skipif no DB).
 """
