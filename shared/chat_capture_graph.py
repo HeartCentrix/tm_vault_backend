@@ -92,6 +92,28 @@ def _content_length(response: httpx.Response) -> int | None:
     return length
 
 
+def permission_scope_hash_for(*, tenant_id: str, application_id: str, principal_id: str) -> str:
+    """Hash owned credentials' configuration; this does not attest actual grants."""
+    for value in (tenant_id, application_id, principal_id):
+        _component(value)
+    context = {"tenant": tenant_id, "application": application_id,
+               "principal": principal_id, "auth_mode": "client_credentials",
+               "requested_scope": "https://graph.microsoft.com/.default"}
+    return hashlib.sha256(json.dumps(context, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def effective_capture_scope_hash(base_hash: str, scope_filter_hash: str | None = None) -> str:
+    """Include the configured source-selection policy in capture identity."""
+    if not isinstance(base_hash, str) or not base_hash:
+        raise ValueError("base source scope hash is required")
+    if scope_filter_hash is None:
+        return base_hash
+    if not isinstance(scope_filter_hash, str) or not scope_filter_hash:
+        raise ValueError("source filter hash must be nonempty")
+    return hashlib.sha256(json.dumps(["chat-capture-filter-v1", base_hash, scope_filter_hash],
+        separators=(",", ":")).encode()).hexdigest()
+
+
 class StrictChatGraphSource:
     """Pinned application source. Construct through ``pinned_chat_source``."""
 
@@ -102,16 +124,8 @@ class StrictChatGraphSource:
         self._initial_app = client.client_id
         self._initial_tenant = client.tenant_id
         self._initial_secret = client.client_secret
-        context = {
-            "tenant": self._initial_tenant,
-            "application": self._initial_app,
-            "principal": principal_id,
-            "auth_mode": "client_credentials",
-            "requested_scope": "https://graph.microsoft.com/.default",
-        }
-        self.permission_scope_hash = hashlib.sha256(
-            json.dumps(context, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
+        self.permission_scope_hash = permission_scope_hash_for(
+            tenant_id=self._initial_tenant, application_id=self._initial_app, principal_id=principal_id)
         self._closed = False
         self._pacing_policy = client._policy
 

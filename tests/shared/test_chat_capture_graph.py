@@ -340,3 +340,11 @@ async def test_closed_source_cannot_reopen_owned_pool(source_factory, operation)
                 pass
     assert len(clients) == count
     assert all(c.is_closed for c in clients)
+
+
+async def test_public_configuration_hash_matches_open_source(source_factory):
+    make, *_ = source_factory
+    module = importlib.import_module("shared.chat_capture_graph")
+    async with make(lambda request: httpx.Response(200, json={"value": []})) as source:
+        assert source.permission_scope_hash == module.permission_scope_hash_for(
+            tenant_id="tenant", application_id="app", principal_id="user")
