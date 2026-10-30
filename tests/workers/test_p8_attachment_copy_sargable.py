@@ -52,16 +52,16 @@ def test_p8_predicate_no_longer_wraps_parent_in_coalesce_in_subselect():
 def test_p8_predicate_is_union_of_two_index_sargable_branches():
     sql = LEGACY_CHAT_ATTACHMENT_COPY_SQL
     assert "UNION ALL" in sql
-    assert "src.parent_external_id = ANY(" in sql
+    assert "src.parent_external_id = mids.message_external_id" in sql
     assert "src.parent_external_id IS NULL" in sql
-    assert "split_part(src.external_id, '::', 1) = ANY(" in sql
+    assert "split_part(src.external_id, '::', 1) = mids.message_external_id" in sql
     # both branches keep the partial-index predicate so
     # idx_snapshot_items_parent_ext stays eligible
     assert sql.count("src.item_type IN ('CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT')") >= 2
     # idempotency contract unchanged
     assert "ON CONFLICT (snapshot_id, external_id, item_type) DO NOTHING" in sql
     # still a DISTINCT ON over the union so forwarded attachments collapse
-    assert "DISTINCT ON (external_id, item_type)" in sql
+    assert "PARTITION BY external_id, item_type" in sql
 
 
 def test_p8_still_runs_under_the_micro_carry_forward_slot():
@@ -123,7 +123,7 @@ async def test_p8_copy_runs_union_insert_in_slot_and_returns_inserted_count(bw, 
     sql, params = sess.calls[0]
     assert "INSERT INTO snapshot_items" in sql
     assert "UNION ALL" in sql
-    assert "src.parent_external_id = ANY(" in sql
+    assert "src.parent_external_id = mids.message_external_id" in sql
     assert "COALESCE(src.parent_external_id, split_part(src.external_id, '::', 1)) IN" not in sql
     assert params == {"tsid": "s1", "tid": "t1", "cid": "19:abc@thread.v2"}
 

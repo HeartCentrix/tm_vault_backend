@@ -143,6 +143,20 @@ async def test_copy_never_uses_explicitly_different_chat(store):
     assert [r["external_id"] for r in await store["rows"]()] == ["m1::own"]
 
 
+async def test_newest_other_chat_row_does_not_hide_older_attributable_row(store):
+    newer = uuid.uuid4()
+    async with store["factory"]() as session:
+        await session.execute(text("INSERT INTO snapshots VALUES (:s,:r)"),
+                              {"s": newer, "r": store["resource"]})
+        await session.commit()
+    await store["add"](metadata={"chat_id": "chat-a", "version": "own"})
+    await store["add"](snapshot=newer, metadata={"chat_id": "chat-b", "version": "other"},
+                       created=datetime(2026, 1, 3))
+    assert await store["copy"]() == 1
+    row, = await store["rows"]()
+    assert row["metadata"]["version"] == "own"
+
+
 async def test_copy_reports_ambiguous_chat_provenance_without_inserting(store):
     await store["add"](metadata={})
     with pytest.raises(RuntimeError, match="provenance"):
