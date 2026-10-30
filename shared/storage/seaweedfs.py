@@ -165,10 +165,12 @@ class SeaweedStore:
         )
 
     def _bucket(self, container: str) -> str:
+        if container.startswith("chat-catalogue-"):
+            return container
         return self._forced_bucket or (self._buckets[0] if self._buckets else container)
 
     def _key(self, container: str, path: str) -> str:
-        if self._forced_bucket and container:
+        if self._forced_bucket and container and not container.startswith("chat-catalogue-"):
             return f"{container}/{path}"
         return path
 
@@ -506,7 +508,7 @@ class SeaweedStore:
 
     async def list_blobs(self, container, prefix: Optional[str] = None):
         bucket = self._bucket(container)
-        base = f"{container}/" if self._forced_bucket and container else ""
+        base = self._key(container, "")
         full_prefix = (base + prefix) if prefix else base
         async with self._client_ctx() as s3:
             paginator = s3.get_paginator("list_objects_v2")
@@ -516,7 +518,7 @@ class SeaweedStore:
 
     async def list_with_props(self, container, prefix: Optional[str] = None):
         bucket = self._bucket(container)
-        base = f"{container}/" if self._forced_bucket and container else ""
+        base = self._key(container, "")
         full_prefix = (base + prefix) if prefix else base
         async with self._client_ctx() as s3:
             paginator = s3.get_paginator("list_objects_v2")
@@ -649,9 +651,22 @@ class SeaweedStore:
             )
 
     async def ensure_container(self, container) -> None:
-        # Bucket must be pre-created with Object Lock enabled; this is a
-        # no-op in the default bucket-per-shard layout.
-        return
+        # Legacy shards are provisioned externally. Catalogue buckets are
+        # isolated from their snapshot-age expiration rules.
+        if not container.startswith("chat-catalogue-"):
+            return
+        async with self._client_ctx() as s3:
+            try:
+                await s3.head_bucket(Bucket=container)
+                return
+            except ClientError as exc:
+                if exc.response["Error"]["Code"] not in {"404", "NoSuchBucket", "NotFound"}:
+                    raise BackendUnreachableError("catalogue bucket unavailable") from exc
+            try:
+                await s3.create_bucket(Bucket=container)
+            except ClientError as exc:
+                if exc.response["Error"]["Code"] != "BucketAlreadyOwnedByYou":
+                    raise BackendUnreachableError("catalogue bucket creation failed") from exc
 
     async def close(self) -> None:
         return
