@@ -189,7 +189,7 @@ async def _retire_unused_inventories(session, limit):
         await session.execute(delete(ChatCataloguePin).where(ChatCataloguePin.id.in_(expired)))
     candidates = list((await session.scalars(select(ChatInventory.id).where(
         ~exists().where(SnapshotChatInventory.inventory_id == ChatInventory.id),
-        ~exists().where(ChatCataloguePin.inventory_id == ChatInventory.id, _pin_live(now)),
+        ~exists().where(ChatCataloguePin.inventory_id == ChatInventory.id),
         ~exists().where(ChatCaptureAttempt.staged_inventory_id == ChatInventory.id,
             ChatCaptureAttempt.state.in_(_ACTIVE_CAPTURE), ChatCaptureAttempt.expires_at > now))
         .order_by(ChatInventory.created_at, ChatInventory.id).limit(limit))).all())
@@ -211,7 +211,7 @@ async def _retire_unused_inventories(session, limit):
             continue
         if await session.scalar(select(exists().where(SnapshotChatInventory.inventory_id == inventory_id))):
             continue
-        if await session.scalar(select(exists().where(ChatCataloguePin.inventory_id == inventory_id, _pin_live(now)))):
+        if await session.scalar(select(exists().where(ChatCataloguePin.inventory_id == inventory_id))):
             continue
         # Every referencing attempt must be removed in this transaction: its
         # inventory FK is deferred, while the reverse FK is immediate.

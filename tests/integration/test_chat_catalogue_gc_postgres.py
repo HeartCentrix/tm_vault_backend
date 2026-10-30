@@ -206,3 +206,20 @@ async def test_tombstone_reconciliation_removes_a_late_upload(store):
     result = await collect(store, storage)
     assert result.objects_deleted == 1
     assert len(storage.deleted) == 2 and storage.deleted[0] == storage.deleted[1]
+
+
+async def test_bounded_expired_pin_cleanup_does_not_abort_inventory_reclamation(store):
+    retained = await capture(store)
+    orphan = await capture(store)
+    async with store.factory.begin() as session:
+        for pin_id, captured in ((1, retained), (2, orphan)):
+            from uuid import UUID
+            session.add(ChatCataloguePin(id=UUID(int=pin_id), inventory_id=captured.result.inventory_id,
+                owner_kind="read", owner_id=uuid4(), generation=1,
+                expires_at=datetime.now(timezone.utc)-timedelta(days=1)))
+    await remove(store, orphan.scope)
+    storage = Storage()
+    first = await collect(store, storage, limit=1)
+    assert first.objects_deleted == 0
+    second = await collect(store, storage, limit=1)
+    assert second.objects_deleted == 1
