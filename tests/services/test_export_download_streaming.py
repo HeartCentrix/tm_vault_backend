@@ -145,3 +145,44 @@ def test_missing_blob_is_still_404(client, monkeypatch):
     shard.present = False
     r = tc.get(f"/api/v1/jobs/export/{job.id}/download")
     assert r.status_code == 404
+
+
+def test_catalogue_export_download_uses_recorded_backend_and_plaintext_length(client, monkeypatch):
+    from shared.storage.router import router
+    from shared.storage.base import BlobProps
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    tc, job, active_shard = client
+    backend = str(uuid.uuid4())
+    job.result.update(chat_catalogue_format=1, backend_id=backend,
+        size_bytes=sum(map(len, CHUNKS)), encryption_key_id="captured-key")
+    calls = []
+
+    async def properties(container, path):
+        calls.append(("head", container, path))
+        return BlobProps(size=sum(map(len, CHUNKS)) + 128,
+            content_type="application/zip", last_modified=datetime.now(timezone.utc),
+            metadata={}, copy_status=None, copy_progress=None, retention_until=None, legal_hold=False)
+
+    async def stream(container, path, **kwargs):
+        calls.append(("stream", container, path))
+        for chunk in CHUNKS:
+            yield chunk
+
+    store = SimpleNamespace(kind="seaweedfs", get_properties=properties, download_stream=stream)
+    monkeypatch.setattr(router, "get_store_by_id", lambda value: store if value == backend else None)
+    response = tc.get(f"/api/v1/jobs/export/{job.id}/download")
+    assert response.status_code == 200
+    assert response.content == b"".join(CHUNKS)
+    assert response.headers["content-length"] == str(sum(map(len, CHUNKS)))
+    assert calls == [("head", "exports", BLOB_PATH), ("stream", "exports", BLOB_PATH)]
+    assert active_shard.stream_calls == []
+
+
+def test_catalogue_export_missing_descriptor_does_not_fall_back_to_active_backend(client):
+    tc, job, shard = client
+    job.result.update(chat_catalogue_format=1, size_bytes=12)
+    response = tc.get(f"/api/v1/jobs/export/{job.id}/download")
+    assert response.status_code == 500
+    assert shard.stream_calls == []

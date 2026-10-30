@@ -3077,7 +3077,16 @@ async def download_export_zip(
     output_mode = result.get("output_mode", "zip")
 
     from shared.azure_storage import azure_storage_manager
-    shard = azure_storage_manager.get_default_shard()
+    catalogue_export = result.get("chat_catalogue_format") == 1
+    if catalogue_export:
+        from shared.azure_storage import _StoreFacade
+        from shared.storage.router import router
+        if (not result.get("backend_id") or not result.get("container")
+                or type(result.get("size_bytes")) is not int or result["size_bytes"] < 0):
+            raise HTTPException(status_code=500, detail="Catalogue export descriptor is incomplete")
+        shard = _StoreFacade(router.get_store_by_id(str(result["backend_id"])))
+    else:
+        shard = azure_storage_manager.get_default_shard()
 
     # Raw single-file shortcut — OneDrive export v2 writes output_mode='raw_single'
     # when exactly one file is exported in ORIGINAL format. Skip ZIP wrapper and
@@ -3129,9 +3138,10 @@ async def download_export_zip(
     candidate_containers: list = []
     if result.get("container"):
         candidate_containers.append(str(result["container"]))
-    if job.tenant_id:
+    if job.tenant_id and not catalogue_export:
         candidate_containers.append(azure_storage_manager.get_container_name(str(job.tenant_id), "exports"))
-    candidate_containers.append("exports")
+    if not catalogue_export:
+        candidate_containers.append("exports")
     # dedupe preserving order
     seen = set(); _uniq = []
     for c in candidate_containers:
@@ -3151,7 +3161,8 @@ async def download_export_zip(
             props = await shard.get_blob_properties(cand, blob_path)
             if props is not None:
                 found_container = cand
-                blob_size = int(props.get("size") or 0)
+                # Encrypted stores report ciphertext length but stream plaintext.
+                blob_size = result["size_bytes"] if catalogue_export else int(props.get("size") or 0)
                 print(f"[JOB_SERVICE] export download: found in container={cand}")
                 break
         except Exception as exc:
