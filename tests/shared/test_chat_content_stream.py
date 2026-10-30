@@ -120,4 +120,3 @@ async def test_genuinely_empty_file_is_valid(tmp_path):
                                         directory=tmp_path) as saved:
         assert saved.size == 0
         assert saved.sha256 == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-
