@@ -259,7 +259,18 @@ class AzureBlobStore:
         )
 
     async def delete(self, container, path) -> None:
-        await self._default_shard().delete_blob(container, path)
+        from shared.blob_gc import is_catalogue_blob_path
+        if not is_catalogue_blob_path(path):
+            await self._default_shard().delete_blob(container, path)
+            return
+        # The legacy shard helper swallows every error; catalogue retirement
+        # needs a provider acknowledgement before recording a tombstone.
+        from azure.core.exceptions import ResourceNotFoundError
+        client = self._default_shard().get_async_client().get_blob_client(container=container, blob=path)
+        try:
+            await client.delete_blob()
+        except ResourceNotFoundError:
+            pass
 
     async def presigned_url(self, container, path, valid_hours=6, *, allow_encrypted=False) -> str:
         # allow_encrypted is a no-op for Azure (its uploads never TMVE-encrypt).
