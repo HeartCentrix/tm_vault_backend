@@ -823,3 +823,31 @@ async def test_single_child_staging_fetches_only_its_parent_from_inventory(store
                 filtered += node.get("Rows Removed by Filter", 0)
                 nodes.extend(node.get("Plans", []))
             assert filtered < 20, f"unrelated parent records inspected: {filtered}"
+
+
+@pytest.mark.parametrize("replacement_body", ["original", "changed after restart"])
+async def test_expired_staged_capture_can_be_replaced_without_touching_other_chat(store, replacement_body):
+    scope = await store.new_scope()
+    old = await store.begin(scope)
+    await store.stage(old, [message()])
+    other = replace(scope, chat_id="other-chat")
+    other_lease = await store.begin(other)
+    await store.stage(other_lease, [message("other saved body")])
+    await store.observe(other, other_lease, [message("other saved body")])
+    other_result = await store.publish(other_lease)
+    async with store.factory.begin() as session:
+        await session.execute(update(models.ChatCaptureAttempt).where(models.ChatCaptureAttempt.id == old.attempt_id)
+            .values(expires_at=datetime.now(timezone.utc)-timedelta(seconds=1)))
+    fresh = await store.begin(scope)
+    assert fresh.generation == old.generation+1
+    await store.stage(fresh, [message(replacement_body)])
+    await store.observe(scope, fresh, [message(replacement_body)])
+    assert (await store.publish(fresh)).outcome == "complete"
+    with pytest.raises(api().ChatCatalogueWorkLeaseMoved):
+        await store.stage(old, [message("stale worker")])
+    async with store.factory() as session:
+        assert (await session.get(models.SnapshotChatInventory, (scope.snapshot_id, other.chat_id))).inventory_id == other_result.inventory_id
+        links = list((await session.scalars(select(models.SnapshotItem).where(models.SnapshotItem.snapshot_id == scope.snapshot_id))).all())
+        assert len(links) == 2
+        hydrated = await api().materialize_chat_items(session, links)
+        assert {i.extra_data["raw"]["body"]["content"] for i in hydrated} == {replacement_body, "other saved body"}

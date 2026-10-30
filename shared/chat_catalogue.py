@@ -23,7 +23,7 @@ import json
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, delete, func, or_, select, text, update
+from sqlalchemy import and_, delete, exists, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 
@@ -154,6 +154,14 @@ async def begin_capture(session, *, scope: ChatCaptureScope, folder_path: str | 
         if previous.expires_at > now:
             raise ChatCatalogueConflict("snapshot chat already has an active capture")
         previous.state = "SUPERSEDED"
+        # A crashed writer may have committed provisional links. Replace only
+        # its unpublished inventory's exact key/version pairs, never another chat.
+        owned = exists(select(ChatInventoryItem.logical_key).where(
+            ChatInventoryItem.inventory_id == previous.staged_inventory_id,
+            ChatInventoryItem.logical_key == SnapshotItem.external_id,
+            ChatInventoryItem.version_id == SnapshotItem.chat_version_id))
+        await session.execute(delete(SnapshotItem).where(
+            SnapshotItem.snapshot_id == scope.snapshot_id, owned))
     attempt_id, inventory_id = uuid4(), uuid4()
     generation = previous.generation + 1 if previous else 1
     expires = now + timedelta(minutes=5)
