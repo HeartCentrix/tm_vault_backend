@@ -244,3 +244,35 @@ async def run_with_db_retry(
             await asyncio.sleep(delay)
     # Unreachable: the loop either returns or raises.
     raise last  # type: ignore[misc]
+
+
+def is_retryable_catalogue_transaction_error(exc: Optional[BaseException]) -> bool:
+    """Only deadlock/serialization SQLSTATEs permit a full catalogue retry.
+
+    The first database code wins; an already-aborted transaction cannot inherit
+    retry eligibility from an earlier error left in its exception context.
+    """
+    for link in _chain(exc):
+        code = getattr(link, "sqlstate", None) or getattr(link, "pgcode", None)
+        if code:
+            return code in {"40P01", "40001"}
+    return False
+
+
+async def run_catalogue_transaction(session_factory, operation, attempts=3):
+    """Run a DB-only operation in a fresh session/transaction on every attempt.
+
+    Never pass Graph, storage or other externally side-effecting operations.
+    Existing generic retry classification and callers remain unchanged.
+    """
+    if type(attempts) is not int or attempts < 1:
+        raise ValueError("attempts must be a positive integer")
+    for number in range(attempts):
+        try:
+            async with session_factory() as session:
+                async with session.begin():
+                    return await operation(session)
+        except Exception as exc:
+            if number + 1 == attempts or not is_retryable_catalogue_transaction_error(exc):
+                raise
+            await asyncio.sleep(min(0.5, 0.05 * 2 ** min(number, 4)))

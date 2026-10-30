@@ -38,6 +38,23 @@ from shared.db_retry import (  # noqa: E402
 )
 
 
+@pytest.mark.parametrize("code,expected", [("40P01", True), ("40001", True), ("25P02", False), ("23505", False), ("08006", False), (None, False)])
+def test_catalogue_transaction_classifier_is_separate_and_sqlstate_only(code, expected):
+    from shared.db_retry import is_retryable_catalogue_transaction_error
+    error = RuntimeError("synthetic database error")
+    error.sqlstate = code
+    assert is_retryable_catalogue_transaction_error(DBAPIError("wrapped", orig=error)) is expected
+    assert not is_transient_db_error(error)
+
+
+def test_catalogue_aborted_transaction_does_not_inherit_retry_from_old_context():
+    from shared.db_retry import is_retryable_catalogue_transaction_error
+    original, aborted = RuntimeError("original"), RuntimeError("aborted")
+    original.sqlstate, aborted.sqlstate = "40001", "25P02"
+    aborted.__context__ = original
+    assert not is_retryable_catalogue_transaction_error(aborted)
+
+
 def _run(coro):
     try:
         loop = asyncio.get_event_loop_policy().get_event_loop()
