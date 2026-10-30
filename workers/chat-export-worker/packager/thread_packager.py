@@ -24,6 +24,19 @@ def _safe_name(name: str, fallback: str = "item") -> str:
     return (s[:120] or fallback)
 
 
+def _hosted_archive_key(message_id: str, hosted: dict, *, thread_path: str) -> str:
+    """Graph hosted IDs are only unique within their parent message."""
+    key = hosted.get("archive_key")
+    if key is not None:
+        if not isinstance(key, str) or re.fullmatch(r"[0-9a-f]{64}", key) is None:
+            raise ValueError("invalid hosted-content archive key")
+        return key
+    # Legacy descriptors have no qualified key. Hash exact source IDs;
+    # sanitizing/concatenating them can collapse distinct Graph IDs.
+    from shared.chat_catalogue_identity import qualified_chat_item_key
+    return qualified_chat_item_key(thread_path, "CHAT_HOSTED_CONTENT", hosted["hc_id"], message_id)
+
+
 def _unique_in_dir(name: str, used: set[str]) -> str:
     """Uniquify a sanitised filename within one ZIP directory.
 
@@ -171,11 +184,12 @@ class ThreadPackager:
             m.attachments = new_atts
             for hc in hosted_map.get(m.external_id, []):
                 ext = hc.get("ext", ".bin")
-                target = f"{att_dir}/inline/{hc['hc_id']}{ext}"
+                archive_key = _hosted_archive_key(m.external_id, hc, thread_path=self.thread_path)
+                target = f"{att_dir}/inline/{archive_key}{ext}"
                 written, missing = await _add_stream(target, hc if hc.get("catalogue") else hc["blob_path"])
                 if missing:
                     _add(
-                        f"{att_dir}/inline/{hc['hc_id']}.MISSING.txt",
+                        f"{att_dir}/inline/{archive_key}.MISSING.txt",
                         (
                             f"Inline image {hc['hc_id']} could not be retrieved.\n"
                             f"blob_path: {hc['blob_path']}\n"

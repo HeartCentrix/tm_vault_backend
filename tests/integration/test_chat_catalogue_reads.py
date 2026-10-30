@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 import sys
 from uuid import uuid4
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -103,6 +103,27 @@ async def test_content_hydrates_inline_and_rejects_wrong_url_snapshot(store, sna
         assert caught.value.status_code == 404
 
 
+@pytest.mark.parametrize("download", [False, True])
+async def test_empty_captured_inline_bytes_are_served_as_bytes_with_captured_name(store, snapshot_api, monkeypatch, download):
+    from contextlib import asynccontextmanager
+    from unittest.mock import AsyncMock
+    import httpx
+    @asynccontextmanager
+    async def audit_client(**kwargs):
+        yield SimpleNamespace(post=AsyncMock(return_value=SimpleNamespace(status_code=200)))
+    monkeypatch.setattr(httpx, "AsyncClient", audit_client)
+    child = inline_child(b"")
+    scope, _, _ = await store.capture([parent_for(child, parent=captured_message("empty attachment")), child])
+    async with store.factory.begin() as db:
+        item = next(i for i in await links(db, scope.snapshot_id) if i.item_type == "CHAT_ATTACHMENT")
+        response = await snapshot_api.get_item_content(str(scope.snapshot_id), str(item.id), download=download, db=db)
+        assert getattr(response, "body", None) == b""
+        assert response.media_type == "image/png"
+        assert response.headers["content-length"] == "0"
+        if download:
+            assert 'filename="captured.png"' in response.headers["content-disposition"]
+
+
 async def test_export_materializes_selected_snapshot_and_exact_children(store, export_scope):
     child = inline_child()
     scope, _, _ = await store.capture([parent_for(child, parent=captured_message("old body")), child])
@@ -116,6 +137,25 @@ async def test_export_materializes_selected_snapshot_and_exact_children(store, e
         assert base64.b64decode(attachment["inline_b64"]) == b"captured bytes"
         assert attachment["sha256"] == hashlib.sha256(b"captured bytes").hexdigest()
         assert str(attachment["snapshot_id"]) == str(scope.snapshot_id)
+
+
+async def test_export_keeps_raw_hosted_ids_and_distinct_parent_scoped_archive_keys(store, export_scope):
+    from shared.chat_catalogue_identity import qualified_chat_item_key
+    items = []
+    for mid, data in (("message-alpha", b"first image"), ("message-beta", b"second image")):
+        child = inline_child(data, graph_id="1", parent=mid, hosted=True)
+        items.extend([parent_for(child, parent=captured_message(mid, mid)), child])
+    scope, _, _ = await store.capture(items)
+    async with store.factory.begin() as db:
+        parents = [i for i in await links(db, scope.snapshot_id) if i.item_type == "TEAMS_CHAT_MESSAGE"]
+        resolved = await export_scope.resolve(db, resource_id=scope.resource_id,
+            snapshot_ids=[scope.snapshot_id], thread_path=None, item_ids=[i.id for i in parents])
+        descriptors = [resolved.hosted_map[mid][0] for mid in ("message-alpha", "message-beta")]
+        assert [h["hc_id"] for h in descriptors] == ["1", "1"]
+        assert [h.get("archive_key") for h in descriptors] == [
+            qualified_chat_item_key(scope.chat_id, "CHAT_HOSTED_CONTENT", "1", mid)
+            for mid in ("message-alpha", "message-beta")]
+        assert descriptors[0]["archive_key"] != descriptors[1]["archive_key"]
 
 
 async def test_browse_detail_and_search_return_captured_payloads(store, snapshot_api):

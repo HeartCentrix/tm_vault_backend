@@ -24,7 +24,7 @@ from workers.chat_export_worker.progress import publish
 from workers.chat_export_worker.scope import resolve
 from workers.chat_export_worker.render.normalizer import normalize_messages
 from workers.chat_export_worker.packager.thread_packager import (
-    ThreadPackager, AttachmentSource, _safe_name,
+    ThreadPackager, AttachmentSource, _safe_name, _hosted_archive_key,
 )
 
 log = logging.getLogger("chat-export.thread")
@@ -190,9 +190,9 @@ async def _run_pipeline(sess, job_id, spec, scope, job, *, read_lease=None) -> N
     #
     # Two layout-dependent shapes (mirrors packager._add paths exactly):
     #   single_thread (HTML at zip root, /{tsafe}.html):
-    #     <img src="./{tsafe}-attachments/inline/{hc_id}{ext}">
+    #     <img src="./{tsafe}-attachments/inline/{archive_key}{ext}">
     #   per_message (HTML at /per-message/{tsafe}/{ext_id}/{ext_id}.html):
-    #     <img src="./attachments/inline/{hc_id}{ext}">
+    #     <img src="./attachments/inline/{archive_key}{ext}">
     #
     # tsafe MUST be _safe_name(thread_name) — the same sanitiser the
     # packager applies. Pre-fix code used `thread_path.split('/')[-1]`
@@ -203,15 +203,15 @@ async def _run_pipeline(sess, job_id, spec, scope, job, *, read_lease=None) -> N
     tsafe = _safe_name(thread_name)
     hosted_by_msg: dict = {}
     for mid, hs in scope.hosted_map.items():
-        msg_tsafe = _safe_name(mid)
         for h in hs:
+            archive_key = _hosted_archive_key(mid, h, thread_path=scope.thread_path)
             if scope.layout == "single_thread":
-                local_path = f"./{tsafe}-attachments/inline/{h['hc_id']}{h.get('ext', '.bin')}"
+                local_path = f"./{tsafe}-attachments/inline/{archive_key}{h.get('ext', '.bin')}"
             else:
                 # per_message: HTML lives in
                 # per-message/{tsafe}/{ext_id}/, attachments dir
                 # is one level deeper. Relative-from-HTML.
-                local_path = f"./attachments/inline/{h['hc_id']}{h.get('ext', '.bin')}"
+                local_path = f"./attachments/inline/{archive_key}{h.get('ext', '.bin')}"
             hosted_by_msg.setdefault(mid, []).append({
                 "hc_id": h["hc_id"],
                 "local_path": local_path,

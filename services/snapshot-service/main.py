@@ -4429,7 +4429,7 @@ async def get_item_content(
         item = (await materialize_chat_items(db, [item]))[0]
         if item.blob_path:
             return await _catalogue_blob_response(db, item, download=download)
-        if item.item_type in {"CHAT_ATTACHMENT", "CHAT_HOSTED_CONTENT"} and not item.extra_data.get("inline_b64"):
+        if item.item_type in {"CHAT_ATTACHMENT", "CHAT_HOSTED_CONTENT"} and item.extra_data.get("inline_b64") is None:
             return {"source": "metadata", "content": item.extra_data}
 
     # Inline path: items with `extra_data.inline_b64` set carry their
@@ -4441,7 +4441,7 @@ async def get_item_content(
     _inline_b64 = _ed_for_inline.get("inline_b64")
     data: Optional[bytes] = None
     source: Optional[str] = None
-    if _inline_b64:
+    if _inline_b64 is not None:
         import base64 as _b64
         try:
             data = _b64.b64decode(_inline_b64)

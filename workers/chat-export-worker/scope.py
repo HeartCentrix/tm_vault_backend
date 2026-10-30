@@ -14,6 +14,7 @@ from sqlalchemy import select, text, tuple_
 from sqlalchemy.orm import aliased
 from shared.models import SnapshotItem, Snapshot, Resource, SnapshotChatInventory
 from shared.chat_catalogue import materialize_chat_items, ChatCatalogueIntegrityError
+from shared.chat_catalogue_identity import qualified_chat_item_key
 
 log = logging.getLogger("chat-export.scope")
 
@@ -95,6 +96,8 @@ async def _catalogue_scope(sess, msgs, *, layout, effective, catalogue_ids):
             att_map.setdefault(item.parent_external_id, []).append(descriptor)
         else:
             descriptor.update(hc_id=item.external_id,
+                archive_key=qualified_chat_item_key(meta.get("chat_id") or hydrated[0].extra_data["chatId"],
+                    "CHAT_HOSTED_CONTENT", item.external_id, item.parent_external_id),
                 ext=mimetypes.guess_extension(meta.get("content_type") or "application/octet-stream") or ".bin")
             hosted_map.setdefault(item.parent_external_id, []).append(descriptor)
     return ResolvedScope(layout, effective, hydrated, att_map, hosted_map,
