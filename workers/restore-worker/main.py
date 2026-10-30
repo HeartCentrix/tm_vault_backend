@@ -10,6 +10,9 @@ import json
 import uuid
 import zipfile
 import io
+import base64
+import hashlib
+import tempfile
 from datetime import datetime
 from typing import Dict, List, Any, Optional, Tuple, NamedTuple
 from pathlib import Path
@@ -68,6 +71,14 @@ _SIBLING_EXCLUDED_STATES = (
     SnapshotStatus.FAILED,
     SnapshotStatus.PENDING_DELETION,
 )
+
+
+class CatalogueExportCancelled(RuntimeError):
+    """The operator or another owner already terminalized this export."""
+
+
+def _catalogue_item(item):
+    return getattr(item, "chat_version_id", None) is not None or getattr(item, "_chat_inventory_format", None) == 1
 
 # Per-worker shared semaphores — bound Graph pressure across every
 # in-flight contact restore job on this process. Sized off settings so
@@ -781,6 +792,7 @@ class RestoreWorker:
             print(f"[{self.worker_id}] semaphore acquired job={job_id}", flush=True)
             async with async_session_factory() as session:
                 print(f"[{self.worker_id}] DB session opened job={job_id}", flush=True)
+                catalogue_operation = False
                 try:
                     # Drop CANCELLED messages at intake. Without this,
                     # update_job_status below reverses the user's cancel
@@ -794,7 +806,7 @@ class RestoreWorker:
                             if hasattr(_existing.status, "name")
                             else str(_existing.status)
                         )
-                        if _status_name == "CANCELLED":
+                        if _status_name in {"CANCELLED", "CANCELLING"}:
                             print(
                                 f"[{self.worker_id}] Skipping CANCELLED restore job {job_id}",
                                 flush=True,
@@ -850,6 +862,7 @@ class RestoreWorker:
                             folder_paths=spec.get("folderPaths") or [],
                             excluded_item_ids=spec.get("excludedItemIds") or [],
                         )
+                        catalogue_operation = any(_catalogue_item(item) for item in items_to_restore)
                         print(f"[{self.worker_id}] fetched {len(items_to_restore)} snapshot items job={job_id}", flush=True)
 
                         # Workload filter (from RestoreModal checkboxes). When spec.workloads is
@@ -863,7 +876,9 @@ class RestoreWorker:
                             before = len(items_to_restore)
                             items_to_restore = [
                                 it for it in items_to_restore
-                                if getattr(it, "item_type", None) in allowed
+                                if getattr(it, "item_type", None) in allowed or (
+                                    "Chats" in workloads and _catalogue_item(it) and
+                                    it.item_type in {"CHAT_ATTACHMENT", "CHAT_HOSTED_CONTENT"})
                             ]
                             print(f"[{self.worker_id}] Workload filter {workloads}: kept {len(items_to_restore)}/{before} items")
 
@@ -921,10 +936,20 @@ class RestoreWorker:
                         flush=True,
                     )
 
+                except CatalogueExportCancelled:
+                    await session.rollback()
+                    return
                 except Exception as e:
+                    from shared.chat_catalogue import ChatCatalogueIntegrityError
                     await session.rollback()
                     try:
-                        await self.handle_restore_failure(session, job_id, e)
+                        fenced = catalogue_operation or isinstance(e, ChatCatalogueIntegrityError)
+                        if fenced:
+                            persisted = await self.handle_restore_failure(session, job_id, e, catalogue_fenced=True)
+                        else:
+                            persisted = await self.handle_restore_failure(session, job_id, e)
+                        if fenced and persisted is False:
+                            return
                         # This commit is what actually lands the FAILED
                         # status + error_message. Without it the mutations
                         # are discarded when the `async with` session
@@ -992,7 +1017,9 @@ class RestoreWorker:
             stmt = select(SnapshotItem).where(
                 SnapshotItem.id.in_([uuid.UUID(iid) for iid in item_ids])
             )
-            return (await session.execute(stmt)).scalars().all()
+            rows = (await session.execute(stmt)).scalars().all()
+            return await self._materialize_catalogue_selection(session, rows, snapshot_ids=snapshot_ids,
+                excluded_item_ids=excluded_item_ids)
 
         if not snapshot_ids:
             return []
@@ -1015,8 +1042,13 @@ class RestoreWorker:
         #   - folder_paths-filtered exports (the user-reported bug)
         #   - item_ids-filtered exports when combined with folder_paths
         sibling_ids: set = set()
+        catalogue_ids = set()
         if picked_rows:
             for picked in picked_rows:
+                if (picked.extra_data or {}).get("chat_inventory_format") == 1:
+                    self._require_catalogue_restore_point(picked)
+                    catalogue_ids.add(picked.id)
+                    continue
                 rows = (
                     await session.execute(
                         select(Snapshot.id).where(
@@ -1027,7 +1059,7 @@ class RestoreWorker:
                     )
                 ).all()
                 sibling_ids.update(r[0] for r in rows)
-        if not sibling_ids:
+        if not sibling_ids and not catalogue_ids:
             sibling_ids = set(picked_uuids)
 
         # Build the newest-wins base query over all siblings.
@@ -1060,7 +1092,13 @@ class RestoreWorker:
             if clauses:
                 base_stmt = base_stmt.where(or_(*clauses))
 
-        rows = (await session.execute(base_stmt)).scalars().all()
+        rows = list((await session.execute(base_stmt)).scalars().all()) if sibling_ids else []
+        if catalogue_ids:
+            exact = select(SnapshotItem).where(SnapshotItem.snapshot_id.in_(catalogue_ids))
+            if folder_paths or item_ids:
+                if clauses:
+                    exact = exact.where(or_(*clauses))
+            rows.extend((await session.execute(exact)).scalars().all())
 
         # Excluded-id filtering happens client-side after newest-wins —
         # excluded ids reference a specific row, not a logical item.
@@ -1068,7 +1106,50 @@ class RestoreWorker:
             excluded_uuids = {uuid.UUID(iid) for iid in excluded_item_ids}
             rows = [r for r in rows if r.id not in excluded_uuids]
 
-        return rows
+        return await self._materialize_catalogue_selection(session, rows, snapshot_ids=snapshot_ids,
+            excluded_item_ids=excluded_item_ids)
+
+    @staticmethod
+    def _require_catalogue_restore_point(snapshot):
+        from shared.chat_catalogue import ChatCatalogueIntegrityError
+        extra = snapshot.extra_data or {}
+        if (snapshot.status not in {SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL} or
+                extra.get("cancelled_at") or extra.get("finalize_cancelled")):
+            raise ChatCatalogueIntegrityError("selected catalogue snapshot is failed, cancelled or unavailable")
+
+    async def _materialize_catalogue_selection(self, session, rows, *, snapshot_ids=None, excluded_item_ids=None,
+            include_children=True):
+        """Hydrate exact owned versions and include only selected parents' children."""
+        from shared.chat_catalogue import materialize_chat_items, ChatCatalogueIntegrityError
+        from sqlalchemy import tuple_
+        if not rows:
+            return []
+        snapshots = {s.id: s for s in (await session.execute(select(Snapshot).where(
+            Snapshot.id.in_({item.snapshot_id for item in rows})))).scalars().all()}
+        catalogue_ids = {sid for sid, snap in snapshots.items() if (snap.extra_data or {}).get("chat_inventory_format") == 1}
+        if not catalogue_ids:
+            return rows
+        if snapshot_ids and not catalogue_ids <= {uuid.UUID(str(sid)) for sid in snapshot_ids}:
+            raise ChatCatalogueIntegrityError("selected catalogue item is outside the requested snapshot scope")
+        for sid in catalogue_ids:
+            self._require_catalogue_restore_point(snapshots[sid])
+        parents = {(item.snapshot_id, item.external_id) for item in rows if item.snapshot_id in catalogue_ids and
+            item.item_type in {"TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"}}
+        all_rows = {item.id: item for item in rows}
+        pairs = sorted(parents, key=lambda pair: (str(pair[0]), pair[1])) if include_children else []
+        for start in range(0, len(pairs), 500):
+            children = (await session.execute(select(SnapshotItem).where(
+                tuple_(SnapshotItem.snapshot_id, SnapshotItem.parent_external_id).in_(pairs[start:start + 500]),
+                SnapshotItem.item_type.in_(["CHAT_ATTACHMENT", "CHAT_HOSTED_CONTENT"])))).scalars().all()
+            all_rows.update((item.id, item) for item in children)
+        excluded = {uuid.UUID(str(value)) for value in (excluded_item_ids or [])}
+        physical = [item for item in all_rows.values() if item.snapshot_id in catalogue_ids and item.id not in excluded]
+        hydrated = []
+        for start in range(0, len(physical), 500):
+            hydrated.extend(await materialize_chat_items(session, physical[start:start + 500]))
+        for item in hydrated:
+            item._chat_inventory_format = 1
+        return [item for item in rows if item.snapshot_id not in catalogue_ids] + hydrated
 
     async def count_snapshot_items(
         self,
@@ -2371,9 +2452,27 @@ class RestoreWorker:
         session: AsyncSession,
         items: List[SnapshotItem],
         message: Dict,
-        spec: Dict
+        spec: Dict,
+        *, _catalogue_read_lease=None, _catalogue_archive=None,
     ) -> Dict:
         """Export items as downloadable ZIP file"""
+        if _catalogue_read_lease is None and any(_catalogue_item(item) for item in items):
+            from shared.chat_catalogue_gc import catalogue_read_pin
+            from shared.chat_catalogue import ChatCatalogueIntegrityError
+            snapshot_ids = {item.snapshot_id for item in items if _catalogue_item(item)}
+            async with catalogue_read_pin(async_session_factory, snapshot_ids=list(snapshot_ids),
+                    owner_kind="export", owner_id=uuid.UUID(str(message["jobId"]))) as lease:
+                physical = list((await session.execute(select(SnapshotItem).where(
+                    SnapshotItem.id.in_({item.id for item in items})).execution_options(populate_existing=True))).scalars().all())
+                if {item.id for item in physical} != {item.id for item in items}:
+                    raise ChatCatalogueIntegrityError("selected catalogue export items were removed")
+                prepared = await self._materialize_catalogue_selection(session, physical, include_children=False)
+                if any(_catalogue_item(item) and item.snapshot_id not in snapshot_ids for item in prepared):
+                    raise ChatCatalogueIntegrityError("catalogue export snapshot ownership changed")
+                with tempfile.TemporaryDirectory(prefix="catalogue-export-") as directory:
+                    with open(Path(directory) / "export.zip", "w+b") as archive:
+                        return await self.export_as_zip(session, prepared, message, spec,
+                            _catalogue_read_lease=lease, _catalogue_archive=archive)
         original_count = len(items)
         # Drop container-only rows early. They're tree-nav markers without
         # a blob; downstream pipelines treat them as corrupted files or
@@ -2768,7 +2867,7 @@ class RestoreWorker:
                 "manifest": result.get("manifest"),
             }
 
-        zip_buffer = io.BytesIO()
+        zip_buffer = _catalogue_archive if _catalogue_read_lease is not None else io.BytesIO()
         exported_count = 0
         failed_count = 0
 
@@ -2800,6 +2899,12 @@ class RestoreWorker:
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             for item in items:
                 try:
+                    if _catalogue_read_lease is not None:
+                        await self._check_catalogue_export_active(message, _catalogue_read_lease)
+                    if _catalogue_item(item):
+                        await self._write_catalogue_zip_item(zip_file, item, message, _catalogue_read_lease)
+                        exported_count += 1
+                        continue
                     metadata = self._get_item_metadata(item)
 
                     # Binary-backed items (package ZIPs) bypass the JSON-assuming loader
@@ -2913,6 +3018,8 @@ class RestoreWorker:
 
                     exported_count += 1
                 except Exception as e:
+                    if _catalogue_item(item) or isinstance(e, CatalogueExportCancelled):
+                        raise
                     print(f"[{self.worker_id}] Failed to export item {item.id}: {e}")
                     failed_count += 1
 
@@ -2959,8 +3066,12 @@ class RestoreWorker:
                 self._contacts_csv_rows = []
 
         zip_buffer.seek(0)
-        zip_bytes = zip_buffer.getvalue()
-        zip_size = len(zip_bytes)
+        if _catalogue_read_lease is not None:
+            zip_buffer.flush()
+            zip_size = Path(zip_buffer.name).stat().st_size
+        else:
+            zip_bytes = zip_buffer.getvalue()
+            zip_size = len(zip_bytes)
 
         # Upload via the async shard API so the event loop isn't blocked while
         # we ship potentially-hundreds-of-MB to Azure. Auto-create the
@@ -2972,10 +3083,14 @@ class RestoreWorker:
         from shared.azure_storage import azure_storage_manager
         shard = azure_storage_manager.get_default_shard()
         # upload_blob auto-creates the container via _ensure_container.
-        upload_result = await shard.upload_blob(
-            container_name, blob_name, zip_bytes,
-            metadata={"job_id": str(message.get("jobId") or ""), "exported_count": str(exported_count)},
-        )
+        upload_metadata = {"job_id": str(message.get("jobId") or ""), "exported_count": str(exported_count)}
+        if _catalogue_read_lease is not None:
+            await self._check_catalogue_export_active(message, _catalogue_read_lease)
+            upload_result = await self._upload_catalogue_export_artifact(shard, container_name, blob_name,
+                zip_buffer.name, zip_size, upload_metadata, message)
+            await self._check_catalogue_export_active(message, _catalogue_read_lease)
+        else:
+            upload_result = await shard.upload_blob(container_name, blob_name, zip_bytes, metadata=upload_metadata)
         if not (isinstance(upload_result, dict) and upload_result.get("success")):
             err = (upload_result or {}).get("error", "unknown") if isinstance(upload_result, dict) else upload_result
             raise RuntimeError(f"export ZIP upload failed: {err}")
@@ -2988,7 +3103,101 @@ class RestoreWorker:
             "download_url": f"/api/v1/jobs/export/{message.get('jobId')}/download",
             "blob_path": blob_name,
             "file_size": zip_size,
+            **({"chat_inventory_format": 1, "chat_catalogue_format": 1,
+                "container": container_name, "size_bytes": zip_size,
+                "backend_id": upload_result.get("backend_id") or getattr(shard, "backend_id", None),
+                "encryption_key_id": upload_result.get("encryption_key_id")} if _catalogue_read_lease is not None else {}),
         }
+
+    async def _upload_catalogue_export_artifact(self, shard, container, path, filename, size, metadata, message):
+        """Default export route with explicit tenant crypto; never mutate a shared facade."""
+        from shared.azure_storage import upload_blob_with_retry_from_file, _StoreFacade
+        from shared.chat_catalogue import ChatCatalogueIntegrityError
+        backend_id = getattr(shard, "backend_id", None)
+        if not backend_id:
+            raise ChatCatalogueIntegrityError("catalogue export target backend is unavailable")
+        store = getattr(shard, "_store", None)
+        if store is not None:
+            from shared.storage.router import router
+            # The default facade can contain a default/default shard clone.
+            # The recorded artifact route and downloader use the base store.
+            store = router.get_store_by_id(str(backend_id))
+            shard = _StoreFacade(store)
+        if getattr(store, "kind", None) != "seaweedfs":
+            result = await upload_blob_with_retry_from_file(container, path, filename,
+                shard=shard, file_size=size, metadata=metadata)
+            return {**result, "backend_id": str(backend_id)}
+        from shared.chat_capture_storage import require_catalogue_write_encryption, _stored_encryption
+        async with async_session_factory.begin() as session:
+            required = await require_catalogue_write_encryption(session, store)
+            tenant_id = await session.scalar(select(Job.tenant_id).where(Job.id == uuid.UUID(str(message["jobId"]))))
+            if tenant_id is None:
+                raise ChatCatalogueIntegrityError("catalogue export target has no owned tenant for encryption")
+        await store.ensure_container(container)
+        info = await store.upload_from_file(container, path, filename, size,
+            metadata={**metadata, "tenant_id": str(tenant_id), "plaintext_size": str(size)},
+            overwrite=False, tenant_id=str(tenant_id))
+        if (str(info.backend_id), info.container, info.path) != (str(store.backend_id), container, path):
+            raise ChatCatalogueIntegrityError("catalogue export upload receipt differs from its selected target")
+        key_id, _ = await _stored_encryption(store, container, path, encryption_required=required)
+        return {"success": True, "backend_id": str(info.backend_id), "encryption_key_id": key_id}
+
+    async def _check_catalogue_export_active(self, message, lease):
+        lease.assert_valid()
+        async with async_session_factory() as session:
+            status = await session.scalar(select(Job.status).where(Job.id == uuid.UUID(str(message["jobId"]))))
+        if status not in {JobStatus.RUNNING, JobStatus.RETRYING}:
+            raise CatalogueExportCancelled("catalogue export is no longer active")
+
+    async def _write_catalogue_zip_item(self, archive, item, message, lease):
+        from shared.chat_catalogue import ChatCatalogueIntegrityError
+        from shared.chat_catalogue_identity import qualified_chat_item_key
+        from shared.storage.router import router
+        if lease is None:
+            raise ChatCatalogueIntegrityError("catalogue export has no read lease")
+        metadata = self._get_item_metadata(item)
+        child = item.item_type in {"CHAT_ATTACHMENT", "CHAT_HOSTED_CONTENT"}
+        chat_id = metadata.get("chat_id") if child else metadata.get("chatId")
+        key = qualified_chat_item_key(chat_id, item.item_type, item.external_id,
+            item.parent_external_id if child else None)
+        base = f"catalogue/{item.snapshot_id}/{key}"
+        if not child:
+            raw = metadata.get("raw")
+            if not isinstance(raw, dict):
+                raise ChatCatalogueIntegrityError("captured message payload is unavailable")
+            archive.writestr(base + ".json", json.dumps(raw, ensure_ascii=False, indent=2))
+            return
+        inline = metadata.get("inline_b64")
+        if inline is None and not item.blob_path:
+            content_type = metadata.get("content_type") or ""
+            pointer = content_type in {"messageReference", "forwardedMessageReference", "meetingReference"}
+            card = content_type.startswith("application/vnd.microsoft.card.")
+            if (metadata.get("resolved") or item.item_type == "CHAT_HOSTED_CONTENT" or
+                    (not (pointer or card) and (metadata.get("content_url") or content_type in {"reference", "fileAttachment"}))):
+                raise ChatCatalogueIntegrityError("required captured attachment bytes are unavailable")
+            archive.writestr(base + ".metadata.json", json.dumps({"captured_attachment_metadata": metadata},
+                ensure_ascii=False, indent=2))
+            return
+        name = _safe_name(item.name or item.external_id)
+        target = base + "/" + ("attachment" if name in {".", ".."} else name)
+        if inline is not None:
+            data = base64.b64decode(inline, validate=True)
+            async def stream():
+                yield data
+            source = stream()
+        else:
+            if not metadata.get("container") or not item.backend_id:
+                raise ChatCatalogueIntegrityError("captured attachment storage route is incomplete")
+            source = router.get_store_by_id(str(item.backend_id)).download_stream(metadata["container"], item.blob_path)
+        checksum, size = hashlib.sha256(), 0
+        with archive.open(target, "w", force_zip64=True) as entry:
+            async for chunk in lease.guard(source):
+                await self._check_catalogue_export_active(message, lease)
+                entry.write(chunk)
+                checksum.update(chunk)
+                size += len(chunk)
+        if size != item.content_size or checksum.hexdigest() != metadata.get("sha256"):
+            raise ChatCatalogueIntegrityError("captured attachment checksum or size differs during export")
 
     async def _export_entra_zip(self, session, items, message, spec) -> Dict:
         """Section-grouped Entra ZIP export. Groups items by UI section
@@ -3133,6 +3342,10 @@ class RestoreWorker:
         spec: Dict
     ) -> Dict:
         """Export items as direct download (JSON)"""
+        if any(_catalogue_item(item) for item in items):
+            # Binary content belongs in a downloadable artifact; storing
+            # base64 in Job.result scales RAM and database size with it.
+            return await self.export_as_zip(session, items, message, spec)
         export_data = []
         failed_count = 0
         for item in items:
@@ -4911,6 +5124,19 @@ class RestoreWorker:
         blob_path but whose blob is unreadable raises so per-item
         handlers count the failure."""
         metadata = self._get_item_metadata(item)
+        if _catalogue_item(item):
+            if not isinstance(metadata.get("raw"), dict):
+                from shared.chat_catalogue_gc import catalogue_read_pin
+                async with catalogue_read_pin(async_session_factory, snapshot_ids=[item.snapshot_id]):
+                    async with async_session_factory() as session:
+                        physical = await session.get(SnapshotItem, item.id)
+                        prepared = await self._materialize_catalogue_selection(session, [physical] if physical else [], include_children=False)
+                        if not prepared:
+                            raise ValueError("selected catalogue item is unavailable")
+                        metadata = self._get_item_metadata(prepared[0])
+            if not isinstance(metadata.get("raw"), dict):
+                raise ValueError("captured binary attachments require descriptor-aware export")
+            return metadata["raw"]
         if metadata.get("raw"):
             return metadata["raw"]
 
@@ -4989,6 +5215,17 @@ class RestoreWorker:
         error_message: Optional[str] = None,
     ):
         """Update job status"""
+        if result and result.get("chat_inventory_format") == 1 and status in {JobStatus.COMPLETED, JobStatus.FAILED}:
+            values = {"status": status, "result": result, "completed_at": datetime.utcnow()}
+            if status == JobStatus.COMPLETED:
+                values["progress_pct"] = 100
+            if error_message:
+                values["error_message"] = error_message
+            changed = await session.execute(update(Job).where(Job.id == job_id,
+                Job.status.in_([JobStatus.RUNNING, JobStatus.RETRYING])).values(**values))
+            if not changed.rowcount:
+                raise CatalogueExportCancelled("catalogue export owner is no longer active")
+            return
         job = await session.get(Job, job_id)
         if job:
             job.status = status
@@ -5009,9 +5246,17 @@ class RestoreWorker:
         self,
         session: AsyncSession,
         job_id: uuid.UUID,
-        error: Exception
+        error: Exception,
+        *, catalogue_fenced=False,
     ):
         """Handle restore job failure"""
+        if catalogue_fenced:
+            from sqlalchemy import func
+            changed = await session.execute(update(Job).where(Job.id == job_id,
+                Job.status.in_([JobStatus.RUNNING, JobStatus.RETRYING])).values(
+                    attempts=func.coalesce(Job.attempts, 0) + 1, error_message=str(error),
+                    status=JobStatus.FAILED, completed_at=datetime.utcnow()))
+            return bool(changed.rowcount)
         job = await session.get(Job, job_id)
         if job:
             job.attempts += 1
