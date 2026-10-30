@@ -5774,6 +5774,20 @@ class BackupWorker:
 
         # ── Step 2: network work without a pinned session ─────────────────
         resource_type = resource.type.value if hasattr(resource.type, 'value') else str(resource.type)
+        if resource_type == "USER_CHATS" and (
+            getattr(settings, "CHAT_CATALOGUE_WRITER_ENABLED", False)
+            or (resource.extra_data or {}).get("chat_inventory_format") == 1
+        ):
+            # Manual single-resource jobs need the same active parent state as bulk jobs.
+            async with async_session_factory() as session:
+                await session.execute(sa_update(Job).where(
+                    Job.id == job_id, Job.tenant_id == resource.tenant_id,
+                    Job.status.in_([JobStatus.QUEUED, JobStatus.PENDING]),
+                ).values(status=JobStatus.RUNNING))
+                active_status = await session.scalar(select(Job.status).where(Job.id == job_id))
+                await session.commit()
+            if active_status not in {JobStatus.RUNNING, JobStatus.RETRYING}:
+                return
         # Per-resource-type handler_key gives each Tier 2 handler its own
         # Graph app from the round-robin pool, so 6 concurrent handlers on
         # the same tenant don't all queue behind one app's RPS budget.
@@ -30559,6 +30573,8 @@ class BackupWorker:
             # fresh snapshot's lease was already expired before the
             # extender's first 120s bump.
             from shared.lease import LEASE_TTL_S as _LEASE_TTL_S
+            from shared.storage.router import router as _snapshot_router
+            _snapshot_backend = _snapshot_router.active_backend_id()
             _now = datetime.utcnow()
             _lease_owner = getattr(getattr(self, "_heartbeat", None), "worker_uuid", None)
             _lease_expires = _now + timedelta(seconds=_LEASE_TTL_S)
@@ -30566,6 +30582,7 @@ class BackupWorker:
                 id=uuid.uuid4(),
                 resource_id=resource.id,
                 job_id=job_id,
+                backend_id=uuid.UUID(str(_snapshot_backend)) if _snapshot_backend else None,
                 type=snapshot_type,
                 status=SnapshotStatus.IN_PROGRESS,
                 started_at=_now,
