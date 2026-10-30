@@ -64,6 +64,19 @@ async def verify_catalogue_content(storage, content):
         raise ChatStorageCaptureError("retained catalogue content is unavailable or changed length")
 
 
+async def require_catalogue_write_encryption(session, store) -> bool:
+    """Capture requested new-write policy before an upload, not a runtime fallback."""
+    if store.kind != "seaweedfs":
+        return False
+    from shared.crypto import runtime
+    config = await session.get(EncryptionConfig, "singleton")
+    required = bool(config.enabled) if config is not None else os.getenv(
+        "BACKUP_ENCRYPTION_ENABLED", "false").strip().lower() in {"true", "1", "yes", "on"}
+    if required and not runtime.is_write_enabled():
+        raise ChatStorageCaptureError("configured encryption runtime is unavailable")
+    return required
+
+
 async def upload_capture_content(*, scope, lease, spooled, storage, session_factory,
                                  source_drive_id=None, source_item_id=None,
                                  source_etag=None, source_ctag=None):
@@ -78,14 +91,7 @@ async def upload_capture_content(*, scope, lease, spooled, storage, session_fact
         path = f"chat-catalogue/v1/{scope.tenant_id}/{object_id}"
         async def reserve(session):
             await renew_capture(session, lease=lease)
-            required = False
-            if store.kind == "seaweedfs":
-                from shared.crypto import runtime
-                config = await session.get(EncryptionConfig, "singleton")
-                required = bool(config.enabled) if config is not None else os.getenv(
-                    "BACKUP_ENCRYPTION_ENABLED", "false").strip().lower() in {"true", "1", "yes", "on"}
-                if required and not runtime.is_write_enabled():
-                    raise ChatStorageCaptureError("configured encryption runtime is unavailable")
+            required = await require_catalogue_write_encryption(session, store)
             now = await session.scalar(select(func.clock_timestamp()))
             deadline = now + timedelta(seconds=UPLOAD_TIMEOUT_SECONDS)
             session.add(ChatBlobObject(id=object_id, tenant_id=scope.tenant_id,
