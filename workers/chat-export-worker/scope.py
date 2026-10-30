@@ -10,9 +10,10 @@ before handing the list to the renderer.
 from dataclasses import dataclass
 import logging
 import mimetypes
-from sqlalchemy import select, text
+from sqlalchemy import select, text, tuple_
 from sqlalchemy.orm import aliased
-from shared.models import SnapshotItem, Snapshot, Resource
+from shared.models import SnapshotItem, Snapshot, Resource, SnapshotChatInventory
+from shared.chat_catalogue import materialize_chat_items, ChatCatalogueIntegrityError
 
 log = logging.getLogger("chat-export.scope")
 
@@ -24,6 +25,80 @@ class ResolvedScope:
     messages: list
     attachment_map: dict
     hosted_map: dict
+    catalogue_snapshot_ids: tuple = ()
+
+
+async def _catalogue_scope(sess, msgs, *, layout, effective, catalogue_ids):
+    if any(m.snapshot_id not in catalogue_ids for m in msgs):
+        raise ValueError("AMBIGUOUS_CAPTURE_VERSIONS")
+    selected_chats = {(m.extra_data or {}).get("chat_id") for m in msgs}
+    wanted = {(m.snapshot_id, (m.extra_data or {}).get("chat_id")) for m in msgs}
+    inventory_rows = (await sess.execute(select(SnapshotChatInventory.snapshot_id, SnapshotChatInventory.chat_id,
+        SnapshotChatInventory.inventory_id).where(SnapshotChatInventory.snapshot_id.in_(catalogue_ids),
+            SnapshotChatInventory.chat_id.in_(selected_chats)))).all()
+    if None in selected_chats or {(sid, cid) for sid, cid, _ in inventory_rows} != wanted:
+        raise ChatCatalogueIntegrityError("selected message has no published captured inventory")
+    inventories = {}
+    for _, chat_id, inventory_id in inventory_rows:
+        inventories.setdefault(chat_id, set()).add(inventory_id)
+    if any(len(versions) > 1 for versions in inventories.values()):
+        raise ValueError("AMBIGUOUS_CAPTURE_VERSIONS")
+    physical = {(m.snapshot_id, m.external_id) for m in msgs}
+    hydrated = []
+    for start in range(0, len(msgs), 500):
+        hydrated.extend(await materialize_chat_items(sess, msgs[start:start + 500]))
+    if len({m.extra_data.get("chatId") for m in hydrated}) > 1:
+        raise ValueError("MULTI_THREAD_NOT_SUPPORTED_YET")
+    # Identical inventories selected through multiple snapshots need one copy.
+    by_version = {}
+    for item in hydrated:
+        by_version.setdefault(item.chat_version_id, item)
+    hydrated = list(by_version.values())
+    children = []
+    pairs = sorted(physical, key=lambda p: (str(p[0]), p[1]))
+    for start in range(0, len(pairs), 500):
+        batch = list((await sess.scalars(select(SnapshotItem).where(
+            SnapshotItem.item_type.in_(["CHAT_ATTACHMENT", "CHAT_HOSTED_CONTENT"]),
+            tuple_(SnapshotItem.snapshot_id, SnapshotItem.parent_external_id).in_(pairs[start:start + 500])))).all())
+        children.extend(await materialize_chat_items(sess, batch))
+    att_map, hosted_map, seen = {}, {}, set()
+    for item in children:
+        if item.chat_version_id in seen:
+            continue
+        seen.add(item.chat_version_id)
+        meta = item.extra_data or {}
+        metadata_bytes = None
+        if not meta.get("resolved"):
+            content_type = meta.get("content_type") or ""
+            pointer = content_type in {"messageReference", "forwardedMessageReference", "meetingReference"}
+            card = content_type.startswith("application/vnd.microsoft.card.")
+            if item.item_type == "CHAT_HOSTED_CONTENT" or (
+                    not (pointer or card) and (meta.get("content_url") or content_type in {"reference", "fileAttachment"})):
+                raise ChatCatalogueIntegrityError("required captured attachment bytes are missing")
+            import json
+            metadata_bytes = json.dumps({"captured_attachment_metadata": meta}, sort_keys=True,
+                ensure_ascii=False, separators=(",", ":")).encode()
+        descriptor = {"name": item.name or item.external_id, "blob_path": item.blob_path,
+            "content_type": meta.get("content_type"), "size": item.content_size or 0,
+            "inline_b64": meta.get("inline_b64"), "backend_id": str(item.backend_id),
+            "container": meta.get("container"), "encryption_key_id": item.encryption_key_id,
+            "sha256": meta.get("sha256"), "object_id": meta.get("object_id"),
+            "snapshot_id": str(item.snapshot_id), "item_id": str(item.id),
+            "catalogue": True}
+        if metadata_bytes is not None:
+            import base64
+            import hashlib
+            descriptor.update(name=descriptor["name"] + ".metadata.json", blob_path=None,
+                inline_b64=base64.b64encode(metadata_bytes).decode(), content_type="application/json",
+                sha256=hashlib.sha256(metadata_bytes).hexdigest(), size=len(metadata_bytes))
+        if item.item_type == "CHAT_ATTACHMENT":
+            att_map.setdefault(item.parent_external_id, []).append(descriptor)
+        else:
+            descriptor.update(hc_id=item.external_id,
+                ext=mimetypes.guess_extension(meta.get("content_type") or "application/octet-stream") or ".bin")
+            hosted_map.setdefault(item.parent_external_id, []).append(descriptor)
+    return ResolvedScope(layout, effective, hydrated, att_map, hosted_map,
+        tuple(sorted(catalogue_ids, key=str)))
 
 
 async def resolve(sess, *, resource_id, snapshot_ids, thread_path: str | None,
@@ -61,6 +136,8 @@ async def resolve(sess, *, resource_id, snapshot_ids, thread_path: str | None,
              .where(Sn.resource_id.in_(resource_ids))
              .where(SnapshotItem.id.in_(item_ids))
              .order_by(SnapshotItem.created_at.asc()))
+        if snapshot_ids:
+            q = q.where(SnapshotItem.snapshot_id.in_(snapshot_ids))
         msgs = list((await sess.execute(q)).scalars())
         paths = {m.folder_path for m in msgs}
         if len(paths) > 1:
@@ -69,6 +146,15 @@ async def resolve(sess, *, resource_id, snapshot_ids, thread_path: str | None,
             raise ValueError("SCOPE_EMPTY")
         effective = next(iter(paths))
         layout = "per_message"
+
+    if msgs:
+        formats = (await sess.execute(select(Snapshot.id, Snapshot.extra_data)
+            .where(Snapshot.id.in_({m.snapshot_id for m in msgs})))).all()
+        catalogue_ids = {sid for sid, metadata in formats
+            if isinstance(metadata, dict) and metadata.get("chat_inventory_format") == 1}
+        if catalogue_ids:
+            return await _catalogue_scope(sess, msgs, layout=layout, effective=effective,
+                catalogue_ids=catalogue_ids)
 
     # Hydrate each message's raw payload from chat_thread_messages. The
     # renderer expects ``extra_data['raw']`` to carry the full Graph

@@ -26,7 +26,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, update, tuple_
 from sqlalchemy.orm import aliased
 
 from shared.config import settings
@@ -39,6 +39,7 @@ from shared.models import (
     Resource,
     Snapshot,
     SnapshotItem,
+    SnapshotChatInventory,
     Tenant,
 )
 from shared.security import get_current_user_from_token
@@ -69,6 +70,48 @@ class ChatExportRequest(BaseModel):
     exportFormat: str
     includeAttachments: bool = True
     force: bool = False
+
+
+async def _catalogue_estimate(sess, *, resource_ids, snapshot_ids, thread_path, item_ids, catalogue_ids):
+    stmt = select(SnapshotItem).join(Snapshot, Snapshot.id == SnapshotItem.snapshot_id).where(
+        Snapshot.resource_id.in_(resource_ids), SnapshotItem.item_type.in_(CHAT_MSG_TYPES))
+    if snapshot_ids:
+        stmt = stmt.where(SnapshotItem.snapshot_id.in_(snapshot_ids))
+    stmt = stmt.where(SnapshotItem.folder_path == thread_path) if thread_path else stmt.where(SnapshotItem.id.in_(item_ids))
+    messages = list((await sess.scalars(stmt)).all())
+    if not messages:
+        raise HTTPException(400, detail={"error": "SCOPE_EMPTY"})
+    if any(m.snapshot_id not in catalogue_ids or m.chat_version_id is None for m in messages):
+        raise HTTPException(400, detail={"error": "AMBIGUOUS_CAPTURE_VERSIONS"})
+    paths = {m.folder_path for m in messages}
+    if len(paths) > 1 or len({(m.extra_data or {}).get("chat_id") for m in messages}) > 1:
+        raise HTTPException(400, detail={"error": "MULTI_THREAD_NOT_SUPPORTED_YET"})
+    selected_chats = {(m.extra_data or {}).get("chat_id") for m in messages}
+    wanted = {(m.snapshot_id, (m.extra_data or {}).get("chat_id")) for m in messages}
+    associations = (await sess.execute(select(SnapshotChatInventory.snapshot_id,
+        SnapshotChatInventory.chat_id, SnapshotChatInventory.inventory_id)
+        .where(SnapshotChatInventory.snapshot_id.in_({m.snapshot_id for m in messages}),
+            SnapshotChatInventory.chat_id.in_(selected_chats)))).all()
+    if None in selected_chats or {(sid, cid) for sid, cid, _ in associations} != wanted:
+        raise HTTPException(409, detail={"error": "CAPTURE_INTEGRITY_GAP"})
+    inventories = {}
+    for _, chat_id, inventory_id in associations:
+        inventories.setdefault(chat_id, set()).add(inventory_id)
+    if any(len(ids) > 1 for ids in inventories.values()):
+        raise HTTPException(400, detail={"error": "AMBIGUOUS_CAPTURE_VERSIONS"})
+    versions = {m.chat_version_id: m.content_size or 0 for m in messages}
+    pairs = list({(m.snapshot_id, m.external_id) for m in messages})
+    children = {}
+    for start in range(0, len(pairs), 500):
+        rows = (await sess.execute(select(SnapshotItem.chat_version_id, SnapshotItem.content_size).where(
+            SnapshotItem.item_type.in_(["CHAT_ATTACHMENT", "CHAT_HOSTED_CONTENT"]),
+            tuple_(SnapshotItem.snapshot_id, SnapshotItem.parent_external_id).in_(pairs[start:start + 500])))).all()
+        for version_id, size in rows:
+            if version_id is None:
+                raise HTTPException(409, detail={"error": "CAPTURE_INTEGRITY_GAP"})
+            children[version_id] = size or 0
+    return len(versions), sum(versions.values()) + sum(children.values()), (
+        "single_thread" if thread_path else "per_message"), next(iter(paths))
 
 
 async def _resolve_counts(
@@ -163,6 +206,17 @@ async def _resolve_counts(
     msg_rows = (await sess.execute(ext_ids_q)).all()
     ext_ids = [r[0] for r in msg_rows]
     msg_tenant_ids = {r[1] for r in msg_rows if r[1] is not None}
+
+    selected_ids = snapshot_uuids
+    if not selected_ids and item_uuids:
+        selected_ids = list((await sess.scalars(select(SnapshotItem.snapshot_id).where(
+            SnapshotItem.id.in_(item_uuids)).distinct())).all())
+    formats = (await sess.execute(select(Snapshot.id, Snapshot.extra_data).where(Snapshot.id.in_(selected_ids)))).all()
+    catalogue_ids = {sid for sid, metadata in formats
+        if isinstance(metadata, dict) and metadata.get("chat_inventory_format") == 1}
+    if catalogue_ids:
+        return await _catalogue_estimate(sess, resource_ids=resource_uuids, snapshot_ids=snapshot_uuids,
+            thread_path=thread_path, item_ids=item_uuids, catalogue_ids=catalogue_ids)
 
     att_size = 0
     if ext_ids:

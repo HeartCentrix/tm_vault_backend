@@ -13,11 +13,12 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, Depends, HTTPException, Query, Body
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, func, distinct, and_, or_, text, String
+from sqlalchemy import select, func, distinct, and_, or_, text, String, cast, DateTime
 from sqlalchemy.orm import aliased
 
 from shared.database import get_db, init_db, close_db, AsyncSession, async_session_factory
-from shared.models import Snapshot, SnapshotItem, Resource, SnapshotType, SnapshotStatus, ResourceType, ResourceStatus, Job
+from shared.models import Snapshot, SnapshotItem, Resource, SnapshotType, SnapshotStatus, ResourceType, ResourceStatus, Job, ChatItemVersion, SnapshotChatInventory, ChatCaptureAttempt
+from shared.chat_catalogue import materialize_chat_items, ChatCatalogueIntegrityError
 from shared.snapshot_reuse import resolve_snapshot_items_target, SnapshotNotFound
 from shared.audit import internal_audit_headers
 from shared.config import settings
@@ -336,6 +337,244 @@ def _item_to_response(item: SnapshotItem) -> SnapshotItemResponse:
         createdAt=item.created_at.isoformat() if item.created_at else "",
         blobPath=item.blob_path,
     )
+
+
+async def _catalogue_snapshot(db, snapshot_id, *, resolve_chat_sibling=False):
+    """Select one captured restore point; a catalogue never unions history."""
+    source = await db.get(Snapshot, UUID(str(snapshot_id)))
+    if source is None:
+        raise HTTPException(404, detail="Snapshot not found")
+    if (source.extra_data or {}).get("chat_inventory_format") == 1:
+        if source.status == SnapshotStatus.PENDING_DELETION:
+            raise HTTPException(404, detail="Snapshot is being deleted")
+        return source
+    if not resolve_chat_sibling:
+        return None
+    resource = await db.get(Resource, source.resource_id)
+    if resource is not None and resource.type == ResourceType.USER_CHATS:
+        return source
+    if resource is None:
+        return None
+    parent_id = resource.id if resource.type == ResourceType.ENTRA_USER else resource.parent_resource_id
+    if parent_id is None:
+        return None
+    sibling_id = await db.scalar(select(Resource.id).where(
+        Resource.parent_resource_id == parent_id, Resource.type == ResourceType.USER_CHATS,
+        Resource.tenant_id == resource.tenant_id))
+    if sibling_id is None:
+        return None
+    candidates = select(Snapshot).where(Snapshot.resource_id == sibling_id,
+        Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL]))
+    selected = await db.scalar(candidates.where(Snapshot.job_id == source.job_id)
+        .order_by(Snapshot.created_at.desc(), Snapshot.id.desc()).limit(1))
+    source_job = await db.get(Job, source.job_id) if source.job_id else None
+    batch_id = (source_job.spec or {}).get("batch_id") if source_job else None
+    if selected is None and batch_id:
+        selected = await db.scalar(candidates.join(Job, Job.id == Snapshot.job_id)
+            .where(Job.spec["batch_id"].as_string() == str(batch_id))
+            .order_by(Snapshot.created_at.desc(), Snapshot.id.desc()).limit(1))
+    if selected is None:
+        selected = await db.scalar(candidates.where(Snapshot.created_at <= source.created_at)
+            .order_by(Snapshot.created_at.desc(), Snapshot.id.desc()).limit(1))
+    if selected is None:
+        raise HTTPException(404, detail="No chat restore point exists for the selected backup")
+    return selected
+
+
+async def _assert_catalogue_links(db, snapshot):
+    bad = await db.scalar(select(SnapshotItem.id).outerjoin(ChatItemVersion,
+        ChatItemVersion.id == SnapshotItem.chat_version_id).where(SnapshotItem.snapshot_id == snapshot.id,
+        or_(ChatItemVersion.id.is_(None), ChatItemVersion.tenant_id != SnapshotItem.tenant_id,
+            ChatItemVersion.logical_key != SnapshotItem.external_id,
+            ChatItemVersion.item_type != SnapshotItem.item_type,
+            SnapshotItem.extra_data["chat_id"].as_string().is_(None),
+            ChatItemVersion.chat_id != SnapshotItem.extra_data["chat_id"].as_string())).limit(1))
+    if bad is not None:
+        raise ChatCatalogueIntegrityError("new-format snapshot link has no owned captured version")
+
+
+async def _catalogue_page(db, snapshot, *, page, size, item_type=None, chat_id=None,
+                          folder=None, query=None, messages_only=False):
+    # A nullable broken link must not vanish inside the version JOIN/filter.
+    await _assert_catalogue_links(db, snapshot)
+    stmt = select(SnapshotItem).join(ChatItemVersion,
+        ChatItemVersion.id == SnapshotItem.chat_version_id).where(SnapshotItem.snapshot_id == snapshot.id)
+    if messages_only:
+        stmt = stmt.where(SnapshotItem.item_type.in_(["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"]))
+    if item_type:
+        stmt = stmt.where(SnapshotItem.item_type == item_type)
+    if chat_id:
+        stmt = stmt.where(ChatItemVersion.chat_id == chat_id)
+    if folder is not None:
+        stmt = stmt.where(SnapshotItem.folder_path == folder)
+    if query:
+        stmt = stmt.where(or_(SnapshotItem.name.ilike(f"%{query}%"),
+            ChatItemVersion.graph_id.ilike(f"%{query}%"),
+            ChatItemVersion.payload["body"]["content"].as_string().ilike(f"%{query}%")))
+    total = await db.scalar(select(func.count()).select_from(stmt.order_by(None).subquery())) or 0
+    # Source-created timestamps are immutable; the item UUID breaks ties.
+    stmt = stmt.order_by(cast(ChatItemVersion.payload["createdDateTime"].as_string(), DateTime(timezone=True)).desc().nullslast(),
+        SnapshotItem.created_at.desc(), SnapshotItem.id.desc()).offset((page - 1) * size).limit(size)
+    links = list((await db.scalars(stmt)).all())
+    return await materialize_chat_items(db, links), total
+
+
+async def _catalogue_item_response(db, snapshot, *, page, size, item_type=None, folder=None, query=None):
+    items, total = await _catalogue_page(db, snapshot, page=page, size=size,
+        item_type=item_type, folder=folder, query=query)
+    return SnapshotItemListResponse(content=[_item_to_response(i) for i in items],
+        totalElements=total, totalPages=max(1, (total + size - 1) // size), size=size, number=page)
+
+
+async def _catalogue_groups(db, snapshot):
+    await _assert_catalogue_links(db, snapshot)
+    messages = ["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"]
+    rows = (await db.execute(select(SnapshotChatInventory.chat_id,
+        ChatCaptureAttempt.folder_path, func.count(SnapshotItem.id).label("count"),
+        func.max(cast(ChatItemVersion.payload["createdDateTime"].as_string(), DateTime(timezone=True))).label("last_message_at"))
+        .join(ChatCaptureAttempt, ChatCaptureAttempt.id == SnapshotChatInventory.capture_attempt_id)
+        .outerjoin(SnapshotItem, and_(SnapshotItem.snapshot_id == SnapshotChatInventory.snapshot_id,
+            SnapshotItem.extra_data["chat_id"].as_string() == SnapshotChatInventory.chat_id,
+            SnapshotItem.item_type.in_(messages)))
+        .outerjoin(ChatItemVersion, ChatItemVersion.id == SnapshotItem.chat_version_id)
+        .where(SnapshotChatInventory.snapshot_id == snapshot.id)
+        .group_by(SnapshotChatInventory.chat_id, ChatCaptureAttempt.folder_path)
+        .order_by(func.max(cast(ChatItemVersion.payload["createdDateTime"].as_string(), DateTime(timezone=True))).desc().nullslast(),
+            SnapshotChatInventory.chat_id))).all()
+    return [{"chatId": r.chat_id, "displayName": (r.folder_path or f"chats/{r.chat_id}").removeprefix("chats/"),
+        "folderPath": r.folder_path or f"chats/{r.chat_id}", "count": int(r.count),
+        "lastMessageAt": r.last_message_at.isoformat() if r.last_message_at else None} for r in rows]
+
+
+async def _catalogue_folders(db, snapshot, *, page, size, item_type=None):
+    await _assert_catalogue_links(db, snapshot)
+    stmt = select(SnapshotItem.folder_path.label("path"), func.count().label("count")).where(
+        SnapshotItem.snapshot_id == snapshot.id)
+    stmt = stmt.where(SnapshotItem.item_type == item_type) if item_type else stmt.where(
+        SnapshotItem.item_type.in_(["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"]))
+    stmt = stmt.group_by(SnapshotItem.folder_path)
+    total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+    rows = (await db.execute(stmt.order_by(SnapshotItem.folder_path).offset((page - 1) * size).limit(size))).all()
+    return {"content": [{"path": r.path or "", "count": int(r.count)} for r in rows],
+        "total": total, "page": page, "size": size, "hasMore": page * size < total}
+
+
+async def _catalogue_blob_response(db, item, *, download):
+    """Stream exact captured bytes while a durable object pin protects them."""
+    import hashlib
+    import mimetypes
+    from urllib.parse import quote
+    from starlette.background import BackgroundTask
+    from shared.chat_catalogue_gc import catalogue_read_pin
+    from shared.storage.router import router
+    meta = item.extra_data or {}
+    if not all(meta.get(key) for key in ("object_id", "container", "sha256")):
+        raise ChatCatalogueIntegrityError("captured content storage descriptor is incomplete")
+    manager = catalogue_read_pin(async_session_factory, snapshot_ids=[item.snapshot_id],
+        object_ids=[UUID(str(meta["object_id"]))])
+    lease = await manager.__aenter__()
+    closed = False
+    async def close_pin():
+        nonlocal closed
+        if not closed:
+            closed = True
+            await manager.__aexit__(None, None, None)
+    try:
+        store = router.get_store_by_id(str(item.backend_id))
+        properties = await store.get_properties(meta["container"], item.blob_path)
+        if properties is None:
+            raise HTTPException(404, detail="Captured content is missing from storage")
+        snapshot = await db.get(Snapshot, item.snapshot_id)
+        lease.assert_valid()
+    except BaseException:
+        await close_pin()
+        raise
+    declared = meta.get("content_type") or ""
+    media = declared if "/" in declared else mimetypes.guess_type(item.name or "")[0]
+    media = media or "application/octet-stream"
+    safe_image = media.lower().split(";", 1)[0] in {"image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp"}
+    headers = {"X-Content-Type-Options": "nosniff", "Content-Length": str(item.content_size or 0),
+        "ETag": f'"{meta["sha256"]}"', "Cache-Control": "private, max-age=3600, immutable"}
+    if not safe_image:
+        media = "application/octet-stream"
+        headers["Content-Disposition"] = "attachment"
+    if download:
+        filename = item.name or f"item-{item.id}"
+        ascii_name = filename.encode("ascii", "replace").decode().replace('"', "'").replace("\r", "").replace("\n", "")
+        headers["Content-Disposition"] = f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}"
+    async def stream():
+        digest, size, pending = hashlib.sha256(), 0, None
+        try:
+            async for chunk in lease.guard(store.download_stream(meta["container"], item.blob_path)):
+                if not chunk:
+                    continue
+                digest.update(chunk)
+                size += len(chunk)
+                if size > item.content_size:
+                    raise ChatCatalogueIntegrityError("captured content length differs during download")
+                if pending is not None:
+                    yield pending
+                pending = chunk
+            if size != item.content_size or digest.hexdigest() != meta["sha256"]:
+                raise ChatCatalogueIntegrityError("captured content checksum differs during download")
+            lease.assert_valid()
+            # Withhold the final chunk until integrity is known; failed streams
+            # cannot satisfy Content-Length with corrupt captured bytes.
+            if pending is not None:
+                yield pending
+            if download:
+                await _emit_download_audit(action="FILE_DOWNLOADED", outcome="SUCCESS",
+                    tenant_id=str(item.tenant_id), resource_id=str(snapshot.resource_id) if snapshot else None,
+                    resource_type=item.item_type, snapshot_id=str(item.snapshot_id),
+                    details={"itemId": str(item.id), "filename": item.name, "byteSize": size,
+                        "sha256": meta["sha256"]})
+        finally:
+            await close_pin()
+    return StreamingResponse(stream(), media_type=media, headers=headers, background=BackgroundTask(close_pin))
+
+
+async def _catalogue_message_response(db, snapshot, *, page, size, chat_id=None, folder=None, search=None):
+    items, total = await _catalogue_page(db, snapshot, page=page, size=size,
+        chat_id=chat_id, folder=folder, query=search, messages_only=True)
+    # Page-sized child load; links are joined by qualified physical message key.
+    ids = [i.id for i in items]
+    parent = aliased(SnapshotItem)
+    children = list((await db.scalars(select(SnapshotItem).join(parent,
+        and_(parent.snapshot_id == SnapshotItem.snapshot_id,
+            parent.external_id == SnapshotItem.parent_external_id)).where(parent.id.in_(ids),
+        SnapshotItem.item_type == "CHAT_HOSTED_CONTENT"))).all()) if ids else []
+    child_items = await materialize_chat_items(db, children)
+    hosted = {}
+    for child in child_items:
+        meta = child.extra_data or {}
+        hosted[(meta.get("chat_id"), child.parent_external_id, child.external_id)] = str(child.id)
+    result = []
+    from urllib.parse import unquote
+    for item in items:
+        raw = (item.extra_data or {}).get("raw") or {}
+        raw = dict(raw)
+        body = dict(raw.get("body") or {})
+        cid = item.extra_data.get("chatId") or item.parent_external_id
+        def replace_hosted(match):
+            child_id = hosted.get((cid, item.external_id, unquote(match.group(1))))
+            if child_id is None:
+                raise ChatCatalogueIntegrityError("captured message references missing hosted content")
+            return f"/api/v1/resources/snapshots/{snapshot.id}/items/{child_id}/content"
+        body["content"] = _HOSTED_CONTENT_RE.sub(replace_hosted, body.get("content") or "")
+        raw["body"] = body
+        sender = (raw.get("from") or {}).get("user") or {}
+        result.append({"id": str(item.id), "snapshotId": str(item.snapshot_id),
+            "externalId": item.external_id, "itemType": item.item_type,
+            "sender": sender.get("displayName") or "Unknown", "senderEmail": sender.get("userPrincipalName") or sender.get("id") or "",
+            "body": body.get("content") or "", "bodyContentType": body.get("contentType") or "text",
+            "date": raw.get("createdDateTime"), "chatTopic": (item.folder_path or f"chats/{cid}").removeprefix("chats/"),
+            "channelName": "", "folderPath": item.folder_path, "attachments": raw.get("attachments") or [],
+            "mentions": raw.get("mentions") or [], "isDeleted": bool(raw.get("deletedDateTime")) or bool(item.is_deleted),
+            "isReply": bool(raw.get("replyToId")), "contentSize": item.content_size or 0,
+            "createdAt": item.created_at.isoformat() if item.created_at else "", "name": sender.get("displayName") or "Unknown",
+            "metadata": {"raw": raw}})
+    return {"content": result, "totalElements": total, "totalPages": max(1, (total + size - 1) // size),
+        "size": size, "number": page}
 
 
 async def _get_power_bi_assembled_items(db: AsyncSession, snapshot_id: str) -> Optional[List[SnapshotItem]]:
@@ -711,6 +950,13 @@ async def get_snapshot_folders(
     Falling back inline like this avoids a one-time backfill migration and
     keeps the endpoint useful for snapshots taken before the folder_path
     plumbing landed."""
+    catalogue = await _catalogue_snapshot(db, snapshot_id,
+        resolve_chat_sibling=item_type in {"TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"})
+    if catalogue is not None:
+        if (catalogue.extra_data or {}).get("chat_inventory_format") == 1:
+            return await _catalogue_folders(db, catalogue, page=page, size=size, item_type=item_type)
+        snapshot_id = str(catalogue.id)
+
     # Archive folders are shared across kinds (one physical folder can hold
     # mail + contacts + events), so a kind-agnostic count would show the mail
     # total under the Contacts tab. Count per-category using the SAME MAPI-kind
@@ -982,6 +1228,10 @@ async def list_snapshot_items(
     itemType: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
+    catalogue = await _catalogue_snapshot(db, snapshot_id)
+    if catalogue is not None:
+        return await _catalogue_item_response(db, catalogue, page=page, size=size, item_type=itemType)
+
     assembled_items = await _get_power_bi_assembled_items(db, snapshot_id)
     if assembled_items is not None:
         filtered = [item for item in assembled_items if not itemType or item.item_type == itemType]
@@ -1045,6 +1295,14 @@ async def browse_snapshot_items(
     itemType: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
+    catalogue = await _catalogue_snapshot(db, snapshot_id)
+    if catalogue is not None:
+        if catalogue.resource_id != UUID(resource_id):
+            owner = await db.get(Resource, catalogue.resource_id)
+            if owner is None or owner.parent_resource_id != UUID(resource_id):
+                raise HTTPException(404, detail="Snapshot not found for resource")
+        return await _catalogue_item_response(db, catalogue, page=page, size=size, item_type=itemType)
+
     assembled_items = await _get_power_bi_assembled_items(db, snapshot_id)
     if assembled_items is not None:
         filtered = [item for item in assembled_items if not itemType or item.item_type == itemType]
@@ -1566,8 +1824,21 @@ async def search_snapshot_items(
     db: AsyncSession = Depends(get_db),
 ):
     """Search snapshot items for a resource with optional filters."""
+    catalogue = await _catalogue_snapshot(db, snapshot_id) if snapshot_id else None
+    if catalogue is not None:
+        if catalogue.resource_id != UUID(resource_id):
+            raise HTTPException(404, detail="Snapshot not found for resource")
+        return await _catalogue_item_response(db, catalogue, page=page, size=size,
+            item_type=item_type, folder=folder_path, query=query)
     resource = await db.get(Resource, UUID(resource_id))
     resource_type = resource.type.value if resource and hasattr(resource.type, "value") else (str(resource.type) if resource else "")
+    if not snapshot_id and resource_type == "USER_CHATS":
+        latest = await db.scalar(select(Snapshot).where(Snapshot.resource_id == resource.id,
+            Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL]))
+            .order_by(Snapshot.created_at.desc(), Snapshot.id.desc()).limit(1))
+        if latest is not None and (latest.extra_data or {}).get("chat_inventory_format") == 1:
+            return await _catalogue_item_response(db, latest, page=page, size=size,
+                item_type=item_type, folder=folder_path, query=query)
     if resource and resource_type == "POWER_BI":
         target_snapshot_id = snapshot_id
         if not target_snapshot_id:
@@ -1687,6 +1958,8 @@ async def get_snapshot_item_detail(snapshot_id: str, item_id: str, db: AsyncSess
     item = result.scalar_one_or_none()
     if not item:
         raise HTTPException(status_code=404, detail="Snapshot item not found")
+    if item.chat_version_id is not None or (await _catalogue_snapshot(db, snapshot_id)) is not None:
+        item = (await materialize_chat_items(db, [item]))[0]
     return _item_to_response(item)
 
 
@@ -2683,6 +2956,12 @@ async def list_snapshot_messages(
     Auto-resolves to the USER_CHATS sibling when the caller passes the
     ENTRA_USER parent or a non-chat sibling's snapshot id.
     """
+    catalogue = await _catalogue_snapshot(db, snapshot_id, resolve_chat_sibling=True)
+    if catalogue is not None:
+        if (catalogue.extra_data or {}).get("chat_inventory_format") == 1:
+            return await _catalogue_message_response(db, catalogue, page=page, size=size,
+                chat_id=chatId, folder=folder, search=search)
+        snapshot_id = str(catalogue.id)
     CHAT_TYPES = ("TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY")
     sibling_ids = await _resolve_sibling_snapshot_ids(
         db, snapshot_id, target_child_type=ResourceType.USER_CHATS,
@@ -3275,6 +3554,11 @@ async def list_snapshot_chat_groups(
     delta-only later run does not drop threads captured by an earlier
     full run.
     """
+    catalogue = await _catalogue_snapshot(db, snapshot_id, resolve_chat_sibling=True)
+    if catalogue is not None:
+        if (catalogue.extra_data or {}).get("chat_inventory_format") == 1:
+            return await _catalogue_groups(db, catalogue)
+        snapshot_id = str(catalogue.id)
     sibling_ids = await _resolve_sibling_snapshot_ids(
         db, snapshot_id, target_child_type=ResourceType.USER_CHATS,
     )
@@ -4138,6 +4422,16 @@ async def get_item_content(
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
 
+    if item.snapshot_id != UUID(snapshot_id):
+        raise HTTPException(status_code=404, detail="Item not found")
+    catalogue = await _catalogue_snapshot(db, snapshot_id)
+    if catalogue is not None:
+        item = (await materialize_chat_items(db, [item]))[0]
+        if item.blob_path:
+            return await _catalogue_blob_response(db, item, download=download)
+        if item.item_type in {"CHAT_ATTACHMENT", "CHAT_HOSTED_CONTENT"} and not item.extra_data.get("inline_b64"):
+            return {"source": "metadata", "content": item.extra_data}
+
     # Inline path: items with `extra_data.inline_b64` set carry their
     # bytes directly in the JSON column instead of in Azure Blob. This
     # covers EMAIL_ATTACHMENT / CHAT_ATTACHMENT / CHAT_HOSTED_CONTENT
@@ -4347,6 +4641,23 @@ async def get_item_attachments(
     # enumerate other snapshots' items by guessing a stray item_id.
     if parent.snapshot_id != _sid:
         raise HTTPException(status_code=404, detail="Item not found")
+
+    catalogue = await _catalogue_snapshot(db, snapshot_id)
+    if catalogue is not None:
+        if parent.chat_version_id is None:
+            raise ChatCatalogueIntegrityError("new-format message has no captured version")
+        children = list((await db.scalars(select(SnapshotItem).where(
+            SnapshotItem.snapshot_id == _sid,
+            SnapshotItem.parent_external_id == parent.external_id,
+            SnapshotItem.item_type == "CHAT_ATTACHMENT").order_by(SnapshotItem.name, SnapshotItem.id))).all())
+        items = await materialize_chat_items(db, children)
+        return [{"id": str(item.id), "name": item.name, "size": item.content_size or 0,
+            "kind": (item.extra_data or {}).get("attachment_kind"),
+            "contentType": (item.extra_data or {}).get("content_type"),
+            "isInline": bool((item.extra_data or {}).get("is_inline")),
+            "contentId": (item.extra_data or {}).get("content_id"),
+            "resolved": bool((item.extra_data or {}).get("resolved")),
+            "sourceUrl": (item.extra_data or {}).get("content_url")} for item in items]
 
     # Email and chat message external_id IS the Graph id — both attachment
     # kinds store that as parent_item_id. One endpoint serves both so the

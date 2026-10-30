@@ -47,7 +47,7 @@ def _unique_in_dir(name: str, used: set[str]) -> str:
 
 
 class AttachmentSource(Protocol):
-    async def open(self, blob_path: str) -> tuple[AsyncIterator[bytes], str, int]: ...
+    async def open(self, blob_path: str | dict) -> tuple[AsyncIterator[bytes], str, int]: ...
 
 
 @dataclass
@@ -77,7 +77,7 @@ class ThreadPackager:
             per_file.append({"path": path, "sha256": sha256(data).hexdigest(), "bytes": len(data)})
             total_bytes += len(data)
 
-        async def _add_stream(path: str, src_path: str) -> tuple[int, bool]:
+        async def _add_stream(path: str, src_path: str | dict) -> tuple[int, bool]:
             """Stream bytes from blob storage straight into a ZIP entry.
 
             Computes sha256 + total bytes on the fly so per_file stays
@@ -97,12 +97,20 @@ class ThreadPackager:
                         entry.write(chunk)
                         h.update(chunk)
                         total += len(chunk)
+                if isinstance(src_path, dict) and src_path.get("catalogue"):
+                    if total != src_path["size"] or h.hexdigest() != src_path["sha256"]:
+                        from shared.chat_catalogue import ChatCatalogueIntegrityError
+                        raise ChatCatalogueIntegrityError("captured attachment checksum differs during export")
                 per_file.append({
                     "path": path, "sha256": h.hexdigest(), "bytes": total,
                 })
                 total_bytes += total
                 return total, False
             except Exception as e:
+                if isinstance(src_path, dict) and src_path.get("catalogue"):
+                    # A new-format export cannot report success with substituted bytes.
+                    zf.close()
+                    raise
                 placeholder = (
                     f"[ATTACHMENT_MISSING]\nblob_path: {src_path}\nerror: {e!r}\n"
                     "This attachment was not available at export time.\n"
@@ -139,7 +147,7 @@ class ThreadPackager:
                     used_att_names.setdefault(att_dir, set()),
                 )
                 target = f"{att_dir}/{clean_name}"
-                written, missing = await _add_stream(target, att["blob_path"])
+                written, missing = await _add_stream(target, att if att.get("catalogue") else att["blob_path"])
                 if missing:
                     # Append a .MISSING marker file next to it so
                     # operators can spot the gap at a glance — the
@@ -164,7 +172,7 @@ class ThreadPackager:
             for hc in hosted_map.get(m.external_id, []):
                 ext = hc.get("ext", ".bin")
                 target = f"{att_dir}/inline/{hc['hc_id']}{ext}"
-                written, missing = await _add_stream(target, hc["blob_path"])
+                written, missing = await _add_stream(target, hc if hc.get("catalogue") else hc["blob_path"])
                 if missing:
                     _add(
                         f"{att_dir}/inline/{hc['hc_id']}.MISSING.txt",

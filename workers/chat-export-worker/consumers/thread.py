@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import tempfile
+from uuid import UUID
 import aio_pika
 from sqlalchemy import select, update
 
@@ -41,8 +42,38 @@ class BlobAttachmentSource(AttachmentSource):
     entry's compression buffer (~16 KiB).
     """
 
-    async def open(self, blob_path: str):
+    def __init__(self, *, read_lease=None):
+        self.read_lease = read_lease
+
+    async def open(self, blob_path: str | dict):
         from shared.azure_storage import azure_storage_manager
+
+        if isinstance(blob_path, dict):
+            import base64
+            import hashlib
+            from shared.chat_catalogue import ChatCatalogueIntegrityError
+            from shared.storage.router import router
+            captured = blob_path
+            if self.read_lease is not None:
+                self.read_lease.assert_valid()
+            if not captured.get("catalogue"):
+                raise ChatCatalogueIntegrityError("unknown captured attachment descriptor")
+            if captured.get("inline_b64") is not None:
+                data = base64.b64decode(captured["inline_b64"], validate=True)
+                if (len(data) != captured["size"] or
+                        hashlib.sha256(data).hexdigest() != captured.get("sha256")):
+                    raise ChatCatalogueIntegrityError("captured inline attachment checksum differs")
+                async def inline():
+                    yield data
+                return inline(), captured.get("content_type") or "application/octet-stream", len(data)
+            if not all(captured.get(key) for key in ("backend_id", "container", "blob_path", "sha256")):
+                raise ChatCatalogueIntegrityError("captured attachment storage route is incomplete")
+            store = router.get_store_by_id(str(captured["backend_id"]))
+            stream = store.download_stream(captured["container"], captured["blob_path"])
+            if self.read_lease is not None:
+                stream = self.read_lease.guard(stream)
+            return (stream,
+                captured.get("content_type") or "application/octet-stream", captured["size"])
 
         # Prefer the project's open_stream helper if it ever lands.
         # Today it doesn't exist, so we fall through to the
@@ -113,55 +144,39 @@ async def consume_thread(message: aio_pika.IncomingMessage) -> None:
                 log.info("job_skipped_terminal id=%s status=%s", job_id, job.status)
                 return
 
-            spec = job.spec or {}
-            try:
-                scope = await resolve(
-                    sess,
-                    resource_id=spec["resourceId"],
-                    snapshot_ids=spec["snapshotIds"],
-                    thread_path=spec.get("threadPath"),
-                    item_ids=spec.get("itemIds") or [],
-                )
-            except ValueError as e:
-                await _update_job(
-                    sess, job_id, status=JobStatus.FAILED,
-                    result={"error": {"code": str(e)}},
-                )
-                await publish(job_id, "error", {"code": str(e)})
-                return
-
-            # The rest of the pipeline (normalize → render → package → upload
-            # → sign) is wrapped in a try/except so an unexpected exception
-            # transitions the Job row to FAILED instead of leaving it stuck
-            # in RUNNING. RabbitMQ acks the message on exit (requeue=False
-            # on message.process) but does not touch the DB, so without
-            # this block the UI would poll forever after any failure.
-            try:
-                await _run_pipeline(sess, job_id, spec, scope, job)
-            except Exception as exc:
-                log.exception("job_failed id=%s", job_id)
-                # Discard whatever the pipeline left uncommitted so the
-                # session is usable again (a DB error mid-pipeline poisons
-                # the transaction), then write FAILED — but never over a
-                # terminal state: the pipeline may already have committed
-                # COMPLETED (a late completion-publish blip lands here) and
-                # clobbering it erases result.blob_path, stranding the
-                # uploaded ZIP with no DB row pointing at it.
-                await sess.rollback()
-                await sess.execute(
-                    update(Job)
-                    .where(Job.id == job_id)
-                    .where(Job.status.notin_([JobStatus.COMPLETED, JobStatus.CANCELLED]))
-                    .values(
-                        status=JobStatus.FAILED,
-                        result={"error": {"code": "pipeline_error", "message": str(exc)}},
-                    )
-                )
-                await sess.commit()
-                await publish(job_id, "error", {"code": "pipeline_error", "message": str(exc)})
+            await _execute_export_job(sess, job_id, job.spec or {}, job)
 
 
-async def _run_pipeline(sess, job_id, spec, scope, job) -> None:
+async def _execute_export_job(sess, job_id, spec, job):
+    from shared.chat_catalogue_gc import catalogue_read_pin
+    from shared.chat_catalogue import ChatCatalogueIntegrityError
+    from shared.models import SnapshotItem
+    try:
+        snapshot_ids = [UUID(str(value)) for value in spec.get("snapshotIds", [])]
+        if not snapshot_ids and spec.get("itemIds"):
+            snapshot_ids = list((await sess.scalars(select(SnapshotItem.snapshot_id).where(
+                SnapshotItem.id.in_([UUID(str(value)) for value in spec["itemIds"]])).distinct())).all())
+        if not snapshot_ids:
+            raise ValueError("SCOPE_EMPTY")
+        async with catalogue_read_pin(async_session_factory, snapshot_ids=snapshot_ids,
+                owner_kind="export", owner_id=UUID(str(job_id))) as read_lease:
+            scope = await resolve(sess, resource_id=spec["resourceId"],
+                snapshot_ids=spec.get("snapshotIds") or [], thread_path=spec.get("threadPath"),
+                item_ids=spec.get("itemIds") or [])
+            await _run_pipeline(sess, job_id, spec, scope, job, read_lease=read_lease)
+    except Exception as exc:
+        log.exception("job_failed id=%s", job_id)
+        await sess.rollback()
+        code = str(exc) if isinstance(exc, ValueError) else (
+            "capture_integrity_error" if isinstance(exc, ChatCatalogueIntegrityError) else "pipeline_error")
+        await sess.execute(update(Job).where(Job.id == job_id)
+            .where(Job.status.notin_([JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]))
+            .values(status=JobStatus.FAILED, result={"error": {"code": code, "message": str(exc)}}))
+        await sess.commit()
+        await publish(job_id, "error", {"code": code, "message": str(exc)})
+
+
+async def _run_pipeline(sess, job_id, spec, scope, job, *, read_lease=None) -> None:
     await publish(
         job_id, "progress",
         {"stage": "rendering", "percent": 20,
@@ -235,7 +250,7 @@ async def _run_pipeline(sess, job_id, spec, scope, job) -> None:
                 thread_name=scope.thread_path.rsplit("/", 1)[-1],
                 thread_path=scope.thread_path,
                 format=spec["exportFormat"],
-                attachment_source=BlobAttachmentSource(),
+                attachment_source=BlobAttachmentSource(read_lease=read_lease),
             )
             summary = await pkg.write(
                 render_messages,
@@ -245,6 +260,8 @@ async def _run_pipeline(sess, job_id, spec, scope, job) -> None:
                 context=pkg_ctx,
             )
 
+        if read_lease is not None:
+            read_lease.assert_valid()
         await publish(job_id, "progress", {"stage": "uploading", "percent": 85})
         if await _check_cancelled(sess, job_id):
             await _update_job(sess, job_id, status=JobStatus.CANCELLED)
@@ -306,6 +323,8 @@ async def _run_pipeline(sess, job_id, spec, scope, job) -> None:
     # Fence the final write against a cancel that landed between the
     # post-upload check and here — an unconditional update would silently
     # overwrite CANCELLING with COMPLETED.
+    if read_lease is not None:
+        read_lease.assert_valid()
     upd = await sess.execute(
         update(Job)
         .where(Job.id == job_id)
