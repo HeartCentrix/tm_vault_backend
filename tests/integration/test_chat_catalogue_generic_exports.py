@@ -119,6 +119,7 @@ async def test_generic_export_actual_zip_contains_captured_json_and_distinct_bin
         result = await getattr(worker, method)(db, items, {"jobId": str(export_id)}, {})
     assert result["exported_count"] == 4 and result["failed_count"] == 0
     assert result["export_type"] == "ZIP" and result["blob_path"] and result["container"] == "exports"
+    assert result["blob_path"].startswith("exports/")
     assert result["chat_catalogue_format"] == 1 and result["size_bytes"] == len(uploaded[0])
     assert len(uploaded) == 1
     with zipfile.ZipFile(io.BytesIO(uploaded[0])) as archive:

@@ -3085,6 +3085,7 @@ class RestoreWorker:
         # upload_blob auto-creates the container via _ensure_container.
         upload_metadata = {"job_id": str(message.get("jobId") or ""), "exported_count": str(exported_count)}
         if _catalogue_read_lease is not None:
+            blob_name = f"exports/{blob_name}"
             await self._check_catalogue_export_active(message, _catalogue_read_lease)
             upload_result = await self._upload_catalogue_export_artifact(shard, container_name, blob_name,
                 zip_buffer.name, zip_size, upload_metadata, message)
