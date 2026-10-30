@@ -1,22 +1,26 @@
 import asyncio
 import hashlib as _hashlib
+import os
 import re as _re
 import base64 as _b64
 import io as _io
+import time as _time
 """Snapshot Service - Manages snapshots and snapshot items"""
 from contextlib import asynccontextmanager
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from uuid import UUID, uuid4
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, Depends, HTTPException, Query, Body
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, func, distinct, and_, or_, text, String
+from sqlalchemy import select, func, distinct, and_, or_, text, String, cast, DateTime
 from sqlalchemy.orm import aliased
 
-from shared.database import get_db, init_db, close_db, AsyncSession
-from shared.models import Snapshot, SnapshotItem, Resource, SnapshotType, SnapshotStatus, ResourceType, Job
+from shared.database import get_db, init_db, close_db, AsyncSession, async_session_factory
+from shared.models import Snapshot, SnapshotItem, Resource, SnapshotType, SnapshotStatus, ResourceType, ResourceStatus, Job, ChatItemVersion, SnapshotChatInventory, ChatCaptureAttempt
+from shared.chat_catalogue import materialize_chat_items, ChatCatalogueIntegrityError
 from shared.snapshot_reuse import resolve_snapshot_items_target, SnapshotNotFound
+from shared.audit import internal_audit_headers
 from shared.config import settings
 # Producer-only; on-demand archive enrichment nudge. Defensive so this read API
 # still boots if the broker deps are ever absent — the trigger just no-ops.
@@ -259,7 +263,64 @@ async def _maybe_trigger_archive_enrichment(db: AsyncSession, items: List[Snapsh
     await _arch_eng.nudge_enrichment(db, items, message_bus.publish)
 
 
+from shared.audit_middleware import AuditMiddleware  # Ops/Data Check 3: mutation-audit backstop
 app = FastAPI(title="Snapshot Service", version="1.0.0", lifespan=lifespan)
+app.add_middleware(AuditMiddleware, service_name="snapshot-service")
+from shared.auth_enforcement import AuthMiddleware, require_admin, confine_guest_path, is_admin  # Ops/Data Check 17
+import re as _authz_re
+from starlette.requests import Request as _AuthzRequest
+
+_SNAP_ID_RE = _authz_re.compile(r"/resources/snapshots/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
+_ITEM_ID_RE = _authz_re.compile(r"/(?:snapshot-items|items)/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
+_HOSTED_TID_RE = _authz_re.compile(r"/teams/hosted-content/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
+
+
+async def _snapshot_tenant_guard(request: _AuthzRequest):
+    """Ops/Data Check 17 — close the authenticated cross-tenant IDOR on the
+    snapshot content routes. AuthMiddleware has already verified a principal;
+    this app-level dependency resolves the snapshot / item / hosted-content id
+    in the path to its owning tenant and 403s if the caller is not entitled to
+    that tenant. Admin and internal principals are exempt. Runs one bounded DB
+    lookup; routes that name no id (e.g. /health, folder listings) pass through.
+    """
+    user = request.scope.get("tmvault_user")
+    if not user or is_admin(user) or user.get("_principal") == "internal":
+        return
+    entitled = {str(t) for t in (user.get("tenant_ids") or [])}
+    path = request.url.path
+    tid = None
+    try:
+        async with async_session_factory() as _db:
+            m3 = _HOSTED_TID_RE.search(path)
+            m1 = _SNAP_ID_RE.search(path)
+            m2 = _ITEM_ID_RE.search(path)
+            if m3:
+                tid = m3.group(1)
+            elif m1:
+                snap = await _db.get(Snapshot, UUID(m1.group(1)))
+                if snap:
+                    res = await _db.get(Resource, snap.resource_id)
+                    tid = str(res.tenant_id) if res and res.tenant_id else None
+            elif m2:
+                it = await _db.get(SnapshotItem, UUID(m2.group(1)))
+                if it:
+                    snap = await _db.get(Snapshot, it.snapshot_id)
+                    if snap:
+                        res = await _db.get(Resource, snap.resource_id)
+                        tid = str(res.tenant_id) if res and res.tenant_id else None
+    except Exception:
+        # A malformed id or a transient DB error must not fail OPEN — but it
+        # also must not mask a real 404 the handler would give. Only enforce
+        # when we positively resolved a tenant; otherwise let the handler run
+        # (it still requires a valid principal via the middleware).
+        return
+    if tid is not None and tid not in entitled:
+        raise HTTPException(status_code=403, detail="Not entitled to the requested resource's tenant")
+from shared.csv_safe import SafeCsvWriter  # Ops/Data Check 17: CSV formula-injection
+app.add_middleware(AuthMiddleware, service_name="snapshot-service", enforce_tenant_scope=True)
+# Ops/Data Check 17: per-request tenant-entitlement on every route that names a
+# snapshot/item/hosted-content id (closes the authenticated cross-tenant IDOR).
+app.router.dependencies.append(Depends(_snapshot_tenant_guard))
 
 
 def _item_to_response(item: SnapshotItem) -> SnapshotItemResponse:
@@ -276,6 +337,244 @@ def _item_to_response(item: SnapshotItem) -> SnapshotItemResponse:
         createdAt=item.created_at.isoformat() if item.created_at else "",
         blobPath=item.blob_path,
     )
+
+
+async def _catalogue_snapshot(db, snapshot_id, *, resolve_chat_sibling=False):
+    """Select one captured restore point; a catalogue never unions history."""
+    source = await db.get(Snapshot, UUID(str(snapshot_id)))
+    if source is None:
+        raise HTTPException(404, detail="Snapshot not found")
+    if (source.extra_data or {}).get("chat_inventory_format") == 1:
+        if source.status == SnapshotStatus.PENDING_DELETION:
+            raise HTTPException(404, detail="Snapshot is being deleted")
+        return source
+    if not resolve_chat_sibling:
+        return None
+    resource = await db.get(Resource, source.resource_id)
+    if resource is not None and resource.type == ResourceType.USER_CHATS:
+        return source
+    if resource is None:
+        return None
+    parent_id = resource.id if resource.type == ResourceType.ENTRA_USER else resource.parent_resource_id
+    if parent_id is None:
+        return None
+    sibling_id = await db.scalar(select(Resource.id).where(
+        Resource.parent_resource_id == parent_id, Resource.type == ResourceType.USER_CHATS,
+        Resource.tenant_id == resource.tenant_id))
+    if sibling_id is None:
+        return None
+    candidates = select(Snapshot).where(Snapshot.resource_id == sibling_id,
+        Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL]))
+    selected = await db.scalar(candidates.where(Snapshot.job_id == source.job_id)
+        .order_by(Snapshot.created_at.desc(), Snapshot.id.desc()).limit(1))
+    source_job = await db.get(Job, source.job_id) if source.job_id else None
+    batch_id = (source_job.spec or {}).get("batch_id") if source_job else None
+    if selected is None and batch_id:
+        selected = await db.scalar(candidates.join(Job, Job.id == Snapshot.job_id)
+            .where(Job.spec["batch_id"].as_string() == str(batch_id))
+            .order_by(Snapshot.created_at.desc(), Snapshot.id.desc()).limit(1))
+    if selected is None:
+        selected = await db.scalar(candidates.where(Snapshot.created_at <= source.created_at)
+            .order_by(Snapshot.created_at.desc(), Snapshot.id.desc()).limit(1))
+    if selected is None:
+        raise HTTPException(404, detail="No chat restore point exists for the selected backup")
+    return selected
+
+
+async def _assert_catalogue_links(db, snapshot):
+    bad = await db.scalar(select(SnapshotItem.id).outerjoin(ChatItemVersion,
+        ChatItemVersion.id == SnapshotItem.chat_version_id).where(SnapshotItem.snapshot_id == snapshot.id,
+        or_(ChatItemVersion.id.is_(None), ChatItemVersion.tenant_id != SnapshotItem.tenant_id,
+            ChatItemVersion.logical_key != SnapshotItem.external_id,
+            ChatItemVersion.item_type != SnapshotItem.item_type,
+            SnapshotItem.extra_data["chat_id"].as_string().is_(None),
+            ChatItemVersion.chat_id != SnapshotItem.extra_data["chat_id"].as_string())).limit(1))
+    if bad is not None:
+        raise ChatCatalogueIntegrityError("new-format snapshot link has no owned captured version")
+
+
+async def _catalogue_page(db, snapshot, *, page, size, item_type=None, chat_id=None,
+                          folder=None, query=None, messages_only=False):
+    # A nullable broken link must not vanish inside the version JOIN/filter.
+    await _assert_catalogue_links(db, snapshot)
+    stmt = select(SnapshotItem).join(ChatItemVersion,
+        ChatItemVersion.id == SnapshotItem.chat_version_id).where(SnapshotItem.snapshot_id == snapshot.id)
+    if messages_only:
+        stmt = stmt.where(SnapshotItem.item_type.in_(["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"]))
+    if item_type:
+        stmt = stmt.where(SnapshotItem.item_type == item_type)
+    if chat_id:
+        stmt = stmt.where(ChatItemVersion.chat_id == chat_id)
+    if folder is not None:
+        stmt = stmt.where(SnapshotItem.folder_path == folder)
+    if query:
+        stmt = stmt.where(or_(SnapshotItem.name.ilike(f"%{query}%"),
+            ChatItemVersion.graph_id.ilike(f"%{query}%"),
+            ChatItemVersion.payload["body"]["content"].as_string().ilike(f"%{query}%")))
+    total = await db.scalar(select(func.count()).select_from(stmt.order_by(None).subquery())) or 0
+    # Source-created timestamps are immutable; the item UUID breaks ties.
+    stmt = stmt.order_by(cast(ChatItemVersion.payload["createdDateTime"].as_string(), DateTime(timezone=True)).desc().nullslast(),
+        SnapshotItem.created_at.desc(), SnapshotItem.id.desc()).offset((page - 1) * size).limit(size)
+    links = list((await db.scalars(stmt)).all())
+    return await materialize_chat_items(db, links), total
+
+
+async def _catalogue_item_response(db, snapshot, *, page, size, item_type=None, folder=None, query=None):
+    items, total = await _catalogue_page(db, snapshot, page=page, size=size,
+        item_type=item_type, folder=folder, query=query)
+    return SnapshotItemListResponse(content=[_item_to_response(i) for i in items],
+        totalElements=total, totalPages=max(1, (total + size - 1) // size), size=size, number=page)
+
+
+async def _catalogue_groups(db, snapshot):
+    await _assert_catalogue_links(db, snapshot)
+    messages = ["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"]
+    rows = (await db.execute(select(SnapshotChatInventory.chat_id,
+        ChatCaptureAttempt.folder_path, func.count(SnapshotItem.id).label("count"),
+        func.max(cast(ChatItemVersion.payload["createdDateTime"].as_string(), DateTime(timezone=True))).label("last_message_at"))
+        .join(ChatCaptureAttempt, ChatCaptureAttempt.id == SnapshotChatInventory.capture_attempt_id)
+        .outerjoin(SnapshotItem, and_(SnapshotItem.snapshot_id == SnapshotChatInventory.snapshot_id,
+            SnapshotItem.extra_data["chat_id"].as_string() == SnapshotChatInventory.chat_id,
+            SnapshotItem.item_type.in_(messages)))
+        .outerjoin(ChatItemVersion, ChatItemVersion.id == SnapshotItem.chat_version_id)
+        .where(SnapshotChatInventory.snapshot_id == snapshot.id)
+        .group_by(SnapshotChatInventory.chat_id, ChatCaptureAttempt.folder_path)
+        .order_by(func.max(cast(ChatItemVersion.payload["createdDateTime"].as_string(), DateTime(timezone=True))).desc().nullslast(),
+            SnapshotChatInventory.chat_id))).all()
+    return [{"chatId": r.chat_id, "displayName": (r.folder_path or f"chats/{r.chat_id}").removeprefix("chats/"),
+        "folderPath": r.folder_path or f"chats/{r.chat_id}", "count": int(r.count),
+        "lastMessageAt": r.last_message_at.isoformat() if r.last_message_at else None} for r in rows]
+
+
+async def _catalogue_folders(db, snapshot, *, page, size, item_type=None):
+    await _assert_catalogue_links(db, snapshot)
+    stmt = select(SnapshotItem.folder_path.label("path"), func.count().label("count")).where(
+        SnapshotItem.snapshot_id == snapshot.id)
+    stmt = stmt.where(SnapshotItem.item_type == item_type) if item_type else stmt.where(
+        SnapshotItem.item_type.in_(["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"]))
+    stmt = stmt.group_by(SnapshotItem.folder_path)
+    total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+    rows = (await db.execute(stmt.order_by(SnapshotItem.folder_path).offset((page - 1) * size).limit(size))).all()
+    return {"content": [{"path": r.path or "", "count": int(r.count)} for r in rows],
+        "total": total, "page": page, "size": size, "hasMore": page * size < total}
+
+
+async def _catalogue_blob_response(db, item, *, download):
+    """Stream exact captured bytes while a durable object pin protects them."""
+    import hashlib
+    import mimetypes
+    from urllib.parse import quote
+    from starlette.background import BackgroundTask
+    from shared.chat_catalogue_gc import catalogue_read_pin
+    from shared.storage.router import router
+    meta = item.extra_data or {}
+    if not all(meta.get(key) for key in ("object_id", "container", "sha256")):
+        raise ChatCatalogueIntegrityError("captured content storage descriptor is incomplete")
+    manager = catalogue_read_pin(async_session_factory, snapshot_ids=[item.snapshot_id],
+        object_ids=[UUID(str(meta["object_id"]))])
+    lease = await manager.__aenter__()
+    closed = False
+    async def close_pin():
+        nonlocal closed
+        if not closed:
+            closed = True
+            await manager.__aexit__(None, None, None)
+    try:
+        store = router.get_store_by_id(str(item.backend_id))
+        properties = await store.get_properties(meta["container"], item.blob_path)
+        if properties is None:
+            raise HTTPException(404, detail="Captured content is missing from storage")
+        snapshot = await db.get(Snapshot, item.snapshot_id)
+        lease.assert_valid()
+    except BaseException:
+        await close_pin()
+        raise
+    declared = meta.get("content_type") or ""
+    media = declared if "/" in declared else mimetypes.guess_type(item.name or "")[0]
+    media = media or "application/octet-stream"
+    safe_image = media.lower().split(";", 1)[0] in {"image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp"}
+    headers = {"X-Content-Type-Options": "nosniff", "Content-Length": str(item.content_size or 0),
+        "ETag": f'"{meta["sha256"]}"', "Cache-Control": "private, max-age=3600, immutable"}
+    if not safe_image:
+        media = "application/octet-stream"
+        headers["Content-Disposition"] = "attachment"
+    if download:
+        filename = item.name or f"item-{item.id}"
+        ascii_name = filename.encode("ascii", "replace").decode().replace('"', "'").replace("\r", "").replace("\n", "")
+        headers["Content-Disposition"] = f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}"
+    async def stream():
+        digest, size, pending = hashlib.sha256(), 0, None
+        try:
+            async for chunk in lease.guard(store.download_stream(meta["container"], item.blob_path)):
+                if not chunk:
+                    continue
+                digest.update(chunk)
+                size += len(chunk)
+                if size > item.content_size:
+                    raise ChatCatalogueIntegrityError("captured content length differs during download")
+                if pending is not None:
+                    yield pending
+                pending = chunk
+            if size != item.content_size or digest.hexdigest() != meta["sha256"]:
+                raise ChatCatalogueIntegrityError("captured content checksum differs during download")
+            lease.assert_valid()
+            # Withhold the final chunk until integrity is known; failed streams
+            # cannot satisfy Content-Length with corrupt captured bytes.
+            if pending is not None:
+                yield pending
+            if download:
+                await _emit_download_audit(action="FILE_DOWNLOADED", outcome="SUCCESS",
+                    tenant_id=str(item.tenant_id), resource_id=str(snapshot.resource_id) if snapshot else None,
+                    resource_type=item.item_type, snapshot_id=str(item.snapshot_id),
+                    details={"itemId": str(item.id), "filename": item.name, "byteSize": size,
+                        "sha256": meta["sha256"]})
+        finally:
+            await close_pin()
+    return StreamingResponse(stream(), media_type=media, headers=headers, background=BackgroundTask(close_pin))
+
+
+async def _catalogue_message_response(db, snapshot, *, page, size, chat_id=None, folder=None, search=None):
+    items, total = await _catalogue_page(db, snapshot, page=page, size=size,
+        chat_id=chat_id, folder=folder, query=search, messages_only=True)
+    # Page-sized child load; links are joined by qualified physical message key.
+    ids = [i.id for i in items]
+    parent = aliased(SnapshotItem)
+    children = list((await db.scalars(select(SnapshotItem).join(parent,
+        and_(parent.snapshot_id == SnapshotItem.snapshot_id,
+            parent.external_id == SnapshotItem.parent_external_id)).where(parent.id.in_(ids),
+        SnapshotItem.item_type == "CHAT_HOSTED_CONTENT"))).all()) if ids else []
+    child_items = await materialize_chat_items(db, children)
+    hosted = {}
+    for child in child_items:
+        meta = child.extra_data or {}
+        hosted[(meta.get("chat_id"), child.parent_external_id, child.external_id)] = str(child.id)
+    result = []
+    from urllib.parse import unquote
+    for item in items:
+        raw = (item.extra_data or {}).get("raw") or {}
+        raw = dict(raw)
+        body = dict(raw.get("body") or {})
+        cid = item.extra_data.get("chatId") or item.parent_external_id
+        def replace_hosted(match):
+            child_id = hosted.get((cid, item.external_id, unquote(match.group(1))))
+            if child_id is None:
+                raise ChatCatalogueIntegrityError("captured message references missing hosted content")
+            return f"/api/v1/resources/snapshots/{snapshot.id}/items/{child_id}/content"
+        body["content"] = _HOSTED_CONTENT_RE.sub(replace_hosted, body.get("content") or "")
+        raw["body"] = body
+        sender = (raw.get("from") or {}).get("user") or {}
+        result.append({"id": str(item.id), "snapshotId": str(item.snapshot_id),
+            "externalId": item.external_id, "itemType": item.item_type,
+            "sender": sender.get("displayName") or "Unknown", "senderEmail": sender.get("userPrincipalName") or sender.get("id") or "",
+            "body": body.get("content") or "", "bodyContentType": body.get("contentType") or "text",
+            "date": raw.get("createdDateTime"), "chatTopic": (item.folder_path or f"chats/{cid}").removeprefix("chats/"),
+            "channelName": "", "folderPath": item.folder_path, "attachments": raw.get("attachments") or [],
+            "mentions": raw.get("mentions") or [], "isDeleted": bool(raw.get("deletedDateTime")) or bool(item.is_deleted),
+            "isReply": bool(raw.get("replyToId")), "contentSize": item.content_size or 0,
+            "createdAt": item.created_at.isoformat() if item.created_at else "", "name": sender.get("displayName") or "Unknown",
+            "metadata": {"raw": raw}})
+    return {"content": result, "totalElements": total, "totalPages": max(1, (total + size - 1) // size),
+        "size": size, "number": page}
 
 
 async def _get_power_bi_assembled_items(db: AsyncSession, snapshot_id: str) -> Optional[List[SnapshotItem]]:
@@ -318,7 +617,7 @@ async def health():
 async def list_snapshots(
     resource_id: str,
     page: int = Query(1, ge=1),
-    size: int = Query(50, ge=1),
+    size: int = Query(50, ge=1, le=1000),
     include_children: bool = Query(False, description="Also include snapshots of child resources (Tier 2 USER_MAIL/ONEDRIVE/etc. under an ENTRA_USER parent). Needed so the Recovery sparkline can plot the actual content bytes instead of the parent's tiny metadata row."),
     include_failed: bool = Query(False, description="Include FAILED / RUNNING snapshots. Default off — the version dropdown only wants successful, recoverable points in time."),
     include_empty: bool = Query(False, description="Include INCREMENTAL snapshots that captured 0 items (no delta since the prior snapshot). Default off — they would otherwise pollute the version dropdown with duplicates that present the same data as the previous entry."),
@@ -342,7 +641,20 @@ async def list_snapshots(
     # (failed = nothing to restore, empty incremental = same data as
     # the prior entry). Admin / debug callers can opt-in via query.
     if not include_failed:
-        filters.append(Snapshot.status == SnapshotStatus.COMPLETED)
+        # PARTIAL is a RECOVERABLE point in time — some content was missed,
+        # but everything that landed is restorable — so it belongs in the
+        # dropdown. This used to be a bare `== COMPLETED`, which swept
+        # PARTIAL up with FAILED/RUNNING under a flag named `include_failed`
+        # and hid EVERY degraded restore point from Recovery. Live on
+        # 2026-08-11: SHAREPOINT_SITE "IT OPS NOTES" had PARTIAL snapshots
+        # for its three most recent runs and the version dropdown offered
+        # none of them, so the newest browsable backup was 2 days stale.
+        # Expect more PARTIAL rows here from 9a861f5 onward, which stops the
+        # reconciler overwriting a handler-declared degraded_reason — that
+        # is honesty, and honest rows must stay reachable.
+        filters.append(
+            Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL])
+        )
     if not include_empty:
         filters.append(Snapshot.item_count > 0)
 
@@ -372,6 +684,7 @@ async def list_snapshots(
     # collapse N different users' snapshots from one bulk into a single
     # row.
     from sqlalchemy import func as _func
+    from sqlalchemy import case as _case
     # NOTE: Job.spec is a plain JSON column, not JSONB — `.astext` is
     # JSONB-only and raises AttributeError on Comparator. Use
     # json_extract_path_text which works for both JSON and JSONB.
@@ -403,6 +716,19 @@ async def list_snapshots(
         ),
         order_by=(
             snap_with_batch.c.item_count.desc().nullslast(),
+            # Tiebreak on status before recency: now that PARTIAL rows are
+            # candidates (see the include_failed filter above), a group can
+            # hold a COMPLETED and a PARTIAL row with the SAME item_count,
+            # and which one won would otherwise depend on created_at alone.
+            # A clean restore point must never lose to an equally-full
+            # degraded one. Ordering item_count first is still deliberate:
+            # within one bulk click the shard/coordinator rows differ in
+            # completeness, and the fullest row is the best restore point
+            # even when it is the PARTIAL one.
+            _case(
+                (snap_with_batch.c.status == SnapshotStatus.COMPLETED, 0),
+                else_=1,
+            ).asc(),
             snap_with_batch.c.created_at.desc(),
         ),
     ).label("dedup_rank")
@@ -424,7 +750,11 @@ async def list_snapshots(
             ranked.c.batch_id_raw,
         )
         .where(deduped_filter)
-        .order_by(snap_alias.created_at.desc())
+        # id tiebreak: one bulk click commits every shard's snapshot row in
+        # the same transaction, so created_at ties are the norm here and a
+        # non-unique sort key lets LIMIT/OFFSET slice the tie group
+        # differently per request.
+        .order_by(snap_alias.created_at.desc(), snap_alias.id.desc())
         .offset((page - 1) * size)
         .limit(size)
     )
@@ -508,7 +838,36 @@ async def storage_summary(
 
     pairs = [(r[0], int(r[1] or 0)) for r in rows if r[0] is not None]
 
-    total_bytes = sum(b for _, b in pairs)
+    # Headline = PROTECTED-DATA size: newest-version content_size per
+    # live item across the subtree. Summing bytes_added undercounts
+    # twice — content-hash dedup means a re-baseline uploads almost
+    # nothing (jrue's 124GB force-full added 16GB), and retention
+    # pruning drops the original baseline's bytes from the sum while
+    # its blobs stay referenced by newer snapshots' items. Observed
+    # 2026-07-14: headline read 32.9GB against a 124GB OneDrive.
+    # bytes_added remains correct for the deltas/sparkline below —
+    # "new data written this period" is exactly what it measures.
+    total_bytes = 0
+    for target_id in target_ids:
+        snap_rows = (await db.execute(
+            select(Snapshot.id).where(
+                Snapshot.resource_id == target_id,
+                Snapshot.status.in_([
+                    SnapshotStatus.COMPLETED,
+                    SnapshotStatus.PARTIAL,
+                    SnapshotStatus.PENDING_DELETION,
+                ]),
+            ).order_by(Snapshot.created_at.desc())
+        )).all()
+        if not snap_rows:
+            continue
+        sib_ids = [r[0] for r in snap_rows]
+        # sib_ids[0] = latest snapshot -> cache key; entries self-
+        # invalidate when a newer snapshot completes.
+        _, child_bytes = await _rollup_latest_items(
+            db, target_id, sib_ids[0], sib_ids, None,
+        )
+        total_bytes += child_bytes
 
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     week_cut = now - timedelta(days=7)
@@ -547,6 +906,28 @@ async def storage_summary(
     }
 
 
+# Cross-sibling auto-resolve for /snapshots/folders: when the caller
+# scopes by item type but passed a different resource's snapshot id
+# (typically the ENTRA_USER parent's), swap to the Tier-2 child that
+# actually owns rows of that type. ONEDRIVE_FILE/FILE were missing
+# until 2026-07-13 — the Recovery OneDrive tab (which sends the parent
+# snapshot id) got the parent's junk folder rows back, so My Drive
+# rendered files but zero folders. Pinned by
+# tests/services/test_snapshot_folder_type_resolve.py.
+FOLDER_ITEM_TYPE_TO_CHILD: Dict[str, "ResourceType"] = {
+    "EMAIL": ResourceType.USER_MAIL,
+    "TEAMS_CHAT_MESSAGE": ResourceType.USER_CHATS,
+    "TEAMS_MESSAGE": ResourceType.USER_CHATS,
+    "TEAMS_MESSAGE_REPLY": ResourceType.USER_CHATS,
+    "CALENDAR_EVENT": ResourceType.USER_CALENDAR,
+    "USER_CONTACT": ResourceType.USER_CONTACTS,
+    "CONTACT": ResourceType.USER_CONTACTS,
+    "ONEDRIVE_FILE": ResourceType.USER_ONEDRIVE,
+    "FILE": ResourceType.USER_ONEDRIVE,
+    "ARCHIVE_ITEM": ResourceType.USER_ARCHIVE,
+}
+
+
 @app.get("/api/v1/resources/snapshots/folders")
 async def get_snapshot_folders(
     snapshot_id: str = Query(...),
@@ -569,6 +950,13 @@ async def get_snapshot_folders(
     Falling back inline like this avoids a one-time backfill migration and
     keeps the endpoint useful for snapshots taken before the folder_path
     plumbing landed."""
+    catalogue = await _catalogue_snapshot(db, snapshot_id,
+        resolve_chat_sibling=item_type in {"TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"})
+    if catalogue is not None:
+        if (catalogue.extra_data or {}).get("chat_inventory_format") == 1:
+            return await _catalogue_folders(db, catalogue, page=page, size=size, item_type=item_type)
+        snapshot_id = str(catalogue.id)
+
     # Archive folders are shared across kinds (one physical folder can hold
     # mail + contacts + events), so a kind-agnostic count would show the mail
     # total under the Contacts tab. Count per-category using the SAME MAPI-kind
@@ -597,17 +985,7 @@ async def get_snapshot_folders(
     # the sibling Contacts snapshot id, etc.), swap to the Tier 2 child
     # of the matching type. Without this, the mail folders tab was
     # empty even when the USER_MAIL snapshot had 39 folders + 967 items.
-    _item_type_to_child: Dict[str, "ResourceType"] = {
-        "EMAIL": ResourceType.USER_MAIL,
-        "TEAMS_CHAT_MESSAGE": ResourceType.USER_CHATS,
-        "TEAMS_MESSAGE": ResourceType.USER_CHATS,
-        "TEAMS_MESSAGE_REPLY": ResourceType.USER_CHATS,
-        "CALENDAR_EVENT": ResourceType.USER_CALENDAR,
-        "USER_CONTACT": ResourceType.USER_CONTACTS,
-        "CONTACT": ResourceType.USER_CONTACTS,
-        "ARCHIVE_ITEM": ResourceType.USER_ARCHIVE,
-    }
-    target_child = _item_type_to_child.get(item_type or "")
+    target_child = FOLDER_ITEM_TYPE_TO_CHILD.get(item_type or "")
     sibling_ids = await _resolve_sibling_snapshot_ids(
         db, snapshot_id, target_child_type=target_child,
     )
@@ -696,33 +1074,52 @@ async def get_snapshot_folders(
             )).all()
             all_sorted = [{"path": r[0], "count": int(r[1])} for r in rows]
         else:
-            exclude_types = [] if item_type else ["EMAIL_ATTACHMENT", "CHAT_ATTACHMENT"]
-            sql = _text("""
-                WITH latest AS (
-                  SELECT DISTINCT ON (external_id)
-                         external_id, COALESCE(folder_path, '') AS path
-                  FROM snapshot_items
-                  WHERE snapshot_id = ANY(:snaps)
-                    {type_filter}
-                  ORDER BY external_id, created_at DESC
-                )
-                SELECT path, COUNT(*) AS cnt
-                FROM latest
-                GROUP BY path
-                ORDER BY path
-            """.format(
-                type_filter=(
-                    "AND item_type = :itype" if item_type
-                    else "AND item_type <> ALL(:excluded)"
-                )
-            ))
-            params: Dict[str, Any] = {"snaps": _sibling_uuids}
-            if item_type:
-                params["itype"] = item_type
+            # Same sibling-set-version cache as _paged_items_cache: this
+            # aggregation walks the full union (3.1s on a 1.22M-row mailbox)
+            # and its result only changes when a sibling's rows change —
+            # which flips a sibling status or adds/removes an id, both of
+            # which change the fingerprint key. Non-settled sibling sets
+            # (streaming backup / pending deletion) are never cached.
+            _state_fp, _cacheable = await _sibling_state_fingerprint(db, _sibling_uuids)
+            _fkey = (_state_fp, item_type)
+            _now = _time.monotonic()
+            _fhit = _folder_agg_cache.get(_fkey) if _cacheable else None
+            if _fhit is not None and (_now - _fhit[0]) < _LIST_CACHE_TTL_S:
+                all_sorted = _fhit[1]
             else:
-                params["excluded"] = exclude_types
-            rows = (await db.execute(sql, params)).all()
-            all_sorted = [{"path": r[0], "count": int(r[1])} for r in rows]
+                # _sibling_uuids are uuid.UUID objects. Psycopg binds them fine
+                # through the `snapshots` param when we use ANY(:snaps).
+                exclude_types = [] if item_type else ["EMAIL_ATTACHMENT", "CHAT_ATTACHMENT"]
+                sql = _text("""
+                    WITH latest AS (
+                      SELECT DISTINCT ON (external_id)
+                             external_id, COALESCE(folder_path, '') AS path
+                      FROM snapshot_items
+                      WHERE snapshot_id = ANY(:snaps)
+                        AND COALESCE(is_deleted, false) = false
+                        {type_filter}
+                      ORDER BY external_id, created_at DESC
+                    )
+                    SELECT path, COUNT(*) AS cnt
+                    FROM latest
+                    GROUP BY path
+                    ORDER BY path
+                """.format(
+                    type_filter=(
+                        "AND item_type = :itype" if item_type
+                        else "AND item_type <> ALL(:excluded)"
+                    )
+                ))
+                params: Dict[str, Any] = {"snaps": _sibling_uuids}
+                if item_type:
+                    params["itype"] = item_type
+                else:
+                    params["excluded"] = exclude_types
+                await _set_local_work_mem(db)
+                rows = (await db.execute(sql, params)).all()
+                all_sorted = [{"path": r[0], "count": int(r[1])} for r in rows]
+                if _cacheable:
+                    _cache_put(_folder_agg_cache, _FOLDER_AGG_CACHE_MAX, _fkey, (_now, all_sorted))
     total = len(all_sorted)
     off = (page - 1) * size
     return {
@@ -827,10 +1224,14 @@ async def get_snapshot(snapshot_id: str, db: AsyncSession = Depends(get_db)):
 async def list_snapshot_items(
     snapshot_id: str,
     page: int = Query(1, ge=1),
-    size: int = Query(50, ge=1),
+    size: int = Query(50, ge=1, le=1000),
     itemType: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
+    catalogue = await _catalogue_snapshot(db, snapshot_id)
+    if catalogue is not None:
+        return await _catalogue_item_response(db, catalogue, page=page, size=size, item_type=itemType)
+
     assembled_items = await _get_power_bi_assembled_items(db, snapshot_id)
     if assembled_items is not None:
         filtered = [item for item in assembled_items if not itemType or item.item_type == itemType]
@@ -858,7 +1259,16 @@ async def list_snapshot_items(
         filters.append(SnapshotItem.item_type == itemType)
 
     total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
-    stmt = select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size)
+    # ORDER BY is not optional on a LIMIT/OFFSET query. This had none at all,
+    # so Postgres returned whatever order the plan produced and page 2 could
+    # repeat or skip rows from page 1 (TMV-006's defect class, measured on
+    # /api/v1/resources at 33/50 id stability between two identical
+    # requests). Capture order, primary key as the unique tiebreak.
+    stmt = (
+        select(SnapshotItem).where(*filters)
+        .order_by(SnapshotItem.created_at.desc(), SnapshotItem.id.desc())
+        .offset((page-1)*size).limit(size)
+    )
     result = await db.execute(stmt)
     items = result.scalars().all()
 
@@ -881,10 +1291,18 @@ async def browse_snapshot_items(
     resource_id: str,
     snapshot_id: str,
     page: int = Query(1, ge=1),
-    size: int = Query(50, ge=1),
+    size: int = Query(50, ge=1, le=1000),
     itemType: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
+    catalogue = await _catalogue_snapshot(db, snapshot_id)
+    if catalogue is not None:
+        if catalogue.resource_id != UUID(resource_id):
+            owner = await db.get(Resource, catalogue.resource_id)
+            if owner is None or owner.parent_resource_id != UUID(resource_id):
+                raise HTTPException(404, detail="Snapshot not found for resource")
+        return await _catalogue_item_response(db, catalogue, page=page, size=size, item_type=itemType)
+
     assembled_items = await _get_power_bi_assembled_items(db, snapshot_id)
     if assembled_items is not None:
         filtered = [item for item in assembled_items if not itemType or item.item_type == itemType]
@@ -912,7 +1330,13 @@ async def browse_snapshot_items(
         filters.append(SnapshotItem.item_type == itemType)
 
     total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
-    stmt = select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size)
+    # Same unordered-pagination defect as its sibling list_snapshot_items
+    # above — see that comment.
+    stmt = (
+        select(SnapshotItem).where(*filters)
+        .order_by(SnapshotItem.created_at.desc(), SnapshotItem.id.desc())
+        .offset((page-1)*size).limit(size)
+    )
     result = await db.execute(stmt)
     items = result.scalars().all()
 
@@ -931,10 +1355,18 @@ async def browse_snapshot_items(
 async def list_resources_with_backups(
     tenantId: str = Query(...),
     page: int = Query(1, ge=1),
-    size: int = Query(50, ge=1),
+    size: int = Query(50, ge=1, le=1000),
     db: AsyncSession = Depends(get_db),
 ):
-    """List all resources for a tenant that have at least one completed snapshot.
+    """List all resources for a tenant that have at least one real recovery point.
+
+    "Real recovery point" is _real_restore_point() (defined below): COMPLETED
+    or PARTIAL, excluding skipped_concurrent placeholders. Counting COMPLETED
+    only had two failure modes here — a resource whose snapshots are ALL
+    PARTIAL was dropped from Recovery entirely (it looked like it had never
+    been backed up, even though a PARTIAL run holds every item it captured),
+    and a resource whose only "backup" is a 0-item concurrency placeholder was
+    listed as protected with nothing behind it.
 
     Tier 2 children (parent_resource_id IS NOT NULL) are hidden from the
     Recovery list — their snapshot counts and item totals roll up under the
@@ -952,12 +1384,19 @@ async def list_resources_with_backups(
     _HIDDEN_RECOVERY_TYPES = (
         "TEAMS_CHAT_EXPORT",
         "USER_MAIL", "USER_ONEDRIVE", "USER_CONTACTS", "USER_CALENDAR", "USER_CHATS",
-        "TEAMS_CHANNEL",
+        "USER_ARCHIVE", "TEAMS_CHANNEL",
     )
     resources_stmt = (
         select(Resource)
         .where(Resource.tenant_id == UUID(tenantId))
-        .order_by(Resource.display_name)
+        # Archived rows (e.g. the 8,270 phantom TEAMS_CHANNEL resources
+        # minted while _get() dropped the teams provisioning filter,
+        # archived 2026-07-14) must not resurface in Recovery.
+        .where(Resource.status != ResourceStatus.ARCHIVED)
+        # display_name is not unique (rooms and shared mailboxes repeat
+        # names across divisions) — id keeps the Recovery list order stable
+        # between refreshes.
+        .order_by(Resource.display_name, Resource.id)
     )
     resources_result = await db.execute(resources_stmt)
     all_resources = resources_result.scalars().all()
@@ -978,7 +1417,10 @@ async def list_resources_with_backups(
             func.count(Snapshot.id).label("snapshot_count"),
             func.sum(Snapshot.item_count).label("total_items"),
         )
-        .where(Snapshot.status == SnapshotStatus.COMPLETED)
+        # Recovery-point semantics, not run-outcome statistics: this feeds
+        # "does this resource have restorable data / how much". PARTIAL
+        # counts; the 0-item skipped_concurrent placeholder does not.
+        .where(_real_restore_point())
         .where(Snapshot.resource_id.in_(resource_ids))
         .group_by(Snapshot.resource_id)
     )
@@ -1094,6 +1536,109 @@ CONTENT_TAB_TO_TYPE: Dict[str, str] = {
 }
 
 
+# Per-tab newest-wins rollup, fully database-side. The previous
+# implementation selected (external_id, content_size, created_at) for
+# EVERY sibling-snapshot row and deduped in a Python loop — O(total
+# rows) of process memory. The chats backup re-captures most of the
+# thread history on every run, so one heavy user reached 11M pointer
+# rows and a single Recovery resource-select OOMKilled the 512Mi pod
+# (2026-07-14). GROUP BY hash-aggregates those rows inside Postgres
+# and returns exactly two scalars.
+#
+# Semantics vs the old loop: newest-wins by created_at per external_id
+# is unchanged; rows with NULL external_id now each count once (keyed
+# by pk) instead of collapsing on shared created_at; deleted-tombstone
+# rows are excluded to match the middle-panel lists and folder badges
+# (commit baa0a69).
+_CONTENT_ROLLUP_SQL = """
+    SELECT COUNT(*) AS cnt, COALESCE(SUM(size), 0) AS bytes
+    FROM (
+      SELECT (array_agg(si.content_size ORDER BY si.created_at DESC))[1] AS size
+      FROM snapshot_items si
+      WHERE si.snapshot_id = ANY(:snaps)
+        {type_filter}
+        AND COALESCE(si.is_deleted, false) = false
+      GROUP BY COALESCE(si.external_id, si.id::text)
+    ) latest
+"""
+
+# Rollup cache keyed by (child resource, its latest COMPLETED snapshot,
+# item-type set). A new completed snapshot changes the key, so entries
+# invalidate themselves; per-process (one cache per uvicorn worker) and
+# rebuilt on restart. Bounded by wholesale clear — Recovery-opened
+# resources number in the dozens, the bound is a runaway guard.
+_content_rollup_cache: Dict[tuple, tuple] = {}
+_CONTENT_ROLLUP_CACHE_MAX = 10000
+
+
+async def _rollup_latest_items(
+    db: AsyncSession,
+    child_resource_id,
+    latest_snapshot_id,
+    sibling_ids: list,
+    count_types: Optional[list] = None,
+) -> tuple:
+    """count_types=None rolls up EVERY item type — used by
+    /storage-summary for the protected-data headline."""
+    types_key = tuple(sorted(count_types)) if count_types else ("*",)
+    key = (str(child_resource_id), str(latest_snapshot_id), types_key)
+    hit = _content_rollup_cache.get(key)
+    if hit is not None:
+        return hit
+    sql = _CONTENT_ROLLUP_SQL.format(
+        type_filter="AND si.item_type = ANY(:types)" if count_types else ""
+    )
+    params: Dict[str, Any] = {"snaps": list(sibling_ids)}
+    if count_types:
+        params["types"] = list(count_types)
+    # Same rationale as _set_local_work_mem's own comment: this GROUP BY
+    # hash-aggregates ~1M rows for heavy mailboxes; the bump keeps it off
+    # temp disk. (Helper is defined later in the module — resolved at
+    # call time, and every call happens post-import.)
+    await _set_local_work_mem(db)
+    row = (await db.execute(text(sql), params)).first()
+    out = (int(row[0] or 0), int(row[1] or 0)) if row else (0, 0)
+    if len(_content_rollup_cache) >= _CONTENT_ROLLUP_CACHE_MAX:
+        _content_rollup_cache.clear()
+    _content_rollup_cache[key] = out
+    return out
+
+
+# A snapshot is a usable recovery point iff it terminated holding data we
+# can read AND it isn't one of the empty concurrency placeholders.
+#
+# PARTIAL belongs here. A run that lost some shards still holds every item
+# it did capture — jrue's 1,114,848-item archive baseline is PARTIAL, and
+# the lossy-shard derivation makes PARTIAL the normal outcome for any
+# SharePoint/OneDrive run with files_failed > 0. Anchoring only on
+# COMPLETED hid such runs entirely; worse, because the sibling roll-up
+# below counts items with created_at <= the anchor, anchoring to an OLDER
+# COMPLETED snapshot silently truncated everything the newest run added.
+#
+# skipped_concurrent placeholders are excluded. backup-worker's cross-job
+# concurrency guard creates a snapshot row purely so the skipped job's
+# FANOUT/FINALIZE counters balance, then immediately marks it COMPLETED
+# with 0 items (~19ms end to end). Those must never win the anchor or
+# count as a version: jrue's newest COMPLETED archive snapshot is one, so
+# the archive would report a 0-item recovery point over a 1.1M-item one.
+_READABLE_SNAPSHOT_STATES = (SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL)
+
+
+def _real_restore_point():
+    """SQL predicate: terminal-with-data, and not a concurrency placeholder."""
+    return and_(
+        Snapshot.status.in_(_READABLE_SNAPSHOT_STATES),
+        # json_extract_path_text is NULL-safe for absent keys and works on
+        # both json and jsonb (extra_data is json); COALESCE keeps rows
+        # that predate the flag. Compared as text so a non-boolean value
+        # can't raise the way an ->>::boolean cast would.
+        func.coalesce(
+            func.json_extract_path_text(Snapshot.extra_data, "skipped_concurrent"),
+            "false",
+        ).notin_(("true", "t", "1")),
+    )
+
+
 @app.get("/api/v1/resources/{resource_id}/content-snapshots")
 async def get_content_snapshots(
     resource_id: str,
@@ -1103,8 +1648,10 @@ async def get_content_snapshots(
 
     Resolution: each tab maps to the child resource type that backs it
     (mail → USER_MAIL, onedrive → USER_ONEDRIVE, …). For each child the
-    most recent COMPLETED snapshot wins. Tabs with no snapshot yet return
-    null so the UI can render an empty state without a second round-trip.
+    most recent *real recovery point* wins — see _real_restore_point():
+    COMPLETED or PARTIAL, excluding skipped_concurrent placeholders. Tabs
+    with no snapshot yet return null so the UI can render an empty state
+    without a second round-trip.
 
     Recovery uses this on resource select so it can hide the snapshot
     dropdown — clicking a tab now jumps straight to the right snapshot."""
@@ -1124,7 +1671,7 @@ async def get_content_snapshots(
     snapshot_count = (await db.execute(
         select(func.count(Snapshot.id))
         .where(Snapshot.resource_id.in_(counted_ids))
-        .where(Snapshot.status == SnapshotStatus.COMPLETED)
+        .where(_real_restore_point())
     )).scalar() or 0
 
     # versionCount = how many distinct backup *attempts* (batch_id) have
@@ -1154,7 +1701,7 @@ async def get_content_snapshots(
         .select_from(Snapshot)
         .outerjoin(Job, Job.id == Snapshot.job_id)
         .where(Snapshot.resource_id.in_(counted_ids))
-        .where(Snapshot.status == SnapshotStatus.COMPLETED)
+        .where(_real_restore_point())
     )).scalar() or 0
 
     # Per-content-type item_type to count against (for the aggregated
@@ -1179,7 +1726,7 @@ async def get_content_snapshots(
         snap = (await db.execute(
             select(Snapshot)
             .where(Snapshot.resource_id == child.id)
-            .where(Snapshot.status == SnapshotStatus.COMPLETED)
+            .where(_real_restore_point())
             .order_by(Snapshot.created_at.desc())
             .limit(1)
         )).scalar_one_or_none()
@@ -1200,35 +1747,59 @@ async def get_content_snapshots(
                     select(Snapshot.id).where(
                         Snapshot.resource_id == child.id,
                         Snapshot.created_at <= snap.created_at,
+                        # Mirror _resolve_sibling_snapshot_ids: FAILED
+                        # runs' leftover metadata rows must not count
+                        # toward tab badges, and PENDING_DELETION rows
+                        # are mid-teardown (sweep claim) — their items/
+                        # blobs are being deleted right now.
+                        Snapshot.status.notin_([
+                            SnapshotStatus.FAILED,
+                            SnapshotStatus.PENDING_DELETION,
+                        ]),
                     )
                 )).all()
             ]
             if sib_ids:
-                rows = (await db.execute(
-                    select(SnapshotItem.external_id, SnapshotItem.content_size, SnapshotItem.created_at)
-                    .where(
-                        SnapshotItem.snapshot_id.in_(sib_ids),
-                        SnapshotItem.item_type.in_(count_types),
-                    )
-                    .order_by(SnapshotItem.created_at.desc())
-                )).all()
-                seen: set = set()
-                agg_count = 0
-                agg_bytes = 0
-                for ext_id, size, _ in rows:
-                    key = ext_id or _
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    agg_count += 1
-                    agg_bytes += int(size or 0)
+                agg_count, agg_bytes = await _rollup_latest_items(
+                    db, child.id, snap.id, sib_ids, count_types,
+                )
 
+        # status / snapshotItemCount (TMV-010, 2026-08-11). The QA sweep read
+        # the Chats tab badge (719,826) against `snapshots.item_count`
+        # (598,807) and called the 121k gap an inconsistency. It is not: the
+        # two are different metrics and both are right. `itemCount` here is
+        # the cross-sibling newest-wins rollup — the number of distinct chat
+        # messages recoverable AS OF this snapshot, across all 18 siblings —
+        # while `snapshots.item_count` is what THIS one delta run captured.
+        # Verified on prod for the test resource: rollup over the anchor's 18
+        # siblings = 719,826 distinct external_ids, anchor item_count =
+        # 598,807.
+        #
+        # The real defect the finding names is the other half: that anchor
+        # snapshot's status is PARTIAL and the payload had no way to say so,
+        # so Recovery rendered a silently-incomplete backup as complete.
+        # `_real_restore_point()` deliberately admits PARTIAL (a lossy-shard
+        # run still holds everything it captured), which makes surfacing the
+        # status mandatory rather than optional. Both fields are additive —
+        # existing consumers keep reading itemCount unchanged.
+        _snap_status = (
+            snap.status.value if hasattr(snap.status, "value") else str(snap.status)
+        )
         by_content[tab] = {
             "snapshotId": str(snap.id),
             "childResourceId": str(child.id),
             "itemCount": agg_count,
             "bytesTotal": agg_bytes,
             "createdAt": snap.created_at.isoformat() if snap.created_at else None,
+            # Status of the anchor snapshot this tab points at.
+            "status": _snap_status,
+            # True for anything that is not a clean COMPLETED — the UI should
+            # badge the tab and banner the panel when this is set.
+            "isPartial": _snap_status != SnapshotStatus.COMPLETED.value,
+            # This snapshot's OWN captured count, next to the cross-sibling
+            # rollup, so the two numbers are never mistaken for each other
+            # again.
+            "snapshotItemCount": int(snap.item_count or 0),
         }
 
     return {
@@ -1249,12 +1820,25 @@ async def search_snapshot_items(
     folder_path: Optional[str] = Query(None),
     snapshot_id: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
-    size: int = Query(50, ge=1),
+    size: int = Query(50, ge=1, le=1000),
     db: AsyncSession = Depends(get_db),
 ):
     """Search snapshot items for a resource with optional filters."""
+    catalogue = await _catalogue_snapshot(db, snapshot_id) if snapshot_id else None
+    if catalogue is not None:
+        if catalogue.resource_id != UUID(resource_id):
+            raise HTTPException(404, detail="Snapshot not found for resource")
+        return await _catalogue_item_response(db, catalogue, page=page, size=size,
+            item_type=item_type, folder=folder_path, query=query)
     resource = await db.get(Resource, UUID(resource_id))
     resource_type = resource.type.value if resource and hasattr(resource.type, "value") else (str(resource.type) if resource else "")
+    if not snapshot_id and resource_type == "USER_CHATS":
+        latest = await db.scalar(select(Snapshot).where(Snapshot.resource_id == resource.id,
+            Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL]))
+            .order_by(Snapshot.created_at.desc(), Snapshot.id.desc()).limit(1))
+        if latest is not None and (latest.extra_data or {}).get("chat_inventory_format") == 1:
+            return await _catalogue_item_response(db, latest, page=page, size=size,
+                item_type=item_type, folder=folder_path, query=query)
     if resource and resource_type == "POWER_BI":
         target_snapshot_id = snapshot_id
         if not target_snapshot_id:
@@ -1296,19 +1880,34 @@ async def search_snapshot_items(
 
     snapshot_ids_stmt = select(Snapshot.id).where(
         Snapshot.resource_id == UUID(resource_id),
-        Snapshot.status == SnapshotStatus.COMPLETED,
+        # PARTIAL rows are real restore points and must be searchable: a
+        # counter-driven honesty gate can flip an otherwise-good snapshot to
+        # PARTIAL, and for some resources EVERY recent snapshot is PARTIAL
+        # (e.g. SHAREPOINT_SITE "IT OPS NOTES", 2026-08-10 → 08-11). Filtering
+        # to COMPLETED alone hid the newest backup from Recovery entirely.
+        # Mirrors the POWER_BI branch above, which already accepts both.
+        Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL]),
     )
     if snapshot_id:
         snapshot_ids_stmt = snapshot_ids_stmt.where(Snapshot.id == UUID(snapshot_id))
     snapshot_ids_result = await db.execute(snapshot_ids_stmt)
-    snapshot_ids = [str(s.id) for s in snapshot_ids_result.scalars().all()]
+    # ``select(Snapshot.id)`` + ``.scalars()`` yields bare UUIDs, NOT ORM rows.
+    # The old ``s.id`` therefore raised
+    #   AttributeError: 'asyncpg.pgproto.pgproto.UUID' object has no attribute 'id'
+    # and 500'd EVERY non-POWER_BI recovery search — including the folder
+    # drill-down, which routes through this same handler with folder_path set.
+    # The empty-result case masked the bug for years: the comprehension never
+    # dereferenced, so a resource with no matching snapshot returned a
+    # plausible-looking 200/total=0 instead of the 500. Pinned by
+    # tests/services/test_recovery_search_snapshot_ids.py.
+    snapshot_ids = list(snapshot_ids_result.scalars().all())
 
     if not snapshot_ids:
         return SnapshotItemListResponse(
             content=[], totalPages=0, totalElements=0, size=size, number=page,
         )
 
-    filters = [SnapshotItem.snapshot_id.in_([UUID(sid) for sid in snapshot_ids])]
+    filters = [SnapshotItem.snapshot_id.in_(snapshot_ids)]
     if item_type:
         filters.append(SnapshotItem.item_type == item_type)
     if folder_path:
@@ -1325,7 +1924,9 @@ async def search_snapshot_items(
     stmt = (
         select(SnapshotItem)
         .where(*filters)
-        .order_by(SnapshotItem.created_at.desc())
+        # id tiebreak — snapshot_items are bulk-inserted, so created_at ties
+        # span thousands of rows and page 2 would otherwise re-slice them.
+        .order_by(SnapshotItem.created_at.desc(), SnapshotItem.id.desc())
         .offset((page - 1) * size)
         .limit(size)
     )
@@ -1357,6 +1958,8 @@ async def get_snapshot_item_detail(snapshot_id: str, item_id: str, db: AsyncSess
     item = result.scalar_one_or_none()
     if not item:
         raise HTTPException(status_code=404, detail="Snapshot item not found")
+    if item.chat_version_id is not None or (await _catalogue_snapshot(db, snapshot_id)) is not None:
+        item = (await materialize_chat_items(db, [item]))[0]
     return _item_to_response(item)
 
 
@@ -1497,14 +2100,45 @@ async def _resolve_sibling_snapshot_ids(
     # created 9 seconds after the Calendar snapshot in the same batch,
     # leaving the Recovery chats tab empty when navigated from any
     # non-chat sibling. Instead return every snapshot of the target.
-    where_clauses = [Snapshot.resource_id == resource_id_for_siblings]
+    where_clauses = [
+        Snapshot.resource_id == resource_id_for_siblings,
+        # FAILED runs can leave blobless coordinator metadata rows behind
+        # (a reaped 348GB force-full persisted ~199k of them, 2026-07-14).
+        # Including those snapshots in the union makes dead rows render
+        # as recoverable "metadata only" items and inflates every tab
+        # badge. Failed runs contribute no recoverable state — drop them.
+        # PENDING_DELETION rows are mid-teardown (cancelled-sweep claim):
+        # their blobs are being deleted this minute — letting them win
+        # the newest-wins dedup would surface items whose restore 404s
+        # and shadow the live versions underneath.
+        Snapshot.status.notin_([
+            SnapshotStatus.FAILED,
+            SnapshotStatus.PENDING_DELETION,
+        ]),
+    ]
     if not cross_resource_swap:
         where_clauses.append(Snapshot.created_at <= row.created_at)
     rows = (await db.execute(
         select(Snapshot.id).where(*where_clauses)
         .order_by(Snapshot.created_at.desc())
     )).all()
-    return [r[0] for r in rows] or [snap_uuid]
+    sibling_ids = [r[0] for r in rows]
+    # Keep the explicitly-requested snapshot viewable even when it is
+    # itself FAILED (deep links / post-mortem inspection of a failed
+    # run) — but only when no cross-resource swap redirected us to a
+    # different resource entirely. PENDING_DELETION is the exception:
+    # unlike an inert FAILED row, a sweep-claimed snapshot's blobs are
+    # being deleted at this moment and its rows vanish minutes later —
+    # re-admitting it would let its (typically newest) items win the
+    # union's newest-wins dedup and shadow live versions with
+    # restore-404s, the exact defect the exclusion above prevents.
+    if (
+        not cross_resource_swap
+        and snap_uuid not in sibling_ids
+        and row.status != SnapshotStatus.PENDING_DELETION
+    ):
+        sibling_ids.append(snap_uuid)
+    return sibling_ids or [snap_uuid]
 
 
 def _raw(item) -> dict:
@@ -1513,16 +2147,428 @@ def _raw(item) -> dict:
     return r if isinstance(r, dict) else {}
 
 
+# The sibling-union queries sort ~1M rows for heavy mailboxes; at the
+# default 4MB work_mem those sorts spill hundreds of MB to disk
+# (measured 405MB/232MB on a 1.22M-row mailbox, 2026-08-03). A per-
+# transaction bump keeps them in memory without touching the shared
+# cluster default. SET LOCAL scopes it to the current transaction.
+_QUERY_WORK_MEM = os.getenv("SNAPSHOT_QUERY_WORK_MEM", "128MB")
+_WORK_MEM_UNIT_KB = {"kB": 1, "MB": 1024, "GB": 1024 * 1024}
+
+
+def _work_mem_kb(value: str) -> Optional[int]:
+    """Parse a work_mem value to whole kB, or None if unusable.
+
+    SET cannot take bind parameters, so the interpolated value must be
+    provably an integer; and Postgres range-checks at execution
+    (64kB..2147483647kB) — an out-of-range value would ERROR, and any
+    errored statement aborts the open transaction, failing every later
+    query in the request. Validating the range here keeps the knob
+    genuinely advisory.
+    """
+    m = _re.match(r"^(\d{1,9})(kB|MB|GB)$", value or "")
+    if not m:
+        return None
+    kb = int(m.group(1)) * _WORK_MEM_UNIT_KB[m.group(2)]
+    if not (64 <= kb <= 2_147_483_647):
+        return None
+    return kb
+
+
+async def _set_local_work_mem(db: AsyncSession) -> None:
+    kb = _work_mem_kb(_QUERY_WORK_MEM)
+    if kb is None:
+        return
+    try:
+        # SAVEPOINT wrapper: if the SET still fails for any reason, the
+        # savepoint rolls back and the enclosing transaction stays
+        # usable — a bare failed statement would abort it and every
+        # later query in the request would raise InFailedSQLTransaction.
+        # (GUC changes survive RELEASE SAVEPOINT, so a successful SET
+        # LOCAL still applies to the rest of the transaction.)
+        async with db.begin_nested():
+            await db.execute(text(f"SET LOCAL work_mem = '{kb}kB'"))
+    except Exception:
+        # Advisory only — a failed SET must never fail the request.
+        pass
+
+
+# Result cache for the union-dedup list/count queries. For a mailbox
+# with 15 near-identical full-capture snapshots, one page-1 request
+# costs ~8s of Postgres time; users click back and forth between
+# accounts, re-paying that on every click. Entries are keyed by the
+# sibling snapshot set *plus each sibling's status*, so:
+#   - a new snapshot (backup completed, retention pruned) changes the
+#     id set → new key;
+#   - an IN_PROGRESS sibling flipping to COMPLETED changes the status
+#     fingerprint → new key (rows stream into an in-progress snapshot
+#     under an unchanged id, so the id set alone is not enough).
+# The residual staleness window — rows streaming into a still-running
+# snapshot — is bounded by the TTL below. Values hold only page ids
+# (≤500 UUID strings); ORM rows are re-hydrated per request so no
+# session-bound state is ever cached. Per-process (one cache per
+# uvicorn worker), wholesale-cleared at the bound as a runaway guard.
+_paged_items_cache: Dict[tuple, Tuple[float, tuple]] = {}
+_PAGED_ITEMS_CACHE_MAX = 4096
+# The dedup COUNT is cached SEPARATELY from the page ids, because it
+# depends on strictly less: the sibling set and the row filters, but
+# not the display sort, the page number or the page size. Folding it
+# into the page key (as it was until 2026-08-11) meant every 1→2→3
+# page click, every size change and every sort flip re-ran the
+# full-union COUNT — 209,325 rows scanned / 1.7 s of Postgres time for
+# Riley Stillman's calendar, and 8,545,195 rows / 140 s for Jason
+# Rue's chats (measured on prod 2026-08-11). Split, the count is paid
+# once per (sibling set, filters) and every later page is page-query
+# only. Pinned by test_count_cache_survives_page_and_sort_changes.
+_dedup_count_cache: Dict[tuple, Tuple[float, int]] = {}
+_DEDUP_COUNT_CACHE_MAX = 4096
+_folder_agg_cache: Dict[tuple, Tuple[float, list]] = {}
+_FOLDER_AGG_CACHE_MAX = 4096
+_LIST_CACHE_TTL_S = int(os.getenv("SNAPSHOT_LIST_CACHE_TTL_S", "900"))
+
+# Statuses whose snapshot_items rows are settled. IN_PROGRESS rows are
+# still streaming in and PENDING_DELETION rows are being removed — a
+# fingerprint containing either must not be cached (the id+status pair
+# wouldn't change while the rows do). FAILED appears only for an
+# explicitly-requested failed snapshot (post-mortem view) — inert rows.
+_CACHEABLE_SNAPSHOT_STATES = frozenset({"COMPLETED", "FAILED", "PARTIAL"})
+
+# Session factory for the concurrent COUNT in _paged_latest_items —
+# module-level indirection so unit tests can substitute a fake without
+# touching the real engine.
+_count_session_factory = async_session_factory
+
+# At most this many COUNTs may run concurrently on second sessions; the
+# rest fall back to running sequentially on the request's own session.
+# Bounds the extra pooled-connection demand: a cold-cache burst of N
+# list requests otherwise wants 2N connections and can starve the pool
+# right when Recovery is busiest (each heavy query holds its connection
+# for seconds).
+_COUNT_CONCURRENCY = asyncio.Semaphore(int(os.getenv("SNAPSHOT_COUNT_CONCURRENCY", "8")))
+
+
+def _cache_put(cache: Dict[tuple, tuple], bound: int, key: tuple, value: tuple) -> None:
+    """Insert with expired-entry sweep before the wholesale-clear guard."""
+    if len(cache) >= bound:
+        now = _time.monotonic()
+        for k in [k for k, v in cache.items() if (now - v[0]) >= _LIST_CACHE_TTL_S]:
+            cache.pop(k, None)
+        if len(cache) >= bound:
+            cache.clear()
+    cache[key] = value
+
+
+async def _sibling_state_fingerprint(db: AsyncSession, sibling_ids) -> Tuple[tuple, bool]:
+    """((id, status) per sibling, sorted) + whether the set is cacheable.
+
+    The fingerprint is the cache-version token: any snapshot add/remove
+    or status flip changes it. `cacheable` is False while any sibling
+    is in a state whose rows still change under an unchanged
+    fingerprint (streaming backup, pending deletion) — those requests
+    run live, exactly the pre-cache behavior.
+    """
+    if not sibling_ids:
+        return (), False
+    rows = (await db.execute(
+        select(Snapshot.id, Snapshot.status)
+        .where(Snapshot.id.in_(list(sibling_ids)))
+    )).all()
+    states = [getattr(r[1], "value", str(r[1])) for r in rows]
+    fp = tuple(sorted((str(r[0]), s) for r, s in zip(rows, states)))
+    cacheable = all(s in _CACHEABLE_SNAPSHOT_STATES for s in states)
+    return fp, cacheable
+
+
+_SINCE_UNITS = {"d": 86400, "h": 3600, "m": 60}
+
+
+def _parse_since(value: Optional[str]) -> Optional[str]:
+    """Normalise a recency window to a Graph-style Zulu timestamp string.
+
+    Accepts an absolute ISO-8601 instant ("2026-08-01T00:00:00Z") or a
+    relative window ("30d", "12h", "90m"). Returns None for None/blank so
+    callers can treat "no window" as "no predicate".
+
+    Why a string and not a datetime: the values it is compared against live
+    in `metadata->'raw'` as Graph's fixed-width Zulu strings, and the sort
+    keys on the same expression. Lexicographic order over that format is
+    chronological order, so filter and sort agree by construction — casting
+    to timestamptz instead would detoast and parse every raw payload in the
+    scan, which is precisely the cost _paged_latest_items exists to avoid.
+    """
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    unit = raw[-1].lower()
+    if unit in _SINCE_UNITS and raw[:-1].isdigit():
+        cutoff = datetime.utcnow() - timedelta(seconds=int(raw[:-1]) * _SINCE_UNITS[unit])
+        return cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid recency window {value!r}: expected ISO-8601 "
+                "(2026-08-01T00:00:00Z) or a relative window (30d / 12h / 90m)"
+            ),
+        )
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+async def _paged_latest_items(
+    db: AsyncSession,
+    sibling_ids,
+    item_types,
+    *,
+    folder: Optional[str] = None,
+    search: Optional[str] = None,
+    exclude_deleted: bool = False,
+    sort_sql: Optional[str] = None,
+    sort_dir: str = "DESC",
+    extra_where: Optional[str] = None,
+    extra_params: Optional[Dict[str, Any]] = None,
+    page: int = 1,
+    size: int = 500,
+):
+    """Newest-wins dedup + display sort + pagination, all database-side.
+
+    The Tier-2 list endpoints aggregate across every sibling snapshot
+    (delta backups split content over many snapshots), which for heavy
+    resources means hundreds of thousands of rows carrying full raw
+    Graph payloads — jrue's USER_MAIL alone is 353k rows / 1.4 GB of
+    metadata JSON. Materializing that per request OOMKilled the pod
+    (2026-07-20 at 1.5 Gi, 2026-07-21 at 3 Gi), so only three bounded
+    queries ever leave Postgres:
+
+      1. COUNT over a GROUP BY dedup_key subquery for totalElements
+         (hash-aggregates; COUNT(DISTINCT) can only sort-aggregate and
+         spilled 405MB to disk on a 1.22M-row mailbox) — run
+         concurrently with (2) on its own session;
+      2. DISTINCT ON dedup (newest snapshot row wins per external_id)
+         in a subquery, display-sorted + LIMIT/OFFSET in the outer
+         query, returning one page of row ids;
+      3. hydrate exactly those ids into ORM rows for the response
+         formatters, re-ordered to the SQL page order.
+
+    (1) and (2) are cached per sibling-set-version (see
+    _paged_items_cache above); (3) always runs so no ORM state outlives
+    its session.
+
+    `sort_sql` is a SQL expression over `si.*` producing the display
+    sort key (callers COALESCE it non-null so `sort_dir` needs no
+    NULLS handling); default is capture order (`si.created_at`).
+    """
+    dedup_key = "COALESCE(si.external_id, si.id::text)"
+    where_parts = [
+        "si.snapshot_id = ANY(:sids)",
+        "si.item_type = ANY(:types)",
+    ]
+    params: Dict[str, Any] = {
+        "sids": [str(s) for s in sibling_ids],
+        "types": list(item_types),
+    }
+    if folder is not None:
+        where_parts.append("si.folder_path = :folder")
+        params["folder"] = folder
+    if search:
+        where_parts.append("si.name ILIKE :search")
+        params["search"] = f"%{search}%"
+    if exclude_deleted:
+        where_parts.append("si.is_deleted IS NOT TRUE")
+    # Caller-supplied row predicate (currently the OneDrive recency window —
+    # see list_snapshot_onedrive). Applied INSIDE the dedup subquery so the
+    # COUNT and the page agree, and folded into both cache keys below so a
+    # different window can never read another window's cached total.
+    if extra_where:
+        where_parts.append(extra_where)
+        params.update(extra_params or {})
+    where_sql = " AND ".join(where_parts)
+
+    sort_dir = "ASC" if sort_dir.upper() == "ASC" else "DESC"
+    sort_expr = sort_sql or "si.created_at"
+
+    # ── Cache lookup ────────────────────────────────────────────────
+    # Two caches, deliberately keyed differently (see _dedup_count_cache
+    # above): the COUNT depends only on the sibling set + row filters,
+    # the page ids additionally on sort/page/size. A user paging or
+    # re-sorting therefore re-pays the page query only.
+    state_fp, cacheable = await _sibling_state_fingerprint(db, sibling_ids)
+    filter_key = (
+        state_fp, tuple(item_types), folder, search, exclude_deleted,
+        extra_where, tuple(sorted((extra_params or {}).items())),
+    )
+    page_key = filter_key + (sort_expr, sort_dir, page, size)
+    now = _time.monotonic()
+
+    total: Optional[int] = None
+    page_ids: Optional[list] = None
+    if cacheable:
+        c_hit = _dedup_count_cache.get(filter_key)
+        if c_hit is not None and (now - c_hit[0]) < _LIST_CACHE_TTL_S:
+            total = c_hit[1]
+        p_hit = _paged_items_cache.get(page_key)
+        if p_hit is not None and (now - p_hit[0]) < _LIST_CACHE_TTL_S:
+            page_ids = list(p_hit[1])
+
+    if total is None or page_ids is None:
+        # COUNT via GROUP BY subquery instead of COUNT(DISTINCT ...):
+        # Postgres can only sort-aggregate COUNT(DISTINCT) (2.8s + a
+        # 405MB disk spill on a 1.22M-row mailbox) while the GROUP BY
+        # form hash-aggregates (1.6s, no spill). When the concurrency
+        # budget allows, it runs CONCURRENTLY with the page query on
+        # its own session — they don't depend on each other and each
+        # costs seconds cold, so overlapping them nearly halves cold
+        # latency. Past the budget it runs sequentially on the request
+        # session instead (no extra pooled connection).
+        count_sql = (
+            f"SELECT COUNT(*) AS n FROM ("
+            f"  SELECT 1 FROM snapshot_items si WHERE {where_sql}"
+            f"  GROUP BY {dedup_key}"
+            f") dedup"
+        )
+
+        async def _run_count_on(count_db) -> int:
+            await _set_local_work_mem(count_db)
+            row = (await count_db.execute(text(count_sql), params)).first()
+            return int(row.n or 0) if row else 0
+
+        async def _run_count_concurrent() -> int:
+            async with _count_session_factory() as count_db:
+                return await _run_count_on(count_db)
+
+        # The permit is released at the await sites below (both the
+        # success and the page-query-failure path), NOT inside the task:
+        # a task cancelled before its first tick never enters its body,
+        # so a release-in-finally there could leak the permit.
+        count_task: Optional[asyncio.Task] = None
+        if total is None and not _COUNT_CONCURRENCY.locked():
+            # Non-blocking acquire: never WAIT on the budget — waiting
+            # while holding the request connection is the hold-and-wait
+            # shape that starves the pool under cold-cache bursts.
+            await _COUNT_CONCURRENCY.acquire()
+            count_task = asyncio.create_task(_run_count_concurrent())
+
+        if page_ids is None:
+            params_page = dict(params)
+            params_page["limit"] = size
+            params_page["offset"] = (page - 1) * size
+            # DISTINCT ON requires its expression to lead the inner ORDER
+            # BY, so the display sort can't live there — it goes on the
+            # outer query. HOW it gets there decides the plan:
+            #
+            #  * A JSON sort key (mail's metadata->'raw'->>'received…')
+            #    must NOT be evaluated inside the dedup — that detoasts
+            #    the full raw Graph payload for every *input* row
+            #    (16.4 s vs 2.9 s on jrue's 353k-row mailbox), so it is
+            #    computed for the deduped winners only, via a self-join
+            #    back to snapshot_items on the winning id.
+            #  * A plain-column sort key (calendar's si.created_at,
+            #    contacts' and OneDrive's LOWER(si.name)) is already in
+            #    the row the dedup scanned. Routing it through the
+            #    self-join anyway re-read every deduped winner through
+            #    the pkey index to fetch a column already in hand.
+            #    Measured on prod 2026-08-11 against Riley Stillman's
+            #    calendar (18 sibling snapshots, 209,325 union rows,
+            #    38,223 distinct events): 5.6 s / 235k shared buffers
+            #    with the self-join vs 1.9 s / 44k buffers with the key
+            #    selected inline — byte-identical page ids. That
+            #    nested loop was 3.5 s of the 5.6 s.
+            #
+            # si.id / latest.id tiebreaks equal sort keys either way so
+            # pages never overlap. Pinned by
+            # test_plain_sort_key_skips_self_join.
+            if "metadata" in sort_expr.lower():
+                page_sql = (
+                    f"SELECT si.id FROM ("
+                    f"  SELECT DISTINCT ON ({dedup_key}) si.id"
+                    f"  FROM snapshot_items si WHERE {where_sql}"
+                    f"  ORDER BY {dedup_key}, si.created_at DESC"
+                    f") latest JOIN snapshot_items si ON si.id = latest.id "
+                    f"ORDER BY ({sort_expr}) {sort_dir}, si.id "
+                    f"LIMIT :limit OFFSET :offset"
+                )
+            else:
+                page_sql = (
+                    f"SELECT latest.id FROM ("
+                    f"  SELECT DISTINCT ON ({dedup_key}) si.id, ({sort_expr}) AS _sk"
+                    f"  FROM snapshot_items si WHERE {where_sql}"
+                    f"  ORDER BY {dedup_key}, si.created_at DESC"
+                    f") latest "
+                    f"ORDER BY latest._sk {sort_dir}, latest.id "
+                    f"LIMIT :limit OFFSET :offset"
+                )
+            try:
+                await _set_local_work_mem(db)
+                page_rows = (await db.execute(text(page_sql), params_page)).all()
+            except BaseException:
+                if count_task is not None:
+                    count_task.cancel()
+                    try:
+                        await count_task
+                    except BaseException:
+                        pass
+                    finally:
+                        _COUNT_CONCURRENCY.release()
+                raise
+            page_ids = [r.id for r in page_rows]
+            if cacheable:
+                _cache_put(
+                    _paged_items_cache, _PAGED_ITEMS_CACHE_MAX,
+                    page_key, (now, tuple(page_ids)),
+                )
+
+        if count_task is not None:
+            try:
+                total = await count_task
+            finally:
+                _COUNT_CONCURRENCY.release()
+            if cacheable:
+                _cache_put(
+                    _dedup_count_cache, _DEDUP_COUNT_CACHE_MAX,
+                    filter_key, (now, total),
+                )
+        elif total is None:
+            total = await _run_count_on(db)
+            if cacheable:
+                _cache_put(
+                    _dedup_count_cache, _DEDUP_COUNT_CACHE_MAX,
+                    filter_key, (now, total),
+                )
+
+    if not page_ids:
+        return [], total
+
+    orm_rows = (await db.execute(
+        select(SnapshotItem).where(SnapshotItem.id.in_(page_ids))
+    )).scalars().all()
+    by_id = {r.id: r for r in orm_rows}
+    return [by_id[i] for i in page_ids if i in by_id], total
+
+
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/emails")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/mail")
 async def list_snapshot_emails(
     snapshot_id: str,
     page: int = Query(1, ge=1),
-    size: int = Query(500, ge=1),
+    size: int = Query(500, ge=1, le=500),
     folder: Optional[str] = Query(None, description="Filter to a specific mail folder path"),
     search: Optional[str] = Query(None, description="Case-insensitive substring match on name/subject"),
     source: Optional[str] = Query(None, description="'archive' → serve Online Archive items via this (gateway-allowed) path"),
     category: Optional[str] = Query(None, description="With source=archive: mail | contacts | calendar"),
+    bodies: Optional[str] = Query(
+        None,
+        description=(
+            "'none' omits body/attachments payloads from each row "
+            "(~10x smaller pages; the Recovery UI fetches the selected "
+            "email's body via the item-detail endpoint instead). "
+            "Default returns full bodies for back-compat."
+        ),
+    ),
     db: AsyncSession = Depends(get_db),
 ):
     """Return emails with from/to/cc/subject/body/date extracted from metadata.
@@ -1544,47 +2590,43 @@ async def list_snapshot_emails(
     )
     if not sibling_ids:
         sibling_ids = [UUID(snapshot_id)]
-    filters = [
-        SnapshotItem.snapshot_id.in_(sibling_ids),
-        SnapshotItem.item_type == "EMAIL",
-    ]
-    if folder is not None:
-        filters.append(SnapshotItem.folder_path == folder)
-    if search:
-        filters.append(SnapshotItem.name.ilike(f"%{search}%"))
-    # Pull every row, dedup by external_id, then sort by send-time DESC so
-    # page 1 = newest emails (Gmail / Outlook order). Sorting by
-    # SnapshotItem.created_at alone was effectively random — all rows in a
-    # single backup share roughly the same insert timestamp, so emails
-    # appeared in worker-write order (arbitrary) instead of chronological.
-    all_rows = (await db.execute(
-        select(SnapshotItem).where(*filters)
-    )).scalars().all()
-    seen: set = set()
-    deduped = []
-    for it in all_rows:
-        key = it.external_id or str(it.id)
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(it)
-    def _mail_sort_key(r):
-        raw = (r.extra_data or {}).get("raw") or {}
-        # receivedDateTime is the inbox-arrival timestamp (what Outlook /
-        # Gmail order on). Falls back to sentDateTime for items in Sent
-        # Items and to row created_at for malformed rows so we never get
-        # a None comparator that would blow up the sort.
-        ts = raw.get("receivedDateTime") or raw.get("sentDateTime")
-        if ts:
-            return ts  # ISO-8601 strings sort lexicographically by time
-        return r.created_at.isoformat() if r.created_at else ""
-    deduped.sort(key=_mail_sort_key, reverse=True)
-    total = len(deduped)
-    offset = (page - 1) * size
-    items = deduped[offset: offset + size]
+    # Dedup + sort + paginate in SQL (see _paged_latest_items). Page 1 =
+    # newest emails: receivedDateTime is the inbox-arrival timestamp
+    # (what Outlook / Gmail order on), sentDateTime covers Sent Items,
+    # created_at covers malformed rows — ISO-8601 strings sort
+    # lexicographically by time so the whole key stays text.
+    # Graph delta deletion markers (@removed / deleted facet) are not
+    # restorable emails — same rule /onedrive already applies below. They
+    # carry no subject and no receivedDateTime/sentDateTime, so the sort
+    # below falls through to created_at (the backup run's own timestamp)
+    # and ranks every one of them above all real mail: 13,249 tombstones
+    # buried Jason Rue's 435k dated messages behind pages of
+    # "(no subject)" (2026-08-07). The walk no longer persists them;
+    # exclude_deleted also hides the rows written before that fix.
+    items, total = await _paged_latest_items(
+        db, sibling_ids, ["EMAIL"],
+        folder=folder, search=search, exclude_deleted=True,
+        sort_sql=(
+            "COALESCE(si.metadata->'raw'->>'receivedDateTime', "
+            "si.metadata->'raw'->>'sentDateTime', "
+            "to_char(si.created_at, 'YYYY-MM-DD\"T\"HH24:MI:SS'), '')"
+        ),
+        sort_dir="DESC", page=page, size=size,
+    )
+
+    # Heavy per-message payloads dropped when bodies == "none". The list
+    # panel renders only subject/from/date/bodyPreview; shipping every
+    # message's full HTML body (typ. 471KB per 50-row page vs ~45KB slim)
+    # made tab-in latency payload-bound. The preview pane lazily fetches
+    # the selected email via GET .../items/{item_id}, whose metadata.raw
+    # still carries the full body.
+    _HEAVY_RAW_KEYS = ("body", "uniqueBody", "attachments", "internetMessageHeaders")
+    slim = bodies == "none"
 
     def fmt(i):
         raw = _raw(i)
+        if slim:
+            raw = {k: v for k, v in raw.items() if k not in _HEAVY_RAW_KEYS}
         from_addr = raw.get("from", {}).get("emailAddress", {})
         to_list = [r.get("emailAddress", {}) for r in raw.get("toRecipients", [])]
         cc_list = [r.get("emailAddress", {}) for r in raw.get("ccRecipients", [])]
@@ -1893,7 +2935,7 @@ async def serve_hosted_content(
 async def list_snapshot_messages(
     snapshot_id: str,
     page: int = Query(1, ge=1),
-    size: int = Query(500, ge=1),
+    size: int = Query(500, ge=1, le=500),
     chatId: Optional[str] = Query(None),
     folder: Optional[str] = Query(None, description="Filter to one chat by folder_path"),
     search: Optional[str] = Query(None, description="Case-insensitive substring match on body"),
@@ -1914,6 +2956,12 @@ async def list_snapshot_messages(
     Auto-resolves to the USER_CHATS sibling when the caller passes the
     ENTRA_USER parent or a non-chat sibling's snapshot id.
     """
+    catalogue = await _catalogue_snapshot(db, snapshot_id, resolve_chat_sibling=True)
+    if catalogue is not None:
+        if (catalogue.extra_data or {}).get("chat_inventory_format") == 1:
+            return await _catalogue_message_response(db, catalogue, page=page, size=size,
+                chat_id=chatId, folder=folder, search=search)
+        snapshot_id = str(catalogue.id)
     CHAT_TYPES = ("TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY")
     sibling_ids = await _resolve_sibling_snapshot_ids(
         db, snapshot_id, target_child_type=ResourceType.USER_CHATS,
@@ -1921,7 +2969,10 @@ async def list_snapshot_messages(
     if not sibling_ids:
         sibling_ids = [UUID(snapshot_id)]
 
-    where_parts = [
+    # Two predicate lists: `si_where_parts` is the subset that only
+    # touches snapshot_items (so it can be evaluated without either
+    # LEFT JOIN — see the COUNT below), `where_parts` is the full set.
+    si_where_parts = [
         "si.snapshot_id = ANY(:sids)",
         "si.item_type = ANY(:types)",
     ]
@@ -1930,11 +2981,12 @@ async def list_snapshot_messages(
         "types": list(CHAT_TYPES),
     }
     if folder is not None:
-        where_parts.append("si.folder_path = :folder")
+        si_where_parts.append("si.folder_path = :folder")
         params["folder"] = folder
     if chatId:
-        where_parts.append("si.parent_external_id = :cid")
+        si_where_parts.append("si.parent_external_id = :cid")
         params["cid"] = chatId
+    where_parts = list(si_where_parts)
     if search:
         where_parts.append("ctm.body_content ILIKE :search")
         params["search"] = f"%{search}%"
@@ -2038,11 +3090,66 @@ async def list_snapshot_messages(
     # carry pointer rows for the same Graph msg id (the chat_thread_messages
     # row is single, so the body is consistent). Use DISTINCT ON to keep
     # one pointer per external_id (the newest-by-snapshot one).
-    sql_count = (
-        "SELECT COUNT(DISTINCT external_id) AS n FROM " + _union_sql
+    # Count the same durable union as the page, with no body joins on
+    # the pointer leg unless searching. GROUP BY permits hash aggregation.
+    pointer_count_from = base_sql_a if search else (
+        " FROM snapshot_items si "
+        f" WHERE {' AND '.join(si_where_parts)} "
     )
-    total_row = (await db.execute(text(sql_count), params)).first()
-    total = int(total_row.n or 0) if total_row else 0
+    sql_count = (
+        "SELECT COUNT(*) AS n FROM ("
+        " SELECT si.external_id " + pointer_count_from +
+        " GROUP BY si.external_id "
+        " UNION SELECT ctm.message_external_id AS external_id " + base_sql_b +
+        ") dedup"
+    )
+
+    state_fp, cacheable = await _sibling_state_fingerprint(db, sibling_ids)
+    durable_state = (await db.execute(text("""
+        WITH tenant_scope AS (
+            SELECT DISTINCT tenant_id FROM snapshots WHERE id = ANY(:sids)
+        )
+        SELECT MAX(ct.updated_at) AS updated_at, COUNT(ct.id) AS thread_count,
+               EXISTS (
+                   SELECT 1 FROM snapshots s
+                   JOIN resources r ON r.id = s.resource_id
+                   WHERE s.tenant_id IN (SELECT tenant_id FROM tenant_scope)
+                     AND r.type = 'USER_CHATS'
+                     AND s.status IN ('IN_PROGRESS', 'PENDING_DELETION')
+               ) AS changing
+        FROM chat_threads ct
+        WHERE ct.tenant_id IN (SELECT tenant_id FROM tenant_scope)
+    """), {"sids": list(sibling_ids)})).first()
+    # A thread's updated_at changes on claim and final drain. Do not cache
+    # during any member's active backup: messages commit between those stamps.
+    cacheable = cacheable and durable_state is not None and not durable_state.changing
+    durable_fp = (
+        durable_state.updated_at, durable_state.thread_count,
+    ) if durable_state is not None else ()
+    count_key = ("chats", state_fp, durable_fp, folder, chatId, search)
+    now = _time.monotonic()
+    total: Optional[int] = None
+    if cacheable:
+        c_hit = _dedup_count_cache.get(count_key)
+        if c_hit is not None and (now - c_hit[0]) < _LIST_CACHE_TTL_S:
+            total = c_hit[1]
+
+    async def _run_chat_count_on(count_db) -> int:
+        await _set_local_work_mem(count_db)
+        row = (await count_db.execute(text(sql_count), params)).first()
+        return int(row.n or 0) if row else 0
+
+    async def _run_chat_count_concurrent() -> int:
+        async with _count_session_factory() as count_db:
+            return await _run_chat_count_on(count_db)
+
+    # Permit released at the await sites below, never inside the task —
+    # a task cancelled before its first tick never enters its body, so
+    # a release-in-finally there could leak the permit.
+    count_task: Optional[asyncio.Task] = None
+    if total is None and not _COUNT_CONCURRENCY.locked():
+        await _COUNT_CONCURRENCY.acquire()
+        count_task = asyncio.create_task(_run_chat_count_concurrent())
 
     offset = (page - 1) * size
     params_page = dict(params)
@@ -2074,9 +3181,42 @@ async def list_snapshot_messages(
         "          sub.si_created_at DESC "
         " LIMIT :limit OFFSET :offset"
     )
-    rows = (await db.execute(text(sql_page), params_page)).all()
-    # Defensive in-process re-sort: identical to the subquery's outer
-    # ORDER BY, but handles any oddball NULL combinations consistently.
+    # PG requires the outer ORDER BY for pagination to match the DISTINCT ON
+    # leading column. Re-sort the page in-process by message timestamp.
+    # The union sort spills to temp for heavy chats (1.2 GB written on
+    # Jason Rue's 8.5M-row union at the 4 MB default) — same SET LOCAL
+    # bump the /mail /calendar /onedrive /contacts helper already does.
+    try:
+        await _set_local_work_mem(db)
+        rows = (await db.execute(text(sql_page), params_page)).all()
+    except BaseException:
+        if count_task is not None:
+            count_task.cancel()
+            try:
+                await count_task
+            except BaseException:
+                pass
+            finally:
+                _COUNT_CONCURRENCY.release()
+        raise
+    if count_task is not None:
+        try:
+            total = await count_task
+        finally:
+            _COUNT_CONCURRENCY.release()
+        if cacheable:
+            _cache_put(
+                _dedup_count_cache, _DEDUP_COUNT_CACHE_MAX,
+                count_key, (now, total),
+            )
+    elif total is None:
+        # Past the concurrency budget — run it on the request session.
+        total = await _run_chat_count_on(db)
+        if cacheable:
+            _cache_put(
+                _dedup_count_cache, _DEDUP_COUNT_CACHE_MAX,
+                count_key, (now, total),
+            )
     rows = sorted(
         rows,
         key=lambda r: (r.created_date_time or r.si_created_at, ""),
@@ -2204,6 +3344,7 @@ async def list_snapshot_messages(
                 async with _httpx.AsyncClient(timeout=2.0) as _c:
                     await _c.post(
                         f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log",
+                        headers=internal_audit_headers(),
                         json={
                             "action": "INTEGRITY_GAP",
                             "actor_type": "SYSTEM",
@@ -2413,6 +3554,11 @@ async def list_snapshot_chat_groups(
     delta-only later run does not drop threads captured by an earlier
     full run.
     """
+    catalogue = await _catalogue_snapshot(db, snapshot_id, resolve_chat_sibling=True)
+    if catalogue is not None:
+        if (catalogue.extra_data or {}).get("chat_inventory_format") == 1:
+            return await _catalogue_groups(db, catalogue)
+        snapshot_id = str(catalogue.id)
     sibling_ids = await _resolve_sibling_snapshot_ids(
         db, snapshot_id, target_child_type=ResourceType.USER_CHATS,
     )
@@ -2604,7 +3750,7 @@ async def azure_db_export(
             columns = payload.get("columns") or ed.get("columns") or []
             data_rows = payload.get("rows") or []
             buf = _io.StringIO()
-            writer = _csv.writer(buf)
+            writer = SafeCsvWriter(_csv.writer(buf))
             if columns:
                 writer.writerow(columns)
             for r in data_rows:
@@ -2770,7 +3916,22 @@ async def azure_db_table(
 async def list_snapshot_calendar(
     snapshot_id: str,
     page: int = Query(1, ge=1),
-    size: int = Query(500, ge=1),
+    # le=1000, not 500, because the Recovery Calendar view asks for exactly
+    # 1000: tm_vault/src/pages/Recovery.tsx:1633
+    # `SnapshotService.listCalendarEvents(snapshotId, 1, 1000)`. Against
+    # le=500 FastAPI rejected that with 422 BEFORE the handler ran, on every
+    # single request — so calendar recovery was not slow or flaky, it was
+    # categorically impossible (QA-01..54 sweep 2026-08-11, QA-03, reported
+    # as a 503; measured as a deterministic 422 in 0.0s).
+    # Raising the ceiling costs nothing: this endpoint's cost is dominated by
+    # the cross-snapshot union it must assemble to rebuild running state, NOT
+    # by the page size. Measured live on snapshot 70acfd9f (18 sibling
+    # snapshots, 209,325 union rows, 38,223 distinct events): size=10 and
+    # size=500 both landed in the same 1-2s band after the query fix, and
+    # before it size=10 was if anything SLOWER than size=500 under load.
+    # The other four content endpoints keep le=500 — no client asks them for
+    # more, and a ceiling that matches its caller is the honest contract.
+    size: int = Query(500, ge=1, le=1000),
     search: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
@@ -2794,35 +3955,28 @@ async def list_snapshot_calendar(
     if not sibling_ids:
         return {"content": [], "total": 0, "page": page, "size": size, "pages": 0}
 
-    filters = [
-        SnapshotItem.snapshot_id.in_(sibling_ids),
-        SnapshotItem.item_type == "CALENDAR_EVENT",
-    ]
-    if search:
-        filters.append(SnapshotItem.name.ilike(f"%{search}%"))
-
-    # Pull every matching row and dedupe in Python by external_id with
-    # newest-snapshot-wins (we already get rows ordered by created_at).
-    # At 10K-events-per-calendar scale this is fine; if it gets bigger
-    # we can switch to a window-function + DISTINCT ON in SQL.
-    all_items = (await db.execute(
-        select(SnapshotItem)
-        .where(*filters)
-        .order_by(SnapshotItem.created_at.desc())
-    )).scalars().all()
-
-    seen: set = set()
-    deduped = []
-    for it in all_items:
-        key = it.external_id or str(it.id)
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(it)
-
-    total = len(deduped)
-    offset = (page - 1) * size
-    items = deduped[offset: offset + size]
+    # Dedup + paginate in SQL (see _paged_latest_items) — "10K events
+    # per calendar is fine in Python" stopped being true at jrue's
+    # 25,855 delta-duplicated rows. Display order stays capture order
+    # (created_at DESC), matching the pre-SQL behavior.
+    #
+    # exclude_deleted (TMV-009, 2026-08-11): the tab badge and this list must
+    # agree and they did not — badge 5,416 vs sidebar 5,418 on the test
+    # resource. `_CONTENT_ROLLUP_SQL`, which computes the badge, has always
+    # carried `AND COALESCE(si.is_deleted, false) = false`; this list did
+    # not, so the two Graph @removed tombstones under that calendar (both
+    # literally named "(deleted event)", 232 B of metadata, no restorable
+    # body) were listed as recoverable events and inflated the sidebar by
+    # exactly 2. Measured against the anchor snapshot's 23 siblings:
+    # dedup incl. deleted = 5,418, excl. deleted = 5,416, deleted rows = 2.
+    # The badge is the correct number; /onedrive already excludes tombstones
+    # for the same reason, so this makes calendar consistent with both.
+    items, total = await _paged_latest_items(
+        db, sibling_ids, ["CALENDAR_EVENT"],
+        search=search, sort_sql="si.created_at",
+        sort_dir="DESC", page=page, size=size,
+        exclude_deleted=True,
+    )
 
     shard, tenant_id, candidates = await _load_blob_context(db, snapshot_id)
     sem = asyncio.Semaphore(20)
@@ -2960,10 +4114,22 @@ CONTACT_ITEM_TYPES = ("USER_CONTACT", "CONTACT")
 async def list_snapshot_onedrive(
     snapshot_id: str,
     page: int = Query(1, ge=1),
-    size: int = Query(500, ge=1),
+    size: int = Query(500, ge=1, le=500),
     folder: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
     sort: Optional[str] = Query(None, description="name_asc|created_desc|modified_desc"),
+    createdSince: Optional[str] = Query(
+        None,
+        description=(
+            "Keep only files whose Graph createdDateTime is at or after this "
+            "point. ISO-8601 (2026-08-01T00:00:00Z) or a relative window "
+            "(30d / 12h). Bounds the Recovery 'Recent' view."
+        ),
+    ),
+    modifiedSince: Optional[str] = Query(
+        None,
+        description="Same as createdSince but against lastModifiedDateTime.",
+    ),
     db: AsyncSession = Depends(get_db),
 ):
     """Return OneDrive files in a snapshot.
@@ -2972,6 +4138,27 @@ async def list_snapshot_onedrive(
       - `created_desc`  → newest file first (Graph createdDateTime)
       - `modified_desc` → most-recently-edited first (Graph lastModifiedDateTime)
       - default / anything else → name A→Z (case-insensitive)
+
+    `createdSince` / `modifiedSince` bound the result to a recency window.
+
+    TMV-016 (QA sweep 2026-08-11): the Recovery "Recent" view was reported
+    as "lists the entire drive (8,295 items), unsorted". The ORDERING half
+    was already here and works — measured live against snapshot a9ce8054,
+    `?sort=created_desc` returns "Screenshot 2026-08-11 090118.png"
+    (createdDateTime 2026-08-11T16:01:24Z) first in 0.21 s, versus
+    "+Connect to New Data Source.odc" with no sort — and Recovery.tsx:6368
+    already sends `sort=created_desc` for that view. What the backend had
+    NO way to express was the WINDOW: `totalElements` stayed 8,295, so
+    "Recent" was the whole drive in a different order and scrolling walked
+    every file. These two params are that missing half; the count and the
+    page are filtered together, so `totalElements` now reports the window.
+
+    Frontend wiring for the Recent view (the other half of TMV-016):
+        GET …/onedrive?sort=created_desc&createdSince=30d&size=50
+    Any window works — `30d`, `12h`, or an absolute ISO-8601 instant.
+    Comparison is lexicographic over the Graph Zulu strings, which is the
+    same key the sort already uses, so a file that sorts into the window
+    always passes the filter.
 
     Sibling-snapshot aggregation: OneDrive uses delta backups, so an
     initial full-pull captures every file and every subsequent run
@@ -2988,45 +4175,55 @@ async def list_snapshot_onedrive(
     )
     if not sibling_ids:
         sibling_ids = [UUID(snapshot_id)]
-    filters = [
-        SnapshotItem.snapshot_id.in_(sibling_ids),
-        SnapshotItem.item_type.in_(ONEDRIVE_ITEM_TYPES),
-    ]
-    if folder is not None:
-        filters.append(SnapshotItem.folder_path == folder)
-    if search:
-        filters.append(SnapshotItem.name.ilike(f"%{search}%"))
+    # Dedup + sort + paginate in SQL (see _paged_latest_items) — the
+    # JSON-path sorts compose fine as ->> expressions on the outer
+    # query. Deletion tombstones (Graph @removed/deleted-facet rows
+    # that the pre-2026-07-13 walk persisted, backfilled to
+    # is_deleted=true) are not restorable files — hidden via
+    # exclude_deleted.
+    if sort == "created_desc":
+        sort_sql, sort_dir = "COALESCE(si.metadata->'raw'->>'createdDateTime', '')", "DESC"
+    elif sort == "modified_desc":
+        sort_sql, sort_dir = "COALESCE(si.metadata->'raw'->>'lastModifiedDateTime', '')", "DESC"
+    else:
+        sort_sql, sort_dir = "LOWER(COALESCE(si.name, ''))", "ASC"
 
-    # Pull all matching rows then dedup by external_id (newest-wins)
-    # before sorting + paginating. Matches the /mail pattern. For a
-    # typical user OneDrive (~500-5,000 files) this is bounded enough
-    # to stay in memory; the alternative SQL-side DISTINCT ON would
-    # be cleaner but doesn't compose with the JSON-path sorts below.
-    all_rows = (await db.execute(
-        select(SnapshotItem).where(*filters)
-    )).scalars().all()
-    seen: set = set()
-    deduped: list = []
-    for it in all_rows:
-        key = it.external_id or str(it.id)
-        if key in seen:
+    recency_clauses = []
+    recency_params: Dict[str, Any] = {}
+    for _param, _field, _bind in (
+        (createdSince, "createdDateTime", "rec_created"),
+        (modifiedSince, "lastModifiedDateTime", "rec_modified"),
+    ):
+        cutoff = _parse_since(_param)
+        if cutoff is None:
             continue
-        seen.add(key)
-        deduped.append(it)
+        # MISSING TIMESTAMP MUST NOT MEAN "EXCLUDE". ONEDRIVE_ITEM_TYPES spans
+        # FILE / ONEDRIVE_FILE / FILE_VERSION, and not every producer writes a
+        # `metadata.raw` envelope: all 124,428 FILE rows on prod (SHAREPOINT_SITE
+        # resources) store `metadata.structured` with NO `raw` key, so both
+        # timestamps read NULL there. With a bare COALESCE(..,'') those rows
+        # compare '' >= cutoff = false and 100% of them vanish — and because
+        # this predicate is applied INSIDE the dedup subquery, totalElements
+        # would report the reduced number as the truth. That is a file browser
+        # silently hiding a backup's contents, which is the one thing this
+        # product must never do. A row we cannot date is kept and left for the
+        # sort to order; "recent" is a convenience filter, not an authority on
+        # what exists. Pinned by tests/services/test_onedrive_recency_window.py.
+        recency_clauses.append(
+            f"(si.metadata->'raw'->>'{_field}' IS NULL"
+            f" OR si.metadata->'raw'->>'{_field}' = ''"
+            f" OR si.metadata->'raw'->>'{_field}' >= :{_bind})"
+        )
+        recency_params[_bind] = cutoff
 
-    def _sort_key(it):
-        raw = (it.extra_data or {}).get("raw") or {}
-        if sort == "created_desc":
-            return raw.get("createdDateTime") or ""
-        if sort == "modified_desc":
-            return raw.get("lastModifiedDateTime") or ""
-        return (it.name or "").lower()
-
-    reverse = sort in ("created_desc", "modified_desc")
-    deduped.sort(key=_sort_key, reverse=reverse)
-    total = len(deduped)
-    offset = (page - 1) * size
-    items = deduped[offset: offset + size]
+    items, total = await _paged_latest_items(
+        db, sibling_ids, list(ONEDRIVE_ITEM_TYPES),
+        folder=folder, search=search, exclude_deleted=True,
+        sort_sql=sort_sql, sort_dir=sort_dir,
+        extra_where=(" AND ".join(recency_clauses) or None),
+        extra_params=(recency_params or None),
+        page=page, size=size,
+    )
     return {
         "content": [_item_to_response(i) for i in items],
         "totalElements": total,
@@ -3123,7 +4320,10 @@ async def list_snapshot_files(
     total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
     items = (await db.execute(
         select(SnapshotItem).where(*filters)
-        .order_by(func.lower(SnapshotItem.name).asc())
+        # Names are far from unique in a snapshot (every "Untitled.docx",
+        # every same-named file in a different folder), so LOWER(name) alone
+        # is not a total order and paging re-slices the ties.
+        .order_by(func.lower(SnapshotItem.name).asc(), SnapshotItem.id.asc())
         .offset((page - 1) * size).limit(size)
     )).scalars().all()
     return {
@@ -3139,7 +4339,7 @@ async def list_snapshot_files(
 async def list_snapshot_contacts(
     snapshot_id: str,
     page: int = Query(1, ge=1),
-    size: int = Query(500, ge=1),
+    size: int = Query(500, ge=1, le=500),
     folder: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
@@ -3153,16 +4353,16 @@ async def list_snapshot_contacts(
     )
     if not sibling_ids:
         sibling_ids = [UUID(snapshot_id)]
-    filters = [
-        SnapshotItem.snapshot_id.in_(sibling_ids),
-        SnapshotItem.item_type.in_(CONTACT_ITEM_TYPES),
-    ]
-    if folder is not None:
-        filters.append(SnapshotItem.folder_path == folder)
-    if search:
-        filters.append(SnapshotItem.name.ilike(f"%{search}%"))
-    total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
-    items = (await db.execute(select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size))).scalars().all()
+    # Dedup + paginate in SQL (see _paged_latest_items). The old path
+    # was already bounded (LIMIT/OFFSET) but paged duplicate sibling
+    # rows with no dedup and no ORDER BY — the same contact appeared
+    # once per delta snapshot, in nondeterministic order. Name A→Z now.
+    items, total = await _paged_latest_items(
+        db, sibling_ids, list(CONTACT_ITEM_TYPES),
+        folder=folder, search=search,
+        sort_sql="LOWER(COALESCE(si.name, ''))", sort_dir="ASC",
+        page=page, size=size,
+    )
 
     def fmt(i):
         raw = _raw(i)
@@ -3222,6 +4422,16 @@ async def get_item_content(
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
 
+    if item.snapshot_id != UUID(snapshot_id):
+        raise HTTPException(status_code=404, detail="Item not found")
+    catalogue = await _catalogue_snapshot(db, snapshot_id)
+    if catalogue is not None:
+        item = (await materialize_chat_items(db, [item]))[0]
+        if item.blob_path:
+            return await _catalogue_blob_response(db, item, download=download)
+        if item.item_type in {"CHAT_ATTACHMENT", "CHAT_HOSTED_CONTENT"} and item.extra_data.get("inline_b64") is None:
+            return {"source": "metadata", "content": item.extra_data}
+
     # Inline path: items with `extra_data.inline_b64` set carry their
     # bytes directly in the JSON column instead of in Azure Blob. This
     # covers EMAIL_ATTACHMENT / CHAT_ATTACHMENT / CHAT_HOSTED_CONTENT
@@ -3231,7 +4441,7 @@ async def get_item_content(
     _inline_b64 = _ed_for_inline.get("inline_b64")
     data: Optional[bytes] = None
     source: Optional[str] = None
-    if _inline_b64:
+    if _inline_b64 is not None:
         import base64 as _b64
         try:
             data = _b64.b64decode(_inline_b64)
@@ -3279,7 +4489,19 @@ async def get_item_content(
                     else "application/octet-stream"
                 )
             )
-            headers = {}
+            # Ops/Data Check 17: the content bytes AND their declared MIME are
+            # attacker-authored (a sender names the attachment and its type).
+            # Never let the browser render them inline same-origin as HTML/SVG.
+            # Only a safe raster image type may render inline; everything else
+            # is forced to an octet-stream attachment. nosniff on every response.
+            _INLINE_SAFE = {"image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp"}
+            headers = {"X-Content-Type-Options": "nosniff"}
+            _ct_base = content_type.split(";", 1)[0].strip().lower()
+            if _ct_base not in _INLINE_SAFE:
+                content_type = "application/octet-stream"
+                if not download:
+                    # force a download rather than inline-render an untrusted type
+                    headers["Content-Disposition"] = "attachment"
             if download:
                 # RFC 5987 filename* for non-ASCII safety; plain filename
                 # kept as a fallback for older browsers. The filename
@@ -3333,7 +4555,7 @@ async def get_item_content(
                         },
                     }
                     async with _httpx2.AsyncClient(timeout=3.0) as _c:
-                        r = await _c.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json=payload)
+                        r = await _c.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json=payload, headers=internal_audit_headers())
                         if r.status_code >= 300:
                             print(f"[FILE_DOWNLOADED audit] HTTP {r.status_code}: {r.text[:200]}", flush=True)
                 except Exception as _e:
@@ -3419,6 +4641,23 @@ async def get_item_attachments(
     # enumerate other snapshots' items by guessing a stray item_id.
     if parent.snapshot_id != _sid:
         raise HTTPException(status_code=404, detail="Item not found")
+
+    catalogue = await _catalogue_snapshot(db, snapshot_id)
+    if catalogue is not None:
+        if parent.chat_version_id is None:
+            raise ChatCatalogueIntegrityError("new-format message has no captured version")
+        children = list((await db.scalars(select(SnapshotItem).where(
+            SnapshotItem.snapshot_id == _sid,
+            SnapshotItem.parent_external_id == parent.external_id,
+            SnapshotItem.item_type == "CHAT_ATTACHMENT").order_by(SnapshotItem.name, SnapshotItem.id))).all())
+        items = await materialize_chat_items(db, children)
+        return [{"id": str(item.id), "name": item.name, "size": item.content_size or 0,
+            "kind": (item.extra_data or {}).get("attachment_kind"),
+            "contentType": (item.extra_data or {}).get("content_type"),
+            "isInline": bool((item.extra_data or {}).get("is_inline")),
+            "contentId": (item.extra_data or {}).get("content_id"),
+            "resolved": bool((item.extra_data or {}).get("resolved")),
+            "sourceUrl": (item.extra_data or {}).get("content_url")} for item in items]
 
     # Email and chat message external_id IS the Graph id — both attachment
     # kinds store that as parent_item_id. One endpoint serves both so the
@@ -3582,7 +4821,7 @@ async def _emit_download_audit(
             },
         }
         async with _httpx.AsyncClient(timeout=5.0) as c:
-            await c.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json=payload)
+            await c.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json=payload, headers=internal_audit_headers())
     except Exception:
         pass
 
@@ -3813,6 +5052,7 @@ async def azure_vm_volume_files(
     item_id: str,
     path: str = Query("", description="Guest-OS path to list (defaults to C:\\ or /)"),
     db: AsyncSession = Depends(get_db),
+    _admin: dict = Depends(require_admin),  # Check 17: live-VM ops are admin-only
 ):
     """List files/folders inside a volume at `path`. Returns empty when
     the volume is a Raw block device (no filesystem detected)."""
@@ -3845,7 +5085,8 @@ async def azure_vm_volume_files(
     fs_hint = (meta.get("file_system") or "").upper()
     is_windows = fs_hint == "NTFS" or (not fs_hint and os_type == "windows")
     default_mount = meta.get("mount_point") or ("C:\\" if is_windows else "/")
-    target = path or default_mount
+    # Check 17: confine the client path under the volume mount point.
+    target = confine_guest_path(default_mount, path, is_windows)
 
     cache_key = f"{item_id}|{target}"
     cached = _VM_FILES_CACHE.get(cache_key)
@@ -4080,6 +5321,7 @@ async def azure_vm_volume_download(
     item_id: str,
     payload: dict = Body(...),
     db: AsyncSession = Depends(get_db),
+    _admin: dict = Depends(require_admin),  # Check 17: live-VM ops are admin-only
 ):
     """Download one or more files / folders from a VM volume.
 
@@ -4109,6 +5351,11 @@ async def azure_vm_volume_download(
     os_type = (meta.get("os_type") or "").lower()
     fs_hint = (meta.get("file_system") or "").upper()
     is_windows = fs_hint == "NTFS" or (not fs_hint and os_type == "windows")
+
+    # Check 17: confine each client-supplied path under the volume mount point
+    # so a caller cannot read arbitrary guest files (ntds.dit, /etc/shadow).
+    _root = meta.get("mount_point") or ("C:\\" if is_windows else "/")
+    paths = [confine_guest_path(_root, p, is_windows) for p in paths]
 
     token = await _arm_token_for_tenant(tenant.external_tenant_id)
     if not token:

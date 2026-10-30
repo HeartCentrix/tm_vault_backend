@@ -1,13 +1,18 @@
 """API Gateway - Routes requests to microservices"""
+import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 import httpx
 
 from shared.config import settings
+from shared.security import decode_token  # Ops/Data Check 6: verify, don't just detect
 from shared.storage.startup import startup_router, shutdown_router
 
 import sys as _sys, pathlib as _pl
@@ -91,6 +96,13 @@ async def proxy_request(service: str, path: str, request: Request, timeout: http
 
     url = f"{service_url}{path}"
 
+    # An explicit timeout=None in httpx does NOT mean "use the client
+    # default" — it disables connect/read/write/pool timeouts entirely,
+    # so one hung downstream pins a pooled connection forever and ~100
+    # of them wedge the whole gateway. Fall back to the module default.
+    if timeout is None:
+        timeout = GATEWAY_TIMEOUT
+
     # Build headers (forward auth)
     headers = {}
     # Cookie-first: the SPA stores its access token in an HttpOnly cookie, so
@@ -122,19 +134,33 @@ async def proxy_request(service: str, path: str, request: Request, timeout: http
     if "cookie" in request.headers:
         headers["Cookie"] = request.headers["cookie"]
 
-    # Retry up to 3 times with exponential backoff
+    # Request bodies here are small (JSON specs); buffering keeps them
+    # replayable for the connect-failure retries below.
+    body = await request.body()
+
+    # Retry up to 3 times with exponential backoff. Only ConnectError /
+    # ConnectTimeout retry for every method — those provably never reached
+    # the service. ReadTimeout / RemoteProtocolError can fire AFTER the
+    # downstream committed its work (pod rollover closing the socket
+    # mid-response), so replaying a POST would duplicate restore/backup/
+    # export jobs — double writes into live mailboxes. Idempotent-only.
+    idempotent = request.method in ("GET", "HEAD")
     last_error = None
     client: httpx.AsyncClient = request.app.state.http_client
     for attempt in range(3):
         try:
-            response = await client.request(
+            upstream_request = client.build_request(
                 method=request.method,
                 url=url,
                 headers=headers,
                 params=request.query_params,
-                content=await request.body(),
+                content=body,
                 timeout=timeout,
             )
+            # Stream the upstream body through instead of buffering it —
+            # export/download artifacts run to multiple GB, and holding
+            # one in memory OOMKills the 512Mi gateway pod.
+            response = await client.send(upstream_request, stream=True)
 
             # Forward response headers the browser actually needs —
             # Content-Disposition is critical for downloads (browser uses
@@ -143,7 +169,6 @@ async def proxy_request(service: str, path: str, request: Request, timeout: http
             # themselves so we don't double-set them.
             _skip = {
                 "content-type",  # set via media_type below
-                "content-length",
                 "transfer-encoding",
                 "connection",
                 "keep-alive",
@@ -153,29 +178,50 @@ async def proxy_request(service: str, path: str, request: Request, timeout: http
                 "trailers",
                 "upgrade",
             }
-            forward_headers = {
-                k: v for k, v in response.headers.items()
-                if k.lower() not in _skip
-            }
-            return Response(
-                content=response.content,
+            async def _relay(upstream=response):
+                # finally (not just BackgroundTask) so the pooled
+                # connection is released even when the client disconnects
+                # mid-download or the upstream dies mid-body.
+                try:
+                    async for chunk in upstream.aiter_raw():
+                        yield chunk
+                finally:
+                    await upstream.aclose()
+
+            proxied = StreamingResponse(
+                _relay(),
                 status_code=response.status_code,
                 media_type=response.headers.get("content-type", "application/json"),
-                headers=forward_headers,
+                background=BackgroundTask(response.aclose),
             )
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.RemoteProtocolError) as e:
+            # multi_items(), not items(): httpx comma-joins repeated
+            # headers in items(), which merged auth-service's three
+            # Set-Cookie headers into one — the browser then stored only
+            # access_token, and every session died unrefreshable at
+            # access-token expiry because refresh_token never landed.
+            for k, v in response.headers.multi_items():
+                if k.lower() not in _skip:
+                    proxied.headers.append(k, v)
+            return proxied
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
             last_error = e
             if attempt < 2:
                 await asyncio.sleep(1 * (attempt + 1))
         except httpx.ReadTimeout as e:
             last_error = e
-            if attempt < 1:
+            if idempotent and attempt < 1:
                 await asyncio.sleep(1)
             else:
                 return JSONResponse(
                     status_code=504,
                     content={"detail": f"Service '{service}' timed out"},
                 )
+        except httpx.RemoteProtocolError as e:
+            last_error = e
+            if idempotent and attempt < 2:
+                await asyncio.sleep(1 * (attempt + 1))
+            else:
+                break
         except httpx.RequestError as e:
             last_error = e
             break
@@ -247,6 +293,11 @@ async def dashboard(request: Request):
 @app.post("/api/v1/tenants/{tenant_id}/test-connection")
 @app.get("/api/v1/organizations")
 @app.get("/api/v1/organizations/{org_id}")
+@app.get("/api/v1/encryption/config")
+@app.put("/api/v1/encryption/config")
+@app.post("/api/v1/encryption/rewrap")
+@app.get("/api/v1/settings/app")
+@app.put("/api/v1/settings/app")
 async def tenant(request: Request):
     return await proxy_request("tenant", request.url.path, request)
 
@@ -481,7 +532,11 @@ async def progress_proxy(request: Request):
 @app.post("/api/v1/audit/siem/webhook")
 @app.post("/api/v1/audit/siem/webhook/{webhook_id}/test")
 @app.get("/api/v1/audit/graph-apps")
-@app.post("/api/v1/audit/log")
+# POST /api/v1/audit/log is deliberately NOT proxied: it writes the audit
+# trail from an unvalidated body and is gated on the X-Internal-Api-Key
+# shared secret, which proxy_request does not forward. Publishing it here
+# only exposed an anonymous audit-forgery endpoint at the ingress; every
+# emitter posts to AUDIT_SERVICE_URL in-cluster instead.
 @app.post("/api/v1/audit/ingest/graph/{tenant_id}")
 async def audit_proxy(request: Request):
     return await proxy_request("audit", request.url.path, request)
@@ -490,3 +545,109 @@ async def audit_proxy(request: Request):
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "api-gateway"}
+
+
+# ─── Aggregated application health ──────────────────────────────────────────
+_RANK = {"healthy": 0, "degraded": 1, "unhealthy": 2}
+# Short server-side cache so probes / the auto-refreshing Health page don't
+# fan out to every service on each request.
+_HEALTH_CACHE: dict = {"at": 0.0, "key": None, "value": None}
+_HEALTH_CACHE_TTL_S = 8.0
+
+
+def _is_authed(request: Request) -> bool:
+    """Return True only for a cryptographically VALID access token.
+
+    Ops/Data Check 6: presence of a cookie or a non-empty ``Authorization``
+    header is not proof of identity — a forged ``Bearer x`` must not unlock the
+    detailed /api/v1/health payload (queue depths, worker counts). Cookie-first,
+    matching the proxy, then a Bearer header; the token is decoded and its
+    signature + ``access`` type verified, and any failure falls back to the
+    coarse public payload."""
+    token = request.cookies.get("access_token")
+    if not token:
+        auth = request.headers.get("authorization", "")
+        if auth[:7].lower() == "bearer ":
+            token = auth[7:].strip()
+    if not token or token.lower() in ("null", "undefined"):
+        return False
+    try:
+        decode_token(token, expected_type="access")
+        return True
+    except Exception:
+        return False
+
+
+async def _probe_service(client: httpx.AsyncClient, name: str, base_url: str) -> dict:
+    try:
+        r = await client.get(f"{base_url}/health", timeout=httpx.Timeout(5.0))
+        return {"name": name, "up": r.status_code == 200}
+    except Exception as e:
+        return {"name": name, "up": False, "error": f"{type(e).__name__}"}
+
+
+@app.get("/api/v1/health")
+async def app_health(request: Request):
+    """Application-wide health: downstream service up/down matrix merged with
+    dashboard-service's deep subsystem checks (DB, RabbitMQ, queues, workers,
+    storage, leases). Overall = worst of all signals.
+
+    Unauthenticated callers get a coarse summary (probe-friendly); an
+    authenticated session additionally gets per-service and per-component
+    detail."""
+    detailed = _is_authed(request)
+    now = time.monotonic()
+    if (
+        _HEALTH_CACHE["value"] is not None
+        and _HEALTH_CACHE["key"] == detailed
+        and (now - _HEALTH_CACHE["at"]) < _HEALTH_CACHE_TTL_S
+    ):
+        return _HEALTH_CACHE["value"]
+
+    client: httpx.AsyncClient = request.app.state.http_client
+
+    # 1) downstream service up/down matrix (concurrent)
+    probes = await asyncio.gather(*[
+        _probe_service(client, name, url) for name, url in SERVICES.items()
+    ])
+    services = {p["name"]: p for p in probes}
+    up = sum(1 for p in probes if p["up"])
+    down = [p["name"] for p in probes if not p["up"]]
+    svc_status = "healthy" if not down else ("unhealthy" if up == 0 else "degraded")
+
+    # 2) deep subsystem checks from dashboard-service
+    components: dict = {}
+    deep_status = "healthy"
+    try:
+        dr = await client.get(
+            f"{SERVICES['dashboard']}/health/deep",
+            params={"detailed": str(detailed).lower()},
+            timeout=httpx.Timeout(12.0),
+        )
+        dr.raise_for_status()
+        deep = dr.json()
+        components = deep.get("components", {})
+        deep_status = deep.get("status", "degraded")
+    except Exception as e:
+        deep_status = "unhealthy"
+        components = {"subsystems": {"status": "unhealthy", "detail": f"deep check unreachable: {type(e).__name__}"}}
+
+    overall = max([svc_status, deep_status], key=lambda s: _RANK.get(s, 1))
+
+    if detailed:
+        payload = {
+            "status": overall,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "services": {"up": up, "down": len(down), "down_list": down, "detail": services},
+            "components": components,
+        }
+    else:
+        payload = {
+            "status": overall,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "services": {"up": up, "down": len(down)},
+            "components": {name: {"status": c.get("status", "degraded")} for name, c in components.items()},
+        }
+
+    _HEALTH_CACHE.update(at=now, key=detailed, value=payload)
+    return payload

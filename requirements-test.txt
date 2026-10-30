@@ -1,0 +1,49 @@
+# ============================================================
+# Dependencies required to RUN THE TEST SUITE.
+#
+# Many test modules import a service / worker `main.py` directly (they
+# are hyphenated dirs, so importlib does the loading). Those imports pull
+# the real runtime dependencies. Without them the modules skip rather
+# than fail, which used to hide the fact that they tested nothing — see
+# the guard in the repo-root conftest.py.
+#
+# Bootstrap with scripts/run-tests.sh, or by hand:
+#     python3 -m venv .venv-test
+#     .venv-test/bin/pip install -r requirements-test.txt
+#     .venv-test/bin/python -m pytest tests/ -q
+#
+# A venv is required: system pip is PEP-668 managed ("externally managed
+# environment") and refuses to install here.
+# ============================================================
+
+# The union of every service/worker runtime requirement. Reused instead of
+# re-listing packages so the test env can't drift from what ships.
+-r requirements.base.txt
+
+# Worker-only runtime deps that requirements.base.txt does not carry.
+# backup-worker/main.py imports aiohttp at module scope, so it is not
+# optional for collection.
+aiohttp>=3.9
+# SQLAlchemy async requires this explicitly on platforms without its extra.
+greenlet>=3.0,<4
+# Actual chat ZIP tests import the export renderer (match its runtime pins).
+bleach==6.1.0
+Jinja2==3.1.3
+
+# --- test tooling ---
+# asyncio_mode = auto in pytest.ini, so pytest-asyncio is mandatory.
+pytest>=8.0
+pytest-asyncio>=0.23
+
+# tests/workers/test_no_undefined_names.py runs a pyflakes pass over the
+# worker to catch NameError-class bugs statically. It was installed
+# nowhere, so that whole check had been silently skipped — found by the
+# conftest guard the moment it was added.
+pyflakes>=3.1
+
+# pytest-timeout: a test that hangs is worse than one that fails — it burns
+# the whole run with no verdict. test_message_bus_connect did exactly that:
+# connect()'s default max_retries=0 means "retry forever", so a RuntimeError
+# from settings.RABBITMQ_URL was swallowed and retried until the suite was
+# killed. Bounded per-test so a hang reports as a failure with a traceback.
+pytest-timeout>=2.2

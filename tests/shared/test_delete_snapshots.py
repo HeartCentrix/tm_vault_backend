@@ -16,15 +16,22 @@ import shared.retention_cleanup as rc
 
 
 class _ExecResult:
-    def __init__(self, rowcount):
+    def __init__(self, rowcount, rows=()):
         self.rowcount = rowcount
+        self.rows = rows
+
+    def fetchall(self):
+        return self.rows
 
 
 class _FakeSession:
     def __init__(self):
         self.events = []   # ordered ("rehydrate", sid) / ("execute", sql-prefix)
 
-    async def execute(self, stmt):
+    async def execute(self, stmt, params=None):
+        if str(stmt).strip().startswith("SELECT"):
+            self.events.append(("guard", str(stmt)))
+            return _ExecResult(0, [(uuid.UUID(sid),) for sid in params["ids"]])
         self.events.append(("execute", str(stmt)[:32].lower()))
         return _ExecResult(rowcount=2)
 
@@ -60,7 +67,7 @@ async def test_rehydrates_every_id_before_deleting(monkeypatch):
     kinds = [e[0] for e in sess.events]
     # every rehydrate happens before the first delete execute
     first_exec = kinds.index("execute")
-    assert kinds[:first_exec] == ["rehydrate", "rehydrate"]
+    assert kinds[:first_exec] == ["guard", "rehydrate", "rehydrate"]
     # two deletes: snapshot_items then snapshots
     assert kinds.count("execute") == 2
     assert "snapshot_items" in sess.events[first_exec][1]

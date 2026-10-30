@@ -51,12 +51,31 @@ class Settings:
         #   surfaces as SQLAlchemy QueuePool / asyncpg TooManyConnections
         #   errors during bulks. Do NOT shrink DB_POOL_SIZE /
         #   DB_MAX_OVERFLOW to "fix" this — pool starvation cascades into
-        #   stuck snapshots. Raise PG max_connections instead.
+        #   stuck snapshots.
+        #   ITO-9652 (pooler era): with DB_PGBOUNCER=true, DB_HOST points at
+        #   the CNPG Pooler (tmvault-pooler-rw), not postgres-ha directly —
+        #   there is no longer a single PG max_connections to "raise" from
+        #   the app side. Connection-count sizing now lives in the Pooler
+        #   spec (pgbouncer.parameters.default_pool_size / max_client_conn,
+        #   see deploy/taylor-morrison/k8s/07-pooler.yaml). "Too many
+        #   clients" no longer applies under the pooler; the equivalent
+        #   symptom is pgbouncer's query_wait_timeout tripping (clients
+        #   queued waiting for a free server connection) — surfaces as
+        #   asyncpg query timeouts, not TooManyConnectionsError. Tune
+        #   default_pool_size / max_client_conn / query_wait_timeout on the
+        #   Pooler, not DB_POOL_SIZE, to fix that.
         self.DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "30"))
         self.DB_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "20"))
         self.DB_POOL_TIMEOUT = int(os.getenv("DB_POOL_TIMEOUT", "30"))
         self.DB_POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", "1800"))
         self.DB_POOL_USE_LIFO = os.getenv("DB_POOL_USE_LIFO", "true").lower() in ("true", "1", "yes")
+        # ITO-9652: set true when DB_HOST points at the CNPG transaction-mode
+        # Pooler (tmvault-pooler-rw) instead of postgres-ha-rw directly.
+        # Transaction pooling swaps the backend connection between
+        # transactions, which breaks asyncpg's client-side prepared-statement
+        # cache (DuplicatePreparedStatementError / InvalidSQLStatementName).
+        # See shared/database.py::_engine_kwargs.
+        self.DB_PGBOUNCER = os.getenv("DB_PGBOUNCER", "false").lower() == "true"
         self.JWT_SECRET = os.getenv("JWT_SECRET", "")
         self.JWT_ALGORITHM = "HS256"
         # Access TTL is short on purpose: a stolen access cookie is useful
@@ -90,7 +109,9 @@ class Settings:
         _placeholder_jwt_secrets = {
             "",
             "your-secret-key-change-in-production",
+            "your-secret-key",  # README.md Configuration block
             "REPLACE_WITH_python_-c_secrets_token_hex_32",
+            "change-this-to-a-secure-random-string",  # .env.railway template
             "change-me",
             "changeme",
             "secret",
@@ -276,6 +297,94 @@ class Settings:
         # Discovery staging / merge batch sizes for large tenant onboarding
         self.DISCOVERY_STAGE_CHUNK_SIZE = int(os.getenv("DISCOVERY_STAGE_CHUNK_SIZE", "500"))
         self.DISCOVERY_PROGRESS_LOG_EVERY = int(os.getenv("DISCOVERY_PROGRESS_LOG_EVERY", "250"))
+        self.DISCOVERY_SCOPE_MAX_CONCURRENCY = int(os.getenv("DISCOVERY_SCOPE_MAX_CONCURRENCY", "1"))
+        self.DISCOVERY_GRAPH_PAGE_SIZE = int(os.getenv("DISCOVERY_GRAPH_PAGE_SIZE", "200"))
+
+        # ── Exchange Online Archive backup (USER_ARCHIVE, Tier-2) ──
+        self.ARCHIVE_BACKUP_ENABLED = os.getenv("ARCHIVE_BACKUP_ENABLED", "true").lower() in ("true", "1", "yes")
+        # Comma-separated allowlist of UPNs permitted to have their archive
+        # backed up (pilot scope gate consumed by discovery in Task 1.2).
+        # "" (or whitespace-only) parses to an empty list, which downstream
+        # means "no allowlist" — fleet mode, all users allowed.
+        archive_allowed_upns = os.getenv("ARCHIVE_BACKUP_ALLOWED_UPNS", "")
+        self.ARCHIVE_BACKUP_ALLOWED_UPNS = [
+            u.strip().lower() for u in archive_allowed_upns.split(",") if u.strip()
+        ]
+        self.ARCHIVE_GRAPH_VERSION = os.getenv("ARCHIVE_GRAPH_VERSION", "beta")
+        self.ARCHIVE_IMPORT_TIMEOUT_S = int(os.getenv("ARCHIVE_IMPORT_TIMEOUT_S", "120"))
+        self.ARCHIVE_FOLDER_CONCURRENCY = int(os.getenv("ARCHIVE_FOLDER_CONCURRENCY", "8"))
+        self.ARCHIVE_EXPORT_CONCURRENCY = int(os.getenv("ARCHIVE_EXPORT_CONCURRENCY", "8"))
+        # Seconds without ANY forward progress (a folder enumerated, an
+        # exportItems POST returned, a chunk persisted) before the archive
+        # run cancels itself and fails honestly. Guards the class of bug
+        # that no other liveness signal can see: on 2026-08-12 snapshot
+        # 0e423f79 stopped at 188,380 of 340,258 items and held a live,
+        # continuously-renewed lease for 15.6 h because the lease extender
+        # and the liveness probe both measure the PROCESS, not the WORK.
+        # Worst honest gap is ~3,600 s (5 retries x 600 s import timeout +
+        # a clamped 120 s Retry-After each), so 5,400 s leaves margin.
+        # 0 disables the guard.
+        self.ARCHIVE_STALL_ABORT_S = int(os.getenv("ARCHIVE_STALL_ABORT_S", "5400"))
+        # How many individual archive folders Graph may permanently refuse
+        # before the whole walk is called a failure instead of a PARTIAL.
+        # Exchange serves a hard, non-transient
+        # `ErrorInternalServerError: "Cannot query rows in a table."` on some
+        # folders (3 of jrue's archive, verified 4/4 attempts 2026-08-06) —
+        # aborting the walk on those meant a 1.1M-item archive could never
+        # finish. Per-folder failures are recorded and finalize PARTIAL; a
+        # count past this cap still fails honestly.
+        self.ARCHIVE_MAX_FOLDER_FAILURES = int(
+            os.getenv("ARCHIVE_MAX_FOLDER_FAILURES", "100")
+        )
+
+        # Minimum % of the PRIOR snapshot's item count that a walk must
+        # re-enumerate before it is allowed to become a restore point.
+        #
+        # The archive walk has no delta cursor — every run re-enumerates the
+        # whole tree — so the previous snapshot's count is a true baseline
+        # and a large shortfall means the TREE got truncated, not that mail
+        # was deleted. 2026-08-07→08-10 produced four consecutive PARTIALs
+        # holding 515,649 of 1,114,978 items (46%), a byte-identical id set
+        # each time, because two whole top-level trees returned nothing;
+        # each was served as the SLA-current restore point with no alert.
+        # Below this floor the run now fails honestly and the prior good
+        # snapshot stays newest-usable.
+        #
+        # Set 0 to disable — needed if a mailbox is ever legitimately
+        # bulk-purged, which would otherwise trip the gate on every run.
+        self.ARCHIVE_MIN_COVERAGE_PCT = int(
+            os.getenv("ARCHIVE_MIN_COVERAGE_PCT", "90")
+        )
+        # Explicit page sizes for the archive walk (ITO-10146). These beta
+        # admin/exchange endpoints default to 10-per-page, so a 332k-item
+        # folder paginated for hours inside ONE _get call — and honors $top
+        # (verified live 2026-08-18: folders $top=100 → 15/page incl. 5 the
+        # default page hid; items $top=1000 → 1000/page). ~100x fewer calls.
+        self.ARCHIVE_FOLDER_PAGE_SIZE = int(os.getenv("ARCHIVE_FOLDER_PAGE_SIZE", "200"))
+        self.ARCHIVE_ITEM_PAGE_SIZE = int(os.getenv("ARCHIVE_ITEM_PAGE_SIZE", "1000"))
+        # Autoexpanded archives shard content across auxiliary mailboxes, and
+        # since ~2026-08-06 Graph's folder listings return only the RESIDENTS
+        # of the location that serves the call (childFolders declared 23,
+        # returned 2, no nextLink, $top-independent — reproduced 3/3). The
+        # walk therefore enumerates every discovered location from its own
+        # root and unions the trees. Cap on distinct mailbox locations walked
+        # (primary + auxiliaries), as a runaway guard.
+        self.ARCHIVE_MAX_LOCATIONS = int(os.getenv("ARCHIVE_MAX_LOCATIONS", "8"))
+        # Aux locations are only discoverable organically (no Graph API lists
+        # them). For prior-snapshot folders that no discovered location
+        # serves, the walk may spend up to this many exportItems calls (≤20
+        # prior item ids each) purely to harvest the owning mailbox from the
+        # per-item ErrorArchiveFolderMovedPermanently reissue URL. 0 disables.
+        self.ARCHIVE_LOCATION_PROBE_CALLS = int(os.getenv("ARCHIVE_LOCATION_PROBE_CALLS", "3"))
+        # Coverage-gate baseline window: the gate refuses a restore point
+        # whose enumeration falls below ARCHIVE_MIN_COVERAGE_PCT of the BEST
+        # item-bearing snapshot in this many days — not merely the immediate
+        # prior. Comparing against the immediate prior let a truncated 46%
+        # PARTIAL become the baseline that scored the NEXT truncated walk
+        # ~100% (ITO-10146 masking factor).
+        self.ARCHIVE_BASELINE_LOOKBACK_DAYS = int(
+            os.getenv("ARCHIVE_BASELINE_LOOKBACK_DAYS", "30")
+        )
 
         # ── Mail export (MBOX / EML) — see docs/superpowers/specs/2026-04-19-mbox-mail-export-design.md ──
         self.EXPORT_PARALLELISM = int(os.getenv("EXPORT_PARALLELISM", "12"))
@@ -388,6 +497,26 @@ class Settings:
             "ONEDRIVE_RESTORE_STREAMING_THRESHOLD_BYTES",
             str(64 * 1024 * 1024),
         ))
+        # ---- SharePoint Restore streaming (ITO-10282) ----
+        # SharePoint files above this size restore via a Graph
+        # uploadSession fed directly by the storage backend's download
+        # stream. Below it, the simple buffered PUT stays — Graph's
+        # simple-upload cap is 250 MB, and 64 MiB keeps RAM flat on the
+        # single-replica restore-worker (a buffered multi-GB body OOMs
+        # the pod and takes every concurrent restore down with it).
+        self.SHAREPOINT_RESTORE_STREAMING_THRESHOLD_BYTES = int(os.getenv(
+            "SHAREPOINT_RESTORE_STREAMING_THRESHOLD_BYTES",
+            str(64 * 1024 * 1024),
+        ))
+        self.SHAREPOINT_RESTORE_CHUNK_BYTES = int(os.getenv(
+            "SHAREPOINT_RESTORE_CHUNK_BYTES", str(10 * 1024 * 1024)))
+        # Cap simultaneous streaming uploadSessions per worker. The
+        # restore loop's job semaphore allows 30 concurrent items; at
+        # ~2-3× chunk_size of transient buffer per stream, 30 parallel
+        # multi-GB streams would still pressure the pod. 4 × ~30 MiB
+        # keeps the worst case ~flat.
+        self.SHAREPOINT_RESTORE_STREAM_CONCURRENCY = int(os.getenv(
+            "SHAREPOINT_RESTORE_STREAM_CONCURRENCY", "4"))
         # ---- Entra Restore v2 ----
         # Default on; set to "false" in env to disable EntraRestoreEngine
         # + EntraExportPipeline and fall back to the legacy PATCH-only
@@ -521,6 +650,11 @@ class Settings:
         ))
 
         # ── USER_CHATS cross-replica partition ──
+        # Immutable catalogue writing is opt-in. Adopted resources fail
+        # closed when disabled; they never return to history-union writes.
+        self.CHAT_CATALOGUE_WRITER_ENABLED = os.getenv(
+            "CHAT_CATALOGUE_WRITER_ENABLED", "false",
+        ).lower() in ("true", "1", "yes")
         # Whale-user chat backups (a single user with hundreds of chats
         # across many teams + 1:1s) partition by chat-id batches so
         # multiple backup_worker replicas drain the same user's chats in
@@ -615,6 +749,13 @@ class Settings:
         # much I/O.
         self.MAIL_PARTITION_MIN_BYTES = int(os.getenv(
             "MAIL_PARTITION_MIN_BYTES", str(2 * 1024 * 1024 * 1024),
+        ))
+        # Item-count proxy for MIN_BYTES: v1.0 folder trees carry no
+        # sizeInBytes (BETA-only property, see get_mail_folder_tree),
+        # so deep-but-narrow mailboxes are sized by totalItemCount
+        # instead. 20k items ~ 2 GiB at a ~100KB/message estimate.
+        self.MAIL_PARTITION_MIN_ITEMS = int(os.getenv(
+            "MAIL_PARTITION_MIN_ITEMS", "20000",
         ))
         self.MAIL_PARTITION_MAX_SHARDS = int(os.getenv(
             "MAIL_PARTITION_MAX_SHARDS", "4",
@@ -725,11 +866,15 @@ class Settings:
         ))
 
         # ── Heavy backup pool ──
-        # Default on: route OneDrive drives above the heavy threshold to
+        # Default on: route heavy content types (OneDrive/chats) to
         # backup.heavy so one monster drive doesn't starve every regular
         # backup-worker replica.
         self.BACKUP_HEAVY_ENABLED = os.getenv("BACKUP_HEAVY_ENABLED", "true").lower() in ("true", "1", "yes")
-        self.BACKUP_HEAVY_THRESHOLD_BYTES = int(os.getenv("BACKUP_HEAVY_THRESHOLD_BYTES", str(100 * 1024 * 1024 * 1024)))
+        # NOTE: a BACKUP_HEAVY_THRESHOLD_BYTES knob used to be read here
+        # but was consumed NOWHERE — heavy routing is type-based
+        # (shared/routing_fence.py + export_routing.pick_backup_queue),
+        # not size-based. Dropped 2026-07-14 (ITO-9652) so an inert env
+        # var can't masquerade as a working control.
         self.BACKUP_HEAVY_QUEUE = os.getenv("BACKUP_HEAVY_QUEUE", "backup.heavy")
         self.BACKUP_WORKER_QUEUE = os.getenv("BACKUP_WORKER_QUEUE", "backup.normal")
 
@@ -861,6 +1006,16 @@ class Settings:
         # to restore.heavy — keeps the normal restore pool responsive.
         self.HEAVY_EXPORT_ENABLED = os.getenv("HEAVY_EXPORT_ENABLED", "true").lower() in ("true", "1", "yes")
         self.RESTORE_WORKER_QUEUE = os.getenv("RESTORE_WORKER_QUEUE", "restore.normal")
+        # ITO-10275: the k8s deploy has no dedicated heavy pool (the compose
+        # restore-worker-heavy was never ported), yet pick_restore_queue
+        # routes ANY >20 GiB restore to restore.heavy unconditionally and
+        # pick_export_queue routes >100 GiB exports there — with no consumer
+        # those jobs hang silently. Default ON: the regular restore-worker
+        # also consumes restore.heavy. Turn OFF only when deploying a
+        # dedicated heavy worker (RESTORE_WORKER_QUEUE=restore.heavy).
+        self.RESTORE_HEAVY_CONSUME_ENABLED = os.getenv(
+            "RESTORE_HEAVY_CONSUME_ENABLED", "true"
+        ).lower() in ("true", "1", "yes")
 
         # --- Chat export (v1) ---
         # See docs/superpowers/specs/2026-04-19-teams-chat-download-design.md §11.
@@ -903,6 +1058,25 @@ class Settings:
         self.chat_export_dynamic_prefetch: bool = os.getenv(
             "CHAT_EXPORT_DYNAMIC_PREFETCH", "true"
         ).lower() in ("true", "1", "yes")
+
+        # Ceiling on how many chat bookkeeping DB writes (the
+        # skip-by-activity pointer-write) may hold a pooled connection at
+        # once, per worker PROCESS.
+        #
+        # Each such write took its own session out of the SQLAlchemy pool.
+        # With several CHATS shards draining concurrently in one pod that
+        # exhausted DB_POOL_SIZE(40)+DB_MAX_OVERFLOW(40) and every acquire
+        # then timed out after 30s: 1,876 `QueuePool limit of size 40
+        # overflow 40 reached` events in the 2026-08-10 10:07 tick, 1,002 in
+        # the 18:07 tick.
+        #
+        # The fix is to BOUND the concurrency, not to grow the pool: 20 pods
+        # x (40+40) already admits up to 1,600 connections against a server
+        # max_connections of 800, in front of a pgbouncer Pooler. Raising
+        # the pool moves the failure from the worker to the database.
+        self.chat_pointer_db_concurrency: int = int(
+            os.getenv("CHAT_POINTER_DB_CONCURRENCY", "6")
+        )
 
         # --- hostedContents capture (backup-worker) ---
         self.chat_hosted_content_concurrency: int = int(

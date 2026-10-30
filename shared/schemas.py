@@ -223,10 +223,33 @@ class BulkOperationRequest(BaseModel):
     resourceIds: List[str]
 
 
+class BulkAssignFilter(BaseModel):
+    """Server-side match criteria for filter-driven bulk assignment.
+
+    Mirrors GET /api/v1/resources/by-type's predicates (same shared
+    builder + Protection scope), so "assign to everything the listing
+    shows" covers every page of the listing, not just the fetched one.
+    """
+    tenantId: str
+    types: List[str]
+    query: Optional[str] = None
+    status: Optional[str] = None
+    sla: Optional[str] = None
+
+
 class BulkAssignRequest(BaseModel):
-    """Request to assign an SLA policy to multiple resources"""
-    resourceIds: List[str]
+    """Request to assign an SLA policy to multiple resources.
+
+    Exactly one of resourceIds / filter must be provided (the endpoint
+    400s otherwise). policyId '' keeps its historical meaning: unassign.
+    dryRun is filter-form only — resolve + validate + counts, zero
+    writes; combined with resourceIds it is a 400 (the id-list branch has
+    no dry-run and must never treat a preview as a real write).
+    """
+    resourceIds: Optional[List[str]] = None
     policyId: str
+    filter: Optional[BulkAssignFilter] = None
+    dryRun: bool = False
 
 
 class BulkUnassignRequest(BaseModel):

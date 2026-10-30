@@ -20,12 +20,19 @@ Q_THREAD = "q.export.chat.thread"
 
 
 async def _reclaim_orphan_jobs() -> None:
-    """Mark chat-export jobs left in RUNNING/PENDING as FAILED on startup.
+    """Mark chat-export jobs left in RUNNING as FAILED on startup.
 
     If the worker was OOM-killed or crashed mid-job, the row stays in RUNNING
     and the UI polls forever. There is exactly one chat-export-worker per
     deployment, so on startup any RUNNING chat-export job has no live owner
     and should be failed so the client sees a terminal state.
+
+    PENDING/QUEUED jobs are NOT orphans and must not be touched: their
+    messages persist in the durable q.export.chat.thread queue and are
+    consumed after startup. With prefetch=1 a backlog is normal, so failing
+    them here flipped every legitimately-waiting export to FAILED on each
+    deploy — and then flip-flopped it back to COMPLETED once the requeued
+    message was processed.
 
     B-M2: the SELECT and UPDATE used to be unsynchronised, leaving a TOCTOU
     window during rolling deploys where a sibling worker could have advanced
@@ -37,14 +44,14 @@ async def _reclaim_orphan_jobs() -> None:
          already operating on (i.e. holding a row lock inside its own
          consumer transaction) is invisible to this reclaim scan.
       2. Re-check the status set in the UPDATE's WHERE clause so a row
-         that legitimately transitioned out of RUNNING/PENDING/QUEUED
+         that legitimately transitioned out of RUNNING
          between SELECT and UPDATE — possibly via a code path that
          doesn't take row locks — is also skipped.
     """
     from sqlalchemy import and_, select, update as sa_update
     from shared.database import async_session_factory
     from shared.models import Job, JobStatus, JobType
-    in_flight_states = [JobStatus.RUNNING, JobStatus.PENDING, JobStatus.QUEUED]
+    in_flight_states = [JobStatus.RUNNING]
     async with async_session_factory() as sess:
         q = (
             select(Job.id, Job.spec)
@@ -89,6 +96,46 @@ async def _reclaim_orphan_jobs() -> None:
         )
 
 
+async def _fail_job_from_message(message) -> None:
+    """Best-effort terminal state for a job whose message escaped
+    consume_thread's own error handling (poison body, Redis publish blip
+    before the pipeline try-block, missing Job row). The message itself has
+    already been rejected to the DLQ, so without this write the Job row
+    would sit in-flight until someone notices. Only in-flight states are
+    touched — a job another path already finished is never clobbered.
+    Must never raise: it runs in the consume loop's crash handler.
+    """
+    import json
+    from sqlalchemy import and_, update as sa_update
+    from shared.database import async_session_factory
+    from shared.models import Job, JobStatus
+    try:
+        job_id = (json.loads(message.body) or {}).get("jobId")
+        if not job_id:
+            return
+        async with async_session_factory() as sess:
+            await sess.execute(
+                sa_update(Job)
+                .where(
+                    and_(
+                        Job.id == job_id,
+                        Job.status.in_(
+                            [JobStatus.RUNNING, JobStatus.PENDING, JobStatus.QUEUED]
+                        ),
+                    )
+                )
+                .values(
+                    status=JobStatus.FAILED,
+                    result={"error": {"code": "consume_error",
+                                       "message": "chat-export message could not be processed; see worker logs"}},
+                )
+            )
+            await sess.commit()
+        log.info("marked job FAILED after consume crash id=%s", job_id)
+    except Exception:
+        log.exception("could not mark job FAILED after consume crash")
+
+
 async def health_server() -> None:
     async def ok(_r):
         return web.Response(text="ok")
@@ -110,7 +157,11 @@ async def main() -> None:
     )
     start_http_server(9102)
     await health_server()
-    await startup_router()
+    await startup_router(required=True)
+    from shared.crypto import bootstrap as enc_bootstrap
+    from shared.database import async_session_factory
+    if await enc_bootstrap.install(async_session_factory):
+        log.info("at-rest encryption hook installed")
     try:
         await _reclaim_orphan_jobs()
     except Exception:
@@ -157,7 +208,19 @@ async def main() -> None:
         async for message in it:
             if stop.is_set():
                 break
-            await consume_thread(message)
+            try:
+                await consume_thread(message)
+            except Exception:
+                # A poison message or a dependency blip that raises outside
+                # consume_thread's pipeline try-block (Redis publish before
+                # the pipeline, json.loads on the body, a missing Job row)
+                # used to propagate here and end main() — killing the whole
+                # worker, whose restart reclaim then mass-failed every job
+                # still waiting in RabbitMQ. message.process(requeue=False)
+                # has already dead-lettered THIS message; record a terminal
+                # state for its job and keep consuming the rest.
+                log.exception("consume_thread crashed; continuing")
+                await _fail_job_from_message(message)
 
     await conn.close()
 

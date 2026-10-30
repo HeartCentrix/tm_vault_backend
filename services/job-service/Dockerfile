@@ -5,6 +5,10 @@ COPY shared/ /app/shared/
 COPY services/job-service/requirements.txt .
 RUN pip install --default-timeout=300 --retries 5 --no-cache-dir -r requirements.txt
 COPY services/job-service/ .
+# alembic tree for the pre-deploy migration Job (ITO-9452); job-service already
+# installs the alembic package, so this image doubles as the migration runner.
+COPY alembic/ /app/alembic/
+COPY alembic.ini /app/alembic.ini
 ENV PORT=8004
 EXPOSE ${PORT}
 RUN groupadd --system --gid 10001 appuser \

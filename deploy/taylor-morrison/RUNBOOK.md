@@ -242,6 +242,102 @@ WHERE status = 'COMPLETED';
 Quarterly: restore a random user fully to a sandbox tenant. Verify
 mailbox / OneDrive / Teams chat fidelity.
 
+### Prometheus alerts
+
+Scrape and alert definitions live in `k8s/monitoring/` (PodMonitors, NetworkPolicy,
+PrometheusRule `tmvault-alerts`, blackbox Probe); `k8s/monitoring/README.md` lists every
+alert, its threshold and what it depends on. Routing is the cluster default:
+`severity: critical` emails the on-call mailbox **and** opens an ITO Jira ticket,
+`severity: warning` opens the ticket only. First checks per alert family:
+
+#### Worker, scheduler or target down
+
+`TMVaultWorkerDown`, `TMVaultHeavyWorkerDown`, `TMVaultSchedulerDown`, `TMVaultTargetDown`:
+Prometheus cannot scrape the pod(s) named in the alert (`job` = the pod's `app` label).
+
+1. `kubectl -n itops get pods -l app=<job>` — CrashLoopBackOff / Error is the image or
+   config, not the network: `kubectl -n itops logs <pod> --previous --tail=50`.
+2. All pods Running but every target `up == 0`: the scrape path is blocked. Confirm
+   `kubectl -n itops get netpol tmvault-ingress-prometheus-scrape` exists and read the
+   target error in the Prometheus UI (Status → Targets). The exporter itself can be
+   checked from inside the pod on its port (9103 core, 9101 scheduler, 9100 restore,
+   9102 chat-export): `kubectl -n itops exec <pod> -- python3 -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:9103/metrics').read()[:200])"`.
+3. Restarting a single-replica role (scheduler, restore/discovery worker, an API service)
+   is safe. Restarting backup workers aborts their in-flight jobs; those are re-queued
+   only after the job lease expires, so prefer waiting for the current wave to drain.
+
+#### Snapshot failures
+
+`TMVaultFailedSnapshotsSpike` (warning), `TMVaultSnapshotFailureRatioHigh` (critical),
+`TMVaultNoSnapshotsCompleted` (warning) — all from `tmvault_snapshots_total{status}`.
+
+1. Find the dominant error: `kubectl -n itops logs deploy/backup-worker --since=1h | grep -iE 'failed|error' | sort | uniq -c | sort -rn | head`
+   (repeat for `deploy/backup-worker-heavy`).
+2. Break the failures down by resource type and tenant in `tm.snapshots` (same table as
+   the wall-time query above, filter `status = 'FAILED'` and the last hour).
+3. If the failures cluster on Graph 429/503 responses, follow "Monitor 429 rate (the
+   canary)" above; if on storage writes, check the storage backend and the storage router
+   (`[storage]` log lines); if on the database, check `databases/postgres-ha` first.
+4. `TMVaultNoSnapshotsCompleted` with healthy workers means nothing is being scheduled:
+   check the scheduler logs and the RabbitMQ queue alerts before assuming the workers.
+
+#### Worker memory
+
+`TMVaultWorkerMemoryHigh` (warning, > 85% of limit), `TMVaultWorkerMemoryCritical`
+(critical, > 95%), `TMVaultContainerOOMKilled` (warning).
+
+1. `kubectl -n itops top pod <pod>` and `kubectl -n itops describe pod <pod> | grep -A4 'Last State'`
+   (an OOMKilled last state confirms the kernel already killed it once).
+2. Backup workers grow with the mailbox/site they are walking. A sustained high value on
+   one pod is usually one huge resource; an OOMKill loses that job and it is retried
+   later, so repeated kills on the same resource mean the limit is too small for it.
+3. Limits live in `k8s/50-workers.yaml` (backup-worker 8Gi, backup-worker-heavy 16Gi,
+   others 1–2Gi) and `k8s/40-services.yaml` (512Mi; snapshot-service 3Gi). Raise with
+   section 3 (Infrastructure sizing) in mind and re-apply the one Deployment.
+
+#### RabbitMQ queues and broker
+
+`TMVaultRabbitmqDown` (critical), `TMVaultRabbitmqResourceAlarm` (critical),
+`TMVaultQueueBacklog`, `TMVaultQueueNoConsumers`, `TMVaultDeadLetterQueueParked` (warning).
+
+1. State of every queue:
+   `kubectl -n itops exec deploy/tmvault-rabbitmq -- rabbitmqctl list_queues name messages_ready messages_unacknowledged consumers`
+   — or the management UI via `kubectl -n itops port-forward svc/tmvault-rabbitmq 15672:15672`.
+2. Queue prefix → consuming Deployment: `backup.*` → backup-worker / backup-worker-heavy,
+   `restore.*` → restore-worker, `discovery.*` → discovery-worker, `azure.*` →
+   azure-workload-worker. Zero consumers with messages waiting means that Deployment is
+   down or wedged before subscribing: restart it and re-check consumers.
+3. `*.dlq` / `dlq.*` messages are jobs that exhausted their retries. They are never retried
+   on their own — inspect them (management UI → queue → Get messages), fix the cause,
+   then re-publish to the work queue or purge them deliberately.
+4. A resource alarm (`rabbitmqctl status`, "alarms") makes the broker block every
+   publisher, so the pipeline stalls silently: free disk on the `/var/lib/rabbitmq` PVC
+   or raise the pod's memory before anything else.
+
+#### Redis down
+
+`TMVaultRedisDown` (critical) — `tmvault-redis` has no available replica (Redis has no
+exporter, so this is the only signal). `kubectl -n itops get pods -l app=tmvault-redis`,
+then the pod logs; the Deployment is in `k8s/21-redis.yaml`.
+
+#### Ingress probe failing
+
+`TMVaultIngressProbeFailing` (critical) — the blackbox exporter in `monitoring` cannot get
+a 2xx from `https://tmvault.taylormorrison.com/` through the ingress VIP.
+
+1. `curl -sk -o /dev/null -w '%{http_code}\n' https://tmvault.taylormorrison.com/` from any
+   host; `kubectl -n itops get pods -l app=tmvault-frontend`; `kubectl -n itops get ingress tmvault`.
+2. If the cluster-wide `metallb-vip-ingress-https` probe is failing at the same time, the
+   problem is the ingress VIP / ingress-nginx, not TM Vault.
+
+#### SLA audit publish failing
+
+`TMVaultSlaAuditPublishFailing` (warning) — backup-scheduler could not publish SLA
+reconcile audit events (`sla_audit_publish_failed_total`), a silent compliance gap.
+`kubectl -n itops logs deploy/backup-scheduler --since=1h | grep -i audit`, check
+`audit-service` health, and confirm `INTERNAL_API_KEY` reaches both pods
+(`tests/deploy/test_manifest_internal_api_key.py` explains the two halves).
+
 ---
 
 ## 6. What to tune if it's still too slow

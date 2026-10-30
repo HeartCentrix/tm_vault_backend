@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, TypeVar
+from datetime import datetime
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.models import Resource, ResourceStatus, ResourceType
@@ -86,6 +88,83 @@ async def run_bounded_user_tasks(
     return await asyncio.gather(*(_run_one(user_id) for user_id in user_ids))
 
 
+def _parent_lock_id(parent_id) -> int:
+    """Stable 63-bit advisory-lock key derived from the parent ENTRA_USER's
+    UUID (same folding the discovery worker uses for its tenant lock)."""
+    v = parent_id.int
+    return ((v >> 64) ^ (v & 0x7FFFFFFFFFFFFFFF)) & 0x7FFFFFFFFFFFFFFF
+
+
+async def _find_existing_child(
+    db: AsyncSession,
+    tenant_id,
+    rtype: ResourceType,
+    parent_resource_id,
+) -> Optional[Resource]:
+    """The child row for (tenant, type, parent) — tolerant of duplicates.
+
+    resources has no unique constraint on (tenant_id, type,
+    parent_resource_id) yet (alembic 0007 adds it) and four callers race this
+    code for the same user, so duplicate USER_* children DO exist in prod.
+    `scalar_one_or_none()` raised MultipleResultsFound on them, which
+    permanently poisoned that user's Tier-2 discovery. Pick the oldest row so
+    concurrent callers converge on the same survivor, and never delete the
+    extras — they may own snapshots.
+    """
+    rows = (await db.execute(
+        select(Resource).where(
+            Resource.tenant_id == tenant_id,
+            Resource.type == rtype,
+            Resource.parent_resource_id == parent_resource_id,
+        ).order_by(Resource.created_at.asc(), Resource.id.asc())
+    )).scalars().all()
+    if not rows:
+        return None
+    # Re-sorted here, not just in SQL: legacy rows can carry a NULL
+    # created_at, and the survivor must not depend on which caller ran the
+    # query or how the DB happened to order the rows.
+    rows = sorted(
+        rows,
+        key=lambda r: (r.created_at is None, r.created_at or datetime.min, str(r.id)),
+    )
+    if len(rows) > 1:
+        print(
+            f"[tier2_discovery] {len(rows)} duplicate {rtype.value} rows under "
+            f"parent {parent_resource_id} — refreshing oldest ({rows[0].id}); "
+            "extras left in place for operator cleanup"
+        )
+    return rows[0]
+
+
+async def _insert_child_or_get_winner(
+    db: AsyncSession,
+    new_row: Resource,
+    tenant_id,
+    rtype: ResourceType,
+    parent_resource_id,
+) -> Resource:
+    """INSERT `new_row` inside a SAVEPOINT; on a duplicate-key conflict adopt
+    the winner's row instead of poisoning the caller's transaction.
+
+    Callers pass `commit=False` and batch many users into one transaction, so
+    an unhandled IntegrityError would fail the whole batch. Once the unique
+    index on (tenant_id, type, parent_resource_id) exists the loser of a
+    four-caller race lands here; without the index the flush just succeeds.
+    """
+    try:
+        async with db.begin_nested():
+            db.add(new_row)
+            await db.flush()
+        return new_row
+    except IntegrityError:
+        winner = await _find_existing_child(db, tenant_id, rtype, parent_resource_id)
+        if winner is None:
+            # Not the duplicate-child race (bad FK, …) — fail loudly rather
+            # than silently dropping a resource we were asked to create.
+            raise
+        return winner
+
+
 async def has_complete_tier2(db: AsyncSession, user_resource_id) -> bool:
     """Cheap precheck — does every one of the five USER_* types exist under
     this ENTRA_USER? Used by the bulk trigger and the backstop sweep to skip
@@ -139,7 +218,56 @@ async def ensure_tier2_children(
         user_principal_name=upn,
         user_display_name=user_resource.display_name,
         licensed_services=licensed_services,
+        # Archive discovery below owns the allowlist and performs one probe.
+        include_archive=False,
     )
+
+    # `resources` has no unique constraint on (tenant_id, parent_resource_id,
+    # type), and four independent callers (tenant-service Backup-now,
+    # job-service gap-fill, the discovery.tier2 consumer, the 7h backstop)
+    # run this concurrently for the same user. Two racers interleaving the
+    # check-then-insert below created duplicate USER_* children, after which
+    # every later lookup raised MultipleResultsFound and the user was stuck
+    # DISCOVERY_FAILED. When any child row is still missing, serialize on a
+    # per-user advisory lock (xact-scoped: released at the caller's
+    # commit/rollback). The steady-state refresh path — all rows already
+    # exist — stays lock-free so a long-running batch (commit=False) never
+    # blocks an interactive Backup-now.
+    try:
+        _dialect = db.get_bind().dialect.name
+    except Exception:
+        _dialect = ""
+    if _dialect == "postgresql":
+        existing_types = {
+            row[0]
+            for row in (
+                await db.execute(
+                    select(Resource.type).where(
+                        Resource.tenant_id == user_resource.tenant_id,
+                        Resource.parent_resource_id == user_resource.id,
+                    )
+                )
+            ).all()
+        }
+        needs_lock = any(t not in existing_types for t in TIER2_CHILD_TYPES)
+        if not needs_lock and ResourceType.USER_ARCHIVE not in existing_types:
+            # Mirror _ensure_archive_child's gate so archive-eligible users
+            # get the same protection on their first archive materialisation.
+            from shared.config import settings as _settings
+            _archive_upn = (
+                (user_resource.extra_data or {}).get("user_principal_name")
+                or user_resource.email
+                or ""
+            ).lower()
+            _allowed = _settings.ARCHIVE_BACKUP_ALLOWED_UPNS
+            needs_lock = _settings.ARCHIVE_BACKUP_ENABLED and (
+                not _allowed or _archive_upn in _allowed
+            )
+        if needs_lock:
+            await db.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                {"lock_key": _parent_lock_id(user_resource.id)},
+            )
 
     out: List[Resource] = []
     for c in raw_children:
@@ -165,41 +293,15 @@ async def ensure_tier2_children(
             else ResourceStatus.DISCOVERED
         )
 
-        existing = (await db.execute(
-            select(Resource).where(
-                Resource.tenant_id == user_resource.tenant_id,
-                Resource.type == rtype,
-                Resource.parent_resource_id == user_resource.id,
-            )
-        )).scalar_one_or_none()
+        # Duplicate-tolerant lookup: rows duplicated BEFORE the advisory lock
+        # above existed (or by a lost race) must not wedge the user in
+        # DISCOVERY_FAILED forever — the lock only serialises new inserts, it
+        # cannot un-duplicate history.
+        existing = await _find_existing_child(
+            db, user_resource.tenant_id, rtype, user_resource.id
+        )
 
-        if existing:
-            existing.display_name = c["display_name"]
-            existing.email = c.get("email")
-            # Merge, don't replace — preserves backup-worker-written state
-            # (delta_token, mail_delta_token, calendar_delta_token,
-            # channel_delta_tokens, chat cursors). Graph discovery keys
-            # (drive_id, user_id, …) are stable and won't collide.
-            existing.extra_data = {**(existing.extra_data or {}), **meta}
-            # If we just recovered from a transient discovery error,
-            # drop the stale pending markers — otherwise they'd stick
-            # in extra_data forever and the row would look "broken" in
-            # the UI even though it's healthy now. Only clear when the
-            # current probe was actually successful (i.e. neither flag
-            # is set in this round's meta).
-            if not is_license_missing and not is_discovery_pending:
-                existing.extra_data.pop("discovery_pending", None)
-                existing.extra_data.pop("last_discovery_error", None)
-                existing.extra_data.pop("license_missing", None)
-                existing.extra_data.pop("license_hint", None)
-                existing.extra_data.pop("probe_status", None)
-            existing.external_id = c["external_id"]
-            # Re-inherit parent SLA so a parent re-policy reaches children
-            # on next discovery sweep without manual fan-out.
-            existing.sla_policy_id = user_resource.sla_policy_id
-            existing.status = child_status
-            out.append(existing)
-        else:
+        if existing is None:
             new_row = Resource(
                 id=uuid4(),
                 tenant_id=user_resource.tenant_id,
@@ -212,12 +314,152 @@ async def ensure_tier2_children(
                 sla_policy_id=user_resource.sla_policy_id,
                 status=child_status,
             )
-            db.add(new_row)
-            out.append(new_row)
+            existing = await _insert_child_or_get_winner(
+                db, new_row, user_resource.tenant_id, rtype, user_resource.id
+            )
+            if existing is new_row:
+                out.append(new_row)
+                continue
+            # Lost the insert race — fall through and refresh the row the
+            # winner committed instead of duplicating it.
+
+        existing.display_name = c["display_name"]
+        existing.email = c.get("email")
+        # Merge, don't replace — preserves backup-worker-written state
+        # (delta_token, mail_delta_token, calendar_delta_token,
+        # channel_delta_tokens, chat cursors). Graph discovery keys
+        # (drive_id, user_id, …) are stable and won't collide.
+        existing.extra_data = {**(existing.extra_data or {}), **meta}
+        # If we just recovered from a transient discovery error,
+        # drop the stale pending markers — otherwise they'd stick
+        # in extra_data forever and the row would look "broken" in
+        # the UI even though it's healthy now. Only clear when the
+        # current probe was actually successful (i.e. neither flag
+        # is set in this round's meta).
+        if not is_license_missing and not is_discovery_pending:
+            existing.extra_data.pop("discovery_pending", None)
+            existing.extra_data.pop("last_discovery_error", None)
+            existing.extra_data.pop("license_missing", None)
+            existing.extra_data.pop("license_hint", None)
+            existing.extra_data.pop("probe_status", None)
+        existing.external_id = c["external_id"]
+        # Re-inherit parent SLA so a parent re-policy reaches children
+        # on next discovery sweep without manual fan-out.
+        existing.sla_policy_id = user_resource.sla_policy_id
+        existing.status = child_status
+        out.append(existing)
+
+    archive_child = await _ensure_archive_child(db, user_resource, graph_client)
+    if archive_child is not None:
+        out.append(archive_child)
 
     if commit:
         await db.commit()
     return out
+
+
+async def _ensure_archive_child(
+    db: AsyncSession,
+    user_resource: Resource,
+    graph_client: Any,
+) -> Optional[Resource]:
+    """USER_ARCHIVE (Task 1.2) — jrue-only pilot, allowlist-gated.
+
+    Unlike the five fixed Tier-2 types above (materialised in bulk via
+    `discover_user_content`), the Exchange Online Archive probe is a
+    separate, explicitly-gated call so non-pilot users incur ZERO Graph
+    traffic for it — the Mailbox Import/Export API is metered.
+
+    Order matters:
+      1. `ARCHIVE_BACKUP_ENABLED` and the allowlist are checked FIRST,
+         entirely without a Graph call. A disabled feature or a
+         non-allowlisted UPN short-circuits before `get_exchange_settings`
+         is ever invoked.
+      2. Only then do we call `get_exchange_settings`.
+      3. Probe failures (429/5xx, or any other exception) are logged and
+         SKIPPED quietly this run — never create a child from a failed
+         probe (create-then-orphan is a prior-defect class in this
+         codebase). An unlicensed/no-archive user naturally 404s here too
+         and is treated the same way: no child.
+      4. No archive in the payload ⇒ no child.
+
+    Returns the child Resource if created/updated this call, else None.
+    Never deletes an existing child (e.g. if an archive is later
+    unassigned) — that's out of scope here and left to a future sweep.
+    """
+    from shared.config import settings as _settings
+
+    if not _settings.ARCHIVE_BACKUP_ENABLED:
+        return None
+
+    upn = ((user_resource.extra_data or {}).get("user_principal_name") or user_resource.email or "").lower()
+    allowed = _settings.ARCHIVE_BACKUP_ALLOWED_UPNS
+    if allowed and upn not in allowed:
+        return None
+
+    try:
+        payload = await graph_client.get_exchange_settings(user_resource.external_id)
+    except Exception as exc:
+        print(
+            f"[tier2_discovery] archive probe failed for "
+            f"{upn or user_resource.external_id}: {type(exc).__name__}: {exc} "
+            "— skipping this run"
+        )
+        return None
+
+    if not payload:
+        return None
+
+    # exchangeSettings (Graph beta) is a flat object: primaryMailboxId is
+    # always present; inPlaceArchiveMailboxId is present ONLY when the
+    # user has an In-Place Archive. No nested "archiveMailbox" object —
+    # do not confuse the two ids.
+    archive_id = payload.get("inPlaceArchiveMailboxId")
+    if not archive_id:
+        return None
+
+    display = user_resource.display_name or upn or user_resource.external_id
+    display_name = f"Archive — {display}"
+    meta = {
+        "archiveMailboxId": archive_id,
+        "archive_mailbox_id": archive_id,
+        "primary_mailbox_id": payload.get("primaryMailboxId"),
+        "user_id": user_resource.external_id,
+        "user_principal_name": upn,
+        "graph_version": _settings.ARCHIVE_GRAPH_VERSION,
+    }
+
+    # Same duplicate-tolerant lookup as the five fixed children above.
+    existing = await _find_existing_child(
+        db, user_resource.tenant_id, ResourceType.USER_ARCHIVE, user_resource.id
+    )
+
+    if existing is None:
+        new_row = Resource(
+            id=uuid4(),
+            tenant_id=user_resource.tenant_id,
+            type=ResourceType.USER_ARCHIVE,
+            external_id=archive_id,
+            display_name=display_name,
+            email=None,
+            extra_data=meta,
+            parent_resource_id=user_resource.id,
+            sla_policy_id=user_resource.sla_policy_id,
+            status=ResourceStatus.DISCOVERED,
+        )
+        existing = await _insert_child_or_get_winner(
+            db, new_row, user_resource.tenant_id, ResourceType.USER_ARCHIVE, user_resource.id
+        )
+        if existing is new_row:
+            return new_row
+        # Lost the insert race — refresh the winner's row below.
+
+    existing.display_name = display_name
+    existing.external_id = archive_id
+    existing.extra_data = {**(existing.extra_data or {}), **meta}
+    existing.sla_policy_id = user_resource.sla_policy_id
+    existing.status = ResourceStatus.DISCOVERED
+    return existing
 
 
 async def find_users_missing_tier2(

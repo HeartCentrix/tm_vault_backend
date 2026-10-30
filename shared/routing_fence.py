@@ -40,6 +40,7 @@ _QUEUE_BY_WORKLOAD = {
     # Tier-2 heavy / partitioned
     "USER_CHATS":        "backup.heavy",
     "USER_ONEDRIVE":     "backup.heavy",
+    "USER_ARCHIVE":      "backup.heavy",
     # Partitions (shard-level)
     "ONEDRIVE_PARTITION":     "backup.onedrive_partition",
     "CHATS_PARTITION":        "backup.chats_partition",

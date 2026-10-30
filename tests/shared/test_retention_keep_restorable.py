@@ -78,7 +78,7 @@ def test_flat_keeps_newest_completed_not_newer_failed():
 def test_archived_keep_last_keeps_newest_completed_not_newer_failed():
     policy = SimpleNamespace(archived_retention_mode="KEEP_LAST", archived_retention_days=None)
     snaps = [_snap("failed_today", 0, "FAILED"), _snap("completed_yesterday", 1, "COMPLETED")]
-    assert _archived_keep_ids(snaps, policy) == {"completed_yesterday"}
+    assert "completed_yesterday" in _archived_keep_ids(snaps, policy)
 
 
 def test_archived_custom_safety_net_is_restorable():

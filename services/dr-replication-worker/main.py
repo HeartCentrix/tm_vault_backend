@@ -1,9 +1,13 @@
 """
 DR Replication Worker — Asynchronous cross-region backup replication
 
-Scans for completed snapshots with dr_replication_status=pending,
+Scans for real recovery points (COMPLETED *or* PARTIAL, excluding
+skipped_concurrent placeholders) with dr_replication_status=pending, and
 initiates blob-to-blob server-side copy from primary to DR region.
 Azure handles the actual transfer over Microsoft's backbone fiber.
+
+Catalogue snapshots instead stream exact captured dependencies into a verified
+recovery archive. Automatic catalogue restore routing remains explicitly gated.
 
 Key principles:
 - Asynchronous: Primary backup succeeds BEFORE DR replication runs
@@ -13,19 +17,21 @@ Key principles:
 """
 import asyncio
 import logging
+import os
 import time
 import traceback
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from typing import List
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from azure.storage.blob.aio import BlobClient
 from azure.storage.blob import generate_blob_sas, BlobSasPermissions
-from sqlalchemy import select, or_, text
+from sqlalchemy import and_, func, or_, select
 
 from shared.config import settings
 from shared.database import async_session_factory, init_db
-from shared.models import Tenant, Resource, Snapshot, SnapshotItem, SlaPolicy
+from shared.models import Tenant, Resource, Snapshot, SnapshotItem, SlaPolicy, SnapshotStatus
 from shared.azure_storage import (
     azure_storage_manager, apply_legal_hold, apply_lifecycle_policy, AzureStorageShard,
     RESOURCE_TYPE_TO_WORKLOADS,
@@ -55,6 +61,78 @@ def _primary_workload(resource_type: str) -> str:
 
 MAX_REPLICATION_ATTEMPTS = 10
 COPY_TIMEOUT_SECONDS = 1800  # 30 min per blob
+SCAN_BATCH_LIMIT = 500
+
+# Snapshot states that hold real, restorable data. Mirrors
+# snapshot-service's _real_restore_point() / _READABLE_SNAPSHOT_STATES —
+# keep the two in step.
+#
+# PARTIAL belongs here. A PARTIAL snapshot lost some shards but still holds
+# every item it DID capture, so it is a real recovery point: in production
+# the only backup of Jason Rue's 1,114,848-item / 152 GB Exchange Online
+# Archive is PARTIAL, and the lossy-shard derivation deployed 2026-08-04
+# makes PARTIAL the normal outcome for any SharePoint/OneDrive run with
+# files_failed > 0. Replicating COMPLETED only meant every one of those
+# recovery points had NO DR copy at all.
+_DR_REPLICABLE_SNAPSHOT_STATES = (SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL)
+
+# How far back the scan looks. Bounded by default so a deploy of this fix
+# can't turn the whole history of never-replicated PARTIAL snapshots into
+# one enormous copy storm. Set DR_SCAN_LOOKBACK_DAYS=0 to disable the
+# window entirely and deliberately drain the historical backlog (see the
+# backlog WARNING this scan logs each pass).
+try:
+    _DR_SCAN_LOOKBACK_DAYS = int(os.getenv("DR_SCAN_LOOKBACK_DAYS", "2"))
+except ValueError:
+    # A typo'd env var must not crash-loop the worker into replicating nothing.
+    logger.error(
+        "[config] DR_SCAN_LOOKBACK_DAYS=%r is not an integer — using 2",
+        os.getenv("DR_SCAN_LOOKBACK_DAYS"),
+    )
+    _DR_SCAN_LOOKBACK_DAYS = 2
+
+
+def _dr_replicable_snapshot():
+    """SQL predicate: terminal-with-data, and not a concurrency placeholder.
+
+    Two halves, both load-bearing:
+
+    * ``status IN (COMPLETED, PARTIAL)`` — a PARTIAL snapshot is a real
+      recovery point holding real data and MUST get a DR copy.
+    * ``skipped_concurrent`` rejection — backup-worker's cross-job
+      concurrency guard (SKIP_CONCURRENT in workers/backup-worker/main.py)
+      creates 0-item snapshot rows purely so a skipped job's
+      FANOUT/FINALIZE counters balance, then marks them COMPLETED in
+      ~19 ms. Those are fake successes holding no data; replicating them
+      burns DR work and registers an empty DR copy.
+
+    ``extra_data`` is a Postgres **json** column (not jsonb), so
+    json_extract_path_text is the correct accessor — it is NULL-safe for
+    absent keys, and jsonb_extract_path_text would raise at runtime.
+    COALESCE is required: rows written before the flag existed hold NULL,
+    and a bare ``NOT IN`` over NULL yields NULL, which would silently
+    filter out every real snapshot. Compared as text so a non-boolean
+    value can't raise the way an ->>::boolean cast would.
+    """
+    return and_(
+        Snapshot.status.in_(_DR_REPLICABLE_SNAPSHOT_STATES),
+        func.coalesce(
+            func.json_extract_path_text(Snapshot.extra_data, "skipped_concurrent"),
+            "false",
+        ).notin_(("true", "t", "1")),
+    )
+
+
+def _dr_pending_retryable():
+    """SQL predicate: DR-side state says this snapshot still needs a copy."""
+    return and_(
+        or_(and_(Snapshot.dr_replication_status.in_(("pending", "failed")),
+                 Snapshot.dr_replication_attempts < MAX_REPLICATION_ATTEMPTS),
+            and_(Snapshot.dr_replication_status == "in_progress",
+                 func.json_extract_path_text(Snapshot.extra_data, "chat_inventory_format") == "1")),
+        func.coalesce(func.json_extract_path_text(Snapshot.extra_data, "chat_catalogue_dr_nonretryable"),
+                      "false").notin_(("true", "t", "1")),
+    )
 
 
 async def scan_and_replicate():
@@ -66,19 +144,51 @@ async def scan_and_replicate():
 
     async with async_session_factory() as session:
         try:
-            snapshots: List[Snapshot] = (
-                await session.execute(
-                    select(Snapshot).where(
-                        text("status = 'COMPLETED'"),
-                        or_(
-                            text("dr_replication_status = 'pending'"),
-                            text("dr_replication_status = 'failed'"),
-                        ),
-                        text("dr_replication_attempts < 10"),
-                        text("created_at > NOW() - INTERVAL '2 days'"),
-                    ).limit(500)
+            # Snapshot.created_at is a naive-UTC column (default=utcnow),
+            # so bind a naive-UTC cutoff. The old `NOW() - INTERVAL '2 days'`
+            # compared it against timestamptz NOW(), which PG resolves using
+            # the session TimeZone — a non-UTC session skewed the window.
+            cutoff = None
+            if _DR_SCAN_LOOKBACK_DAYS > 0:
+                cutoff = (
+                    datetime.now(timezone.utc).replace(tzinfo=None)
+                    - timedelta(days=_DR_SCAN_LOOKBACK_DAYS)
                 )
-            ).scalars().all()
+
+            stmt = select(Snapshot).where(
+                _dr_replicable_snapshot(),
+                _dr_pending_retryable(),
+            )
+            if cutoff is not None:
+                stmt = stmt.where(Snapshot.created_at > cutoff)
+            # Newest recovery points get their DR copy first; also makes the
+            # batch deterministic when the candidate set exceeds the limit.
+            stmt = stmt.order_by(Snapshot.created_at.desc()).limit(SCAN_BATCH_LIMIT)
+
+            snapshots: List[Snapshot] = (await session.execute(stmt)).scalars().all()
+
+            # Anything real and unreplicated that has already aged out of the
+            # window will NEVER be reconsidered while the window is in force —
+            # the gap is permanent, not just delayed. Surface the number so the
+            # backlog is a decision rather than a silent hole. Draining it is an
+            # explicit operator act (DR_SCAN_LOOKBACK_DAYS=0), not a side effect
+            # of deploying this fix.
+            if cutoff is not None:
+                backlog = (await session.execute(
+                    select(func.count(Snapshot.id)).where(
+                        _dr_replicable_snapshot(),
+                        _dr_pending_retryable(),
+                        Snapshot.created_at <= cutoff,
+                    )
+                )).scalar() or 0
+                if backlog:
+                    logger.warning(
+                        "[scan_and_replicate] BACKLOG: %d real recovery point(s) "
+                        "older than the %d-day look-back have no DR copy and will "
+                        "never be retried while the window stands. Set "
+                        "DR_SCAN_LOOKBACK_DAYS=0 to drain them.",
+                        backlog, _DR_SCAN_LOOKBACK_DAYS,
+                    )
 
             if not snapshots:
                 logger.info("[scan_and_replicate] No pending snapshots to replicate — scan complete")
@@ -187,6 +297,27 @@ async def replicate_snapshot(snapshot: Snapshot, tenant: Tenant, session):
         "[replicate_snapshot] START — snapshot=%s, tenant=%s, container_source=%s",
         snapshot.id, tenant.id, snapshot.id,
     )
+
+    # Defense in depth: the scan predicate already excludes concurrency
+    # placeholders, but this function is also reachable directly. A
+    # placeholder has zero items, so it would fall through to the
+    # "metadata-only" branch below and be marked `replicated` with a
+    # dr_blob_path — registering an empty DR copy that looks like a real
+    # recovery point. Mark it skipped instead, and set no dr_blob_path /
+    # dr_replicated_at. Nothing is deleted or overwritten either way.
+    if (getattr(snapshot, "extra_data", None) or {}).get("skipped_concurrent"):
+        snapshot.dr_replication_status = "skipped"
+        snapshot.dr_error = "Concurrency placeholder (skipped_concurrent) — no data to replicate"
+        logger.info(
+            "[replicate_snapshot] Snapshot %s is a skipped_concurrent placeholder "
+            "(0 items) — not replicating",
+            snapshot.id,
+        )
+        return
+
+    if (getattr(snapshot, "extra_data", None) or {}).get("chat_inventory_format") == 1:
+        await _replicate_catalogue_snapshot(snapshot, tenant, session)
+        return
 
     snapshot.dr_replication_status = "in_progress"
     snapshot.dr_replication_attempts = (snapshot.dr_replication_attempts or 0) + 1
@@ -397,6 +528,145 @@ async def replicate_snapshot(snapshot: Snapshot, tenant: Tenant, session):
             snapshot.id, snapshot.dr_replication_attempts,
         )
         snapshot.dr_error = f"Permanently failed after {MAX_REPLICATION_ATTEMPTS} attempts: {snapshot.dr_error}"
+
+
+async def _catalogue_dr_target(tenant, container):
+    from shared.chat_catalogue import ChatCatalogueIntegrityError
+    from shared.chat_catalogue_dr import AzureCatalogueDRStore
+    from shared.azure_storage import read_encryption_scope_state
+    if not tenant.dr_region_enabled or not tenant.dr_storage_account_name or not tenant.dr_storage_account_key_encrypted:
+        raise ChatCatalogueIntegrityError("catalogue DR target credentials/region are not configured")
+    key = decrypt_secret(tenant.dr_storage_account_key_encrypted)
+    shard = _create_dr_shard(tenant.dr_storage_account_name, key)
+    target = AzureCatalogueDRStore(backend_id=f"dr-azure:{tenant.dr_storage_account_name}",
+                                  name="catalogue-dr", shards=[shard])
+    try:
+        await target.ensure_container(container)
+        props = await shard.get_async_client().get_container_client(container).get_container_properties()
+        scope = getattr(getattr(props, "encryption_scope", None), "default_encryption_scope", None)
+        if scope == "$account-encryption-key":
+            scope = None
+        uri = None
+        if scope:
+            observed = await read_encryption_scope_state(container, shard=shard)
+            if (observed.get("error") or observed.get("scope") != scope or
+                str(observed.get("state")).lower() != "enabled" or not observed.get("key_uri")):
+                raise ChatCatalogueIntegrityError("DR customer encryption scope cannot be verified")
+            uri = observed["key_uri"]
+        encryption = {"mode": "azure_server_side", "scope": scope, "key_uri": uri}
+        await target.verify_encryption(container, None, encryption)
+        return target, encryption
+    except BaseException:
+        await target.close()
+        raise
+
+
+async def _replicate_catalogue_snapshot(snapshot, tenant, session):
+    """Archive safely; never conflate verified archival with automated DR restore."""
+    from types import SimpleNamespace
+    from sqlalchemy.orm.attributes import set_committed_value
+    from shared.chat_catalogue import ChatCatalogueIntegrityError
+    from shared.chat_catalogue_dr import FORMAT, replicate_catalogue_snapshot
+    from shared.db_retry import run_catalogue_transaction
+    from shared.models import ChatCataloguePin
+    from shared.storage.router import router
+
+    if (snapshot.extra_data or {}).get("chat_catalogue_dr_nonretryable"):
+        return
+    snapshot_id, tenant_id = snapshot.id, tenant.id
+    owner_id = uuid4()
+    tenant_config = SimpleNamespace(**{name: getattr(tenant, name) for name in
+        ("dr_region_enabled", "dr_storage_account_name", "dr_storage_account_key_encrypted")})
+    # Release the scanner's read transaction before pins or external storage I/O.
+    await session.commit()
+    fields = ("dr_replication_status", "dr_replication_attempts", "dr_error", "dr_blob_path", "dr_replicated_at", "extra_data")
+
+    async def mark(db, *, starting=False, archived=None, error=None):
+        row = await db.scalar(select(Snapshot).where(Snapshot.id == snapshot_id).with_for_update())
+        resource = await db.get(Resource, row.resource_id) if row else None
+        if row is None or resource is None or resource.tenant_id != tenant_id:
+            raise ChatCatalogueIntegrityError("catalogue DR snapshot ownership no longer exists")
+        def state(claimed):
+            return {**{name: getattr(row, name) for name in fields}, "claimed": claimed}
+        metadata = row.extra_data or {}
+        if starting:
+            now = await db.scalar(select(func.clock_timestamp()))
+            if row.dr_replication_status == "in_progress":
+                previous, started = metadata.get("chat_catalogue_dr_attempt_id"), metadata.get("chat_catalogue_dr_started_at")
+                try:
+                    previous = UUID(previous) if previous else None
+                except (ValueError, TypeError):
+                    previous = None
+                try:
+                    started = datetime.fromisoformat(started) if started else None
+                except (ValueError, TypeError):
+                    started = None
+                live_pin = await db.scalar(select(ChatCataloguePin.id).where(
+                    ChatCataloguePin.owner_kind == "dr", ChatCataloguePin.owner_id == previous,
+                    or_(ChatCataloguePin.expires_at.is_(None), ChatCataloguePin.expires_at > now)).limit(1)) if previous else None
+                # Pins renew during long copies. Grace covers target setup before pin acquisition.
+                if live_pin or (started and started.utcoffset() is not None and now - started < timedelta(minutes=5)):
+                    return state(False)
+            if (row.dr_replication_attempts or 0) >= MAX_REPLICATION_ATTEMPTS:
+                row.dr_replication_status = "failed"
+                row.dr_error = "Catalogue DR attempt budget exhausted after interrupted archival"
+                await db.flush()
+                return state(False)
+            row.dr_replication_attempts = (row.dr_replication_attempts or 0) + 1
+            row.extra_data = {**metadata, "chat_catalogue_dr_attempt_id": str(owner_id),
+                              "chat_catalogue_dr_started_at": now.isoformat()}
+        elif metadata.get("chat_catalogue_dr_attempt_id") != str(owner_id):
+            return state(False)
+        row.dr_replication_status = "in_progress" if starting else "failed"
+        row.dr_error, row.dr_blob_path, row.dr_replicated_at = error, None, None
+        if archived is not None:
+            row.extra_data = {**(row.extra_data or {}), "chat_catalogue_dr_archive": archived}
+        row.extra_data = {**(row.extra_data or {}), "chat_catalogue_dr_nonretryable":
+                          bool(not starting and archived and archived.get("verified"))}
+        await db.flush()
+        return state(True)
+
+    initial = await run_catalogue_transaction(async_session_factory, lambda db: mark(db, starting=True))
+    for name in fields:
+        set_committed_value(snapshot, name, initial[name])
+    if not initial["claimed"]:
+        return
+    archived = (initial["extra_data"] or {}).get("chat_catalogue_dr_archive")
+    target = None
+    try:
+        if not archived or not archived.get("verified"):
+            # Catalogue retention follows restore-point reachability, not legacy workload age rules.
+            container = f"chat-catalogue-dr-{UUID(str(tenant_id)).hex}"
+            target, encryption = await _catalogue_dr_target(tenant_config, container)
+            result = await replicate_catalogue_snapshot(session_factory=async_session_factory,
+                snapshot_id=snapshot_id, tenant_id=tenant_id, source_router=router,
+                target=target, target_container=container, encryption=encryption, owner_id=owner_id)
+            archived = {**asdict(result), "format": FORMAT, "verified": True,
+                        "verified_at": datetime.now(timezone.utc).isoformat()}
+        error = "Catalogue DR archive verified; automatic restore routing is unsupported"
+    except asyncio.CancelledError:
+        try:
+            interrupted = await asyncio.shield(run_catalogue_transaction(async_session_factory,
+                lambda db: mark(db, error="Catalogue DR archive interrupted; primary retained")))
+            for name in fields:
+                set_committed_value(snapshot, name, interrupted[name])
+        except Exception:
+            logger.exception("[catalogue-dr] Could not record interrupted archive")
+        raise
+    except Exception as exc:
+        error = f"Catalogue DR archive failed: {type(exc).__name__}: {exc}"[:1000]
+        archived = None
+        logger.warning("[catalogue-dr] snapshot %s archive failed: %s", snapshot_id, error)
+    finally:
+        if target is not None:
+            try:
+                await target.close()
+            except Exception:
+                logger.warning("[catalogue-dr] DR storage client cleanup failed")
+    saved = await run_catalogue_transaction(async_session_factory,
+        lambda db: mark(db, archived=archived, error=error))
+    for name in fields:
+        set_committed_value(snapshot, name, saved[name])
 
 
 def _create_dr_shard(account_name: str, account_key: str) -> AzureStorageShard:
@@ -777,6 +1047,10 @@ async def main():
     except Exception as e:
         logger.error("[main] Database initialization failed: %s\n%s", e, traceback.format_exc())
         raise
+
+    # Seaweed reads must retain their envelope-decryption seam in this worker.
+    from shared.crypto.bootstrap import install as install_crypto
+    await install_crypto(async_session_factory)
 
     # Start replication scan loop
     async def scan_loop():

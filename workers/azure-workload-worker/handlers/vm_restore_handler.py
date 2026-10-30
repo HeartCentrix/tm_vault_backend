@@ -82,7 +82,7 @@ class VmRestoreHandler:
 
             # Step 2: Create managed disks from backup VHD blobs
             disk_results = await self._create_disks_from_backup(
-                compute_client, target_rg, target_vm_name, vm_config, snapshot
+                compute_client, target_rg, target_vm_name, vm_config, snapshot, tenant
             )
 
             # Step 3: Create or reuse network interfaces
@@ -237,10 +237,14 @@ class VmRestoreHandler:
 
     async def _create_disks_from_backup(self, compute_client, target_rg: str,
                                          target_vm_name: str, vm_config: Dict,
-                                         snapshot: Snapshot) -> list:
+                                         snapshot: Snapshot, tenant: Tenant) -> list:
         """Create managed disks from backup VHD blobs."""
         results = []
-        container = azure_storage_manager.get_container_name(str(snapshot.extra_data.get("tenant_id", "")), "azure-vm")
+        # Container must come from the real tenant — the backup handler
+        # never writes tenant_id into snapshot.extra_data, so deriving it
+        # from there built a container name for tenant "" and no VHD was
+        # ever found (every full VM restore died at disk creation).
+        container = azure_storage_manager.get_container_name(str(tenant.id), "azure-vm")
         shard = azure_storage_manager.get_default_shard()
 
         # OS disk
@@ -273,9 +277,15 @@ class VmRestoreHandler:
 
         # Data disks
         for dd in vm_config.get("data_disks", []):
-            dd_blob_prefix = f"{vm_config['vm_name']}/{snapshot.id.hex[:12]}/data-{dd.get('name', '').lower().replace(' ', '-')}"
+            # Prefix must byte-match what the backup wrote: vm_handler
+            # names the blob data-<disk name> with the disk's real name
+            # verbatim (case preserved, no munging). Lowercasing here
+            # silently skipped every mixed-case data disk.
+            dd_disk_name = dd.get("name") or f"{vm_config['vm_name']}-data-disk-{dd.get('lun', 0)}"
+            dd_blob_prefix = f"{vm_config['vm_name']}/{snapshot.id.hex[:12]}/data-{dd_disk_name}"
 
             data_disk_name = f"{target_vm_name}-datadisk-{dd.get('lun', 0)}"
+            dd_found = False
             async for blob in shard.get_async_client().get_container_client(container).list_blobs(name_starts_with=dd_blob_prefix):
                 disk_params = {
                     "location": vm_config.get("location", "eastus"),
@@ -293,7 +303,17 @@ class VmRestoreHandler:
                 )
                 result = await poller.result()
                 results.append({"type": "Data", "disk_id": result.id, "disk_name": data_disk_name, "lun": dd.get("lun", 0)})
+                dd_found = True
                 break
+
+            # A VM quietly restored without one of its data disks is
+            # silent data loss — fail the restore instead of attaching
+            # fewer disks than the backup captured.
+            if not dd_found:
+                raise ValueError(
+                    f"No VHD blob found for data disk {dd_disk_name} "
+                    f"(prefix={dd_blob_prefix})"
+                )
 
         return results
 
@@ -349,6 +369,10 @@ class VmRestoreHandler:
         if not os_disk_result:
             raise ValueError("No OS disk available for VM creation")
 
+        # NOTE: no os_profile here — ARM rejects osProfile on a VM built
+        # from an ATTACHed OS disk ("Parameter 'osProfile' is not allowed").
+        # The attached disk already carries the OS, hostname and users;
+        # os_type on the os_disk is required for ATTACH instead.
         vm_params = {
             "location": vm_config.get("location", "eastus"),
             "hardware_profile": {"vm_size": vm_config.get("vm_size", "Standard_D2s_v3")},
@@ -357,11 +381,8 @@ class VmRestoreHandler:
                     "managed_disk": {"id": os_disk_result["disk_id"]},
                     "caching": "ReadWrite",
                     "create_option": DiskCreateOptionTypes.ATTACH,
+                    "os_type": vm_config.get("os_disk", {}).get("os_type", "Linux"),
                 },
-            },
-            "os_profile": {
-                "computer_name": vm_config.get("os_profile", {}).get("computer_name", target_vm_name[:15]),
-                "admin_username": "restoreadmin",
             },
             "network_profile": {
                 "network_interfaces": [

@@ -4,11 +4,12 @@ Router is included from main.py. All paths route to the chat-export-worker
 via `q.export.chat.thread`; progress streams come back through Redis Pub/Sub.
 
 Auth model (matches shared.security.get_current_user_from_token): user is a
-dict with keys {id, email, roles, org_id, tenant_ids}. We treat the FIRST
-tenant_id in the list as the actor's active tenant (matches how existing
-services interpret JWT scope). `roles` carries UserRole enum values as
-strings — "TENANT_ADMIN" / "SUPER_ADMIN" / "ORG_ADMIN" elevates for admin-
-only routes.
+dict with keys {id, email, roles, org_id, tenant_ids}. The rules themselves
+live in `export_authz` because the endpoints that serve the finished ZIP
+(`main.py`) must enforce exactly the same ones — see that module's docstring
+for the model and for the SQL that grants an operator role. Authorization is
+enforced in this service, not delegated to the gateway: api-gateway proxies
+these routes without validating any token.
 
 Status values:
 - New jobs start as PENDING (distinct from worker-owned QUEUED so the
@@ -25,7 +26,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, update, tuple_
 from sqlalchemy.orm import aliased
 
 from shared.config import settings
@@ -38,16 +39,27 @@ from shared.models import (
     Resource,
     Snapshot,
     SnapshotItem,
+    SnapshotChatInventory,
     Tenant,
 )
 from shared.security import get_current_user_from_token
+
+from export_authz import (
+    AUTHORIZED_SCOPE_KEY,
+    CHAT_EXPORT_KIND,
+    authorize_export_scope as _authorize_scope,
+    authorize_restore_destinations as _authorize_destinations,
+    authorized_scope_stamp as _authorized_scope_stamp,
+    ensure_job_access as _ensure_job_access,
+    ensure_resource_access as _ensure_ownership,
+    is_admin as _is_admin,
+)
 
 router = APIRouter(prefix="/api/v1/exports/chat", tags=["Chat Export"])
 
 Q = "q.export.chat.thread"
 CHAT_MSG_TYPES = ("TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY")
-KIND = "chat_export_thread"
-ADMIN_ROLES = {"SUPER_ADMIN", "ORG_ADMIN", "TENANT_ADMIN", "tenant_admin"}
+KIND = CHAT_EXPORT_KIND
 
 
 class ChatExportRequest(BaseModel):
@@ -60,44 +72,46 @@ class ChatExportRequest(BaseModel):
     force: bool = False
 
 
-def _user_tenant_id(user: dict) -> uuid.UUID | None:
-    """First tenant id from the JWT scope, as UUID, or None."""
-    tids = user.get("tenant_ids") or []
-    if not tids:
-        return None
-    try:
-        return uuid.UUID(tids[0]) if isinstance(tids[0], str) else tids[0]
-    except (ValueError, TypeError):
-        return None
-
-
-def _is_admin(user: dict) -> bool:
-    return any(r in ADMIN_ROLES for r in (user.get("roles") or []))
-
-
-async def _ensure_ownership(sess: AsyncSession, user: dict, resource_id: str) -> Resource:
-    try:
-        rid = uuid.UUID(resource_id)
-    except (ValueError, TypeError):
-        raise HTTPException(400, detail={"error": "INVALID_RESOURCE_ID"})
-    res = (await sess.execute(select(Resource).where(Resource.id == rid))).scalar_one_or_none()
-    if not res:
-        raise HTTPException(404, detail={"error": "RESOURCE_NOT_FOUND"})
-    # Gateway already enforces JWT validity + tenant scoping before this call.
-    # At service layer we only require: valid user subject + existing resource.
-    # Enforce strict JWT-tenant match only when the JWT carries tenant_ids
-    # (admin tokens and back-office tokens may omit them).
-    user_tenant = _user_tenant_id(user)
-    if user_tenant is not None and res.tenant_id != user_tenant and not _is_admin(user):
-        import logging as _lg
-        _lg.getLogger("chat-export.auth").warning(
-            "ownership_denied user_id=%s user_tenants=%s resource_tenant=%s",
-            user.get("id"), user.get("tenant_ids"), str(res.tenant_id),
-        )
-        raise HTTPException(403, detail={"error": "AUTH_DENIED"})
-    if not user.get("id"):
-        raise HTTPException(401, detail={"error": "AUTH_REQUIRED"})
-    return res
+async def _catalogue_estimate(sess, *, resource_ids, snapshot_ids, thread_path, item_ids, catalogue_ids):
+    stmt = select(SnapshotItem).join(Snapshot, Snapshot.id == SnapshotItem.snapshot_id).where(
+        Snapshot.resource_id.in_(resource_ids), SnapshotItem.item_type.in_(CHAT_MSG_TYPES))
+    if snapshot_ids:
+        stmt = stmt.where(SnapshotItem.snapshot_id.in_(snapshot_ids))
+    stmt = stmt.where(SnapshotItem.folder_path == thread_path) if thread_path else stmt.where(SnapshotItem.id.in_(item_ids))
+    messages = list((await sess.scalars(stmt)).all())
+    if not messages:
+        raise HTTPException(400, detail={"error": "SCOPE_EMPTY"})
+    if any(m.snapshot_id not in catalogue_ids or m.chat_version_id is None for m in messages):
+        raise HTTPException(400, detail={"error": "AMBIGUOUS_CAPTURE_VERSIONS"})
+    paths = {m.folder_path for m in messages}
+    if len(paths) > 1 or len({(m.extra_data or {}).get("chat_id") for m in messages}) > 1:
+        raise HTTPException(400, detail={"error": "MULTI_THREAD_NOT_SUPPORTED_YET"})
+    selected_chats = {(m.extra_data or {}).get("chat_id") for m in messages}
+    wanted = {(m.snapshot_id, (m.extra_data or {}).get("chat_id")) for m in messages}
+    associations = (await sess.execute(select(SnapshotChatInventory.snapshot_id,
+        SnapshotChatInventory.chat_id, SnapshotChatInventory.inventory_id)
+        .where(SnapshotChatInventory.snapshot_id.in_({m.snapshot_id for m in messages}),
+            SnapshotChatInventory.chat_id.in_(selected_chats)))).all()
+    if None in selected_chats or {(sid, cid) for sid, cid, _ in associations} != wanted:
+        raise HTTPException(409, detail={"error": "CAPTURE_INTEGRITY_GAP"})
+    inventories = {}
+    for _, chat_id, inventory_id in associations:
+        inventories.setdefault(chat_id, set()).add(inventory_id)
+    if any(len(ids) > 1 for ids in inventories.values()):
+        raise HTTPException(400, detail={"error": "AMBIGUOUS_CAPTURE_VERSIONS"})
+    versions = {m.chat_version_id: m.content_size or 0 for m in messages}
+    pairs = list({(m.snapshot_id, m.external_id) for m in messages})
+    children = {}
+    for start in range(0, len(pairs), 500):
+        rows = (await sess.execute(select(SnapshotItem.chat_version_id, SnapshotItem.content_size).where(
+            SnapshotItem.item_type.in_(["CHAT_ATTACHMENT", "CHAT_HOSTED_CONTENT"]),
+            tuple_(SnapshotItem.snapshot_id, SnapshotItem.parent_external_id).in_(pairs[start:start + 500])))).all()
+        for version_id, size in rows:
+            if version_id is None:
+                raise HTTPException(409, detail={"error": "CAPTURE_INTEGRITY_GAP"})
+            children[version_id] = size or 0
+    return len(versions), sum(versions.values()) + sum(children.values()), (
+        "single_thread" if thread_path else "per_message"), next(iter(paths))
 
 
 async def _resolve_counts(
@@ -166,27 +180,86 @@ async def _resolve_counts(
     count, bytes_ = (await sess.execute(q)).one()
 
     # Attachment bytes — linked by parent_external_id to the matched messages.
+    # This number is user-facing AND enforcing: it drives softCapExceeded /
+    # hardCapExceeded and the gate in trigger() that refuses the export. It
+    # must therefore agree with what workers/chat-export-worker/scope.py
+    # actually writes into the ZIP, or a phantom overcount blocks an export
+    # that would have been comfortably under cap. Mirror that function:
+    # message ids from the SAME snapshot scope, child rows tenant-scoped
+    # (with the snapshot -> resource fallback for the NULL tenant_id every
+    # CHAT_HOSTED_CONTENT row carries), NOT snapshot-scoped (shared-chat
+    # attachments live in the first drainer's snapshot), then de-duplicated
+    # per logical child so carry-forward copies count once.
     ext_ids_q = (
-        select(SnapshotItem.external_id)
+        select(SnapshotItem.external_id, SnapshotItem.tenant_id)
         .join(Sn, Sn.id == SnapshotItem.snapshot_id)
         .where(Sn.resource_id.in_(resource_uuids))
     )
     if thread_path:
-        ext_ids_q = ext_ids_q.where(SnapshotItem.folder_path == thread_path).where(
-            SnapshotItem.item_type.in_(CHAT_MSG_TYPES)
+        ext_ids_q = (
+            ext_ids_q.where(SnapshotItem.snapshot_id.in_(snapshot_uuids))
+            .where(SnapshotItem.folder_path == thread_path)
+            .where(SnapshotItem.item_type.in_(CHAT_MSG_TYPES))
         )
     else:
         ext_ids_q = ext_ids_q.where(SnapshotItem.id.in_(item_uuids))
-    ext_ids = [r[0] for r in (await sess.execute(ext_ids_q))]
+    msg_rows = (await sess.execute(ext_ids_q)).all()
+    ext_ids = [r[0] for r in msg_rows]
+    msg_tenant_ids = {r[1] for r in msg_rows if r[1] is not None}
+
+    selected_ids = snapshot_uuids
+    if not selected_ids and item_uuids:
+        selected_ids = list((await sess.scalars(select(SnapshotItem.snapshot_id).where(
+            SnapshotItem.id.in_(item_uuids)).distinct())).all())
+    formats = (await sess.execute(select(Snapshot.id, Snapshot.extra_data).where(Snapshot.id.in_(selected_ids)))).all()
+    catalogue_ids = {sid for sid, metadata in formats
+        if isinstance(metadata, dict) and metadata.get("chat_inventory_format") == 1}
+    if catalogue_ids:
+        return await _catalogue_estimate(sess, resource_ids=resource_uuids, snapshot_ids=snapshot_uuids,
+            thread_path=thread_path, item_ids=item_uuids, catalogue_ids=catalogue_ids)
 
     att_size = 0
     if ext_ids:
         att_q = (
-            select(func.coalesce(func.sum(SnapshotItem.content_size), 0))
+            select(
+                SnapshotItem.parent_external_id,
+                SnapshotItem.external_id,
+                SnapshotItem.content_size,
+                SnapshotItem.tenant_id,
+                SnapshotItem.snapshot_id,
+                SnapshotItem.blob_path,
+            )
             .where(SnapshotItem.item_type.in_(["CHAT_ATTACHMENT", "CHAT_HOSTED_CONTENT"]))
             .where(SnapshotItem.parent_external_id.in_(ext_ids))
+            .order_by(SnapshotItem.created_at.desc())
         )
-        att_size = (await sess.execute(att_q)).scalar() or 0
+        child_rows = (await sess.execute(att_q)).all()
+        fallback_tenant: dict = {}
+        null_snap_ids = {
+            r[4] for r in child_rows if r[3] is None and r[4] is not None
+        }
+        if null_snap_ids and msg_tenant_ids:
+            fallback_tenant = {
+                sid: tid
+                for sid, tid in (await sess.execute(
+                    select(Snapshot.id, Resource.tenant_id)
+                    .join(Resource, Resource.id == Snapshot.resource_id)
+                    .where(Snapshot.id.in_(list(null_snap_ids)))
+                )).all()
+            }
+        best: dict = {}
+        for parent_ext, child_ext, size, tid, snap_id, blob in child_rows:
+            if msg_tenant_ids:
+                owner = tid if tid is not None else fallback_tenant.get(snap_id)
+                if owner is None or owner not in msg_tenant_ids:
+                    continue
+            key = (parent_ext, child_ext)
+            cur = best.get(key)
+            # Same preference as the worker's `_one_per_child`: newest copy
+            # (ORDER BY created_at DESC) unless it has no blob.
+            if cur is None or (not cur[1] and blob):
+                best[key] = (size or 0, blob)
+        att_size = sum(size for size, _blob in best.values())
 
     return int(count or 0), int(bytes_ or 0) + int(att_size or 0), layout, effective
 
@@ -198,6 +271,9 @@ async def estimate(
     sess: AsyncSession = Depends(get_db),
 ):
     await _ensure_ownership(sess, user, req.resourceId)
+    # The ids are authorized too, not just the resource: the counts below
+    # describe whatever those ids point at.
+    await _authorize_scope(sess, user, snapshot_ids=req.snapshotIds, item_ids=req.itemIds)
     count, est_bytes, layout, _ = await _resolve_counts(
         sess,
         resource_id=req.resourceId,
@@ -224,7 +300,23 @@ async def trigger(
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
     res = await _ensure_ownership(sess, user, req.resourceId)
-    user_tenant = _user_tenant_id(user) or res.tenant_id
+    # Authorize the requested ids as well as the resource: a caller may pass
+    # their own resourceId alongside someone else's snapshot/item ids, and the
+    # worker exports what the spec's ids point at.
+    scope_targets = await _authorize_scope(
+        sess, user, snapshot_ids=req.snapshotIds, item_ids=req.itemIds
+    )
+    # No-op today — `ChatExportRequest` carries no destination field and the
+    # chat-export worker only writes a ZIP to blob storage. Called anyway so
+    # this door obeys the same rule as the other two: if a destination field is
+    # ever added to the request model, it gets authorized (or fails closed)
+    # instead of being silently trusted.
+    await _authorize_destinations(sess, user, req.model_dump())
+    # Stamp the tenant we actually authorized against. `tenant_ids[0]` is not
+    # necessarily the resource's tenant once a caller is entitled to more than
+    # one, and a mismatch would file the job under the wrong tenant's
+    # idempotency/concurrency budget and hide it from its own owner.
+    user_tenant = res.tenant_id
 
     # Feature flag gate — three-state logic so a fresh tenant doesn't
     # default-deny and trip 503 FEATURE_NOT_ENABLED on the first click.
@@ -324,6 +416,17 @@ async def trigger(
         "layoutMode": layout,
         "triggered_by": "MANUAL",
     }
+    # Same stamp the generic export/restore triggers write: the SSE + JSON
+    # status route for a chat export is polled for the life of the job, and
+    # without this every tick re-walked snapshot_items (see
+    # export_authz.AUTHORIZED_SCOPE_KEY).
+    spec[AUTHORIZED_SCOPE_KEY] = _authorized_scope_stamp(
+        spec,
+        # `res.id` is what lands in Job.resource_id below — use the row, not the
+        # caller's spelling of it, so the fingerprint matches at serve time.
+        resource_id=res.id,
+        resource_ids=[res.id, *scope_targets.keys()],
+    )
     job = Job(
         id=uuid.uuid4(),
         tenant_id=user_tenant,
@@ -364,7 +467,7 @@ def _job_snapshot(job: Job) -> dict:
         op = job.result or {}
         out["download"] = {
             "url": op.get("signed_url"),
-            "sizeBytes": op.get("total_bytes"),
+            "sizeBytes": op.get("size_bytes", op.get("total_bytes")),
             "sha256": op.get("sha256"),
             "filename": f"teams-chat-{str(job.id)[:8]}.zip",
             "supportsRange": True,
@@ -406,11 +509,7 @@ async def status_or_sse(
     job = (await sess.execute(select(Job).where(Job.id == jid))).scalar_one_or_none()
     if not job:
         raise HTTPException(404, detail={"error": "JOB_NOT_FOUND"})
-    user_tenant = _user_tenant_id(user)
-    if user_tenant is not None and job.tenant_id != user_tenant and not _is_admin(user):
-        raise HTTPException(403, detail={"error": "AUTH_DENIED"})
-    if not user.get("id"):
-        raise HTTPException(401, detail={"error": "AUTH_REQUIRED"})
+    await _ensure_job_access(sess, user, job)
 
     # Accept header switches JSON snapshot vs SSE stream. Frontend polling
     # uses JSON; the live progress bar subscribes over SSE.
@@ -474,11 +573,7 @@ async def cancel(
     job = (await sess.execute(select(Job).where(Job.id == jid))).scalar_one_or_none()
     if not job:
         raise HTTPException(404, detail={"error": "JOB_NOT_FOUND"})
-    user_tenant = _user_tenant_id(user)
-    if user_tenant is not None and job.tenant_id != user_tenant and not _is_admin(user):
-        raise HTTPException(403, detail={"error": "AUTH_DENIED"})
-    if not user.get("id"):
-        raise HTTPException(401, detail={"error": "AUTH_REQUIRED"})
+    await _ensure_job_access(sess, user, job)
     # Only flip transient states. Terminal jobs (COMPLETED/FAILED/CANCELLED)
     # are left alone so we don't overwrite a legit final state.
     if job.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
@@ -510,6 +605,9 @@ async def force_delete(
     job = (await sess.execute(select(Job).where(Job.id == jid))).scalar_one_or_none()
     if not job:
         raise HTTPException(404, detail={"error": "JOB_NOT_FOUND"})
+    # Admin rights are not global: this queues the export blob for deletion,
+    # so the job must also live in a tenant this admin is entitled to.
+    await _ensure_job_access(sess, user, job)
     new_result = {
         **(job.result or {}),
         "force_deleted": True,

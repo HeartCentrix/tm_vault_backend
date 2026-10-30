@@ -11,10 +11,12 @@ Responsibilities:
 - Track SLA compliance and violations
 """
 import asyncio
+import json
 import os
+import traceback
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Sequence
 from fastapi import FastAPI, BackgroundTasks
 from sqlalchemy import select, and_, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,10 +37,27 @@ from shared.message_bus import (
 )
 from shared.config import settings
 from shared.power_bi_client import PowerBIClient
-from shared.audit import emit_backup_triggered
+from shared.azure_storage import azure_storage_manager
+from shared.audit import emit_backup_triggered, internal_audit_headers
+
+# Sibling-file load: backup-scheduler has a hyphen so a plain
+# `from .dispatch_policy import` won't resolve. Same importlib pattern
+# audit-service uses for activity_backup.py.
+import importlib.util as _ilu_dp
+import pathlib as _pl_dp
+import sys as _sys_dp
+_dp_path = _pl_dp.Path(__file__).resolve().parent / "dispatch_policy.py"
+_dp_spec = _ilu_dp.spec_from_file_location(
+    "backup_scheduler_dispatch_policy", _dp_path,
+)
+dispatch_policy = _ilu_dp.module_from_spec(_dp_spec)
+_sys_dp.modules["backup_scheduler_dispatch_policy"] = dispatch_policy
+_dp_spec.loader.exec_module(dispatch_policy)
 from shared.sla_workloads import RESOURCE_TYPE_TO_SLA_FLAG, resource_type_enabled
 
+from shared.audit_middleware import AuditMiddleware  # Ops/Data Check 3: mutation-audit backstop
 app = FastAPI(title="Backup Scheduler Service", version="3.0.0")
+app.add_middleware(AuditMiddleware, service_name="backup-scheduler")
 
 # APScheduler for dynamic SLA policy scheduling
 scheduler = AsyncIOScheduler()
@@ -57,7 +76,7 @@ RESOURCE_TYPE_DISPLAY_NAMES: Dict[str, str] = {
     "USER_CONTACTS": "User contacts",
     "USER_CALENDAR": "User calendars",
     "USER_CHATS": "User chats",
-    "USER_ARCHIVE": "Exchange online archive",
+    "USER_ARCHIVE": "Online archives",
     "ENTRA_DIRECTORY": "Azure Active Directory",
     "ENTRA_USER": "Entra user data",
     "ENTRA_GROUP": "Entra group data",
@@ -84,6 +103,7 @@ RESOURCE_TYPE_DISPLAY_NAMES: Dict[str, str] = {
 
 SLA_FLAG_DISPLAY_NAMES: Dict[str, str] = {
     "backup_exchange": "Exchange",
+    "backup_exchange_archive": "Online archives",
     "backup_onedrive": "OneDrive and OneNote",
     "backup_sharepoint": "SharePoint",
     "backup_teams": "Teams channels",
@@ -326,6 +346,55 @@ async def _emit_policy_audit(
             pass
 
 
+async def publish_cycle_audit_event(
+    policy: SlaPolicy, action: str, details: Dict[str, Any],
+    tenant_id: Optional[str] = None, *,
+    outcome: str = "PARTIAL", priority: int = 3,
+):
+    """Emit ONE cycle-level warning event for a policy-wide dispatch
+    decision (overlap skip / override / concurrency deferral).
+
+    Cycle-level on purpose: a 33-resource deferral emitted per resource
+    would flood the Activity feed with 33 warning rows. Per-resource
+    detail rides in ``details.resource_ids``.
+
+    ``resource_type``/``resource_name`` are set because the Activity
+    warning row renders ``resource_name or resource_type or "Unknown
+    resource"`` — without them every one of these reads "Unknown
+    resource".
+
+    Waves pass ``outcome='SUCCESS'`` — a wave is normal progress, not a
+    PARTIAL cycle.
+    """
+    if tenant_id is None:
+        tenant_id = str(getattr(policy, "tenant_id", "") or "")
+    if not tenant_id:
+        # tenant_id is nullable on the column but carries an FK to
+        # tenants.id, and the Activity feed filters by tenantId — a
+        # tenant-less event would be invisible anyway. Log and move on
+        # rather than risk an FK error aborting the dispatch.
+        print(f"[SCHEDULER] {action}: no tenant on policy "
+              f"'{policy.name}' — logging only, no audit event")
+        return
+    try:
+        audit_message = create_audit_event_message(
+            action=action,
+            tenant_id=tenant_id,
+            actor_type="SYSTEM",
+            resource_id=None,
+            resource_type="SLA_POLICY",
+            resource_name=policy.name,
+            outcome=outcome,
+            details=details,
+        )
+        await message_bus.publish("audit.events", audit_message, priority=priority)
+    except Exception as exc:
+        # Audit is observability, not the control path — never let a bus
+        # hiccup abort or double-run a dispatch decision.
+        print(f"[SCHEDULER] {action}: audit publish failed ({exc}) — "
+              f"decision already applied")
+
+
 async def publish_sla_skip_audit_events(policy: SlaPolicy, skipped_resources: List[Resource]):
     """Emit warning audit events for resources skipped by SLA coverage filters."""
     if not skipped_resources:
@@ -439,6 +508,21 @@ async def startup():
         coalesce=True,
     )
 
+    # Deferred-resource drain: re-dispatch what the concurrency cap held
+    # back, in waves, as in-flight work finishes (see drain_policy_cycle).
+    # max_instances=1 + coalesce so a slow tick never stacks; a 30 s
+    # misfire grace because APScheduler's default (1 s) silently drops a
+    # tick that lands while the loop is busy.
+    scheduler.add_job(
+        drain_policy_cycles, "interval",
+        seconds=dispatch_policy.drain_tick_seconds(),
+        id="policy_cycle_drain",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=30,
+    )
+
     # Schedule SLA violation check every 30 minutes
     scheduler.add_job(check_sla_violations, "interval", minutes=30)
 
@@ -460,6 +544,9 @@ async def startup():
 
     # Phase 2: Retention cleanup — FLAT/GFS snapshot pruning per SLA policy (daily)
     scheduler.add_job(run_retention_cleanup, "interval", hours=24)
+    scheduler.add_job(run_chat_catalogue_cleanup, "interval", minutes=5,
+                      id="chat_catalogue_cleanup", max_instances=1, coalesce=True,
+                      replace_existing=True)
 
     # Stale-snapshot sweep — close out snapshots that have been
     # IN_PROGRESS for >30min with no live handler. This happens when a
@@ -506,6 +593,23 @@ async def startup():
                                  WHERE si.snapshot_id = s.id),
                                 s.started_at
                               ) < NOW() - INTERVAL '30 minutes'
+                          -- Lease guard (2026-07-14): a live worker renews
+                          -- lease_expires_at every 120s (LeaseExtender) —
+                          -- including during OneDrive *enumeration*, which
+                          -- writes no snapshot_items rows and so never
+                          -- advances the watermark above. Only sweep rows
+                          -- whose lease lapsed (dead worker) or that never
+                          -- had one (heartbeat init failed / legacy rows),
+                          -- which keep the 30-min horizon.
+                          -- 2026-08-25 grace: a lease merely PAST its TTL
+                          -- proves only that a few renew WRITES were
+                          -- severed — during the 8/24-8/25 pooler storms
+                          -- that was true of live walks (the reconciler's
+                          -- STEP B gained the same grace; without it here
+                          -- this 5-min sweep reaps the live walk first and
+                          -- can even derive COMPLETED for a half-done run).
+                          AND (s.lease_expires_at IS NULL
+                               OR s.lease_expires_at < NOW() - INTERVAL '900 seconds')
                           -- Bug #169 defense: never reap a partitioned
                           -- snapshot whose shards are still in flight.
                           -- The partition stale-sweep below owns the
@@ -524,8 +628,30 @@ async def startup():
                           )
                     )
                     UPDATE snapshots s SET
-                        status = (CASE WHEN c.n_items > 0 THEN 'COMPLETED'
-                                       ELSE 'FAILED' END)::snapshotstatus,
+                        -- A partitioned run whose shards finished but LOST
+                        -- files records the count in
+                        -- snapshot_partitions.failure_state (see
+                        -- _mark_partition_terminal — partition status stays
+                        -- a two-value terminal domain). Deriving purely from
+                        -- item count would flip such a run to COMPLETED when
+                        -- this 5-min sweep reaches the row before the 60s
+                        -- reconciler does, so the snapshot would pose as a
+                        -- complete restore point that retention may promote
+                        -- over a genuinely-complete predecessor. Same
+                        -- predicate as the other four derivation sites, and
+                        -- type-checked so a malformed value can never abort
+                        -- the sweep for every other snapshot.
+                        status = (CASE
+                            WHEN c.n_items = 0 THEN 'FAILED'
+                            WHEN EXISTS (
+                                SELECT 1 FROM snapshot_partitions sp
+                                 WHERE sp.snapshot_id = s.id
+                                   AND jsonb_typeof(
+                                         sp.failure_state::jsonb -> 'files_failed'
+                                       ) = 'number'
+                                   AND (sp.failure_state::jsonb ->> 'files_failed')::bigint > 0
+                            ) THEN 'PARTIAL'
+                            ELSE 'COMPLETED' END)::snapshotstatus,
                         item_count = c.n_items,
                         new_item_count = COALESCE(s.new_item_count, c.n_items),
                         completed_at = NOW(),
@@ -822,6 +948,15 @@ async def startup():
                                AND started_at IS NOT NULL
                                AND started_at < NOW()
                                                 - (:stale * INTERVAL '1 minute')
+                               -- Lease guard (2026-07-14): a shard being
+                               -- actively drained has its lease renewed
+                               -- every 120s by the owning worker's
+                               -- LeaseExtender; started_at age alone says
+                               -- nothing about liveness on multi-hour
+                               -- downloads. Only touch lapsed/lease-less
+                               -- rows.
+                               AND (lease_expires_at IS NULL
+                                    OR lease_expires_at < NOW())
                                AND retry_count >= :max_r
                          RETURNING id, snapshot_id
                             """
@@ -858,6 +993,15 @@ async def startup():
                                AND started_at IS NOT NULL
                                AND started_at < NOW()
                                                 - (:stale * INTERVAL '1 minute')
+                               -- Lease guard (2026-07-14): see step 1. This
+                               -- reset ran every sweep pass against LIVE
+                               -- multi-hour shards, so the sweep itself
+                               -- manufactured the retry_count that step 1
+                               -- then failed on (jlucas snapshot 370e1af6:
+                               -- 4 shards x 5 sweep-resets = FAILED with 0
+                               -- real worker deaths).
+                               AND (lease_expires_at IS NULL
+                                    OR lease_expires_at < NOW())
                                AND retry_count < :max_r
                          RETURNING id, snapshot_id, job_id, tenant_id,
                                    resource_id, drive_id, partition_type,
@@ -1103,13 +1247,35 @@ async def startup():
                       LEFT JOIN resources r ON r.id = s.resource_id
                       LEFT JOIN jobs j      ON j.id = s.job_id
                      WHERE (
+                          (
                             -- Population A + C: explicit cancellation marker.
                             (s.extra_data::jsonb ->> 'cancelled_at') IS NOT NULL
                           ) OR (
                             -- Population B: late-arrival orphans.
                             s.status = 'IN_PROGRESS'
                             AND j.status IN ('CANCELLED', 'FAILED')
+                          ) OR (
+                            -- Population D: teardown resumption — a prior
+                            -- sweep pass claimed this row (see the Step-0
+                            -- claim below) and crashed before finishing.
+                            s.status = 'PENDING_DELETION'
                           )
+                       )
+                       -- NEVER hard-delete under a live lease. A renewing
+                       -- lease means a worker is actively walking this
+                       -- snapshot; deleting the row out from under it made
+                       -- the worker walk blind for hours and die on the
+                       -- first item INSERT (FK violation), then resurrect
+                       -- the row via fail_snapshot's merge — the archive
+                       -- run-#8 chain (job flipped FAILED by an earlier
+                       -- attempt's error path, RMQ redelivery created new
+                       -- IN_PROGRESS snapshots under the FAILED job, and
+                       -- this sweep deleted each within 30s of creation,
+                       -- 2026-07-31). Lease-dead rows still clean up
+                       -- within one lease TTL (~10 min), including
+                       -- operator cancels — a deferred teardown beats a
+                       -- corrupted live run.
+                       AND (s.lease_expires_at IS NULL OR s.lease_expires_at < NOW())
                        -- Defense against partitioned-shard double-cleanup.
                        AND NOT EXISTS (
                            SELECT 1 FROM snapshot_partitions sp
@@ -1135,6 +1301,52 @@ async def startup():
                 # is the correct workload container; legacy split-container rows
                 # fall through to the remaining candidates.
                 containers = container_candidates(row.resource_type, row.tenant_id)
+
+                # Step 0 — ATOMIC CLAIM before any destruction. The
+                # candidate SELECT's lease check is stale by the time we
+                # get here (blob deletion alone can take minutes, and a
+                # redelivered run re-claims a dead lease / the archive
+                # liveness guard re-arms it every ~2 min). Destroying
+                # blobs+items first and only lease-checking the final
+                # row DELETE would GUT a surviving run: row stays, its
+                # items and blobs are gone, and the run finalizes
+                # COMPLETED with silent data loss. Re-verify candidacy
+                # + dead lease and flip to PENDING_DELETION (the
+                # established "this row is being torn down" status —
+                # retention treats it as delete-me, the archive
+                # liveness guard sees non-IN_PROGRESS and aborts, and
+                # Population D resumes the teardown if we crash here).
+                # rowcount 0 → someone re-leased or changed state:
+                # skip, next pass reconsiders.
+                try:
+                    async with async_session_factory() as ds:
+                        claim = await ds.execute(
+                            text(
+                                "UPDATE snapshots s "
+                                "   SET status = 'PENDING_DELETION', "
+                                "       lease_owner_id = NULL, "
+                                "       lease_expires_at = NULL, "
+                                "       lease_token = s.lease_token + 1 "
+                                "  FROM jobs j "
+                                " WHERE s.id = :sid "
+                                "   AND s.job_id = j.id "
+                                "   AND (s.lease_expires_at IS NULL OR s.lease_expires_at < NOW()) "
+                                "   AND ( (s.extra_data::jsonb ->> 'cancelled_at') IS NOT NULL "
+                                "         OR (s.status IN ('IN_PROGRESS','FAILED') "
+                                "             AND j.status IN ('CANCELLED','FAILED')) "
+                                "         OR s.status = 'PENDING_DELETION' )"
+                            ),
+                            {"sid": sid},
+                        )
+                        await ds.commit()
+                    if not (claim.rowcount and claim.rowcount > 0):
+                        continue
+                except Exception as claim_exc:
+                    print(
+                        f"[backup-scheduler] cancelled_sweep claim failed "
+                        f"sid={sid}: {claim_exc}"
+                    )
+                    continue
 
                 # Step 1 — delete blobs. Done in its own short
                 # transaction-per-snapshot so any one snapshot stuck on
@@ -1206,33 +1418,33 @@ async def startup():
                             )
 
                     # Step 2 — DB cleanup (items first, then snapshot).
-                    # Re-confirms candidacy inside the txn so a snapshot
-                    # that COMPLETED between SELECT and DELETE doesn't
-                    # get nuked.
+                    # The Step-0 claim already re-verified candidacy +
+                    # dead lease and took ownership via
+                    # PENDING_DELETION, so both deletes key on that
+                    # claimed status — nothing here can gut a live run.
+                    # Belt on top of the Step-0 claim: also require the
+                    # lease to still be dead at delete time. Every lease
+                    # writer is fenced on status='IN_PROGRESS' so nothing
+                    # should re-arm a PENDING_DELETION row — this guards
+                    # the invariant against future unfenced writers.
                     async with async_session_factory() as ds:
                         await ds.execute(
                             text(
-                                "DELETE FROM snapshot_items WHERE snapshot_id = :sid"
+                                "DELETE FROM snapshot_items si "
+                                " USING snapshots s "
+                                " WHERE si.snapshot_id = :sid "
+                                "   AND s.id = si.snapshot_id "
+                                "   AND s.status = 'PENDING_DELETION' "
+                                "   AND (s.lease_expires_at IS NULL OR s.lease_expires_at < NOW())"
                             ),
                             {"sid": sid},
                         )
-                        # Only delete the snapshot row if it still
-                        # qualifies (cancellation marker present OR
-                        # owning job is CANCELLED/FAILED). Protects
-                        # against the rare race where a partition
-                        # finalizer flipped status to COMPLETED while
-                        # we were deleting items.
                         res = await ds.execute(
                             text(
                                 "DELETE FROM snapshots s "
-                                " USING jobs j "
                                 " WHERE s.id = :sid "
-                                "   AND s.job_id = j.id "
-                                "   AND ( (s.extra_data::jsonb ->> 'cancelled_at') IS NOT NULL "
-                                "         OR (s.status = 'FAILED' "
-                                "             AND j.status IN ('CANCELLED','FAILED')) "
-                                "         OR (s.status = 'IN_PROGRESS' "
-                                "             AND j.status IN ('CANCELLED','FAILED')) )"
+                                "   AND s.status = 'PENDING_DELETION' "
+                                "   AND (s.lease_expires_at IS NULL OR s.lease_expires_at < NOW())"
                             ),
                             {"sid": sid},
                         )
@@ -1321,6 +1533,54 @@ async def startup():
                         str(r) for r in (job.batch_resource_ids or [])
                     ]
                     if not resource_ids:
+                        # Single-resource shape (manual trigger, AUTO_RETRY):
+                        # a publish lost between the Job commit and the AMQP
+                        # send left this row QUEUED forever — no other
+                        # sweeper covers zero-snapshot single-resource jobs
+                        # (2026-08-18 review finding; the :1751 comment
+                        # documents the same gap for manual triggers).
+                        # Re-send from the row, bounded by jobs.attempts.
+                        if job.resource_id is None:
+                            continue
+                        attempts = int(job.attempts or 0)
+                        if attempts >= 3:
+                            job.status = JobStatus.FAILED
+                            job.completed_at = datetime.utcnow()
+                            job.error_message = (
+                                "outbox reconcile: message never consumed "
+                                "after 3 republish attempts"
+                            )
+                            await session.commit()
+                            print(f"[backup-scheduler] outbox_reconcile: "
+                                  f"single-resource job {job.id} FAILED — "
+                                  f"republish budget exhausted")
+                            continue
+                        job.attempts = attempts + 1
+                        await session.commit()
+                        spec = job.spec or {}
+                        try:
+                            await message_bus.publish(
+                                "backup.urgent",
+                                {
+                                    "jobId": str(job.id),
+                                    "resourceId": str(job.resource_id),
+                                    "tenantId": str(job.tenant_id),
+                                    "type": "FULL" if spec.get("full_backup") else "INCREMENTAL",
+                                    "priority": job.priority or 1,
+                                    "triggeredBy": spec.get("triggered_by", "MANUAL"),
+                                    "snapshotLabel": spec.get("snapshot_label", "manual"),
+                                    "forceFullBackup": bool(spec.get("full_backup", False)),
+                                },
+                                priority=job.priority or 1,
+                            )
+                            published += 1
+                            print(f"[backup-scheduler] outbox_reconcile: "
+                                  f"republished single-resource job {job.id} "
+                                  f"(attempt {attempts + 1}/3)")
+                        except Exception as _spe:
+                            print(f"[backup-scheduler] outbox_reconcile: "
+                                  f"single-resource republish failed for "
+                                  f"{job.id}: {_spe}")
                         continue
                     queue = (job.spec or {}).get("queue", "backup.urgent")
                     msg = create_mass_backup_message(
@@ -1581,66 +1841,219 @@ async def startup():
         _reap_stuck_running_jobs, "interval", minutes=2,
     )
 
-    # Orphan-job reaper — closes the gap _reap_stuck_running_jobs leaves: it
-    # only handles RUNNING jobs that carry batch_resource_ids. Single-resource
-    # jobs (resource_id, empty batch_resource_ids) and jobs stuck in QUEUED
-    # after their work finished (worker died before the job-level update, or a
-    # fanned-out child owns the snapshot) never flipped to terminal — so the
-    # Activity feed showed them "In Progress" forever. Flip any QUEUED/RUNNING
-    # BACKUP job, idle >5min, whose snapshots ALL reached a terminal status.
-    # Mirrors resolve_finished_job_status(); idempotent (WHERE filters non-
-    # terminal jobs) and n_open=0 guards against reaping a live run.
-    async def _reap_finished_nonterminal_jobs():
+    # Missing-snapshot zombie reaper — third phantom-"In Progress"
+    # class (observed 2026-07-22, job 572bb0b6). The failed-snapshot
+    # retry sweep can hard-DELETE a job's snapshot rows (reap-vs-live-
+    # consumer race, 7/20 ITOPS SP incident); the reaper above counts
+    # EXISTING terminal rows so a job with deleted snapshots never
+    # satisfies n_terminal >= n_resources and stays RUNNING forever.
+    # Finalize only when the job is provably dead: lease expired,
+    # updated_at stale >= 1 hour (early enumeration legitimately has
+    # zero snapshot rows; live walks renew the job lease via
+    # LeaseExtender), nothing non-terminal under it, no in-flight
+    # shard, and rows actually MISSING (the all-rows-settled case
+    # belongs to _reap_stuck_running_jobs).
+    async def _reap_missing_snapshot_jobs():
         try:
-            from shared.models import SnapshotStatus as _SnapStatus
-            # Derive the terminal-status list from the enum, cast the column to
-            # text, and inject via placeholder (never an f-string — the SQL has
-            # literal '{}'::jsonb braces). Hand-typing this list is exactly what
-            # broke the reaper: a stray 'CANCELLED' literal (not an enum member)
-            # made Postgres reject the whole statement (InvalidTextRepresentation)
-            # so NO job was ever reaped. status::text avoids enum coercion.
-            terminal_sql = ", ".join("'%s'" % s.value for s in _SnapStatus.terminal())
-            reaper_sql = """
-                    WITH cand AS (
+            async with async_session_factory() as session:
+                result = await session.execute(text("""
+                    WITH t AS (
                         SELECT j.id AS job_id,
-                               (SELECT count(*) FROM snapshots s WHERE s.job_id = j.id) AS n_snaps,
-                               (SELECT count(*) FROM snapshots s WHERE s.job_id = j.id
-                                  AND s.status::text NOT IN (__TERMINAL__)) AS n_open,
-                               (SELECT count(*) FROM snapshots s WHERE s.job_id = j.id
-                                  AND s.status = 'COMPLETED') AS n_completed
+                               cardinality(j.batch_resource_ids) AS n_resources,
+                               (SELECT count(*) FROM snapshots s
+                                WHERE s.job_id = j.id) AS n_existing,
+                               (SELECT count(*) FROM snapshots s
+                                WHERE s.job_id = j.id
+                                  AND s.status NOT IN
+                                      ('COMPLETED','FAILED','PARTIAL',
+                                       'PENDING_DELETION')) AS n_nonterminal,
+                               (SELECT count(*) FROM snapshots s
+                                WHERE s.job_id = j.id
+                                  AND s.status = 'COMPLETED') AS n_completed,
+                               (SELECT COALESCE(SUM(s.item_count), 0)
+                                FROM snapshots s
+                                WHERE s.job_id = j.id) AS items_total,
+                               (SELECT COALESCE(SUM(s.bytes_total), 0)
+                                FROM snapshots s
+                                WHERE s.job_id = j.id) AS bytes_total
                         FROM jobs j
-                        WHERE j.status IN ('QUEUED','RUNNING')
+                        WHERE j.status = 'RUNNING'
                           AND j.type = 'BACKUP'
-                          AND j.updated_at < NOW() - INTERVAL '5 minutes'
+                          AND cardinality(j.batch_resource_ids) > 0
+                          AND j.updated_at < NOW() - INTERVAL '1 hour'
+                          AND (j.lease_expires_at IS NULL OR j.lease_expires_at < NOW())
                     )
                     UPDATE jobs j SET
-                        status = (CASE WHEN c.n_completed > 0 THEN 'COMPLETED' ELSE 'FAILED' END)::jobstatus,
+                        status = (CASE WHEN t.n_completed > 0
+                                       THEN 'COMPLETED' ELSE 'FAILED'
+                                  END)::jobstatus,
                         progress_pct = 100,
                         completed_at = NOW(),
                         updated_at = NOW(),
+                        -- 2026-08-25: the old text asserted "deleted
+                        -- after dispatch" but absence-of-row cannot
+                        -- distinguish deletion from a dispatch message
+                        -- that dead-lettered before any worker touched
+                        -- it (batch b552bb16: per-resource message
+                        -- poisoned to backup.urgent.dlq during a
+                        -- conn-kill storm — nothing was ever deleted).
+                        -- Say what is actually known, and expose WHICH
+                        -- resources are uncovered so they can be
+                        -- re-driven instead of silently skipped.
+                        error_message = COALESCE(
+                            j.error_message,
+                            (t.n_resources - t.n_existing)::text ||
+                            ' of ' || t.n_resources::text ||
+                            ' resource(s) have no snapshot row — dispatch '
+                            'message lost/dead-lettered before any worker '
+                            'ran, or rows deleted after dispatch; '
+                            'finalized by missing_snapshot_reaper'),
                         result = COALESCE(j.result::jsonb, '{}'::jsonb)
-                                 || jsonb_build_object('reaped_by', 'finished_nonterminal_reaper')
-                    FROM cand c
-                    WHERE j.id = c.job_id
-                      AND c.n_snaps > 0
-                      AND c.n_open = 0
-                    RETURNING j.id
-            """.replace("__TERMINAL__", terminal_sql)
-            async with async_session_factory() as session:
-                result = await session.execute(text(reaper_sql))
+                                 || jsonb_build_object(
+                                    'reaped_by', 'missing_snapshot_reaper',
+                                    'total', t.n_resources,
+                                    'completed', t.n_completed,
+                                    'failed', t.n_resources - t.n_completed,
+                                    'missing', t.n_resources - t.n_existing,
+                                    -- Cap at 50 (a wholesale dead-lettered
+                                    -- 5k-resource batch must not bloat the
+                                    -- result row); exclude resources with a
+                                    -- snapshot under a SIBLING job since
+                                    -- dispatch — G2 dedup skips resources
+                                    -- already in flight elsewhere, and those
+                                    -- are covered, not missing.
+                                    'missing_resource_ids', (
+                                        SELECT COALESCE(jsonb_agg(rid::text)
+                                                    FILTER (WHERE ord <= 50),
+                                                '[]'::jsonb)
+                                          FROM (
+                                              SELECT rid,
+                                                     row_number() OVER (ORDER BY rid) AS ord
+                                                FROM unnest(j.batch_resource_ids) AS rid
+                                               WHERE NOT EXISTS (
+                                                   SELECT 1 FROM snapshots s
+                                                    WHERE s.resource_id = rid
+                                                      AND (s.job_id = j.id
+                                                           OR s.created_at >= j.created_at))
+                                          ) v
+                                    ),
+                                    'item_count', t.items_total,
+                                    'bytes_added', t.bytes_total
+                                 )
+                    FROM t
+                    WHERE j.id = t.job_id
+                      AND t.n_nonterminal = 0
+                      AND t.n_existing < t.n_resources
+                      AND NOT EXISTS (
+                          SELECT 1 FROM snapshot_partitions sp
+                           WHERE sp.job_id = j.id
+                             AND sp.status NOT IN ('COMPLETED','FAILED')
+                      )
+                    RETURNING j.id, j.status::text
+                """))
                 rows = result.fetchall()
                 await session.commit()
                 if rows:
                     print(
-                        f"[backup-scheduler] finished_nonterminal_reaper: "
-                        f"finalized {len(rows)} job(s) whose snapshots were all "
-                        f"terminal but the job row was stuck QUEUED/RUNNING"
+                        f"[backup-scheduler] missing_snapshot_reaper: "
+                        f"finalized {len(rows)} zombie jobs whose "
+                        f"snapshot rows were deleted: "
+                        f"{[(str(r[0]), r[1]) for r in rows]}"
                     )
         except Exception as exc:
-            print(f"[backup-scheduler] finished_nonterminal_reaper failed: {exc}")
+            print(f"[backup-scheduler] missing_snapshot_reaper failed: {exc}")
 
     scheduler.add_job(
-        _reap_finished_nonterminal_jobs, "interval", minutes=2,
+        _reap_missing_snapshot_jobs, "interval", minutes=5,
+    )
+
+    # Single-resource trigger-job reaper — sibling of the reaper above
+    # for the OTHER uncovered shape. `POST /scheduler/resource/{id}`
+    # (manual / force-full trigger) creates its Job QUEUED with
+    # `resource_id` set and EMPTY batch_resource_ids, publishes to
+    # backup.urgent, and no code path ever flips the Job row — the
+    # worker only manages job status for mass-backup messages. Result:
+    # the Activity feed showed force-full runs from 7/13 as "In
+    # Progress" forever even though their snapshots were COMPLETED /
+    # FAILED (all_jobs_terminal gate, observed 2026-07-14). Mirror the
+    # snapshot outcome onto the Job once every snapshot under it has
+    # settled (5-min grace) and no shard is still in flight.
+    async def _reap_settled_single_resource_jobs():
+        try:
+            async with async_session_factory() as session:
+                result = await session.execute(text("""
+                    WITH agg AS (
+                        SELECT s.job_id,
+                               COUNT(*) FILTER (WHERE s.status IN ('COMPLETED','PARTIAL')) AS n_ok,
+                               COUNT(*) FILTER (WHERE s.status NOT IN
+                                   ('COMPLETED','PARTIAL','FAILED','PENDING_DELETION')) AS n_pending,
+                               MAX(s.completed_at) AS last_settled,
+                               COALESCE(SUM(s.item_count), 0)  AS items_total,
+                               COALESCE(SUM(s.bytes_total), 0) AS bytes_total
+                        FROM snapshots s
+                        GROUP BY s.job_id
+                    )
+                    UPDATE jobs j SET
+                        status = (CASE WHEN a.n_ok > 0
+                                       THEN 'COMPLETED' ELSE 'FAILED'
+                                  END)::jobstatus,
+                        progress_pct = 100,
+                        completed_at = COALESCE(a.last_settled, NOW()),
+                        updated_at = NOW(),
+                        -- 2026-08-25: this reaper used to finalize FAILED
+                        -- with error_message NULL (jobs fef2894a/2d0da6b8),
+                        -- making reaped failures indistinguishable from
+                        -- "no error recorded". Copy the newest snapshot's
+                        -- failure_reason up so the job row answers WHY.
+                        error_message = CASE WHEN a.n_ok > 0
+                            THEN j.error_message
+                            ELSE COALESCE(
+                                j.error_message,
+                                LEFT('finalized FAILED by single_resource_job_reaper — '
+                                     || COALESCE(
+                                        (SELECT NULLIF(s2.extra_data->>'failure_reason', '')
+                                           FROM snapshots s2
+                                          WHERE s2.job_id = j.id
+                                          ORDER BY s2.created_at DESC
+                                          LIMIT 1),
+                                        'snapshot recorded no failure_reason'),
+                                     500))
+                            END,
+                        result = COALESCE(j.result::jsonb, '{}'::jsonb)
+                                 || jsonb_build_object(
+                                    'reaped_by', 'single_resource_job_reaper',
+                                    'item_count', a.items_total,
+                                    'bytes_added', a.bytes_total
+                                 )
+                    FROM agg a
+                    WHERE j.id = a.job_id
+                      AND j.type = 'BACKUP'
+                      AND j.status IN ('QUEUED','RUNNING')
+                      AND j.resource_id IS NOT NULL
+                      AND COALESCE(cardinality(j.batch_resource_ids), 0) = 0
+                      AND a.n_pending = 0
+                      AND a.last_settled < NOW() - INTERVAL '5 minutes'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM snapshot_partitions sp
+                           WHERE sp.job_id = j.id
+                             AND sp.status NOT IN ('COMPLETED','FAILED')
+                      )
+                    RETURNING j.id, j.status::text
+                """))
+                rows = result.fetchall()
+                await session.commit()
+                if rows:
+                    print(
+                        f"[backup-scheduler] single_resource_job_reaper: "
+                        f"finalized {len(rows)} trigger jobs from their "
+                        f"snapshot outcomes: "
+                        f"{[(str(r[0]), r[1]) for r in rows[:5]]}"
+                    )
+        except Exception as exc:
+            print(f"[backup-scheduler] single_resource_job_reaper failed: {exc}")
+
+    scheduler.add_job(
+        _reap_settled_single_resource_jobs, "interval", minutes=2,
     )
 
     # Task 26: Delete orphaned export ZIPs older than 1 day (3am UTC daily).
@@ -1693,6 +2106,10 @@ async def startup():
     # Progress" forever. See
     # docs/superpowers/specs/2026-05-16-distributed-reconciliation-design.md.
     await start_orphan_sweeper_loop()
+
+    # Automatic retry of failed backup jobs (Configuration tab). Reads
+    # job_retry_max / job_retry_delay_minutes from app_settings each pass.
+    await start_job_retry_loop()
 
 
 @app.on_event("shutdown")
@@ -1748,6 +2165,10 @@ async def catch_up_missed_policy_runs():
 
         for policy in policies:
             try:
+                # Capped policies have a durable within-cycle drain that opens
+                # missed cron cycles itself. Catch-up owns only uncapped ones.
+                if (getattr(policy, "max_concurrent_backups", None) or 0) > 0:
+                    continue
                 active_since = _utc_naive(policy.created_at) if policy.created_at else window_start
                 fire_start = max(window_start, active_since)
                 fires = _policy_fire_times_between(policy, fire_start, now)
@@ -1767,7 +2188,7 @@ async def catch_up_missed_policy_runs():
                 enabled_count = 0
                 for resource in active_resources:
                     resource_type = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
-                    if resource_type_enabled(resource_type, policy):
+                    if resource_type_enabled(resource_type, policy) and resource_backup_eligible(resource):
                         enabled_count += 1
 
                 if enabled_count <= 0:
@@ -1810,7 +2231,21 @@ async def catch_up_missed_policy_runs():
             f"({enabled_count} eligible resources)"
         )
         try:
-            await dispatch_policy_backups(policy_id)
+            # Cron may have fired after the scan. Recheck under the same lock
+            # that serializes cron/drain dispatch before opening another run.
+            async with _policy_lock(policy_id):
+                async with async_session_factory() as session:
+                    recent = (await session.execute(
+                        select(func.count(Job.id)).where(
+                            Job.type == JobType.BACKUP,
+                            func.json_extract_path_text(Job.spec, "sla_policy_id") == policy_id,
+                            func.json_extract_path_text(Job.spec, "triggered_by") == "SCHEDULED",
+                            Job.created_at >= last_fire - timedelta(minutes=5),
+                        )
+                    )).scalar() or 0
+                if not recent:
+                    _cycle_exhausted_until.pop(policy_id, None)
+                    await _dispatch_policy_backups_impl(policy_id)
         except Exception as exc:
             print(f"[SCHEDULER] Catch-up dispatch failed for policy {policy_name} ({policy_id}): {exc}")
 
@@ -1884,8 +2319,17 @@ async def health_check():
 
 @app.post("/scheduler/policy/{policy_id}/trigger")
 async def trigger_policy_backup(policy_id: str, background_tasks: BackgroundTasks):
-    """Manually trigger backup dispatch for a specific SLA policy"""
-    background_tasks.add_task(dispatch_policy_backups, policy_id)
+    """Manually trigger backup dispatch for a specific SLA policy.
+
+    Bypasses the run-overlap guard on purpose — an explicit operator
+    trigger must not be silently swallowed because a cycle is in flight.
+    Per-resource safety still holds: the worker's cross-job
+    ``skipped_concurrent`` guard prevents any resource from being backed
+    up twice concurrently.
+    """
+    background_tasks.add_task(
+        dispatch_policy_backups, policy_id, False,
+    )
     return {"status": "scheduled", "policy_id": policy_id}
 
 
@@ -1987,26 +2431,10 @@ def resource_backup_eligible(resource) -> bool:
 
 
 def select_resources_for_dispatch(enabled_resources, inflight_resource_ids):
-    """Return every enabled resource that is NOT already being backed up
-    and is NOT license-ineligible (see ``resource_backup_eligible``).
+    """Filter in-flight and unlicensed resources before applying wave capacity.
 
-    Coverage is COMPLETE by design — the scheduler never caps how many
-    resources get backed up per fire. Capping coverage (the old
-    max_concurrent_backups budget) silently breaks the SLA at scale: e.g.
-    65k resources / 50-per-fire x 3 fires/day ~= 430 days for one full pass.
-    Simultaneity is bounded DOWNSTREAM where it belongs — per-queue prefetch
-    + the worker semaphores (WORKLOAD_CONCURRENCY / BACKUP_CONCURRENCY, which
-    process every resource N-at-a-time, never slicing the list) + Graph app
-    pacing / rotation / 429 backoff.
-
-    Two skip reasons, both self-correcting on the next fire:
-      * in-flight (QUEUED/RUNNING) backup — so a slow / under-provisioned
-        cycle never double-dispatches the same resource (which would also
-        re-trigger the concurrent-drain snapshot race);
-      * license-ineligible — the user has no M365 license for this workload
-        (see ``resource_backup_eligible``); dispatching it can only fail and
-        would stall the Activity batch. Discovery auto-clears the flag when a
-        license appears, so it rejoins the next fire.
+    The caller applies the concurrency budget; the drain carries the remaining
+    eligible resources during the same policy cycle.
     """
     skip = set(inflight_resource_ids or ())
     return [
@@ -2015,9 +2443,51 @@ def select_resources_for_dispatch(enabled_resources, inflight_resource_ids):
     ]
 
 
-async def dispatch_policy_backups(policy_id: str):
+# One asyncio.Lock per policy: the cron tick and the drain tick (Task 4)
+# both read the in-flight count and then INSERT jobs against the same
+# cap, so they must never interleave for one policy. Process-local — the
+# scheduler is single-replica; scaling it out needs a DB advisory lock.
+_policy_locks: Dict[str, asyncio.Lock] = {}
+# Drain memo: once a cycle has nothing left to dispatch, remember the
+# window end so idle ticks cost nothing. Cleared by the cron tick.
+_cycle_exhausted_until: Dict[str, datetime] = {}
+
+
+def _policy_lock(policy_id: str) -> asyncio.Lock:
+    lock = _policy_locks.get(policy_id)
+    if lock is None:
+        lock = _policy_locks[policy_id] = asyncio.Lock()
+    return lock
+
+
+async def dispatch_policy_backups(
+    policy_id: str, respect_overlap_guard: bool = True,
+):
+    """Cron / manual entry point. Holds the per-policy lock so a drain wave
+    can never interleave with the tick; see ``_dispatch_policy_backups_impl``
+    for the strategy."""
+    # Canonicalize BEFORE touching the lock map: the manual
+    # /scheduler/policy/{id}/trigger path can hand in a differently-cased
+    # or brace-wrapped id, and that must serialize against the SAME lock
+    # the cron/drain path uses — not a second, distinct lock entry. This
+    # also rejects a garbage id before it can insert a bogus lock.
+    pid = str(uuid.UUID(str(policy_id)))
+    async with _policy_lock(pid):
+        _cycle_exhausted_until.pop(pid, None)
+        return await _dispatch_policy_backups_impl(policy_id, respect_overlap_guard)
+
+
+async def _dispatch_policy_backups_impl(
+    policy_id: str, respect_overlap_guard: bool = True,
+):
     """
     Dispatch backups for a specific SLA policy, filtering resources by the policy's backup flags.
+
+    ``respect_overlap_guard`` — True for the cron path (skip the tick if
+    the previous scheduled cycle is still draining). The manual
+    ``/scheduler/policy/{id}/trigger`` endpoint passes False: an operator
+    asking for a run explicitly has already decided, and silently
+    swallowing their click would look like a broken button.
 
     The policy_id comes from the resource's sla_policy_id assignment.
 
@@ -2043,6 +2513,61 @@ async def dispatch_policy_backups(policy_id: str):
             return
 
         print(f"[SCHEDULER] Processing policy '{policy.name}' (frequency={policy.frequency})")
+
+        # R2.3 — run-overlap guard. Do NOT start a new cycle while the
+        # previous SCHEDULED cycle for this policy is still draining.
+        #
+        # There was no cycle-level control before this: dispatch only
+        # publishes to RabbitMQ and returns in seconds, so APScheduler's
+        # max_instances=1 never engaged, and Gold (THREE_DAILY, 8h) fired
+        # cycle N+1 with cycle N 12h into a 62GB SharePoint partition.
+        # max_concurrent_backups could not cover this — it counted Jobs
+        # (~10/cycle) against a resource budget (50), so its defer path
+        # needed five stalled cycles.
+        #
+        # Checked BEFORE the resource fetch / Power BI prefilter so a
+        # skipped tick costs one cheap COUNT instead of a Graph walk.
+        stale_after_hours = dispatch_policy.overlap_stale_after_hours(
+            policy.frequency,
+        )
+        inflight_jobs, inflight_oldest = (
+            await session.execute(
+                dispatch_policy.build_scheduled_inflight_query(policy.id)
+            )
+        ).one()
+        now_utc = datetime.utcnow()
+        overlap_action = dispatch_policy.decide_overlap_action(
+            inflight_jobs=int(inflight_jobs or 0),
+            oldest_created_at=inflight_oldest,
+            now=now_utc,
+            stale_after_hours=stale_after_hours,
+            guard_enabled=(
+                respect_overlap_guard and dispatch_policy.overlap_guard_enabled()
+            ),
+        )
+        # SKIP is now a per-RESOURCE hold rather than a whole-policy stop —
+        # see dispatch_policy.partition_overlap_holds. One over-cadence
+        # resource (IT OPS NOTES, 12.84h vs Gold's 8h) suppressed the other
+        # 49 and lost the entire 2026-08-06 02:07Z tick. We therefore can no
+        # longer return here: the resource list is needed to decide what is
+        # actually busy, so the hold is applied after the flag filter below
+        # (still before the Power BI Graph prefilter, so a fully-held tick
+        # costs no Graph calls).
+        overlap_hold = overlap_action == dispatch_policy.SKIP
+        if overlap_action != dispatch_policy.DISPATCH:
+            details = dispatch_policy.overlap_audit_details(
+                policy, action=overlap_action,
+                inflight_jobs=int(inflight_jobs or 0),
+                oldest_created_at=inflight_oldest, now=now_utc,
+                stale_after_hours=stale_after_hours,
+            )
+            if not overlap_hold:
+                # OVERRIDE — a cycle wedged past the horizon must not halt
+                # every future backup, so we dispatch anyway and say so.
+                print(f"[SCHEDULER] WARNING: {details['message']}")
+                await publish_cycle_audit_event(
+                    policy, "BACKUP_CYCLE_OVERLAP_OVERRIDE", details,
+                )
 
         # Fetch all active resources assigned to this policy
         resources_result = await session.execute(
@@ -2100,42 +2625,69 @@ async def dispatch_policy_backups(policy_id: str):
             print(f"[SCHEDULER] No license-eligible resources for policy '{policy.name}'")
             return
 
-        # COVERAGE IS COMPLETE EVERY FIRE. We do NOT cap how many resources are
-        # backed up per cycle — capping coverage silently breaks the SLA at
-        # scale. The old max_concurrent_backups budget kept only
-        # enabled_resources[:budget] and dropped the rest ("next trigger"), but
-        # nothing re-dispatches between the 8h cron fires (check_sla_violations
-        # only alerts; catch_up only covers downtime), so 65k resources /
-        # 50-per-fire x 3/day ~= 430 days for one full pass. Simultaneity is
-        # bounded DOWNSTREAM where it belongs: per-queue prefetch + the worker
-        # semaphores (WORKLOAD/BACKUP_CONCURRENCY) + Graph app pacing/rotation.
-        # The ONLY resources we skip are those that already have an in-flight
-        # (QUEUED/RUNNING) backup, so a slow / under-provisioned cycle never
-        # double-dispatches the same resource (which also re-triggers the
-        # concurrent-drain snapshot race). They are covered on the next fire.
-        inflight_rows = (await session.execute(
-            select(Job.batch_resource_ids, Job.resource_id).where(and_(
-                Job.type == JobType.BACKUP,
-                Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]),
-                func.json_extract_path_text(Job.spec, "sla_policy_id") == str(policy.id),
-            ))
-        )).all()
-        inflight_resource_ids = set()
-        for _brids, _rid in inflight_rows:
-            if _rid:
-                inflight_resource_ids.add(_rid)
-            for _x in (_brids or []):
-                inflight_resource_ids.add(_x)
-        _before = len(enabled_resources)
-        enabled_resources = select_resources_for_dispatch(enabled_resources, inflight_resource_ids)
-        _skipped_inflight = _before - len(enabled_resources)
-        if _skipped_inflight:
-            print(f"[SCHEDULER] Policy '{policy.name}': {_skipped_inflight} resource(s) already have an "
-                  f"in-flight backup — covered once their current run finishes")
-        if not enabled_resources:
-            print(f"[SCHEDULER] Policy '{policy.name}': all {_before} enabled resource(s) already "
-                  f"in-flight — nothing to dispatch this tick")
-            return
+        # Per-resource overlap hold. The previous cycle is still draining, so
+        # hold back only the resources that genuinely have a backup in flight
+        # and let the idle ones run. Skipping the whole policy (the old
+        # behaviour) turned any resource slower than the cadence into a total
+        # coverage loss for every other resource on that policy.
+        #
+        # The in-flight id query is deliberately NOT policy-scoped: a resource
+        # busy via a manual "Backup now" or a PREEMPTIVE run must be held too.
+        #
+        # Bound BEFORE the guard so the job spec always carries the key, even
+        # on a tick that never enters the hold branch. An absent key means
+        # "batch predates this writer" to the Activity rollup, which is a
+        # different (and deliberately conservative) statement from "nothing was
+        # held" — see shared/batch_rollup._withheld_children_cte.
+        overlap_held_resource_ids: List[str] = []
+        if overlap_hold:
+            inflight_ids = {
+                row[0] for row in (await session.execute(
+                    dispatch_policy.build_inflight_resource_ids_query()
+                )).all() if row[0] is not None
+            }
+            enabled_resources, held = dispatch_policy.partition_overlap_holds(
+                enabled_resources, inflight_ids,
+            )
+            if not enabled_resources:
+                # Every resource is busy — this is the only case that still
+                # skips the cycle outright, and it is the honest one.
+                details = dispatch_policy.overlap_audit_details(
+                    policy, action=dispatch_policy.SKIP,
+                    inflight_jobs=int(inflight_jobs or 0),
+                    oldest_created_at=inflight_oldest, now=now_utc,
+                    stale_after_hours=stale_after_hours,
+                )
+                print(f"[SCHEDULER] {details['message']}")
+                await publish_cycle_audit_event(
+                    policy, "BACKUP_CYCLE_SKIPPED_OVERLAP", details,
+                )
+                return
+            if held:
+                # Record WHICH resources the guard withheld, so the Activity
+                # rollup can tell a deliberate hold from a lost fan-out
+                # instead of inferring it. Measured 2026-08-11: batch
+                # 667734c3 (Gold, 10:07 UTC) held 10 busy resources and
+                # dispatched 40; its 7 withheld USER_CHATS children left
+                # missing_t2 = 7 with every job COMPLETED, so the row read
+                # "In Progress · 15 %" and could never clear. The withheld
+                # ids are the only durable trace — the audit event is not
+                # queryable from the rollup's single CTE query.
+                overlap_held_resource_ids = [str(r.id) for r in held]
+                details = dispatch_policy.overlap_partial_audit_details(
+                    policy, held,
+                    inflight_jobs=int(inflight_jobs or 0),
+                    oldest_created_at=inflight_oldest, now=now_utc,
+                    dispatched=len(enabled_resources),
+                )
+                print(f"[SCHEDULER] {details['message']}")
+                for r in held:
+                    rtype = r.type.value if hasattr(r.type, "value") else str(r.type)
+                    print(f"[SCHEDULER]   overlap-held: {rtype} {r.id} "
+                          f"({getattr(r, 'display_name', None)})")
+                await publish_cycle_audit_event(
+                    policy, "BACKUP_CYCLE_PARTIAL_OVERLAP", details,
+                )
 
         power_bi_resources = [resource for resource in enabled_resources if resource.type == ResourceType.POWER_BI]
         if power_bi_resources:
@@ -2188,148 +2740,480 @@ async def dispatch_policy_backups(policy_id: str):
                 if resource.type != ResourceType.POWER_BI or str(resource.id) in filtered_power_bi_ids
             ]
 
+        # R2.2 — honor max_concurrent_backups. Cap how many RESOURCES we
+        # publish this tick. The drain picks up the remainder in later
+        # waves of this cycle as capacity becomes available.
+        #
+        # The in-flight side counts RESOURCES, not job rows. It used to
+        # count Jobs while spending the budget on resources: one job can
+        # carry up to BATCH_SIZE (1000) resources, so a row count
+        # understated load by orders of magnitude and made `budget == 0`
+        # unreachable. Its only real effect on Gold (50 resources, cap
+        # 50) was an off-by-N trim that silently dropped one resource per
+        # tick and wedged the Activity row at "In Progress" for 48h.
+        #
+        # Every deferral is now logged AND audited — a resource dropping
+        # out of a cycle in silence is how the 8h SLA got missed with no
+        # trace.
+        deferred_resource_ids: List[str] = []
+        max_concurrent = getattr(policy, "max_concurrent_backups", None) or 0
+        if max_concurrent > 0:
+            inflight_resources = (await session.execute(
+                dispatch_policy.build_inflight_resource_count_query(policy.id)
+            )).scalar() or 0
+            requested = len(enabled_resources)
+            enabled_resources, deferred = dispatch_policy.plan_concurrency_budget(
+                enabled_resources, max_concurrent, int(inflight_resources),
+            )
+            if deferred:
+                deferred_resource_ids = [str(r.id) for r in deferred]
+                details = dispatch_policy.deferred_audit_details(
+                    policy, deferred,
+                    max_concurrent=max_concurrent,
+                    inflight_resources=int(inflight_resources),
+                    dispatched=len(enabled_resources),
+                )
+                print(f"[SCHEDULER] {details['message']}")
+                for r in deferred:
+                    rtype = r.type.value if hasattr(r.type, "value") else str(r.type)
+                    print(f"[SCHEDULER]   deferred: {rtype} {r.id} "
+                          f"({getattr(r, 'display_name', None)})")
+                await publish_cycle_audit_event(
+                    policy, "BACKUP_DEFERRED_CONCURRENCY_CAP", details,
+                )
+            if not enabled_resources:
+                print(f"[SCHEDULER] Policy '{policy.name}' at concurrency cap "
+                      f"({inflight_resources}/{max_concurrent} resources "
+                      f"in-flight) — deferring all {requested} this tick")
+                return
+
         print(f"[SCHEDULER] Found {len(enabled_resources)} resources to backup for policy '{policy.name}'")
 
-        # Group by resource type + tenant
-        groups: Dict[str, List[Resource]] = {}
-        for resource in enabled_resources:
-            group_key = f"{resource.type.value}:{resource.tenant_id}"
-            if group_key not in groups:
-                groups[group_key] = []
-            groups[group_key].append(resource)
+        # One batch_id per policy dispatch, shared by every Job it
+        # creates. The Activity rollup groups jobs on spec.batch_id and
+        # expects the Tier-1 users job and its content-type siblings in
+        # ONE group — without this stamp each job rolled up alone, the
+        # users job's expected Tier-2 children were never "observed"
+        # (missing_t2 > 0), and every scheduled dispatch left a
+        # permanently-"In Progress" Activity row (2026-07-14). The UI
+        # click path (job-service) has stamped batch_id since the
+        # 2026-05-15 incident; the scheduled path was missed.
+        # Drain waves (Task 4) REUSE this id so the row stays one per cycle.
+        dispatch_batch_id = str(uuid.uuid4())
 
-        print(f"[SCHEDULER] Grouped into {len(groups)} resource type + tenant combinations")
+        total_dispatched, dispatched_queues = await _dispatch_resources(
+            session, policy, enabled_resources,
+            dispatch_batch_id=dispatch_batch_id,
+            deferred_resource_ids=deferred_resource_ids,
+            overlap_held_resource_ids=overlap_held_resource_ids,
+            wave=1,
+        )
 
-        # Determine queue based on frequency (frequent = higher priority queue)
-        queue = "backup.high" if policy.frequency == "THREE_DAILY" else "backup.normal"
+        # Report the queues actually used — resources fan out across
+        # backup.high/normal, backup.heavy and the azure.* lanes, so
+        # naming a single queue misreported where the work went.
+        queues_used = ", ".join(sorted(dispatched_queues)) or "none"
+        print(f"[SCHEDULER] Dispatched {total_dispatched} resources "
+              f"across [{queues_used}] for policy '{policy.name}'"
+              + (f"; {len(deferred_resource_ids)} deferred to later waves of this cycle"
+                 if deferred_resource_ids else "")
+              + (f"; {len(overlap_held_resource_ids)} overlap-held to the "
+                 f"next cycle" if overlap_held_resource_ids else ""))
 
-        # Dispatch batches
-        total_dispatched = 0
-        BATCH_SIZE = 1000
 
-        # One Activity row per FIRE (not per type-job): stamp a shared batch_id
-        # on every job of this fire, keyed per tenant. The audit rollup groups
-        # jobs by COALESCE(spec->>'batch_id', id::text) — without a shared
-        # batch_id each of the ~6 type-jobs (mail/onedrive/chats/calendar/
-        # contacts/entra) falls back to its own id and renders as a SEPARATE
-        # row. A shared batch_id collapses them into one "N users" rollup whose
-        # status is derived from the child jobs (Done when all terminal).
-        # We deliberately do NOT create a backup_batches row: that would route
-        # the fire through the ENTRA_USER-centric finalizer, which can hang a
-        # scheduled incremental. With no row the rollup stays job-derived and
-        # _finalize_batch_if_complete no-ops on the missing row.
-        _fire_batch_ids: Dict[str, str] = {}
+async def _dispatch_resources(
+    session, policy: SlaPolicy, resources: Sequence[Any], *,
+    dispatch_batch_id: str,
+    deferred_resource_ids: List[str],
+    overlap_held_resource_ids: List[str],
+    wave: int = 1,
+) -> Tuple[int, set]:
+    """Build one QUEUED Job per ``type:tenant`` group (1000-resource
+    batches), COMMIT, then publish each job's message.
 
-        for group_key, group_resources in groups.items():
-            resource_type, tenant_id = group_key.split(":")
-            _batch_id = _fire_batch_ids.setdefault(tenant_id, str(uuid.uuid4()))
+    Commit-before-publish is load-bearing. Until 2026-09-03 the rows were
+    published first: the worker looked up the jobId, found nothing
+    (uncommitted), acked and dropped it, and the 3-minute outbox reconciler
+    republished every scheduled batch ~5 min late on backup.urgent. A
+    publish failure after the commit is logged, not raised — the row is
+    QUEUED, counts toward the cap, and the reconciler republishes it.
 
-            # AZ-4: Route Azure workload resources to their dedicated queues
-            azure_queue = None
-            try:
-                rt = ResourceType(resource_type)
-                azure_queue = AZURE_WORKLOAD_QUEUES.get(rt)
-            except ValueError:
-                pass
+    Shared by the cron tick (``wave=1``) and the drain (``wave>=2``).
+    ``resources`` may be ORM rows or light Row projections: only ``id``,
+    ``type``, ``tenant_id`` and ``last_backup_at`` are read.
+    """
+    groups: Dict[str, List[Any]] = {}
+    for resource in resources:
+        rtype = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
+        groups.setdefault(f"{rtype}:{resource.tenant_id}", []).append(resource)
 
-            base_queue = "backup.high" if policy.frequency == "THREE_DAILY" else "backup.normal"
-            if azure_queue:
-                group_queue = azure_queue
-                print(f"[SCHEDULER] Azure workload {resource_type} → queue {azure_queue} (not backup.*)")
+    print(f"[SCHEDULER] Grouped into {len(groups)} resource type + tenant combinations")
+
+    BATCH_SIZE = 1000
+    pending: List[Tuple[Job, str, Dict[str, Any], bool, str, int]] = []
+
+    for group_key, group_resources in groups.items():
+        resource_type, tenant_id = group_key.split(":")
+
+        # AZ-4: Route Azure workload resources to their dedicated queues
+        azure_queue = None
+        try:
+            rt = ResourceType(resource_type)
+            azure_queue = AZURE_WORKLOAD_QUEUES.get(rt)
+        except ValueError:
+            pass
+
+        base_queue = "backup.high" if policy.frequency == "THREE_DAILY" else "backup.normal"
+        if azure_queue:
+            group_queue = azure_queue
+            print(f"[SCHEDULER] Azure workload {resource_type} → queue {azure_queue} (not backup.*)")
+        else:
+            # Heavy-pool routing for file-content workloads — keeps shared
+            # backup.high / backup.normal lanes free for MAILBOX / ENTRA /
+            # USER_* work so a single 500 GB drive can't starve them.
+            from shared.export_routing import pick_backup_queue
+            group_queue = pick_backup_queue(
+                resource_type=resource_type,
+                default_queue=base_queue,
+            )
+            if group_queue != base_queue:
+                print(f"[SCHEDULER] Heavy workload {resource_type} → queue {group_queue}")
+
+        for i in range(0, len(group_resources), BATCH_SIZE):
+            batch = group_resources[i:i + BATCH_SIZE]
+            resource_ids = [str(r.id) for r in batch]
+
+            # fullBackup: True only if NONE of the resources have been backed up before
+            has_previous_backup = any(r.last_backup_at is not None for r in batch)
+            effective_full_backup = not has_previous_backup
+
+            job_id = uuid.uuid4()
+            job = Job(
+                id=job_id,
+                type=JobType.BACKUP,
+                tenant_id=uuid.UUID(tenant_id),
+                batch_resource_ids=[uuid.UUID(rid) for rid in resource_ids],
+                status=JobStatus.QUEUED,
+                priority=5,
+                spec={
+                    "sla_policy_id": str(policy.id),
+                    "sla_policy_name": policy.name,
+                    "resource_type": resource_type,
+                    "batch_size": len(resource_ids),
+                    "triggered_by": "SCHEDULED",
+                    "snapshot_label": "scheduled",
+                    "fullBackup": effective_full_backup,
+                    "batch_id": dispatch_batch_id,
+                    # Resources the concurrency cap held back this
+                    # cycle. The Activity rollup subtracts these from
+                    # expected_t2 — otherwise a DELIBERATE deferral
+                    # is indistinguishable from a LOST fan-out and
+                    # wedges the row at "In Progress" for the full
+                    # 48h batch_recent horizon (2026-08-05 RCA).
+                    # Stamped on every job in the batch; the rollup
+                    # unions them per batch_id. On a drain wave this is
+                    # the remainder still waiting after the wave.
+                    "deferred_resource_ids": deferred_resource_ids,
+                    # Resources the run-overlap guard (or the drain's
+                    # unconditional in-flight partition) held back
+                    # because they still had a backup in flight.
+                    # Separate key on purpose: same rollup treatment,
+                    # different reason (cap = capacity, overlap = duration).
+                    "overlap_held_resource_ids": overlap_held_resource_ids,
+                    # Lane the message was published on. The outbox
+                    # reconciler republishes on spec.queue (defaulting to
+                    # backup.urgent when absent), so recording it keeps a
+                    # rescued job on its intended lane.
+                    "queue": group_queue,
+                    # 1 = the cron tick; 2.. = drain waves within the cycle.
+                    "wave": wave,
+                }
+            )
+            session.add(job)
+
+            message = create_mass_backup_message(
+                job_id=str(job_id),
+                tenant_id=tenant_id,
+                resource_type=resource_type,
+                resource_ids=resource_ids,
+                sla_policy_id=str(policy.id),
+                full_backup=effective_full_backup,
+            )
+            # Propagate the dispatch batch_id so any Jobs the worker
+            # spawns downstream (Tier-2 handoff, heavy-lane OneDrive)
+            # land in the same Activity group.
+            message["batchId"] = dispatch_batch_id
+            pending.append((job, group_queue, message, effective_full_backup,
+                            resource_type, len(resource_ids)))
+
+    # Rows first. A worker that receives a message for a job it cannot
+    # SELECT acks and drops it (workers/backup-worker/main.py, "if not job").
+    await session.commit()
+
+    total_dispatched = 0
+    dispatched_queues: set = set()
+    for job, group_queue, message, effective_full_backup, resource_type, count in pending:
+        try:
+            await message_bus.publish(
+                group_queue,
+                message,
+                priority=message["priority"],
+            )
+        except Exception as exc:
+            print(f"[SCHEDULER] publish failed for job {job.id} on {group_queue}: "
+                  f"{exc} — row is committed; outbox reconcile will republish")
+
+        # The BACKUP_TRIGGERED audit depends only on the committed row,
+        # not on the publish succeeding — the outbox reconciler republishes
+        # a failed-publish job later WITHOUT ever emitting this, so a job
+        # whose first publish attempt failed must still get its trigger
+        # audit row here.
+        try:
+            await emit_backup_triggered(
+                job=job, resource=None, tenant=None,
+                trigger_label="SCHEDULED",
+                actor_type="SYSTEM",
+                full_backup=effective_full_backup,
+                batch_resource_count=count,
+                extra_details={
+                    "sla_policy_id": str(policy.id),
+                    "sla_policy_name": policy.name,
+                    "resource_type": resource_type,
+                    "wave": wave,
+                },
+            )
+        except Exception as exc:
+            print(f"[SCHEDULER] BACKUP_TRIGGERED audit failed for job {job.id}: {exc}")
+
+        total_dispatched += count
+        dispatched_queues.add(group_queue)
+
+        # Stagger dispatch to prevent overwhelming Graph API
+        await asyncio.sleep(0.1)
+
+    return total_dispatched, dispatched_queues
+
+
+# ─── deferred-resource drain ────────────────────────────────────────────
+#
+# The cron tick trims to max_concurrent_backups and records the remainder
+# in spec.deferred_resource_ids. Until 2026-09-03 nothing ever picked that
+# remainder up before the NEXT tick, so a DAILY policy with 356 eligible
+# resources and cap 50 protected 50 a night (Silver: 219 never backed up).
+# This tick recomputes, per capped policy, what the current cycle has NOT
+# carried yet and dispatches the next wave whenever slots are free — the
+# cap becomes a concurrency limit instead of a daily quota.
+#
+# Stateless on purpose: the cycle window comes from the policy's own
+# CronTrigger, "already carried" comes from the jobs table, in-flight from
+# the same queries the tick uses. Nothing to persist, nothing to migrate,
+# nothing to get out of sync. BACKUP_CYCLE_DRAIN=off turns it into a no-op.
+
+_cycle_incomplete_emitted: Dict[str, datetime] = {}
+
+
+def _policy_cycle_trigger(policy: SlaPolicy):
+    """The trigger the cron job is registered with, so the drain's idea of
+    'this cycle' is exactly the cron's. Falls back to building one from the
+    same params if the job is not registered (e.g. unit tests, startup race)."""
+    job = scheduler.get_job(f"policy_backup_{policy.id}")
+    if job is not None and getattr(job, "trigger", None) is not None:
+        return job.trigger
+    cron_params = frequency_to_cron_params(
+        policy.frequency, policy.backup_days, policy.backup_window_start,
+        policy_id=str(policy.id),
+    )
+    if cron_params is None:
+        return None
+    from apscheduler.triggers.cron import CronTrigger
+    # frequency_to_cron_params returns add_job kwargs, which include
+    # trigger="cron" — CronTrigger.__init__ has no such parameter.
+    params = {k: v for k, v in cron_params.items() if k != "trigger"}
+    return CronTrigger(timezone="UTC", **params)
+
+
+def _enabled_type_values(policy: SlaPolicy) -> List[str]:
+    return [rt.value for rt in ResourceType if resource_type_enabled(rt.value, policy)]
+
+
+async def drain_policy_cycle(
+    policy_id: str, *, now: Optional[datetime] = None,
+) -> int:
+    """Dispatch the next wave for one policy's open cycle. Returns the
+    number of resources dispatched (0 on every no-op path)."""
+    if not dispatch_policy.drain_enabled():
+        return 0
+    # Canonical form, same reasoning as dispatch_policy_backups: this must
+    # be the SAME lock key the cron/manual path uses for this policy, and
+    # a garbage id must never insert a lock entry.
+    pid = str(uuid.UUID(str(policy_id)))
+    async with _policy_lock(pid):
+        async with async_session_factory() as session:
+            policy = await session.get(SlaPolicy, uuid.UUID(pid))
+            if not policy or not policy.enabled:
+                return 0
+            max_concurrent = int(getattr(policy, "max_concurrent_backups", None) or 0)
+            if max_concurrent <= 0:
+                return 0
+
+            now_utc = now or datetime.utcnow()
+            trigger = _policy_cycle_trigger(policy)
+            if trigger is None:
+                return 0
+            window = dispatch_policy.cycle_window_from_trigger(trigger, now_utc)
+            if window is None or not dispatch_policy.cycle_is_drainable(window, now=now_utc):
+                return 0
+            if not dispatch_policy.within_backup_window(
+                now=now_utc, window_start=policy.backup_window_start,
+                window_end=policy.backup_window_end,
+            ):
+                return 0
+            if _cycle_exhausted_until.get(pid) == window.end:
+                return 0
+
+            tick = dispatch_policy.drain_tick_seconds()
+            # Only the LAST tick before the window closes — 2×tick let two
+            # consecutive ticks both see "closing", so the first one could
+            # emit INCOMPLETE with whatever was left BEFORE its own wave
+            # even ran, and the once-per-cycle memo then muzzled the
+            # accurate report the next (truly last) tick would have sent.
+            closing = now_utc >= window.end - timedelta(seconds=tick)
+
+            inflight_resources = int((await session.execute(
+                dispatch_policy.build_inflight_resource_count_query(policy.id)
+            )).scalar() or 0)
+            budget = max_concurrent - inflight_resources
+            if budget <= 0 and not closing:
+                return 0
+
+            # Anchor at the window start itself. Cron Job rows are
+            # created by this same process seconds AFTER the fire time,
+            # so `created_at >= window.start` already carries them — a
+            # -60s anchor overlapped the PREVIOUS cycle's closing band,
+            # mis-carrying its last wave into this new cycle and reusing
+            # the old cycle's batch_id/wave numbering.
+            since = window.start
+            enabled_types = _enabled_type_values(policy)
+            if not enabled_types:
+                return 0
+            rows = (await session.execute(
+                dispatch_policy.build_drain_candidates_query(policy.id, since, enabled_types)
+            )).all()
+            if not rows:
+                _cycle_exhausted_until[pid] = window.end
+                return 0
+
+            # Never dispatch a resource that is in flight under ANY job
+            # (manual, preemptive, or an earlier wave still running).
+            inflight_ids = {
+                row[0] for row in (await session.execute(
+                    dispatch_policy.build_inflight_resource_ids_query()
+                )).all() if row[0] is not None
+            }
+            candidates, held = dispatch_policy.partition_overlap_holds(rows, inflight_ids)
+            ordered = sorted(candidates, key=dispatch_policy.backup_priority_key)
+            # On the closing tick, bypass the wave floor: with 3 free slots
+            # and 100 remaining the floor would wait forever for a fraction
+            # of the cap that this cycle no longer has time left to reach.
+            # Take whatever capacity is free instead of dispatching nothing.
+            wave_items = dispatch_policy.plan_wave(
+                ordered, max(0, budget), max_concurrent,
+                min_fraction=0.0 if closing else dispatch_policy.DRAIN_MIN_WAVE_FRACTION,
+            )
+            remaining = ordered[len(wave_items):]
+
+            batch_id = (await session.execute(
+                dispatch_policy.build_cycle_batch_id_query(policy.id, since)
+            )).scalar()
+
+            async def _report_incomplete_if_closing(final_batch_id):
+                # Emitted AFTER the wave attempt (if any) so it reports the
+                # TRUE remainder — not whatever was left before this tick's
+                # own dispatch — and, when the drain itself opened the
+                # cycle, references the same fresh batch_id the wave was
+                # dispatched under rather than the nonexistent looked-up one.
+                if (closing and (remaining or held)
+                        and _cycle_incomplete_emitted.get(pid) != window.end):
+                    _cycle_incomplete_emitted[pid] = window.end
+                    details = dispatch_policy.cycle_incomplete_audit_details(
+                        policy, remaining, held=held,
+                        batch_id=final_batch_id, window_end=window.end,
+                    )
+                    print(f"[SCHEDULER][drain] WARNING: {details['message']}")
+                    await publish_cycle_audit_event(
+                        policy, "BACKUP_CYCLE_INCOMPLETE", details,
+                    )
+
+            if not wave_items:
+                if candidates and budget > 0:
+                    print(f"[SCHEDULER][drain] Policy '{policy.name}': "
+                          f"{len(candidates)} remaining, budget {budget} "
+                          f"below wave floor — waiting")
+                # A fresh batch_id is not needed here — nothing was
+                # dispatched, so the looked-up one (possibly None) is what
+                # the cycle actually carries so far.
+                await _report_incomplete_if_closing(batch_id)
+                return 0
+
+            started_cycle = batch_id is None
+            if started_cycle:
+                # The cron created no rows this cycle (all held, at cap, or
+                # a missed tick). Open the cycle here so coverage does not
+                # wait a day; in-flight ids were partitioned above and the
+                # cap applies, so this is as safe as the tick itself.
+                batch_id = str(uuid.uuid4())
+                wave = 1
             else:
-                # Heavy-pool routing for file-content workloads — keeps shared
-                # backup.high / backup.normal lanes free for MAILBOX / ENTRA /
-                # USER_* work so a single 500 GB drive can't starve them.
-                from shared.export_routing import pick_backup_queue
-                group_queue = pick_backup_queue(
-                    resource_type=resource_type,
-                    default_queue=base_queue,
-                )
-                if group_queue != base_queue:
-                    print(f"[SCHEDULER] Heavy workload {resource_type} → queue {group_queue}")
+                max_wave = int((await session.execute(
+                    dispatch_policy.build_cycle_max_wave_query(policy.id, since)
+                )).scalar() or 0)
+                wave = max(max_wave, 1) + 1
 
-            # Split into batches
-            for i in range(0, len(group_resources), BATCH_SIZE):
-                batch = group_resources[i:i + BATCH_SIZE]
-                resource_ids = [str(r.id) for r in batch]
+            total, queues = await _dispatch_resources(
+                session, policy, wave_items,
+                dispatch_batch_id=batch_id,
+                deferred_resource_ids=[str(r.id) for r in remaining],
+                overlap_held_resource_ids=[str(r.id) for r in held],
+                wave=wave,
+            )
+            details = dispatch_policy.wave_audit_details(
+                policy, batch_id=batch_id, wave=wave, dispatched=total,
+                remaining=len(remaining), held=len(held),
+                inflight_resources=inflight_resources,
+                max_concurrent=max_concurrent, started_cycle=started_cycle,
+            )
+            print(f"[SCHEDULER][drain] {details['message']} "
+                  f"queues=[{', '.join(sorted(queues)) or 'none'}]")
+            await publish_cycle_audit_event(
+                policy, "BACKUP_CYCLE_WAVE_DISPATCHED", details,
+                outcome="SUCCESS",
+            )
+            # batch_id here is final (fresh uuid on the started_cycle path).
+            await _report_incomplete_if_closing(batch_id)
+            return total
 
-                # Determine fullBackup: True only if NONE of the resources have been backed up before
-                has_previous_backup = any(r.last_backup_at is not None for r in batch)
-                effective_full_backup = not has_previous_backup
 
-                # Create job record for tracking
-                job_id = uuid.uuid4()
-                job = Job(
-                    id=job_id,
-                    type=JobType.BACKUP,
-                    tenant_id=uuid.UUID(tenant_id),
-                    batch_resource_ids=[uuid.UUID(rid) for rid in resource_ids],
-                    status=JobStatus.QUEUED,
-                    priority=5,
-                    spec={
-                        "sla_policy_id": str(policy.id),
-                        "sla_policy_name": policy.name,
-                        "resource_type": resource_type,
-                        "batch_size": len(resource_ids),
-                        "triggered_by": "SCHEDULED",
-                        "snapshot_label": "scheduled",
-                        "fullBackup": effective_full_backup,
-                        # Shared per-fire/per-tenant id so the Activity rollup
-                        # renders ONE row for the whole fire (see _fire_batch_ids).
-                        "batch_id": _batch_id,
-                        # Exclude scheduled jobs from the rollup's Tier-1
-                        # (ENTRA_USER) scope. A scheduled INCREMENTAL only backs
-                        # up DUE resources, so the manual-bulk Tier-2 expected-
-                        # coverage gate (missing_t2 in shared/batch_rollup) would
-                        # otherwise never reach 100% and the row would show a
-                        # false "In Progress N%". Only tier1_scope reads
-                        # spec.tier2 (verified — the worker ignores it, so backup
-                        # behavior is unchanged); status becomes job/snapshot-
-                        # derived (Done when every dispatched resource has a
-                        # terminal snapshot).
-                        "tier2": True,
-                    }
-                )
-                session.add(job)
-
-                # Create mass backup message
-                message = create_mass_backup_message(
-                    job_id=str(job_id),
-                    tenant_id=tenant_id,
-                    resource_type=resource_type,
-                    resource_ids=resource_ids,
-                    sla_policy_id=str(policy.id),
-                    full_backup=effective_full_backup,
-                )
-
-                # Send to queue
-                await message_bus.publish(
-                    group_queue,
-                    message,
-                    priority=message["priority"],
-                )
-
-                await emit_backup_triggered(
-                    job=job, resource=None, tenant=None,
-                    trigger_label="SCHEDULED",
-                    actor_type="SYSTEM",
-                    full_backup=effective_full_backup,
-                    batch_resource_count=len(resource_ids),
-                    extra_details={
-                        "sla_policy_id": str(policy.id),
-                        "sla_policy_name": policy.name,
-                        "resource_type": resource_type,
-                    },
-                )
-
-                total_dispatched += len(resource_ids)
-
-                # Stagger dispatch to prevent overwhelming Graph API
-                await asyncio.sleep(0.1)
-
-        await session.commit()
-
-        print(f"[SCHEDULER] Dispatched {total_dispatched} resources to {queue} for policy '{policy.name}'")
+async def drain_policy_cycles():
+    """Interval tick: try every capped, scheduled, enabled policy."""
+    if not dispatch_policy.drain_enabled():
+        return
+    try:
+        async with async_session_factory() as session:
+            policy_ids = [
+                str(row[0]) for row in (await session.execute(
+                    dispatch_policy.build_drainable_policies_query()
+                )).all()
+            ]
+    except Exception as exc:
+        print(f"[SCHEDULER][drain] could not list policies (non-fatal): {exc}")
+        print(traceback.format_exc())
+        return
+    for pid in policy_ids:
+        try:
+            await drain_policy_cycle(pid)
+        except Exception as exc:
+            print(f"[SCHEDULER][drain] policy {pid} failed (non-fatal): {exc}")
+            print(traceback.format_exc())
 
 
 async def check_sla_violations():
@@ -2356,40 +3240,83 @@ async def check_sla_violations():
             )
         )
         
+        # Resources with a backup actively in flight. Used to stop
+        # escalating a slow-but-progressing run to CRITICAL every 30min —
+        # IT OPS NOTES (62GB SharePoint partition, 12h into a run that
+        # was still inserting snapshot_items) paged continuously while
+        # data protection was in fact happening. The run-overlap guard
+        # makes this more common, since a skipped cycle ages
+        # last_backup_at further, so the two fixes ship together.
+        inflight_ids = {
+            row[0] for row in (await session.execute(
+                dispatch_policy.build_inflight_resource_ids_query()
+            )).all() if row[0] is not None
+        }
+
         violations = []
         for resource, policy in resources_result.all():
             if not policy:
                 continue
-            
-            # Calculate expected backup frequency
-            frequency_hours = {
-                "THREE_DAILY": 8,  # Every 8 hours
-                "DAILY": 24,
-                "WEEKLY": 168,
-            }.get(policy.frequency, 24)
-            
-            # Check if backup is overdue
-            if resource.last_backup_at:
-                hours_since_backup = (now - resource.last_backup_at).total_seconds() / 3600
-                
-                if hours_since_backup > frequency_hours:
-                    severity = "CRITICAL" if hours_since_backup > frequency_hours * 2 else "WARNING"
-                    
-                    violations.append({
-                        "resource_id": str(resource.id),
-                        "tenant_id": str(resource.tenant_id),
-                        "resource_type": resource.type.value,
-                        "sla_policy_id": str(policy.id),
-                        "sla_policy_name": policy.name,
-                        "last_backup_at": resource.last_backup_at.isoformat(),
-                        "hours_overdue": hours_since_backup - frequency_hours,
-                        "severity": severity,
-                    })
-                    
-                    # Log violation (in production: send to alert service)
-                    print(f"[SLA VIOLATION] {severity}: Resource {resource.id} ({resource.type.value}) "
-                          f"last backed up {hours_since_backup:.1f}h ago (SLA: {frequency_hours}h)")
-        
+
+            # A policy with no cadence has no SLA window. MANUAL policies
+            # are never put on the cron (frequency_to_cron_params returns
+            # None), so measuring them against a fabricated 24h default
+            # makes every resource on them a permanent, unfixable
+            # violation — prod ships `Manual` with sla_violation_alert on.
+            if not dispatch_policy.policy_has_sla_cadence(policy.frequency):
+                continue
+
+            # Shared with the dispatch path so the two can't drift, and
+            # so MONTHLY stops falling back to 24h (which reported a
+            # violation every single day).
+            frequency_hours = dispatch_policy.frequency_interval_hours(
+                policy.frequency
+            )
+
+            in_progress = resource.id in inflight_ids
+            never_backed_up = resource.last_backup_at is None
+            hours_since_backup = (
+                None if never_backed_up
+                else (now - resource.last_backup_at).total_seconds() / 3600
+            )
+            severity = dispatch_policy.classify_sla_violation(
+                hours_since_backup=hours_since_backup,
+                frequency_hours=frequency_hours,
+                never_backed_up=never_backed_up,
+                backup_in_progress=in_progress,
+            )
+            if severity is None:
+                continue
+
+            violations.append({
+                "resource_id": str(resource.id),
+                "tenant_id": str(resource.tenant_id),
+                "resource_type": resource.type.value,
+                "sla_policy_id": str(policy.id),
+                "sla_policy_name": policy.name,
+                "last_backup_at": (
+                    None if never_backed_up
+                    else resource.last_backup_at.isoformat()
+                ),
+                "never_backed_up": never_backed_up,
+                "backup_in_progress": in_progress,
+                "hours_overdue": (
+                    None if hours_since_backup is None
+                    else hours_since_backup - frequency_hours
+                ),
+                "severity": severity,
+            })
+
+            if never_backed_up:
+                age = "NEVER backed up"
+            else:
+                age = f"last backed up {hours_since_backup:.1f}h ago"
+            suffix = " [backup in flight]" if in_progress else ""
+            print(f"[SLA VIOLATION] {severity}: Resource {resource.id} "
+                  f"({resource.type.value}) {age} "
+                  f"(SLA: {frequency_hours}h){suffix}")
+
+
         if violations:
             print(f"[SLA] Found {len(violations)} violations")
             # Send violations to alert-service via HTTP
@@ -2645,6 +3572,9 @@ async def send_daily_backup_report():
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 f"{settings.REPORT_SERVICE_URL}/api/v1/reports/generate",
+                # report-service gates this route on a user JWT or the
+                # internal key; the scheduler has no user session.
+                headers=internal_audit_headers(),
                 json={"report_type": "DAILY"}
                 )
             if response.status_code == 200:
@@ -2662,6 +3592,7 @@ async def send_weekly_summary_report():
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 f"{settings.REPORT_SERVICE_URL}/api/v1/reports/generate",
+                headers=internal_audit_headers(),
                 json={"report_type": "WEEKLY"}
             )
             if response.status_code == 200:
@@ -2673,22 +3604,51 @@ async def send_weekly_summary_report():
 
 
 async def send_violations_to_alert_service(violations: List[Dict]):
-    """Send SLA violations to alert-service"""
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            for violation in violations:
-                await client.post(f"{settings.ALERT_SERVICE_URL}/api/v1/alerts", json={
+    """Send SLA violations to alert-service.
+
+    The try/except is per-violation on purpose: it used to wrap the whole
+    loop, so one bad payload or one 500 from alert-service silently
+    dropped every remaining violation in the batch.
+    """
+    if not violations:
+        return
+    sent = failed = 0
+    # alert-service gates POST /api/v1/alerts on the internal-services key
+    # (or an admin token) — same header every other service-to-service
+    # call carries.
+    headers = (
+        {"X-Internal-Api-Key": settings.INTERNAL_API_KEY}
+        if settings.INTERNAL_API_KEY else {}
+    )
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for violation in violations:
+            try:
+                resp = await client.post(f"{settings.ALERT_SERVICE_URL}/api/v1/alerts", json={
                     "type": "SLA_VIOLATION",
                     "severity": violation.get("severity", "WARNING"),
-                    "message": f"SLA violation: {violation.get('resource_type')} resource overdue by "
-                               f"{violation.get('hours_overdue', 0):.1f} hours",
+                    "message": dispatch_policy.sla_alert_message(violation),
                     "tenant_id": violation.get("tenant_id"),
                     "resource_id": violation.get("resource_id"),
                     "resource_type": violation.get("resource_type"),
                     "details": violation,
-                })
-    except Exception as e:
-        print(f"[SLA] Failed to send violations to alert-service: {e}")
+                }, headers=headers)
+                # httpx does not raise on 4xx/5xx. Until this check every
+                # response counted as "sent" — including the 405 that
+                # alert-service answered to every one of these POSTs (it
+                # had no POST route), so 0 SLA_VIOLATION alerts were ever
+                # stored while this function reported nothing wrong.
+                if resp.status_code >= 400:
+                    failed += 1
+                    print(f"[SLA] alert POST failed status={resp.status_code} "
+                          f"body={resp.text[:200]}")
+                    continue
+                sent += 1
+            except Exception as e:
+                failed += 1
+                print(f"[SLA] Failed to send violation for resource "
+                      f"{violation.get('resource_id')}: {e}")
+    if failed:
+        print(f"[SLA] Alert delivery: {sent} sent, {failed} failed")
 
 
 async def reconcile_pending_discovery():
@@ -2824,6 +3784,235 @@ async def start_orphan_sweeper_loop():
 
     asyncio.create_task(_loop())
     print(f"[ORPHAN_SWEEPER] loop started — interval={ORPHAN_SWEEP_INTERVAL_S}s")
+
+
+# ── Automatic retry of failed backup jobs (Configuration tab, 2026-08-18) ──
+#
+# Operator ask: when a backup job fails, wait N minutes and retry it, up to
+# M times. M (job_retry_max, default 3, 0 = disabled) and N
+# (job_retry_delay_minutes, default 5) live in the app_settings singleton and
+# are edited on the Configuration tab; the loop re-reads them every pass so a
+# change takes effect without a restart.
+#
+# Design constraints (each earned the hard way):
+#   * Each retry is a FRESH single-resource Job row + a fresh AMQP publish —
+#     the exact shape of the proven POST /scheduler/resource/{id} path. We
+#     never flip an existing FAILED job back to QUEUED: the 2026-08-07 review
+#     of that shape found re-queued bulk jobs are silently dropped by the
+#     bulk_fanout_seen dedup and then sit non-terminal forever.
+#   * Retries are counted per FAILURE CHAIN via spec->>'retry_root' (the
+#     original failed job's id), so "3 retries" means 3 per original failure
+#     — a later scheduled cycle's new failure starts a new chain.
+#   * Per-pass dispatch cap + only the NEWEST failure per resource + skip
+#     when anything is already in flight: retries multiply load, and the
+#     2026-08-18 BufferMapping convoy was a retry-amplified write pile-up.
+#   * Only failures newer than JOB_RETRY_LOOKBACK_HOURS are eligible, so
+#     enabling the feature can never resurrect a week of stale failures.
+JOB_RETRY_SWEEP_INTERVAL_S = int(os.environ.get("JOB_RETRY_SWEEP_INTERVAL_S", "60"))
+JOB_RETRY_LOOKBACK_HOURS = int(os.environ.get("JOB_RETRY_LOOKBACK_HOURS", "12"))
+JOB_RETRY_DISPATCH_CAP = int(os.environ.get("JOB_RETRY_DISPATCH_CAP", "5"))
+
+
+async def _job_retry_tick() -> int:
+    """One sweep: dispatch retry jobs for recently-failed resources.
+    Returns the number of retries dispatched."""
+    from shared.app_settings import get_app_settings
+
+    async with async_session_factory() as session:
+        settings_row = await get_app_settings(session)
+        await session.commit()
+    retry_max = int(settings_row.get("job_retry_max") or 0)
+    delay_min = int(settings_row.get("job_retry_delay_minutes") or 5)
+    if retry_max <= 0:
+        return 0
+    # The eligibility window must always cover the configured delay —
+    # a 24h delay against a fixed 12h lookback would make every candidate
+    # age out before it becomes eligible (review finding, 2026-08-18).
+    lookback_min = max(JOB_RETRY_LOOKBACK_HOURS * 60, delay_min + 120)
+
+    async with async_session_factory() as session:
+        candidates = (await session.execute(text("""
+            SELECT DISTINCT ON (s.resource_id)
+                   s.id AS snapshot_id, s.resource_id, s.job_id,
+                   s.completed_at, r.tenant_id
+              FROM snapshots s
+              JOIN resources r ON r.id = s.resource_id
+             WHERE s.status = 'FAILED'
+               AND s.completed_at > NOW() - make_interval(mins => :lookback)
+               AND s.completed_at <= NOW() - make_interval(mins => :delay)
+               -- a user cancel is final, not a failure to retry
+               AND coalesce(s.extra_data->>'cancelled_at', '') = ''
+               -- a failure the worker marked deterministic (e.g. the
+               -- archive coverage gate) re-fails identically — retrying
+               -- it is pure load. Absent flag = retryable.
+               AND coalesce((s.extra_data->>'retryable')::bool, true)
+               -- match the dispatch paths' status filter (DISCOVERED
+               -- resources are backed up too — 'ACTIVE'-only silently
+               -- excluded most of the fleet)
+               AND r.status IN ('DISCOVERED', 'ACTIVE')
+               -- a QUEUED/RUNNING job for this resource IS in-flight even
+               -- though it has produced no snapshot row yet — without this
+               -- a queued-behind-backlog retry re-dispatched every 60s
+               -- until the whole budget was burned (review finding)
+               AND NOT EXISTS (
+                     SELECT 1 FROM jobs jf
+                      WHERE jf.resource_id = s.resource_id
+                        AND jf.status IN ('QUEUED','PENDING','RUNNING','RETRYING')
+                   )
+               -- nothing in flight and nothing newer for this resource:
+               -- a newer run (even another failure) supersedes this one —
+               -- the newer failure gets its own chain. A concurrent-skip
+               -- no-op (skipped_concurrent) is NOT a real capture and
+               -- must not suppress the retry.
+               AND NOT EXISTS (
+                     SELECT 1 FROM snapshots n
+                      WHERE n.resource_id = s.resource_id
+                        AND n.id <> s.id
+                        AND n.created_at > s.created_at
+                        AND (n.status = 'IN_PROGRESS'
+                             OR (n.status IN ('COMPLETED','PARTIAL','FAILED')
+                                 AND NOT coalesce(
+                                       (n.extra_data->>'skipped_concurrent')::bool,
+                                       false)))
+                   )
+             ORDER BY s.resource_id, s.completed_at DESC
+             LIMIT 50
+        """), {"lookback": lookback_min, "delay": delay_min})).all()
+
+        dispatched = 0
+        for cand in candidates:
+            if dispatched >= JOB_RETRY_DISPATCH_CAP:
+                print(f"[JOB_RETRY] pass cap {JOB_RETRY_DISPATCH_CAP} reached — "
+                      f"{len(candidates) - dispatched} candidate(s) wait for the next pass")
+                break
+
+            # Resolve the failure chain root. A failed retry's snapshot
+            # chains back via its AUTO_RETRY job's spec; any OTHER failure
+            # roots a fresh chain at its own SNAPSHOT id. The root must be
+            # per-resource: scheduled cycles put up to 1000 resources on
+            # ONE bulk job id, so rooting at the job made retry_max a
+            # SHARED budget across the whole batch (critical review
+            # finding) — snapshot ids are per-resource per-run by
+            # construction.
+            root = str(cand.snapshot_id)
+            failed_job = None
+            if cand.job_id is not None:
+                failed_job = await session.get(Job, cand.job_id)
+            if failed_job is not None:
+                spec = failed_job.spec or {}
+                if spec.get("triggered_by") == "AUTO_RETRY" and spec.get("retry_root"):
+                    root = str(spec["retry_root"])
+
+            used = (await session.execute(text("""
+                SELECT count(*) FROM jobs
+                 WHERE spec->>'retry_root' = :root
+                   AND spec->>'triggered_by' = 'AUTO_RETRY'
+                   AND resource_id = CAST(:rid AS uuid)
+                   -- a retry whose AMQP publish failed never ran; it is
+                   -- marked FAILED/publish_failed and must not burn budget
+                   AND coalesce(result->>'publish_failed', '') <> 'true'
+            """), {"root": root, "rid": str(cand.resource_id)})).scalar() or 0
+            if used >= retry_max:
+                continue
+            # An already-queued retry for this chain that hasn't produced a
+            # snapshot yet also shows up in `used`, so double-dispatch on
+            # consecutive passes is bounded by the same counter.
+
+            resource = await session.get(Resource, cand.resource_id)
+            if resource is None:
+                continue
+
+            job_id = uuid.uuid4()
+            job = Job(
+                id=job_id,
+                type=JobType.BACKUP,
+                tenant_id=cand.tenant_id,
+                resource_id=cand.resource_id,
+                status=JobStatus.QUEUED,
+                priority=2,
+                spec={
+                    "full_backup": False,
+                    "triggered_by": "AUTO_RETRY",
+                    "snapshot_label": "auto-retry",
+                    "retry_root": root,
+                    "retry_attempt": used + 1,
+                    "retry_of_snapshot": str(cand.snapshot_id),
+                },
+            )
+            session.add(job)
+            await session.commit()
+
+            try:
+                await message_bus.publish(
+                    "backup.urgent",
+                    {
+                        "jobId": str(job_id),
+                        "resourceId": str(cand.resource_id),
+                        "tenantId": str(cand.tenant_id),
+                        "type": "INCREMENTAL",
+                        "priority": 2,
+                        "triggeredBy": "AUTO_RETRY",
+                        "snapshotLabel": "auto-retry",
+                        "forceFullBackup": False,
+                    },
+                    priority=2,
+                )
+            except Exception as _pe:
+                # Publish-after-commit dual-write: without this the row
+                # sits QUEUED forever (no reaper covers zero-snapshot
+                # single-resource jobs) while still counting against the
+                # chain budget. Mark it failed-at-publish; the budget
+                # count excludes that marker, and the outbox reconciler
+                # (single-resource branch) re-sends any that slipped
+                # through a crash between commit and here.
+                print(f"[JOB_RETRY] publish failed for job {job_id} "
+                      f"({type(_pe).__name__}: {_pe}) — marking publish_failed")
+                async with async_session_factory() as _fs:
+                    await _fs.execute(text(
+                        "UPDATE jobs SET status = 'FAILED', "
+                        "       completed_at = NOW(), "
+                        # jobs.result is json (not jsonb): concat in jsonb,
+                        # cast back on assignment
+                        "       result = (coalesce(result::jsonb, '{}'::jsonb) "
+                        "                || '{\"publish_failed\": \"true\"}'::jsonb)::json "
+                        " WHERE id = CAST(:jid AS uuid) AND status = 'QUEUED'"
+                    ), {"jid": str(job_id)})
+                    await _fs.commit()
+                continue
+            try:
+                await emit_backup_triggered(
+                    job=job, resource=resource,
+                    trigger_label="AUTO_RETRY", actor_type="SYSTEM",
+                    extra_details={"retry_attempt": used + 1,
+                                   "retry_root": root,
+                                   "retry_of_snapshot": str(cand.snapshot_id)},
+                )
+            except Exception as _ae:
+                print(f"[JOB_RETRY] audit emit failed (non-fatal): {_ae}")
+            dispatched += 1
+            print(f"[JOB_RETRY] retry {used + 1}/{retry_max} dispatched for "
+                  f"{resource.display_name or cand.resource_id} "
+                  f"(failed snapshot {cand.snapshot_id}, delay {delay_min}m, "
+                  f"job {job_id})")
+        return dispatched
+
+
+async def start_job_retry_loop():
+    async def _loop():
+        # Stagger past boot-time schema sync and the orphan sweeper's
+        # first pass.
+        await asyncio.sleep(20)
+        while True:
+            try:
+                await _job_retry_tick()
+            except Exception as exc:
+                print(f"[JOB_RETRY] tick failed: {exc}")
+            await asyncio.sleep(JOB_RETRY_SWEEP_INTERVAL_S)
+
+    asyncio.create_task(_loop())
+    print(f"[JOB_RETRY] loop started — interval={JOB_RETRY_SWEEP_INTERVAL_S}s, "
+          f"lookback={JOB_RETRY_LOOKBACK_HOURS}h, "
+          f"cap={JOB_RETRY_DISPATCH_CAP}/pass")
 
 
 # ── R3.2: Backup verification cron ──
@@ -2984,12 +4173,45 @@ async def _raise_verification_alert(
 
 # ── Round 1.5: DLQ consumer + failed-snapshot retry ──
 
+def backup_dlq_queue_names() -> List[str]:
+    """Every backup DLQ RabbitMQ actually declares.
+
+    Fixed 2026-08-11: this consumer watched FOUR queues — the priority lanes
+    — while MessageBus._declare_queue creates a `<queue>.dlq` for every
+    declared queue, including the heavy lane and all six partition lanes.
+    Anything dead-lettered off a partition queue was therefore invisible:
+    poison USER_CHATS shard messages had been parked in
+    backup.chats_partition.dlq with ZERO consumers and no alert, which is a
+    lost slice of a user's chat backup that nothing would ever have reported.
+
+    Derived, not hand-listed, wherever a list already exists: the six
+    partition queues come from shared.reconciler._PARTITION_QUEUE_BY_TYPE
+    (the single mirror of the publish-side routing, with a CI test that fails
+    if a partition type the workers persist is missing from it), and the
+    heavy / default lanes come from settings. Only the four priority lanes are
+    spelled out here, because MessageBus.connect() declares them as inline
+    literals with no constant to import — if that ever changes, read them
+    from there instead.
+    """
+    from shared.reconciler import _PARTITION_QUEUE_BY_TYPE
+
+    queues = [
+        "backup.urgent", "backup.high", "backup.normal", "backup.low",
+        settings.BACKUP_WORKER_QUEUE,
+        settings.BACKUP_HEAVY_QUEUE,
+    ]
+    queues += sorted(_PARTITION_QUEUE_BY_TYPE.values())
+    # dict.fromkeys de-dupes while keeping order — BACKUP_WORKER_QUEUE
+    # defaults to backup.normal, which is already in the list.
+    return [f"{q}.dlq" for q in dict.fromkeys(queues)]
+
+
 async def consume_backup_dlq():
     """Long-running consumer for backup.*.dlq queues — every poison message
     becomes an Alert so ops can investigate. Without this, dead-lettered
     messages sit in RabbitMQ forever with no signal to operators."""
     from shared.models import Alert
-    dlq_queues = ["backup.urgent.dlq", "backup.high.dlq", "backup.normal.dlq", "backup.low.dlq"]
+    dlq_queues = backup_dlq_queue_names()
 
     # Wait for message_bus to be ready (startup ordering)
     for _ in range(30):
@@ -3009,32 +4231,88 @@ async def consume_backup_dlq():
         print(f"[DLQ] consuming from {queue_name}")
         async with queue.iterator() as it:
             async for msg in it:
+                # Log the RAW body BEFORE anything that can fail. Every path
+                # below ends in ack(), so this print is the only guaranteed
+                # record of the message — without it a poison message is
+                # destroyed silently. Root cause of that: `json` was never
+                # imported at module scope, so json.loads raised NameError
+                # on EVERY message, the blanket except acked it, and the
+                # alert was never written. The `alerts` table has 0 rows in
+                # its entire history for that reason.
+                raw = msg.body.decode("utf-8", errors="replace")
+                print(
+                    f"[DLQ] raw message from {queue_name} "
+                    f"message_id={getattr(msg, 'message_id', None)} "
+                    f"body={raw[:4000]}"
+                )
                 try:
-                    body = json.loads(msg.body.decode())
+                    # Parse in its own guard. A malformed body must still
+                    # raise an Alert (carrying the raw text) rather than
+                    # skipping straight to the swallow-and-ack path.
+                    parse_error: Optional[str] = None
+                    try:
+                        body = json.loads(raw)
+                        if not isinstance(body, dict):
+                            raise ValueError(f"expected object, got {type(body).__name__}")
+                    except Exception as pe:
+                        body = {}
+                        parse_error = f"{type(pe).__name__}: {pe}"
+
                     job_id = body.get("jobId")
                     resource_id = body.get("resourceId") or (body.get("resourceIds") or [None])[0]
-                    workload = body.get("workload")
+                    # create_backup_message (shared/message_bus.py) emits
+                    # "type" (FULL/INCREMENTAL) — there has never been a
+                    # "workload" key, so the old read was always None and
+                    # every alert said "(None)".
+                    workload = body.get("type")
+                    # x-delivery-count is a QUORUM-queue header; every queue
+                    # here is classic, so it is always absent. Kept only so
+                    # the alert text stays stable if queues are migrated.
                     delivery_count = (msg.headers or {}).get("x-delivery-count", "?")
-                    print(f"[DLQ] poison message in {queue_name}: job={job_id} resource={resource_id} workload={workload} delivery_count={delivery_count}")
+                    print(
+                        f"[DLQ] poison message in {queue_name}: job={job_id} "
+                        f"resource={resource_id} type={workload} "
+                        f"delivery_count={delivery_count} parse_error={parse_error}"
+                    )
                     async with async_session_factory() as session:
-                        # Look up tenant via resource if available
+                        # tenantId is on the message itself; only fall back to
+                        # a Resource lookup when it is absent or unparseable.
                         tenant_id = None
-                        if resource_id:
+                        _raw_tid = body.get("tenantId")
+                        if _raw_tid:
+                            try:
+                                tenant_id = uuid.UUID(str(_raw_tid))
+                            except Exception:
+                                tenant_id = None
+                        if tenant_id is None and resource_id:
                             try:
                                 from shared.models import Resource
                                 r = await session.get(Resource, uuid.UUID(resource_id))
                                 tenant_id = r.tenant_id if r else None
                             except Exception:
                                 pass
+                        # Never let a malformed id abort the alert — that
+                        # would drop us into the ack-anyway path and destroy
+                        # the message. An unparseable resource id is worth an
+                        # alert WITHOUT the FK, not no alert at all.
+                        _res_fk = None
+                        if resource_id:
+                            try:
+                                _res_fk = uuid.UUID(str(resource_id))
+                            except Exception:
+                                _res_fk = None
                         session.add(Alert(
                             tenant_id=tenant_id,
                             type="BACKUP_DLQ",
                             severity="HIGH",
                             message=(
-                                f"Backup message dead-lettered after {delivery_count} delivery attempts on {queue_name}. "
-                                f"Job {job_id} for resource {resource_id} ({workload}) is stuck — investigate."
+                                f"Backup message dead-lettered on {queue_name} "
+                                f"(delivery_count={delivery_count}). "
+                                f"Job {job_id} for resource {resource_id} ({workload}) "
+                                f"is stuck — investigate."
+                                + (f" UNPARSEABLE BODY: {parse_error}" if parse_error else "")
                             ),
-                            resource_id=uuid.UUID(resource_id) if resource_id else None,
+                            resource_id=_res_fk,
                             triggered_by="dlq-consumer",
                             details={
                                 "queue": queue_name,
@@ -3042,19 +4320,55 @@ async def consume_backup_dlq():
                                 "job_id": job_id,
                                 "resource_id": resource_id,
                                 "workload": workload,
+                                "parse_error": parse_error,
+                                # Truncated raw body, so the message survives
+                                # in the DB and not only in pod logs.
+                                "raw_body": raw[:8000],
                             },
                         ))
                         await session.commit()
                     await msg.ack()
                 except Exception as e:
-                    # Ack anyway — re-rejecting would just re-queue to DLQ infinitely
-                    print(f"[DLQ] failed to alert on poison message: {type(e).__name__}: {e}")
+                    # Ack anyway — this is a DLQ, so rejecting would either
+                    # re-queue in a tight loop or (with no onward route) drop
+                    # the message regardless. The raw body was already
+                    # printed above, so acking here is recoverable from logs
+                    # rather than silent. Print the body again with the
+                    # failure so both land in one place.
+                    print(
+                        f"[DLQ] failed to alert on poison message from "
+                        f"{queue_name}: {type(e).__name__}: {e} — "
+                        f"UNRECORDED body={raw[:4000]}"
+                    )
                     try:
                         await msg.ack()
                     except Exception:
                         pass
 
     await asyncio.gather(*[consume_one(q) for q in dlq_queues], return_exceptions=True)
+
+
+def _not_skipped_concurrent():
+    """SQL predicate: this snapshot row is not a concurrency placeholder.
+
+    backup-worker's cross-job concurrency guard creates a snapshot row and
+    immediately marks it COMPLETED with item_count=0 and
+    extra_data.skipped_concurrent=true, purely so the owning job's
+    FANOUT/FINALIZE counters balance (see SKIP_CONCURRENT in
+    workers/backup-worker/main.py). It captured NOTHING, so it must never be
+    read as evidence that a backup succeeded. Mirrors
+    services/snapshot-service/main.py::_real_restore_point().
+
+    json_extract_path_text is NULL-safe for absent keys and works on both
+    json and jsonb (extra_data is json); COALESCE keeps rows that predate
+    the flag — without it, NOT IN over NULL yields NULL and would filter
+    out every real snapshot. Compared as text so a non-boolean value can't
+    raise the way an ->>::boolean cast would.
+    """
+    return func.coalesce(
+        func.json_extract_path_text(Snapshot.extra_data, "skipped_concurrent"),
+        "false",
+    ).notin_(("true", "t", "1"))
 
 
 async def retry_failed_snapshots():
@@ -3093,10 +4407,25 @@ async def retry_failed_snapshots():
                 # If a newer COMPLETED snapshot for the same resource exists,
                 # the failure has already been "healed" by the next scheduled
                 # run — skip the retry to avoid wasted work.
+                #
+                # A skipped_concurrent placeholder is NOT a healing success.
+                # backup-worker's cross-job guard writes one ~19ms after a
+                # genuine failure (COMPLETED, item_count=0, nothing captured),
+                # which used to satisfy this test and permanently cancel the
+                # FAILED snapshot's ONE automatic retry — the marker written
+                # below makes the skip stick on every later sweep, so the
+                # resource silently stopped being retried. Exclude
+                # placeholders so only a real capture cancels the retry.
+                #
+                # COMPLETED-only is deliberate: a PARTIAL run captured some
+                # but not all items, so it does not prove the failure healed.
+                # Erring toward one extra retry is cheap; erring toward a
+                # cancelled retry loses the data.
                 newer_stmt = select(Snapshot.id).where(and_(
                     Snapshot.resource_id == snap.resource_id,
                     Snapshot.status == SnapshotStatus.COMPLETED,
                     Snapshot.completed_at > snap.completed_at,
+                    _not_skipped_concurrent(),
                 )).limit(1)
                 if (await session.execute(newer_stmt)).first():
                     snap.extra_data = (snap.extra_data or {}) | {"retry_attempted": True, "retry_skipped_reason": "newer_success_exists"}
@@ -3142,6 +4471,19 @@ async def retry_failed_snapshots():
 
 
 # ── Phase 2: Retention Cleanup ──
+
+async def run_chat_catalogue_cleanup():
+    """Reclaim a bounded batch of unreachable catalogue-owned generations."""
+    from shared.chat_catalogue_gc import collect_chat_catalogue
+    from shared.storage.router import router
+    try:
+        result = await collect_chat_catalogue(session_factory=async_session_factory,
+                                              storage=router, limit=100)
+        if result.objects_deleted or result.deletion_failures:
+            print(f"[CHAT_CATALOGUE_GC] deleted={result.objects_deleted} failed={result.deletion_failures}")
+    except Exception as exc:
+        print(f"[CHAT_CATALOGUE_GC] deferred: {type(exc).__name__}")
+
 
 async def run_retention_cleanup():
     """Daily: apply FLAT/GFS retention rules, delete snapshots outside the window.
@@ -3521,6 +4863,19 @@ async def sweep_dirty_lifecycle_policies():
     # immediately; non-leaders log and exit. Lock is session-scoped, so
     # we keep a dedicated connection open for the duration of this run
     # and release explicitly at the end.
+    #
+    # ITO-9652 (pgbouncer pooler) WARNING: this leader-election scheme
+    # depends on `lock_session`'s underlying backend connection staying
+    # open and unchanged for the *entire* sweep — pg_advisory_lock (session
+    # form) is tied to the backend connection/session, not a transaction.
+    # Under pgbouncer transaction-mode pooling, any commit() (or any
+    # statement that ends the current transaction) on `lock_session` mid-
+    # sweep hands the client-side connection back to the pooler, which is
+    # free to reassign a *different* backend connection to the next
+    # statement — silently dropping the advisory lock without an error and
+    # breaking leader election (multiple pods can end up believing they're
+    # leader). Do not call lock_session.commit() anywhere in this sweep
+    # except via the deliberate acquire/unlock pair below.
     lock_acquired = False
     lock_session = None
 

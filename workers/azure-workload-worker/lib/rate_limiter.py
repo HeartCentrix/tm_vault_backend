@@ -162,6 +162,9 @@ class AzureApiRateLimiter:
                     host=settings.REDIS_HOST,
                     port=settings.REDIS_PORT,
                     db=settings.REDIS_DB,
+                    # `or None` is load-bearing (ITO-10192): password=""
+                    # would send AUTH against a no-auth server and error.
+                    password=settings.REDIS_PASSWORD or None,
                     decode_responses=True,
                 )
         return self._redis

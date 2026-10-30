@@ -1,8 +1,10 @@
 """Microsoft Graph /v1.0/$batch wrapper.
 
 Bundles up to 20 non-paginated GET sub-requests into one HTTP call.
-Retries 429 sub-responses in a follow-up batch honoring each sub's
-Retry-After. Rejects endpoints known to paginate (delta, $skiptoken,
+Retries 429/502/503/504 sub-responses (and outer-$batch failures mapped
+onto the subs) in a follow-up batch honoring each sub's Retry-After;
+401 re-mints the token and replays. Rejects endpoints known to paginate
+(delta, $skiptoken,
 $top) at submission time — $batch cannot follow @odata.nextLink inside
 a sub-response and using it for paged data silently truncates.
 
@@ -114,6 +116,9 @@ class BatchClient:
         # back to the original sleep behaviour.
         current_token: Optional[str] = None
         current_app_id: str = self._gc.client_id
+        # Last non-200 status per sub-request, so exhaustion reports what
+        # actually happened instead of a synthetic 429.
+        last_status: Dict[str, int] = {}
         while pending and attempts < s.GRAPH_MAX_RETRIES + 1:
             attempts += 1
             responses = await self._send_once(
@@ -124,17 +129,41 @@ class BatchClient:
             max_retry_after = 0.0
             by_id = {r.id: r for r in pending}
             any_throttle = False
+            any_auth = False
             for resp in responses:
-                if resp.status in (429, 503):
+                # 429/503 (throttle) and 502/504 (gateway transients) are
+                # retryable whether they arrive on a sub-response or as an
+                # outer-$batch status that _send_once mapped onto every
+                # sub. Treating a lone gateway blip as final silently
+                # dropped all 20 subs (empty channel replies / chat member
+                # lists in a "successful" snapshot).
+                if resp.status in (429, 502, 503, 504):
                     any_throttle = True
                     ra = parse_retry_after(resp.headers.get("Retry-After"))
                     if ra is not None:
                         max_retry_after = max(max_retry_after, ra)
                     failed.append(by_id[resp.id])
+                    last_status[resp.id] = resp.status
+                elif resp.status == 401:
+                    # Token aged out mid-chunk — current_token is minted
+                    # once for the chunk's whole retry lifetime, so a
+                    # migrated token can expire under us. Re-mint + replay.
+                    any_auth = True
+                    failed.append(by_id[resp.id])
+                    last_status[resp.id] = resp.status
                 else:
                     collected[resp.id] = resp
             pending = failed
             if pending:
+                if any_auth:
+                    # Drop both the chunk-pinned override token and the
+                    # client's cached token so the next attempt re-mints.
+                    current_token = None
+                    current_app_id = self._gc.client_id
+                    self._gc._access_token = None
+                    if not any_throttle:
+                        # Pure auth expiry — no cooldown needed.
+                        continue
                 # Mark the current app throttled (per-app accounting)
                 # then attempt migration. The "any other healthy app"
                 # case is the common one with 20 apps registered.
@@ -159,11 +188,12 @@ class BatchClient:
                         multi_app_manager.mark_success(current_app_id, 0.0)
                     except Exception:
                         pass
-        # Any still-failing requests: return as-is with their last 429 so
-        # the caller can decide whether to surface or skip.
+        # Any still-failing requests: return as-is with their last non-200
+        # status so the caller can decide whether to surface or skip.
         for req in pending:
             collected[req.id] = BatchResponse(
-                id=req.id, status=429, headers={}, body={},
+                id=req.id, status=last_status.get(req.id, 429), headers={},
+                body={},
             )
         return collected
 

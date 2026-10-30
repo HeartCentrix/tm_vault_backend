@@ -7,3 +7,4 @@ pydantic-settings==2.1.0
 
 # Observability — Prometheus metrics scraped on CORE_METRICS_PORT (default 9103)
 prometheus_client>=0.20.0
+python-jose[cryptography]==3.3.0

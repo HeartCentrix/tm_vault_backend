@@ -654,18 +654,25 @@ class MailRestoreEngine:
 
         Uses the shard routing from azure_storage_manager (same pattern as
         _download_blob_content in the file restore worker). Mail attachment
-        blobs are written to the "email" container; "mailbox" is the legacy
-        fallback."""
+        blobs are written to the "email" container, but legacy MAILBOX bulk
+        backups shipped them under "mailbox" and group mailboxes under
+        "group-mailbox" — the same candidate walk the PST exporter does
+        (main.py export_as_pst). Trying only "email" silently restored
+        those messages attachment-less."""
         if not getattr(att, "blob_path", None):
             return None
-        try:
-            tenant_id = str(self.target.tenant_id)
-            shard = azure_storage_manager.get_shard_for_resource(tenant_id, tenant_id)
-            container = azure_storage_manager.get_container_name(tenant_id, "email")
-            return await shard.download_blob(container, att.blob_path)
-        except Exception as e:
-            print(f"[{self.worker_id}] [MAIL-RESTORE] blob read failed {att.blob_path}: {type(e).__name__}: {e}")
-            return None
+        tenant_id = str(self.target.tenant_id)
+        shard = azure_storage_manager.get_shard_for_resource(tenant_id, tenant_id)
+        for workload in ("email", "mailbox", "group-mailbox"):
+            container = azure_storage_manager.get_container_name(tenant_id, workload)
+            try:
+                data = await shard.download_blob(container, att.blob_path)
+            except Exception as e:
+                print(f"[{self.worker_id}] [MAIL-RESTORE] blob read failed {container}/{att.blob_path}: {type(e).__name__}: {e}")
+                continue
+            if data is not None:
+                return data
+        return None
 
     async def run(self, items: List[SnapshotItem]) -> Dict[str, Any]:
         """Top-level driver — plan → ensure → sieve → concurrent

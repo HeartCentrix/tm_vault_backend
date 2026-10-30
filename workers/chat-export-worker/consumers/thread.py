@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import tempfile
+from uuid import UUID
 import aio_pika
 from sqlalchemy import select, update
 
@@ -23,10 +24,11 @@ from workers.chat_export_worker.progress import publish
 from workers.chat_export_worker.scope import resolve
 from workers.chat_export_worker.render.normalizer import normalize_messages
 from workers.chat_export_worker.packager.thread_packager import (
-    ThreadPackager, AttachmentSource, _safe_name,
+    ThreadPackager, AttachmentSource, _safe_name, _hosted_archive_key,
 )
 
 log = logging.getLogger("chat-export.thread")
+_ACTIVE_EXPORT_STATUSES = (JobStatus.PENDING, JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.RETRYING)
 
 
 class BlobAttachmentSource(AttachmentSource):
@@ -41,8 +43,38 @@ class BlobAttachmentSource(AttachmentSource):
     entry's compression buffer (~16 KiB).
     """
 
-    async def open(self, blob_path: str):
+    def __init__(self, *, read_lease=None):
+        self.read_lease = read_lease
+
+    async def open(self, blob_path: str | dict):
         from shared.azure_storage import azure_storage_manager
+
+        if isinstance(blob_path, dict):
+            import base64
+            import hashlib
+            from shared.chat_catalogue import ChatCatalogueIntegrityError
+            from shared.storage.router import router
+            captured = blob_path
+            if self.read_lease is not None:
+                self.read_lease.assert_valid()
+            if not captured.get("catalogue"):
+                raise ChatCatalogueIntegrityError("unknown captured attachment descriptor")
+            if captured.get("inline_b64") is not None:
+                data = base64.b64decode(captured["inline_b64"], validate=True)
+                if (len(data) != captured["size"] or
+                        hashlib.sha256(data).hexdigest() != captured.get("sha256")):
+                    raise ChatCatalogueIntegrityError("captured inline attachment checksum differs")
+                async def inline():
+                    yield data
+                return inline(), captured.get("content_type") or "application/octet-stream", len(data)
+            if not all(captured.get(key) for key in ("backend_id", "container", "blob_path", "sha256")):
+                raise ChatCatalogueIntegrityError("captured attachment storage route is incomplete")
+            store = router.get_store_by_id(str(captured["backend_id"]))
+            stream = store.download_stream(captured["container"], captured["blob_path"])
+            if self.read_lease is not None:
+                stream = self.read_lease.guard(stream)
+            return (stream,
+                captured.get("content_type") or "application/octet-stream", captured["size"])
 
         # Prefer the project's open_stream helper if it ever lands.
         # Today it doesn't exist, so we fall through to the
@@ -80,15 +112,26 @@ class BlobAttachmentSource(AttachmentSource):
 
 
 async def _update_job(sess, job_id, **values):
-    await sess.execute(update(Job).where(Job.id == job_id).values(**values))
+    stmt = update(Job).where(Job.id == job_id)
+    if values.get("status") == JobStatus.CANCELLED:
+        stmt = stmt.where(Job.status == JobStatus.CANCELLING)
+    result = await sess.execute(stmt.values(**values))
     await sess.commit()
+    return bool(result.rowcount)
 
 
 async def _check_cancelled(sess, job_id) -> bool:
     from sqlalchemy import select
     from shared.models import Job, JobStatus
     st = (await sess.execute(select(Job.status).where(Job.id == job_id))).scalar_one()
-    return st == JobStatus.CANCELLING
+    return st in (JobStatus.CANCELLING, JobStatus.CANCELLED)
+
+
+async def _settle_cancellation(sess, job_id):
+    """A cancellation request may settle; another owner's terminal result may not."""
+    changed = await _update_job(sess, job_id, status=JobStatus.CANCELLED)
+    if changed or await _check_cancelled(sess, job_id):
+        await publish(job_id, "cancelled", {})
 
 
 async def consume_thread(message: aio_pika.IncomingMessage) -> None:
@@ -101,45 +144,58 @@ async def consume_thread(message: aio_pika.IncomingMessage) -> None:
         async with async_session_factory() as sess:
             job = (await sess.execute(select(Job).where(Job.id == job_id))).scalar_one()
             if job.status == JobStatus.CANCELLING:
-                await _update_job(sess, job_id, status=JobStatus.CANCELLED)
-                await publish(job_id, "cancelled", {})
+                await _settle_cancellation(sess, job_id)
+                return
+            if job.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
+                # Terminal already — e.g. a broker redelivery after a crash
+                # that landed between the COMPLETED commit and the ack, or a
+                # job an operator/reclaim already failed. Re-running would
+                # resurrect it (FAILED -> COMPLETED flip-flop) and duplicate
+                # the export.
+                log.info("job_skipped_terminal id=%s status=%s", job_id, job.status)
                 return
 
-            spec = job.spec or {}
-            try:
-                scope = await resolve(
-                    sess,
-                    resource_id=spec["resourceId"],
-                    snapshot_ids=spec["snapshotIds"],
-                    thread_path=spec.get("threadPath"),
-                    item_ids=spec.get("itemIds") or [],
-                )
-            except ValueError as e:
-                await _update_job(
-                    sess, job_id, status=JobStatus.FAILED,
-                    result={"error": {"code": str(e)}},
-                )
-                await publish(job_id, "error", {"code": str(e)})
-                return
-
-            # The rest of the pipeline (normalize → render → package → upload
-            # → sign) is wrapped in a try/except so an unexpected exception
-            # transitions the Job row to FAILED instead of leaving it stuck
-            # in RUNNING. RabbitMQ acks the message on exit (requeue=False
-            # on message.process) but does not touch the DB, so without
-            # this block the UI would poll forever after any failure.
-            try:
-                await _run_pipeline(sess, job_id, spec, scope, job)
-            except Exception as exc:
-                log.exception("job_failed id=%s", job_id)
-                await _update_job(
-                    sess, job_id, status=JobStatus.FAILED,
-                    result={"error": {"code": "pipeline_error", "message": str(exc)}},
-                )
-                await publish(job_id, "error", {"code": "pipeline_error", "message": str(exc)})
+            await _execute_export_job(sess, job_id, job.spec or {}, job)
 
 
-async def _run_pipeline(sess, job_id, spec, scope, job) -> None:
+async def _execute_export_job(sess, job_id, spec, job):
+    from shared.chat_catalogue_gc import catalogue_read_pin
+    from shared.chat_catalogue import ChatCatalogueIntegrityError
+    from shared.models import SnapshotItem
+    try:
+        snapshot_ids = [UUID(str(value)) for value in spec.get("snapshotIds", [])]
+        if not snapshot_ids and spec.get("itemIds"):
+            snapshot_ids = list((await sess.scalars(select(SnapshotItem.snapshot_id).where(
+                SnapshotItem.id.in_([UUID(str(value)) for value in spec["itemIds"]])).distinct())).all())
+        if not snapshot_ids:
+            raise ValueError("SCOPE_EMPTY")
+        async with catalogue_read_pin(async_session_factory, snapshot_ids=snapshot_ids,
+                owner_kind="export", owner_id=UUID(str(job_id))) as read_lease:
+            scope = await resolve(sess, resource_id=spec["resourceId"],
+                snapshot_ids=spec.get("snapshotIds") or [], thread_path=spec.get("threadPath"),
+                item_ids=spec.get("itemIds") or [])
+            await _run_pipeline(sess, job_id, spec, scope, job, read_lease=read_lease)
+    except Exception as exc:
+        log.exception("job_failed id=%s", job_id)
+        await sess.rollback()
+        code = str(exc) if isinstance(exc, ValueError) else (
+            "capture_integrity_error" if isinstance(exc, ChatCatalogueIntegrityError) else "pipeline_error")
+        failed = await sess.execute(update(Job).where(Job.id == job_id)
+            .where(Job.status.in_(_ACTIVE_EXPORT_STATUSES))
+            .values(status=JobStatus.FAILED, result={"error": {"code": code, "message": str(exc)}}))
+        await sess.commit()
+        if not failed.rowcount:
+            await _settle_cancellation(sess, job_id)
+            return
+        await publish(job_id, "error", {"code": code, "message": str(exc)})
+
+
+async def _run_pipeline(sess, job_id, spec, scope, job, *, read_lease=None) -> None:
+    catalogue_export = bool(getattr(scope, "catalogue_snapshot_ids", ()))
+    if catalogue_export and read_lease is None:
+        from shared.chat_catalogue import ChatCatalogueIntegrityError
+        raise ChatCatalogueIntegrityError("catalogue thread export has no durable read lease")
+    artifact_route = {}
     await publish(
         job_id, "progress",
         {"stage": "rendering", "percent": 20,
@@ -153,9 +209,9 @@ async def _run_pipeline(sess, job_id, spec, scope, job) -> None:
     #
     # Two layout-dependent shapes (mirrors packager._add paths exactly):
     #   single_thread (HTML at zip root, /{tsafe}.html):
-    #     <img src="./{tsafe}-attachments/inline/{hc_id}{ext}">
+    #     <img src="./{tsafe}-attachments/inline/{archive_key}{ext}">
     #   per_message (HTML at /per-message/{tsafe}/{ext_id}/{ext_id}.html):
-    #     <img src="./attachments/inline/{hc_id}{ext}">
+    #     <img src="./attachments/inline/{archive_key}{ext}">
     #
     # tsafe MUST be _safe_name(thread_name) — the same sanitiser the
     # packager applies. Pre-fix code used `thread_path.split('/')[-1]`
@@ -166,15 +222,15 @@ async def _run_pipeline(sess, job_id, spec, scope, job) -> None:
     tsafe = _safe_name(thread_name)
     hosted_by_msg: dict = {}
     for mid, hs in scope.hosted_map.items():
-        msg_tsafe = _safe_name(mid)
         for h in hs:
+            archive_key = _hosted_archive_key(mid, h, thread_path=scope.thread_path)
             if scope.layout == "single_thread":
-                local_path = f"./{tsafe}-attachments/inline/{h['hc_id']}{h.get('ext', '.bin')}"
+                local_path = f"./{tsafe}-attachments/inline/{archive_key}{h.get('ext', '.bin')}"
             else:
                 # per_message: HTML lives in
                 # per-message/{tsafe}/{ext_id}/, attachments dir
                 # is one level deeper. Relative-from-HTML.
-                local_path = f"./attachments/inline/{h['hc_id']}{h.get('ext', '.bin')}"
+                local_path = f"./attachments/inline/{archive_key}{h.get('ext', '.bin')}"
             hosted_by_msg.setdefault(mid, []).append({
                 "hc_id": h["hc_id"],
                 "local_path": local_path,
@@ -200,8 +256,7 @@ async def _run_pipeline(sess, job_id, spec, scope, job) -> None:
     }
 
     if await _check_cancelled(sess, job_id):
-        await _update_job(sess, job_id, status=JobStatus.CANCELLED)
-        await publish(job_id, "cancelled", {})
+        await _settle_cancellation(sess, job_id)
         return
 
     tmp_fd, tmp_path = tempfile.mkstemp(prefix=f"chat-export-{job_id}-", suffix=".zip")
@@ -213,7 +268,7 @@ async def _run_pipeline(sess, job_id, spec, scope, job) -> None:
                 thread_name=scope.thread_path.rsplit("/", 1)[-1],
                 thread_path=scope.thread_path,
                 format=spec["exportFormat"],
-                attachment_source=BlobAttachmentSource(),
+                attachment_source=BlobAttachmentSource(read_lease=read_lease),
             )
             summary = await pkg.write(
                 render_messages,
@@ -223,20 +278,32 @@ async def _run_pipeline(sess, job_id, spec, scope, job) -> None:
                 context=pkg_ctx,
             )
 
+        if read_lease is not None:
+            read_lease.assert_valid()
         await publish(job_id, "progress", {"stage": "uploading", "percent": 85})
         if await _check_cancelled(sess, job_id):
-            await _update_job(sess, job_id, status=JobStatus.CANCELLED)
-            await publish(job_id, "cancelled", {})
+            await _settle_cancellation(sess, job_id)
             return
 
         account = settings.AZURE_STORAGE_ACCOUNT_NAME
         container = "exports"
         blob_path = f"{job_id}/export.zip"
         shard = azure_storage_manager.get_default_shard()
-        up_result = await upload_blob_with_retry_from_file(
-            container, blob_path, tmp_path,
-            shard=shard, max_retries=3,
-        )
+        if catalogue_export:
+            from shared.chat_capture_storage import upload_catalogue_export_artifact
+            # Raw backend keys retain the exports prefix used by lifecycle cleanup.
+            blob_path = f"exports/{blob_path}"
+            zip_size = os.stat(tmp_path).st_size
+            up_result = await upload_catalogue_export_artifact(session_factory=async_session_factory,
+                job_id=job_id, shard=shard, container=container, path=blob_path,
+                filename=tmp_path, size=zip_size, metadata={"job_id": str(job_id)})
+            artifact_route = {"chat_catalogue_format": 1, "backend_id": up_result.get("backend_id"),
+                "size_bytes": zip_size, "encryption_key_id": up_result.get("encryption_key_id")}
+        else:
+            up_result = await upload_blob_with_retry_from_file(
+                container, blob_path, tmp_path,
+                shard=shard, max_retries=3,
+            )
         if not up_result.get("success"):
             raise RuntimeError(f"blob upload failed: {up_result.get('error')}")
     finally:
@@ -281,22 +348,46 @@ async def _run_pipeline(sess, job_id, spec, scope, job) -> None:
         if _api_base else f"/api/v1/jobs/export/{job_id}/download"
     )
 
-    await _update_job(
-        sess, job_id, status=JobStatus.COMPLETED,
-        result={
-            "export_zip_blob_path": f"{account}/{container}/{blob_path}",
-            "blob_path": blob_path,
-            "container": container,
-            "signed_url": download_url,
-            "total_msgs": len(render_messages),
-            "total_bytes": summary["total_bytes"],
-            "sha256": summary["sha256"],
-        },
+    # Fence the final write against a cancel that landed between the
+    # post-upload check and here — an unconditional update would silently
+    # overwrite a cancellation or another owner's terminal result.
+    if read_lease is not None:
+        read_lease.assert_valid()
+    upd = await sess.execute(
+        update(Job)
+        .where(Job.id == job_id)
+        .where(Job.status.in_(_ACTIVE_EXPORT_STATUSES))
+        .values(
+            status=JobStatus.COMPLETED,
+            result={
+                "export_zip_blob_path": f"{account}/{container}/{blob_path}",
+                "blob_path": blob_path,
+                "container": container,
+                "signed_url": download_url,
+                "total_msgs": len(render_messages),
+                "total_bytes": summary["total_bytes"],
+                "sha256": summary["sha256"],
+                **artifact_route,
+            },
+        )
     )
-    await publish(
-        job_id, "complete",
-        {"url": download_url,
-         "sizeBytes": summary["total_bytes"],
-         "sha256": summary["sha256"]},
-    )
+    await sess.commit()
+    if (upd.rowcount or 0) == 0:
+        await _settle_cancellation(sess, job_id)
+        return
+    try:
+        await publish(
+            job_id, "complete",
+            {"url": download_url,
+             "sizeBytes": artifact_route.get("size_bytes", summary["total_bytes"]),
+             "sha256": summary["sha256"]},
+        )
+    except Exception:
+        # The job IS completed and the row already says so. Letting a Redis
+        # blip propagate from here used to flip the committed COMPLETED row
+        # back to FAILED, erasing blob_path/container and orphaning the
+        # uploaded ZIP. SSE clients miss one event; polling still sees
+        # COMPLETED.
+        log.warning("completion publish failed id=%s (job remains COMPLETED)",
+                    job_id, exc_info=True)
     log.info("job_completed id=%s bytes=%d", job_id, summary["total_bytes"])

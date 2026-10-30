@@ -212,7 +212,14 @@ class GraphRateLimiter:
         self._bucket = _RedisTokenBucket(
             client, "graph:bucket:global", self._rate, self._burst, fallback=self._local,
         )
-        logger.info("[graph_rate_limiter] Redis-coordinated bucket active at %s", url)
+        # Log host:port only — REDIS_URL can carry the auth password in URL
+        # form, and worker pods now route shared.* INFO to stdout.
+        from urllib.parse import urlparse
+        _loc = urlparse(url)
+        logger.info(
+            "[graph_rate_limiter] Redis-coordinated bucket active at %s:%s",
+            _loc.hostname, _loc.port,
+        )
 
     async def acquire(self, n: float = 1.0, reason: str = "graph_call") -> float:
         """Block until ``n`` tokens are available. Returns wait-seconds.

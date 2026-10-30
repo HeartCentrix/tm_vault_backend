@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
 from datetime import datetime
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -48,6 +49,9 @@ def _record_blob_write(encrypted: bool) -> None:
         sla_metrics.record_blob_write(encrypted)
     except Exception:
         pass
+
+
+logger = logging.getLogger(__name__)
 
 
 _MODE_TMVAULT_TO_S3 = {"Locked": "COMPLIANCE", "Unlocked": "GOVERNANCE"}
@@ -161,10 +165,12 @@ class SeaweedStore:
         )
 
     def _bucket(self, container: str) -> str:
+        if container.startswith("chat-catalogue-"):
+            return container
         return self._forced_bucket or (self._buckets[0] if self._buckets else container)
 
     def _key(self, container: str, path: str) -> str:
-        if self._forced_bucket and container:
+        if self._forced_bucket and container and not container.startswith("chat-catalogue-"):
             return f"{container}/{path}"
         return path
 
@@ -289,13 +295,21 @@ class SeaweedStore:
             buf = bytearray()
 
             async def _send_part(pn: int, data: bytes):
-                async with sem:
+                # The producer acquires `sem` BEFORE creating this task —
+                # acquiring it here instead would only throttle upload_part
+                # calls while letting task creation (each holding a full
+                # part's bytes) run unbounded, so a Graph download that
+                # outpaces the backend buffers toward whole-file size and
+                # OOMs the worker.
+                try:
                     resp = await s3.upload_part(
                         Bucket=bucket, Key=key,
                         PartNumber=pn, UploadId=upload_id,
                         Body=data,
                     )
                     return {"PartNumber": pn, "ETag": resp["ETag"]}
+                finally:
+                    sem.release()
 
             try:
                 async for chunk in byte_stream:
@@ -307,6 +321,10 @@ class SeaweedStore:
                         part_number += 1
                         part_data = bytes(buf[:chunk_size])
                         del buf[:chunk_size]
+                        # Back-pressure: block the stream until a slot
+                        # frees so at most max_parallel_parts parts are
+                        # buffered in memory at any moment.
+                        await sem.acquire()
                         inflight.append(asyncio.create_task(
                             _send_part(part_number, part_data),
                         ))
@@ -315,6 +333,7 @@ class SeaweedStore:
                 # EXCEPT the last one — any size is fine there.
                 if buf or part_number == 0:
                     part_number += 1
+                    await sem.acquire()
                     inflight.append(asyncio.create_task(
                         _send_part(part_number, bytes(buf)),
                     ))
@@ -489,7 +508,7 @@ class SeaweedStore:
 
     async def list_blobs(self, container, prefix: Optional[str] = None):
         bucket = self._bucket(container)
-        base = f"{container}/" if self._forced_bucket and container else ""
+        base = self._key(container, "")
         full_prefix = (base + prefix) if prefix else base
         async with self._client_ctx() as s3:
             paginator = s3.get_paginator("list_objects_v2")
@@ -499,7 +518,7 @@ class SeaweedStore:
 
     async def list_with_props(self, container, prefix: Optional[str] = None):
         bucket = self._bucket(container)
-        base = f"{container}/" if self._forced_bucket and container else ""
+        base = self._key(container, "")
         full_prefix = (base + prefix) if prefix else base
         async with self._client_ctx() as s3:
             paginator = s3.get_paginator("list_objects_v2")
@@ -632,9 +651,22 @@ class SeaweedStore:
             )
 
     async def ensure_container(self, container) -> None:
-        # Bucket must be pre-created with Object Lock enabled; this is a
-        # no-op in the default bucket-per-shard layout.
-        return
+        # Legacy shards are provisioned externally. Catalogue buckets are
+        # isolated from their snapshot-age expiration rules.
+        if not container.startswith("chat-catalogue-"):
+            return
+        async with self._client_ctx() as s3:
+            try:
+                await s3.head_bucket(Bucket=container)
+                return
+            except ClientError as exc:
+                if exc.response["Error"]["Code"] not in {"404", "NoSuchBucket", "NotFound"}:
+                    raise BackendUnreachableError("catalogue bucket unavailable") from exc
+            try:
+                await s3.create_bucket(Bucket=container)
+            except ClientError as exc:
+                if exc.response["Error"]["Code"] != "BucketAlreadyOwnedByYou":
+                    raise BackendUnreachableError("catalogue bucket creation failed") from exc
 
     async def close(self) -> None:
         return

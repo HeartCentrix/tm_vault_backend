@@ -7,6 +7,7 @@ requested format."""
 from __future__ import annotations
 
 import csv
+from shared.csv_safe import SafeCsvWriter  # Check 17: CSV formula-injection
 import io
 import json
 import zipfile
@@ -160,7 +161,7 @@ def format_section_csv(section: str, items: List[Any]) -> str:
         raise KeyError(f"no CSV columns defined for section {section!r}")
     cols = _CSV_COLUMNS[section]
     buf = io.StringIO()
-    writer = csv.writer(buf)
+    writer = SafeCsvWriter(csv.writer(buf))
     writer.writerow(cols)
     for it in items:
         raw = (getattr(it, "extra_data", None) or {}).get("raw") or {}
@@ -218,7 +219,7 @@ class EntraExportPipeline:
                     companion_name, parent_key = _MEMBERS_COMPANION[section]
                     rows = _flatten_members_rows(parent_key, items)
                     buf = io.StringIO()
-                    writer = csv.writer(buf)
+                    writer = SafeCsvWriter(csv.writer(buf))
                     for r in rows:
                         writer.writerow(r)
                     zf.writestr(companion_name, buf.getvalue())

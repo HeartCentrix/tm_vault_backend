@@ -8,10 +8,15 @@ each row's ``extra_data['raw']`` from ``chat_thread_messages.metadata_raw``
 before handing the list to the renderer.
 """
 from dataclasses import dataclass
+import logging
 import mimetypes
-from sqlalchemy import select, text
+from sqlalchemy import select, text, tuple_
 from sqlalchemy.orm import aliased
-from shared.models import SnapshotItem, Snapshot, Resource
+from shared.models import SnapshotItem, Snapshot, Resource, SnapshotChatInventory
+from shared.chat_catalogue import materialize_chat_items, ChatCatalogueIntegrityError
+from shared.chat_catalogue_identity import qualified_chat_item_key
+
+log = logging.getLogger("chat-export.scope")
 
 
 @dataclass
@@ -21,6 +26,82 @@ class ResolvedScope:
     messages: list
     attachment_map: dict
     hosted_map: dict
+    catalogue_snapshot_ids: tuple = ()
+
+
+async def _catalogue_scope(sess, msgs, *, layout, effective, catalogue_ids):
+    if any(m.snapshot_id not in catalogue_ids for m in msgs):
+        raise ValueError("AMBIGUOUS_CAPTURE_VERSIONS")
+    selected_chats = {(m.extra_data or {}).get("chat_id") for m in msgs}
+    wanted = {(m.snapshot_id, (m.extra_data or {}).get("chat_id")) for m in msgs}
+    inventory_rows = (await sess.execute(select(SnapshotChatInventory.snapshot_id, SnapshotChatInventory.chat_id,
+        SnapshotChatInventory.inventory_id).where(SnapshotChatInventory.snapshot_id.in_(catalogue_ids),
+            SnapshotChatInventory.chat_id.in_(selected_chats)))).all()
+    if None in selected_chats or {(sid, cid) for sid, cid, _ in inventory_rows} != wanted:
+        raise ChatCatalogueIntegrityError("selected message has no published captured inventory")
+    inventories = {}
+    for _, chat_id, inventory_id in inventory_rows:
+        inventories.setdefault(chat_id, set()).add(inventory_id)
+    if any(len(versions) > 1 for versions in inventories.values()):
+        raise ValueError("AMBIGUOUS_CAPTURE_VERSIONS")
+    physical = {(m.snapshot_id, m.external_id) for m in msgs}
+    hydrated = []
+    for start in range(0, len(msgs), 500):
+        hydrated.extend(await materialize_chat_items(sess, msgs[start:start + 500]))
+    if len({m.extra_data.get("chatId") for m in hydrated}) > 1:
+        raise ValueError("MULTI_THREAD_NOT_SUPPORTED_YET")
+    # Identical inventories selected through multiple snapshots need one copy.
+    by_version = {}
+    for item in hydrated:
+        by_version.setdefault(item.chat_version_id, item)
+    hydrated = list(by_version.values())
+    children = []
+    pairs = sorted(physical, key=lambda p: (str(p[0]), p[1]))
+    for start in range(0, len(pairs), 500):
+        batch = list((await sess.scalars(select(SnapshotItem).where(
+            SnapshotItem.item_type.in_(["CHAT_ATTACHMENT", "CHAT_HOSTED_CONTENT"]),
+            tuple_(SnapshotItem.snapshot_id, SnapshotItem.parent_external_id).in_(pairs[start:start + 500])))).all())
+        children.extend(await materialize_chat_items(sess, batch))
+    att_map, hosted_map, seen = {}, {}, set()
+    for item in children:
+        if item.chat_version_id in seen:
+            continue
+        seen.add(item.chat_version_id)
+        meta = item.extra_data or {}
+        metadata_bytes = None
+        if not meta.get("resolved"):
+            content_type = meta.get("content_type") or ""
+            pointer = content_type in {"messageReference", "forwardedMessageReference", "meetingReference"}
+            card = content_type.startswith("application/vnd.microsoft.card.")
+            if item.item_type == "CHAT_HOSTED_CONTENT" or (
+                    not (pointer or card) and (meta.get("content_url") or content_type in {"reference", "fileAttachment"})):
+                raise ChatCatalogueIntegrityError("required captured attachment bytes are missing")
+            import json
+            metadata_bytes = json.dumps({"captured_attachment_metadata": meta}, sort_keys=True,
+                ensure_ascii=False, separators=(",", ":")).encode()
+        descriptor = {"name": item.name or item.external_id, "blob_path": item.blob_path,
+            "content_type": meta.get("content_type"), "size": item.content_size or 0,
+            "inline_b64": meta.get("inline_b64"), "backend_id": str(item.backend_id),
+            "container": meta.get("container"), "encryption_key_id": item.encryption_key_id,
+            "sha256": meta.get("sha256"), "object_id": meta.get("object_id"),
+            "snapshot_id": str(item.snapshot_id), "item_id": str(item.id),
+            "catalogue": True}
+        if metadata_bytes is not None:
+            import base64
+            import hashlib
+            descriptor.update(name=descriptor["name"] + ".metadata.json", blob_path=None,
+                inline_b64=base64.b64encode(metadata_bytes).decode(), content_type="application/json",
+                sha256=hashlib.sha256(metadata_bytes).hexdigest(), size=len(metadata_bytes))
+        if item.item_type == "CHAT_ATTACHMENT":
+            att_map.setdefault(item.parent_external_id, []).append(descriptor)
+        else:
+            descriptor.update(hc_id=item.external_id,
+                archive_key=qualified_chat_item_key(meta.get("chat_id") or hydrated[0].extra_data["chatId"],
+                    "CHAT_HOSTED_CONTENT", item.external_id, item.parent_external_id),
+                ext=mimetypes.guess_extension(meta.get("content_type") or "application/octet-stream") or ".bin")
+            hosted_map.setdefault(item.parent_external_id, []).append(descriptor)
+    return ResolvedScope(layout, effective, hydrated, att_map, hosted_map,
+        tuple(sorted(catalogue_ids, key=str)))
 
 
 async def resolve(sess, *, resource_id, snapshot_ids, thread_path: str | None,
@@ -58,6 +139,8 @@ async def resolve(sess, *, resource_id, snapshot_ids, thread_path: str | None,
              .where(Sn.resource_id.in_(resource_ids))
              .where(SnapshotItem.id.in_(item_ids))
              .order_by(SnapshotItem.created_at.asc()))
+        if snapshot_ids:
+            q = q.where(SnapshotItem.snapshot_id.in_(snapshot_ids))
         msgs = list((await sess.execute(q)).scalars())
         paths = {m.folder_path for m in msgs}
         if len(paths) > 1:
@@ -66,6 +149,15 @@ async def resolve(sess, *, resource_id, snapshot_ids, thread_path: str | None,
             raise ValueError("SCOPE_EMPTY")
         effective = next(iter(paths))
         layout = "per_message"
+
+    if msgs:
+        formats = (await sess.execute(select(Snapshot.id, Snapshot.extra_data)
+            .where(Snapshot.id.in_({m.snapshot_id for m in msgs})))).all()
+        catalogue_ids = {sid for sid, metadata in formats
+            if isinstance(metadata, dict) and metadata.get("chat_inventory_format") == 1}
+        if catalogue_ids:
+            return await _catalogue_scope(sess, msgs, layout=layout, effective=effective,
+                catalogue_ids=catalogue_ids)
 
     # Hydrate each message's raw payload from chat_thread_messages. The
     # renderer expects ``extra_data['raw']`` to carry the full Graph
@@ -124,12 +216,14 @@ async def resolve(sess, *, resource_id, snapshot_ids, thread_path: str | None,
                     try:
                         import os as _os
                         import httpx as _httpx_alert
+                        from shared.audit import internal_audit_headers
                         _audit_url = _os.getenv(
                             "AUDIT_SERVICE_URL", "http://audit-service:8012"
                         )
                         async with _httpx_alert.AsyncClient(timeout=2.0) as _c:
                             await _c.post(
                                 f"{_audit_url}/api/v1/audit/log",
+                                headers=internal_audit_headers(),
                                 json={
                                     "action": "INTEGRITY_GAP",
                                     "actor_type": "SYSTEM",
@@ -153,10 +247,122 @@ async def resolve(sess, *, resource_id, snapshot_ids, thread_path: str | None,
     att_map: dict = {}
     hosted_map: dict = {}
     if ext_ids:
-        aq = (select(SnapshotItem)
-              .where(SnapshotItem.item_type == "CHAT_ATTACHMENT")
-              .where(SnapshotItem.parent_external_id.in_(ext_ids)))
-        for a in (await sess.execute(aq)).scalars():
+        # Child-row scoping. Two real defects in the pre-fix query
+        # (item_type + parent_external_id only, matching the entire
+        # snapshot_items table):
+        #   * cross-TENANT bleed — Teams message ids are creation-timestamp
+        #     strings that recur across chats and tenants, so another
+        #     tenant's attachment row could be pulled into this ZIP;
+        #   * N-fold duplication — chat pointer rows are carried forward into
+        #     every later snapshot (backup-worker
+        #     `_carry_forward_prior_chat_snapshot_items`), so one logical
+        #     attachment exists once per snapshot that ever held its message
+        #     and the ZIP got N copies of the same file.
+        #
+        # What must NOT be scoped away is the SNAPSHOT. In a shared chat only
+        # the FIRST drainer persists CHAT_ATTACHMENT / CHAT_HOSTED_CONTENT
+        # rows; claim-skipped users get the message pointer row while the
+        # child row stays under the first drainer's snapshot (and resource) —
+        # see backup-worker/main.py:1230-1237 and the same invariant spelled
+        # out at services/snapshot-service/main.py:3158-3170, which is why
+        # that read path scopes CHAT_ATTACHMENT by tenant, not by snapshot.
+        # Restricting children to the exporting resource's snapshots would
+        # DROP attachments that were exported before this fix.
+        #
+        # Tenant scoping cannot trust SnapshotItem.tenant_id alone:
+        # `_userchats_backup_hosted_contents` never passes tenant_id
+        # (backup-worker/main.py:10120), carry-forward copies src.tenant_id so
+        # the NULL propagates, and P8's back-fill can't reach those rows (its
+        # source predicate is `src.tenant_id = :tid`). Every
+        # CHAT_HOSTED_CONTENT row therefore has tenant_id NULL, and a plain
+        # `tenant_id IN (...)` silently drops every inline image. Rows with no
+        # tenant_id get their tenancy resolved through the owning snapshot's
+        # resource instead; anything still unattributable is excluded but
+        # LOGGED — never dropped in silence.
+        msg_tenant_ids = {m.tenant_id for m in msgs if m.tenant_id is not None}
+
+        def _child_query(item_type: str):
+            # Newest first: retention / blob reap walks the oldest snapshots
+            # first, so when several copies carry a blob the newest one is
+            # the least likely to have been reaped out from under us.
+            return (select(SnapshotItem)
+                    .where(SnapshotItem.item_type == item_type)
+                    .where(SnapshotItem.parent_external_id.in_(ext_ids))
+                    .order_by(SnapshotItem.created_at.desc()))
+
+        async def _tenant_by_snapshot(snapshot_ids: set) -> dict:
+            """snapshot_id -> owning resource's tenant_id. Fallback tenancy
+            for child rows whose own tenant_id column is NULL."""
+            if not snapshot_ids:
+                return {}
+            rows = (await sess.execute(
+                select(Snapshot.id, Resource.tenant_id)
+                .join(Resource, Resource.id == Snapshot.resource_id)
+                .where(Snapshot.id.in_(list(snapshot_ids)))
+            )).all()
+            return {r[0]: r[1] for r in rows}
+
+        def _one_per_child(rows) -> list:
+            best: dict = {}
+            for r in rows:
+                key = (r.parent_external_id, r.external_id)
+                cur = best.get(key)
+                # First writer wins (= newest, given the ORDER BY), but a
+                # blob-less incumbent is upgraded to any copy that actually
+                # has content: a pointer/card-only capture would otherwise
+                # export as .MISSING.txt even though another snapshot holds
+                # the resolved bytes.
+                if cur is None or (not cur.blob_path and r.blob_path):
+                    best[key] = r
+            # Stable, created_at-independent output order.
+            return sorted(
+                best.values(),
+                key=lambda r: (r.parent_external_id or "", r.external_id or ""),
+            )
+
+        async def _scoped_children(item_type: str) -> list:
+            rows = list((await sess.execute(_child_query(item_type))).scalars())
+            if not rows:
+                return []
+            if not msg_tenant_ids:
+                # No resolved message carries a tenant_id (pointer rows do set
+                # it, so this is a data anomaly). Keep the rows rather than
+                # ship an export that quietly lost its attachments, and say so.
+                log.warning(
+                    "chat-export child rows could not be tenant-scoped: "
+                    "item_type=%s rows=%d — no resolved message carries a "
+                    "tenant_id, so every candidate row is being kept",
+                    item_type, len(rows),
+                )
+                return _one_per_child(rows)
+            fallback = await _tenant_by_snapshot({
+                r.snapshot_id for r in rows
+                if r.tenant_id is None and r.snapshot_id is not None
+            })
+            kept: list = []
+            dropped: list = []
+            for r in rows:
+                tid = r.tenant_id if r.tenant_id is not None else fallback.get(r.snapshot_id)
+                (kept if (tid is not None and tid in msg_tenant_ids) else dropped).append(r)
+            if dropped:
+                # Loud on purpose: this is the only signal that a row matching
+                # a message in this thread is NOT in the ZIP. Expected when a
+                # Teams message id collides across tenants; a surprise
+                # otherwise, and the packager cannot emit a .MISSING.txt for
+                # a child it never receives.
+                log.warning(
+                    "chat-export child rows excluded by tenant scope: "
+                    "item_type=%s excluded=%d kept=%d export_tenants=%s "
+                    "excluded_item_ids=%s — these rows matched a message id in "
+                    "this thread but resolve to another tenant (or to no "
+                    "tenant at all) and are NOT in the export",
+                    item_type, len(dropped), len(kept),
+                    sorted(str(t) for t in msg_tenant_ids),
+                    [str(r.id) for r in dropped[:10]],
+                )
+            return _one_per_child(kept)
+
+        for a in await _scoped_children("CHAT_ATTACHMENT"):
             ed = a.extra_data or {}
             att_map.setdefault(a.parent_external_id, []).append({
                 "name": ed.get("name") or a.name or a.external_id,
@@ -164,10 +370,7 @@ async def resolve(sess, *, resource_id, snapshot_ids, thread_path: str | None,
                 "content_type": ed.get("content_type"),
                 "size": a.content_size or 0,
             })
-        hq = (select(SnapshotItem)
-              .where(SnapshotItem.item_type == "CHAT_HOSTED_CONTENT")
-              .where(SnapshotItem.parent_external_id.in_(ext_ids)))
-        for h in (await sess.execute(hq)).scalars():
+        for h in await _scoped_children("CHAT_HOSTED_CONTENT"):
             ed = h.extra_data or {}
             ctype = ed.get("content_type") or "application/octet-stream"
             ext = mimetypes.guess_extension(ctype) or ".bin"

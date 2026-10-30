@@ -37,15 +37,39 @@ def _to_uuids(values: Iterable[str]) -> List[uuid.UUID]:
     return out
 
 
+#: ESCAPE character used with every LIKE built here. Must match the
+#: ``escape=`` argument passed to ``folder_path.like`` in
+#: :func:`resolve_selection` and in the restore-worker call sites that
+#: use :func:`_prefix_and_exact_for` directly.
+LIKE_ESCAPE = "\\"
+
+
+def _escape_like(value: str) -> str:
+    """Escape SQL LIKE metacharacters in a user-supplied folder path.
+
+    ``_`` and ``%`` are pattern operators in LIKE, and underscores are
+    everywhere in real folder names: without escaping, restoring
+    ``/HR_2026`` also selected every item under ``/HRX2026`` — wrong
+    folder's files shipped in the restore/export.
+    """
+    return (
+        value.replace(LIKE_ESCAPE, LIKE_ESCAPE + LIKE_ESCAPE)
+        .replace("%", LIKE_ESCAPE + "%")
+        .replace("_", LIKE_ESCAPE + "_")
+    )
+
+
 def _prefix_and_exact_for(folder_paths: Iterable[str]) -> Tuple[List[str], List[str]]:
     """Normalise folder paths into the two SQL forms the resolver needs:
 
-    * ``prefixes``: ``<path>/%`` — descendant LIKE match. Trailing slash
-      is stripped from ``<path>`` first so ``/Foo`` does NOT accidentally
-      match a sibling ``/Foo Bar``.
-    * ``exacts``:   the folder path itself. Catches items whose
-      ``folder_path`` column equals the ticked path (files directly at
-      the folder's top level rather than in a subfolder).
+    * ``prefixes``: ``<path>/%`` — descendant LIKE match, with LIKE
+      metacharacters in ``<path>`` escaped (see :func:`_escape_like`).
+      Trailing slash is stripped from ``<path>`` first so ``/Foo`` does
+      NOT accidentally match a sibling ``/Foo Bar``.
+    * ``exacts``:   the folder path itself, unescaped — matched with
+      equality, not LIKE. Catches items whose ``folder_path`` column
+      equals the ticked path (files directly at the folder's top level
+      rather than in a subfolder).
 
     Empty / whitespace-only inputs are dropped.
     """
@@ -61,7 +85,7 @@ def _prefix_and_exact_for(folder_paths: Iterable[str]) -> Tuple[List[str], List[
             prefixes.append("/%")
             exacts.append("/")
             continue
-        prefixes.append(stripped + "/%")
+        prefixes.append(_escape_like(stripped) + "/%")
         exacts.append(stripped)
     return prefixes, exacts
 
@@ -97,7 +121,7 @@ async def resolve_selection(
     if item_uuids:
         clauses.append(SnapshotItem.id.in_(item_uuids))
     for prefix in prefixes:
-        clauses.append(SnapshotItem.folder_path.like(prefix))
+        clauses.append(SnapshotItem.folder_path.like(prefix, escape=LIKE_ESCAPE))
     if exacts:
         clauses.append(SnapshotItem.folder_path.in_(exacts))
 

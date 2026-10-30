@@ -5,10 +5,32 @@ import os
 import httpx
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import AsyncGenerator, AsyncIterator, Iterator, List, Optional, Dict, Any, Set, Tuple, Union
+from typing import AsyncGenerator, AsyncIterator, Callable, Iterator, List, Optional, Dict, Any, Set, Tuple, Union
 from datetime import datetime, timedelta
 import hashlib
 import time
+from urllib.parse import urlsplit
+
+# SSRF guard (Check-17): every credential-attaching helper below re-issues
+# URLs that can originate from Graph response bodies (@odata.context,
+# @odata.nextLink, error.message redirects). A hostile Graph-side value
+# could otherwise point an app-only-bearer request at link-local metadata
+# (169.254.169.254), cluster ClusterIPs, or localhost. Pin the credentialed
+# egress to the known Microsoft identity/Graph/SharePoint surface.
+_ALLOWED_GRAPH_HOSTS = ("graph.microsoft.com", "login.microsoftonline.com")
+_ALLOWED_GRAPH_SUFFIXES = (".sharepoint.com", ".sharepoint.us")
+
+
+def _assert_graph_target(url: str) -> None:
+    """Raise ValueError unless ``url`` is an https request to an allow-listed
+    Microsoft host. Call as the FIRST statement of any helper that attaches
+    'Authorization: Bearer <token>' before an httpx call."""
+    p = urlsplit(url)
+    if p.scheme != "https":
+        raise ValueError(f"refusing non-https credentialed request: {url[:80]}")
+    h = (p.hostname or "").lower()
+    if h not in _ALLOWED_GRAPH_HOSTS and not h.endswith(_ALLOWED_GRAPH_SUFFIXES):
+        raise ValueError(f"refusing credentialed request to non-allowlisted host {h}")
 
 from shared.power_bi_client import PowerBIClient
 from shared.graph_ratelimit import (
@@ -88,40 +110,27 @@ def _parse_retry_after(resp: httpx.Response, default: float = 30.0, cap: float =
             return min(default, cap)
 
 
+def _is_resync_gone(e: Exception) -> bool:
+    """True only for Graph 410 Gone / resyncRequired (expired delta token).
+
+    Deliberately NOT a bare "410" substring: exception messages embed URLs,
+    drive ids, and delta tokens that routinely contain 410 (2026-08-27
+    review), and a false positive here converts an unrelated error into a
+    full re-walk — a multi-GB re-transfer against an already-failing tenant.
+    httpx's raise_for_status message is "Client error '410 Gone' for url…";
+    wrapped Graph errors carry the resyncRequired code.
+    """
+    if getattr(getattr(e, "response", None), "status_code", 0) == 410:
+        return True
+    msg = str(e).lower()
+    return "resyncrequired" in msg or "410 gone" in msg
+
+
 class GraphClient:
     """Client for Microsoft Graph API calls with multi-app support"""
 
     GRAPH_URL = "https://graph.microsoft.com/v1.0"
     TOKEN_URL = "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
-
-    @staticmethod
-    def _safe_first_page_params(next_url: str, params: Optional[Dict]) -> Optional[Dict]:
-        """Decide which query params to actually send on a request.
-
-        The pager historically passed ``params`` only when the URL was NOT
-        absolute (``not next_url.startswith("http")``) — but EVERY Graph URL is
-        absolute, so the whole ``params`` dict (``$top``/``$select``/``$filter``/
-        ``$expand``) was silently dropped on the first request. The big silent
-        cost was ``$top``: Graph fell back to its default ~10-item pages, so a
-        1458-message folder took ~146 round-trips instead of 2 — across mailbox,
-        Teams, SharePoint, contacts, calendar and group handlers.
-
-        We now preserve ONLY ``$top`` on absolute URLs — it is pure page-size
-        (pure perf, no result/field/behavior change). ``$select``/``$filter``/
-        ``$expand`` are deliberately STILL dropped here: applying them globally
-        would shrink stored objects ($select) or change which items come back
-        ($filter/$expand) for every caller. Handlers that need those embed them
-        directly in the URL (e.g. the mail sub-shard and chat incremental
-        paths). Relative URLs (defensive; not produced today) keep full params.
-        """
-        if not next_url.startswith("http"):
-            return params
-        # Only when the URL has no query of its own — otherwise a deltaLink /
-        # URL-embedded query already carries everything (and httpx would
-        # otherwise APPEND a duplicate $top to it).
-        if params and "$top" in params and "?" not in next_url:
-            return {"$top": params["$top"]}
-        return None
 
     SCOPES = [
         "https://graph.microsoft.com/.default"
@@ -447,7 +456,8 @@ class GraphClient:
         self.__policy_cached = p
         return p
 
-    async def _get(self, url: str, params: Optional[Dict] = None) -> Dict[str, Any]:
+    async def _get(self, url: str, params: Optional[Dict] = None,
+                   on_activity: Optional[Callable[[], None]] = None) -> Dict[str, Any]:
         """Make authenticated GET request with pagination, throttling, and timeout retry.
 
         Branches on GRAPH_HARDENING_ENABLED: when off (default), runs the
@@ -457,20 +467,141 @@ class GraphClient:
 
         Preserves @odata.deltaLink for incremental sync and handles
         single-object responses (e.g. /users/{id}) that have no 'value' array.
+
+        ``on_activity`` (optional) fires once per Graph round-trip — every
+        successful page AND every throttle/transient retry decision. Long
+        multi-page walks are ONE ``_get`` call (an archive folder with 332k
+        items paginates for hours), so a caller-side liveness guard keyed on
+        call completion reads a healthy walk as a stall: ITO-10146 — every
+        archive run since 2026-08-11 was aborted at exactly 562 progress
+        events by its own stall guard while giant folders paginated silently.
+        Retries count as activity on purpose: a retrying call is genuinely
+        talking to Graph, and a hostile endless-throttle is still bounded by
+        the policy's cumulative cap (raises GraphRetryExhaustedError), so
+        stamping retries cannot mask a true wedge — a wedge makes no
+        round-trips at all. The callback must never raise into the client.
         """
         from shared.config import settings as _s
         if _s.GRAPH_HARDENING_ENABLED:
-            return await self._get_hardened(url, params)
-        return await self._get_legacy(url, params)
+            return await self._get_hardened(url, params, on_activity=on_activity)
+        return await self._get_legacy(url, params, on_activity=on_activity)
 
-    async def _get_legacy(self, url: str, params: Optional[Dict] = None) -> Dict[str, Any]:
-        """Pre-hardening _get — preserved verbatim as the kill-switch path."""
+    async def _post_json(
+        self, url: str, body: Dict[str, Any], timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Authenticated POST returning parsed JSON — the write-side companion
+        to ``_get`` (added for Graph Mailbox Import/Export exportItems, which
+        is POST-only).
+
+        Mirrors ``_get_legacy``'s hardening: bearer token, 429 Retry-After
+        with multi-app migration (immediate retry on a healthy app rather
+        than burning Retry-After on a throttled one), and transient-timeout
+        retry with backoff. ``raise_for_status`` is called so non-2xx —
+        including the autoexpanded-archive ``ErrorArchiveFolderMovedPermanently``
+        redirect — surfaces as an ``httpx.HTTPStatusError`` for the caller to
+        inspect/reissue.
+
+        Unlike ``_get`` this does NOT paginate (a POST body is not safe to
+        replay across ``@odata.nextLink``) and it forwards ``timeout`` straight
+        to httpx so export/import calls can honor ``ARCHIVE_IMPORT_TIMEOUT_S``
+        independent of the generous client-wide read default.
+        """
+        _assert_graph_target(url)
         token = await self._get_token()
+        current_app_id = self.client_id
+        max_retries = 5
+        retry_count = 0
+
+        from shared.graph_rate_limiter import graph_rate_limiter
+        while True:
+            try:
+                async with self._http_session() as client:
+                    headers = {
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                    }
+                    await graph_rate_limiter.acquire(reason="graph_post_json")
+                    resp = await client.post(
+                        url, headers=headers, json=body, timeout=timeout,
+                    )
+
+                    if resp.status_code in (429, 502, 503, 504):  # MS retryable trio + 502 (gateway transients; 2026-07-29 archive pilot)
+                        # CLAMPED, never the raw header. This sleep runs
+                        # INSIDE archive_backup's export semaphore
+                        # (ARCHIVE_EXPORT_CONCURRENCY, prod=4), so honoring a
+                        # multi-hour Retry-After verbatim freezes the whole
+                        # export: 2026-08-12 snapshot 0e423f79 wrote 188,380
+                        # of 340,258 items then sat RUNNING 15.6 h at 1
+                        # millicore with zero sockets and — because this
+                        # branch used to log nothing — zero explanation.
+                        # The clamp also bounds mark_throttled's ban FLOOR,
+                        # which otherwise banned all 6 apps for hours and
+                        # defeated the migration that avoids sleeping at all.
+                        retry_after = _parse_retry_after(resp)
+                        from shared.multi_app_manager import multi_app_manager
+                        multi_app_manager.mark_throttled(current_app_id, retry_after)
+                        if retry_count < max_retries:
+                            retry_count += 1
+                            new_token, new_app = await self._try_migrate_app(current_app_id)
+                            if new_token and new_app:
+                                token = new_token
+                                current_app_id = new_app
+                                continue
+                            print(
+                                f"[GraphClient] POST {resp.status_code} on {url[:100]} — "
+                                f"sleeping {retry_after:.0f}s (Retry-After clamped, "
+                                f"attempt {retry_count}/{max_retries}, no healthy alt-app)"
+                            )
+                            await asyncio.sleep(retry_after)
+                            continue
+                        resp.raise_for_status()
+
+                    resp.raise_for_status()
+                    try:
+                        from shared.multi_app_manager import multi_app_manager
+                        _lat_ms = float(resp.elapsed.total_seconds() * 1000) if getattr(resp, "elapsed", None) else 0.0
+                        multi_app_manager.mark_success(current_app_id, _lat_ms)
+                    except Exception:
+                        pass
+                    return resp.json() or {}
+
+            except httpx.TransportError as e:
+                # All network-level transients — incl. ReadError from a
+                # stale keepalive conn (2026-07-29 archive pilot), not just
+                # timeouts. exportItems is a read-only export: safe to
+                # replay. HTTP status errors are handled above, not here.
+                if retry_count < max_retries:
+                    retry_count += 1
+                    wait = min(5 * retry_count, 30)
+                    print(f"[GraphClient] POST transport error on {url} (attempt {retry_count}/{max_retries}), retrying in {wait}s: {type(e).__name__}: {e}")
+                    await asyncio.sleep(wait)
+                    token = await self._get_token()
+                    continue
+                raise
+
+    async def _get_legacy(self, url: str, params: Optional[Dict] = None,
+                          on_activity: Optional[Callable[[], None]] = None) -> Dict[str, Any]:
+        """Pre-hardening _get — preserved verbatim as the kill-switch path.
+        ``on_activity`` fires per round-trip — see _get."""
+        def _activity() -> None:
+            if on_activity is None:
+                return
+            try:
+                on_activity()
+            except Exception:
+                pass
+        # Minted per page below (see the loop top) — a single up-front mint
+        # dies with a 401 on walks that outlive the ~60-min token
+        # (2026-07-29 Online Archive pilot). _get_token() caches with a
+        # 5-min-early refresh, so the per-page consult is free.
+        token: Optional[str] = None
         # Track which app's token is currently in use. Starts as self
         # but may migrate on 429 to a healthier app — see _try_migrate_app
         # docstring for why this beats sleep+retry-on-same-app.
         current_app_id = self.client_id
+        auth_retried = False  # one forced-refresh retry per page on 401
         all_items = []
+        needs_consistency = bool(params and params.get("$count") == "true")
         next_url = url
         max_retries = 5
         retry_count = 0
@@ -479,23 +610,38 @@ class GraphClient:
 
         from shared.graph_rate_limiter import graph_rate_limiter
         while next_url:
+            _assert_graph_target(next_url)  # guards initial url + every @odata.nextLink page
+            if current_app_id == self.client_id:
+                token = await self._get_token()
             try:
                 async with self._http_session() as client:
                     # ConsistencyLevel: eventual is only valid with $count queries
-                    if params and params.get("$count") == "true":
+                    if needs_consistency:
                         headers = {"Authorization": f"Bearer {token}", "ConsistencyLevel": "eventual"}
                     else:
                         headers = {"Authorization": f"Bearer {token}"}
                     await graph_rate_limiter.acquire(reason="graph_get_legacy")
-                    resp = await client.get(next_url, headers=headers, params=self._safe_first_page_params(next_url, params))
+                    # Pass params as-is: the loop nulls them after the
+                    # first page (nextLink embeds them). The previous
+                    # guard `if not next_url.startswith("http")` was
+                    # ALWAYS false (next_url is a full URL), so every
+                    # $filter/$top/$select given to _get() was silently
+                    # dropped — discover_teams' provisioningOptions
+                    # filter never reached Graph and every one of the
+                    # tenant's ~10k groups got a phantom TEAMS_CHANNEL
+                    # resource (2026-07-14, task: Adobe Acrobat group).
+                    resp = await client.get(next_url, headers=headers, params=params)
 
                     # Handle 429 throttling
-                    if resp.status_code == 429:
-                        retry_after = int(resp.headers.get("Retry-After", "30"))
+                    if resp.status_code in (429, 502, 503, 504):  # MS retryable trio + 502 (gateway transients; 2026-07-29 archive pilot)
+                        # Clamped — see _post_json for why a raw Retry-After
+                        # is a worker-wedge (2026-08-12).
+                        retry_after = _parse_retry_after(resp)
                         from shared.multi_app_manager import multi_app_manager
                         multi_app_manager.mark_throttled(current_app_id, retry_after)
                         if retry_count < max_retries:
                             retry_count += 1
+                            _activity()  # throttled-but-answered = liveness
                             # Try to swap to a different healthy app FIRST.
                             # If one's available, immediate retry — no
                             # sleep, no wasted minutes burning through
@@ -512,9 +658,23 @@ class GraphClient:
                             # All other apps throttled (or single-app
                             # deployment) — fall back to honoring
                             # Retry-After on the same app.
+                            print(
+                                f"[GraphClient] GET {resp.status_code} on {next_url[:100]} — "
+                                f"sleeping {retry_after:.0f}s (Retry-After clamped, "
+                                f"attempt {retry_count}/{max_retries}, no healthy alt-app)"
+                            )
                             await __import__('asyncio').sleep(retry_after)
                             continue
                         resp.raise_for_status()
+
+                    if resp.status_code == 401 and not auth_retried:
+                        # Token aged out mid-walk (typically a 429-migrated
+                        # token, since unmigrated pages re-mint at the loop
+                        # top): force one fresh mint and retry this page.
+                        auth_retried = True
+                        current_app_id = self.client_id
+                        self._access_token = None
+                        continue
 
                     resp.raise_for_status()
                     # Adaptive circuit-breaker feedback: tell the
@@ -528,9 +688,20 @@ class GraphClient:
                         multi_app_manager.mark_success(current_app_id, _lat_ms)
                     except Exception:
                         pass
-                    data = resp.json()
+                    try:
+                        data = resp.json()
+                    except ValueError as _je:
+                        # Truncated / non-JSON 200 body — same transient as in
+                        # the hardened path (see there). Re-raised as a
+                        # TransportError so the existing retry/backoff branch
+                        # below owns it instead of it escaping to the caller.
+                        raise httpx.ReadError(
+                            f"malformed response body: {_je}"
+                        ) from _je
                     last_data = data
                     retry_count = 0  # Reset on success
+                    _activity()  # one successful page fetched
+                    auth_retried = False  # re-arm the 401 retry per page
 
                     # Single-object response (e.g. /users/{id}, /users/{id}/drive)
                     # These have no "value" array — return the object directly
@@ -546,11 +717,15 @@ class GraphClient:
                     next_url = data.get("@odata.nextLink")
                     params = None  # params only on first request
 
-            except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RemoteProtocolError) as e:
+            except httpx.TransportError as e:
+                # All network-level transients — incl. ReadError from a
+                # stale keepalive conn (2026-07-29 archive pilot), not
+                # just timeouts.
                 if retry_count < max_retries:
                     retry_count += 1
+                    _activity()  # a retried round-trip is liveness, not a stall
                     wait = min(5 * retry_count, 30)
-                    print(f"[GraphClient] Timeout on {next_url} (attempt {retry_count}/{max_retries}), retrying in {wait}s: {e}")
+                    print(f"[GraphClient] Transport error on {next_url} (attempt {retry_count}/{max_retries}), retrying in {wait}s: {type(e).__name__}: {e}")
                     await __import__('asyncio').sleep(wait)
                     # Refresh token in case it expired during the wait
                     token = await self._get_token()
@@ -564,21 +739,42 @@ class GraphClient:
         # Preserve delta link so callers can save it for incremental backups
         if delta_link:
             result["@odata.deltaLink"] = delta_link
+        # Parity with _get_hardened — @odata.context identifies the mailbox
+        # that served a 308-followed response (autoexpanded archive).
+        if "@odata.context" in last_data:
+            result["@odata.context"] = last_data["@odata.context"]
         return result
 
     async def _get_hardened(
         self, url: str, params: Optional[Dict] = None,
+        on_activity: Optional[Callable[[], None]] = None,
     ) -> Dict[str, Any]:
         """Policy-driven GET: pacing + Retry-After + backoff + cumulative cap.
 
         Same result shape as _get_legacy so callers are unaffected when the
-        feature flag flips.
+        feature flag flips. ``on_activity`` fires per round-trip — see _get.
         """
         from shared.config import settings as s
         from shared.multi_app_manager import multi_app_manager
         policy = self._policy
-        token = await self._get_token()
+
+        def _activity() -> None:
+            if on_activity is None:
+                return
+            try:
+                on_activity()
+            except Exception:
+                pass
+        # Minted per page below — a single up-front mint dies on walks that
+        # outlive the ~60-min token (2026-07-29: the Online Archive pilot
+        # paged one folder past $skip=20700 for 65 min and hard-401'd).
+        # _get_token() caches with a 5-min-early refresh, so the per-page
+        # consult is free until a refresh is actually due.
+        token: Optional[str] = None
+        migrated = False      # riding a 429-swapped alternate-app token
+        auth_retried = False  # one forced-refresh retry per page on 401
         all_items: List[Dict[str, Any]] = []
+        needs_consistency = bool(params and params.get("$count") == "true")
         next_url: Optional[str] = url
         delta_link: Optional[str] = None
         last_data: Dict[str, Any] = {}
@@ -586,12 +782,15 @@ class GraphClient:
         from shared.graph_rate_limiter import graph_rate_limiter
         async with self._http_session() as client:
             while next_url:
+                _assert_graph_target(next_url)  # guards initial url + every @odata.nextLink page
+                if not migrated:
+                    token = await self._get_token()
                 prio = self._effective_priority()
                 await policy.stream_bucket.acquire(priority=prio)
                 await multi_app_manager.acquire_app_token(
                     self.client_id, priority=prio
                 )
-                if params and params.get("$count") == "true":
+                if needs_consistency:
                     headers = {"Authorization": f"Bearer {token}",
                                "ConsistencyLevel": "eventual"}
                 else:
@@ -600,22 +799,26 @@ class GraphClient:
                     await graph_rate_limiter.acquire(reason="graph_get_hardened")
                     resp = await client.get(
                         next_url, headers=headers,
-                        params=self._safe_first_page_params(next_url, params),
+                        params=params,
                     )
-                except (httpx.ReadTimeout, httpx.ConnectTimeout,
-                        httpx.RemoteProtocolError) as exc:
+                except httpx.TransportError as exc:
+                    # All network-level transients — incl. ReadError from a
+                    # stale keepalive conn (killed the 2026-07-29 archive
+                    # walk 19 min in), not just timeouts. Status errors are
+                    # handled below; the policy budget bounds these retries.
                     action = policy.decide_transient_error()
                     if action.exhausted:
                         raise GraphRetryExhaustedError(
                             f"transient cap hit on {next_url}: {type(exc).__name__}"
                         )
+                    _activity()  # a retried round-trip is liveness, not a stall
                     print(f"[GraphClient/hardened] transient {type(exc).__name__} "
                           f"on {next_url[:80]}; sleep {action.sleep_seconds:.1f}s")
                     await asyncio.sleep(action.sleep_seconds)
                     token = await self._get_token()
                     continue
 
-                if resp.status_code in (429, 503):
+                if resp.status_code in (429, 502, 503, 504):
                     action = policy.decide(
                         status_code=resp.status_code,
                         retry_after=resp.headers.get("Retry-After"),
@@ -624,8 +827,24 @@ class GraphClient:
                         raise GraphRetryExhaustedError(
                             f"cumulative cap hit on {next_url}: {action.reason}"
                         )
+                    _activity()  # throttled-but-answered round-trip = liveness
+                    # CLAMPED, never the policy's verbatim Retry-After. This
+                    # was the 4th call site missed by the 2026-08-12 clamp
+                    # (commit 7cce29f fixed _post_json + _get_legacy + the
+                    # download path): RateLimitPolicy.decide trusts the
+                    # header up to the 14,400s cumulative cap, so a single
+                    # hostile Retry-After produced one unbroken multi-hour
+                    # sleep here — longer than the archive stall guard's
+                    # 5,400s window, converting an honest throttle into a
+                    # false stall abort. The uncapped value still charges
+                    # the cumulative budget inside policy.decide, so a
+                    # hostile endless-throttle exhausts honestly; the clamp
+                    # also bounds mark_throttled's ban FLOOR (an uncapped
+                    # floor banned all 6 apps for hours and defeated
+                    # migration).
+                    _sleep_s = min(float(action.sleep_seconds), 120.0)
                     multi_app_manager.mark_throttled(
-                        self.client_id, int(action.sleep_seconds),
+                        self.client_id, int(_sleep_s),
                     )
                     # Multi-app rotation: same reasoning as the legacy
                     # path — sleeping ~30s of Retry-After is wasteful
@@ -637,30 +856,66 @@ class GraphClient:
                     new_token, _new_app = await self._try_migrate_app(self.client_id)
                     if new_token:
                         token = new_token
+                        migrated = True
                         print(
                             f"[GraphClient/hardened] {resp.status_code} on "
                             f"{next_url[:80]} — migrating app "
-                            f"(skipping {action.sleep_seconds:.1f}s sleep)"
+                            f"(skipping {_sleep_s:.1f}s sleep)"
                         )
                         continue
                     print(f"[GraphClient/hardened] {resp.status_code} on "
-                          f"{next_url[:80]} — {action.reason}")
-                    await asyncio.sleep(action.sleep_seconds)
+                          f"{next_url[:80]} — {action.reason} "
+                          f"(sleeping {_sleep_s:.1f}s, clamped)")
+                    await asyncio.sleep(_sleep_s)
                     if s.GRAPH_POST_THROTTLE_BRAKE_MS > 0:
                         await asyncio.sleep(
                             s.GRAPH_POST_THROTTLE_BRAKE_MS / 1000.0
                         )
                     continue
 
+                if resp.status_code == 401 and not auth_retried:
+                    # Token aged out mid-walk (typically a 429-migrated
+                    # token, since unmigrated pages re-mint above): force
+                    # one fresh mint and retry this same page.
+                    auth_retried = True
+                    migrated = False
+                    self._access_token = None
+                    continue
+
                 resp.raise_for_status()
                 policy.reset_on_success()
+                _activity()  # one successful page fetched
+                auth_retried = False  # re-arm the 401 retry for the next page
                 # Adaptive circuit-breaker feedback for the hardened path.
                 try:
                     _lat_ms = float(resp.elapsed.total_seconds() * 1000) if getattr(resp, "elapsed", None) else 0.0
                     multi_app_manager.mark_success(self.client_id, _lat_ms)
                 except Exception:
                     pass
-                data = resp.json() or {}
+                try:
+                    data = resp.json() or {}
+                except ValueError as exc:
+                    # A truncated / non-JSON 200 body. json.JSONDecodeError is a
+                    # ValueError, NOT an httpx error, so before this it escaped
+                    # the retry policy entirely and surfaced as a permanent
+                    # handler failure (2026-08-06 Corp_Esplanade ROOM_MAILBOX:
+                    # two attempts died at byte 392644 and 4826748 — different
+                    # offsets ⇒ a cut stream ⇒ transient). Account it against
+                    # the same transient budget as a TransportError and retry
+                    # the page.
+                    action = policy.decide_transient_error()
+                    if action.exhausted:
+                        raise GraphRetryExhaustedError(
+                            f"transient cap hit on {next_url}: malformed "
+                            f"response body ({type(exc).__name__}: {exc})"
+                        ) from exc
+                    _activity()  # a retried round-trip is liveness, not a stall
+                    print(f"[GraphClient/hardened] malformed body on "
+                          f"{next_url[:80]} ({exc}); sleep "
+                          f"{action.sleep_seconds:.1f}s")
+                    await asyncio.sleep(action.sleep_seconds)
+                    token = await self._get_token()
+                    continue
                 last_data = data
 
                 if "value" not in data and "@odata.nextLink" not in data:
@@ -678,10 +933,18 @@ class GraphClient:
         }
         if delta_link:
             result["@odata.deltaLink"] = delta_link
+        # Preserve @odata.context: it names the mailbox/entity that ACTUALLY
+        # served the (possibly 308-redirected) response, which is the only way
+        # archive_backup._walk_folders can tell an autoexpanded archive's
+        # auxiliary mailbox from the primary one. Dropping it made every
+        # aux-resident folder id 404 against the primary base.
+        if "@odata.context" in last_data:
+            result["@odata.context"] = last_data["@odata.context"]
         return result
 
     async def _iter_pages(
         self, url: str, params: Optional[Dict] = None,
+        headers: Optional[Dict[str, str]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Streaming variant of _get: yields each page as it arrives.
 
@@ -693,48 +956,89 @@ class GraphClient:
         can fire upload tasks per page and continue pulling instead of waiting
         for the full response to materialize in RAM. Preserves 429 Retry-After
         + timeout retry semantics.
+
+        ``headers`` are extra request headers sent on EVERY page (first call
+        and each nextLink) — e.g. ``Prefer: odata.maxpagesize=999`` for
+        ``/messages/delta``, where ``$top`` is not a page size but a cap on
+        the whole delta round (tests/workers/test_mail_delta_no_top.py).
+        ``Authorization`` is always ours and cannot be overridden.
         """
         from shared.config import settings as _s
         if _s.GRAPH_HARDENING_ENABLED:
-            async for p in self._iter_pages_hardened(url, params):
+            async for p in self._iter_pages_hardened(url, params, headers=headers):
                 yield p
             return
-        async for p in self._iter_pages_legacy(url, params):
+        async for p in self._iter_pages_legacy(url, params, headers=headers):
             yield p
+
+    @staticmethod
+    def _merge_extra_headers(
+        base: Dict[str, str], extra: Optional[Dict[str, str]],
+    ) -> Dict[str, str]:
+        """Overlay caller headers on the per-page auth headers without letting
+        a caller replace ``Authorization`` (that is always the minted token)."""
+        if not extra:
+            return base
+        merged = dict(base)
+        for k, v in extra.items():
+            if k.lower() == "authorization":
+                continue
+            merged[k] = v
+        return merged
 
     async def _iter_pages_legacy(
         self, url: str, params: Optional[Dict] = None,
+        headers: Optional[Dict[str, str]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Pre-hardening _iter_pages — preserved verbatim as the kill-switch path."""
+        """Pre-hardening _iter_pages — preserved verbatim as the kill-switch path
+        (plus the ``headers`` overlay shared with the hardened path)."""
+        needs_consistency = bool(params and params.get("$count") == "true")
         next_url = url
         max_retries = 5
         retry_count = 0
-        # Reset the captured delta link at the start of each stream so a
-        # stale value from a previous call never leaks into the caller's
-        # `getattr(graph_client, "_last_delta_link", None)` read. Without
-        # this the legacy path silently breaks incremental backups (every
-        # run re-fetches full history because the token is never stored).
-        self._last_delta_link: Optional[str] = None
-        # Tracks which app's token is currently in use for this stream;
-        # migrates on 429 (see _try_migrate_app). Streams stay on the
-        # failover app for the remainder of pagination — re-pinning to
-        # self.client_id every page would defeat the migration.
-        token = await self._get_token()
+        # NOTE: the terminal @odata.deltaLink is deliberately NOT stashed
+        # on self — GraphClients are cached per (tenant, resource_type)
+        # and shared across concurrent jobs, so instance state raced:
+        # user A's task could read user B's cursor and persist it as A's
+        # (silent cross-user data loss). Callers read "@odata.deltaLink"
+        # off the yielded pages instead.
+        #
+        # Minted per page at the loop top, same as _get_legacy: a single
+        # up-front mint dies with a 401 on walks that outlive the ~60-min
+        # token (2026-07-29 archive pilot), and _get_token() caches with a
+        # 5-min-early refresh so a stream can START with only ~5 min of
+        # validity (a USER_CHATS baseline is ~12.5k pages plus Retry-After
+        # sleeps). The per-page consult is free until a refresh is actually
+        # due. Skipped while riding a 429-migrated failover token: streams
+        # stay on the failover app for the remainder of pagination (see
+        # _try_migrate_app) — re-pinning to self.client_id every page would
+        # defeat the migration, hence the app check.
+        token: Optional[str] = None
         current_app_id = self.client_id
+        auth_retried = False  # one forced-refresh retry per page on 401
 
         while next_url:
+            _assert_graph_target(next_url)  # Check 17 SSRF guard
             try:
+                # Inside the try on purpose: a transport error raised while
+                # minting is then caught by the timeout retry below instead
+                # of escaping the pager. (Both merge sides added this guard;
+                # keeping one — a second mint per page is pure overhead.)
+                if current_app_id == self.client_id:
+                    token = await self._get_token()
                 async with self._http_session() as client:
-                    if params and params.get("$count") == "true":
-                        headers = {"Authorization": f"Bearer {token}", "ConsistencyLevel": "eventual"}
+                    if needs_consistency:
+                        req_headers = {"Authorization": f"Bearer {token}", "ConsistencyLevel": "eventual"}
                     else:
-                        headers = {"Authorization": f"Bearer {token}"}
+                        req_headers = {"Authorization": f"Bearer {token}"}
+                    req_headers = self._merge_extra_headers(req_headers, headers)
                     resp = await client.get(
-                        next_url, headers=headers,
-                        params=self._safe_first_page_params(next_url, params),
+                        next_url, headers=req_headers,
+                        params=params,
                     )
                     if resp.status_code == 429:
-                        retry_after = int(resp.headers.get("Retry-After", "30"))
+                        # Clamped — see _post_json (2026-08-12 archive wedge).
+                        retry_after = _parse_retry_after(resp)
                         from shared.multi_app_manager import multi_app_manager
                         multi_app_manager.mark_throttled(current_app_id, retry_after)
                         if retry_count < max_retries:
@@ -751,12 +1055,21 @@ class GraphClient:
                                 current_app_id = new_app
                                 continue
                             print(
-                                f"[GraphClient] 429 on {next_url[:100]} — sleeping {retry_after}s "
+                                f"[GraphClient] 429 on {next_url[:100]} — sleeping {retry_after:.0f}s "
                                 f"(attempt {retry_count}/{max_retries}, no healthy alt-app)"
                             )
                             await asyncio.sleep(retry_after)
                             continue
                         resp.raise_for_status()
+
+                    if resp.status_code == 401 and not auth_retried:
+                        # Token aged out mid-stream (typically a 429-migrated
+                        # token, since unmigrated pages re-mint at the loop
+                        # top): force one fresh mint and retry this page.
+                        auth_retried = True
+                        current_app_id = self.client_id
+                        self._access_token = None
+                        continue
 
                     resp.raise_for_status()
                     # Adaptive circuit-breaker feedback (legacy stream path).
@@ -768,12 +1081,11 @@ class GraphClient:
                         pass
                     data = resp.json()
                     retry_count = 0
-                    yield data
+                    auth_retried = False  # re-arm the 401 retry per page
                     # Graph returns @odata.deltaLink on the FINAL page of a
-                    # delta stream (mutually exclusive with @odata.nextLink).
-                    # Persist it so callers can store and resume next run.
-                    if "@odata.deltaLink" in data:
-                        self._last_delta_link = data["@odata.deltaLink"]
+                    # delta stream (mutually exclusive with @odata.nextLink);
+                    # it rides the yielded page — callers capture it there.
+                    yield data
                     next_url = data.get("@odata.nextLink")
                     params = None  # params only on the first request
 
@@ -791,6 +1103,7 @@ class GraphClient:
 
     async def _iter_pages_hardened(
         self, url: str, params: Optional[Dict] = None,
+        headers: Optional[Dict[str, str]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Policy-paced page iteration with sticky app rotation.
 
@@ -800,9 +1113,12 @@ class GraphClient:
         GRAPH_STICKY_PAGES_BEFORE_RETURN pages; after that window, checks
         is_app_throttled(original) and returns if clean, else stays put.
 
-        Captures @odata.deltaLink on the terminal page into self._last_delta_link
-        so callers that want the cursor (chats / mail / onedrive delta) can
-        read it post-iteration.
+        The terminal @odata.deltaLink rides the yielded page — callers
+        that want the cursor (chats / mail / onedrive delta) capture it
+        from each page. It is deliberately NOT stashed on self:
+        GraphClients are cached per (tenant, resource_type) and shared
+        across concurrent jobs, so instance state raced (one user's task
+        could persist another user's cursor — silent cross-user data loss).
         """
         from shared.config import settings as s
         from shared.multi_app_manager import multi_app_manager
@@ -811,8 +1127,18 @@ class GraphClient:
         original_app = self.client_id
         current_app = original_app
         pages_on_failover = 0
+        needs_consistency = bool(params and params.get("$count") == "true")
         next_url: Optional[str] = url
-        token = await self._get_token()
+        # Minted per page at the loop top — a single up-front mint dies with
+        # a 401 on walks that outlive the ~60-min token (2026-07-29 archive
+        # pilot, same fix as _get_hardened), and _get_token() caches with a
+        # 5-min-early refresh so a stream can START with only ~5 min of
+        # validity (a USER_CHATS baseline is ~12.5k pages plus Retry-After
+        # sleeps). Skipped while riding a 429-migrated alternate-app token,
+        # which _get_token() can't re-mint — re-pinning to self.client_id
+        # every page would defeat the migration.
+        token: Optional[str] = None
+        auth_retried = False  # one forced-refresh retry per page on 401
         # EXPERIMENTAL (GRAPH_ITER_APP_ROTATION): start this stream on a
         # rotated healthy app instead of always self.client_id, so the many
         # concurrent per-folder mail streams of one mailbox spread across the
@@ -822,20 +1148,23 @@ class GraphClient:
             if rot_token and rot_app:
                 token = rot_token
                 current_app = rot_app
-        self._last_delta_link: Optional[str] = None
 
         async with self._http_session() as client:
             while next_url:
+                _assert_graph_target(next_url)  # Check 17 SSRF guard
+                if current_app == original_app:
+                    token = await self._get_token()
                 prio = self._effective_priority()
                 await policy.stream_bucket.acquire(priority=prio)
                 await multi_app_manager.acquire_app_token(
                     current_app, priority=prio
                 )
-                if params and params.get("$count") == "true":
-                    headers = {"Authorization": f"Bearer {token}",
-                               "ConsistencyLevel": "eventual"}
+                if needs_consistency:
+                    req_headers = {"Authorization": f"Bearer {token}",
+                                   "ConsistencyLevel": "eventual"}
                 else:
-                    headers = {"Authorization": f"Bearer {token}"}
+                    req_headers = {"Authorization": f"Bearer {token}"}
+                req_headers = self._merge_extra_headers(req_headers, headers)
                 try:
                     # Per-tenant global limiter (was missing on the paging
                     # path — present on _get_hardened). Prevents many parallel
@@ -843,11 +1172,13 @@ class GraphClient:
                     # tenant-wide RPS ceiling and triggering 429 storms.
                     await graph_rate_limiter.acquire(reason="graph_iter_pages")
                     resp = await client.get(
-                        next_url, headers=headers,
-                        params=self._safe_first_page_params(next_url, params),
+                        next_url, headers=req_headers,
+                        params=params,
                     )
-                except (httpx.ReadTimeout, httpx.ConnectTimeout,
-                        httpx.RemoteProtocolError) as exc:
+                except httpx.TransportError as exc:
+                    # Aligned with _get_hardened: every network-level
+                    # transient, incl. ReadError from a stale keepalive conn
+                    # — not just the timeout/protocol trio.
                     action = policy.decide_transient_error()
                     if action.exhausted:
                         raise GraphRetryExhaustedError(
@@ -856,7 +1187,26 @@ class GraphClient:
                     print(f"[GraphClient/hardened iter] transient "
                           f"{type(exc).__name__}; sleep {action.sleep_seconds:.1f}s")
                     await asyncio.sleep(action.sleep_seconds)
-                    token = await self._get_token()
+                    continue
+
+                if resp.status_code in (502, 504):
+                    # Gateway transients (seen mid-walk on beta endpoints).
+                    # Routed through the TRANSIENT walker, not policy.decide()
+                    # — decide() has no rule for 502/504 and falls through to
+                    # sleep=0/never-exhausts, i.e. an unbounded retry loop.
+                    # The transient walker backs off and honors the cumulative
+                    # cap, so a persistent gateway failure ends as a loud
+                    # GraphRetryExhaustedError the caller can redeliver.
+                    action = policy.decide_transient_error()
+                    if action.exhausted:
+                        raise GraphRetryExhaustedError(
+                            f"transient cap hit on {next_url}: "
+                            f"HTTP {resp.status_code}"
+                        )
+                    print(f"[GraphClient/hardened iter] HTTP "
+                          f"{resp.status_code} on {next_url[:80]}; "
+                          f"sleep {action.sleep_seconds:.1f}s")
+                    await asyncio.sleep(action.sleep_seconds)
                     continue
 
                 if resp.status_code in (429, 503):
@@ -899,8 +1249,19 @@ class GraphClient:
                         )
                     continue
 
+                if resp.status_code == 401 and not auth_retried:
+                    # Token aged out mid-stream (typically a 429-migrated
+                    # token, since unmigrated pages re-mint above): force one
+                    # fresh own-app mint and retry this same page.
+                    auth_retried = True
+                    current_app = original_app
+                    pages_on_failover = 0
+                    self._access_token = None
+                    continue
+
                 resp.raise_for_status()
                 policy.reset_on_success()
+                auth_retried = False  # re-arm the 401 retry for the next page
                 # Adaptive circuit-breaker feedback (hardened stream path).
                 try:
                     _lat_ms = float(resp.elapsed.total_seconds() * 1000) if getattr(resp, "elapsed", None) else 0.0
@@ -914,10 +1275,8 @@ class GraphClient:
 
                 next_url = data.get("@odata.nextLink")
                 params = None
-                if "@odata.deltaLink" in data:
-                    self._last_delta_link = data["@odata.deltaLink"]
-                    if not next_url:
-                        break
+                if "@odata.deltaLink" in data and not next_url:
+                    break
 
                 # Sticky-return check: if on failover for long enough and
                 # the original app has cooled down, switch back.
@@ -943,6 +1302,7 @@ class GraphClient:
 
     async def _post(self, url: str, payload: Dict[str, Any], headers: Optional[Dict] = None) -> Dict[str, Any]:
         """Make authenticated POST request"""
+        _assert_graph_target(url)
         token = await self._get_token()
         async with self._http_session() as client:
             req_headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -954,6 +1314,7 @@ class GraphClient:
 
     async def _put(self, url: str, content: Any, headers: Optional[Dict] = None) -> Dict[str, Any]:
         """Make authenticated PUT request (for file uploads)"""
+        _assert_graph_target(url)
         token = await self._get_token()
         async with self._http_session() as client:
             req_headers = {"Authorization": f"Bearer {token}"}
@@ -971,6 +1332,7 @@ class GraphClient:
 
     async def _patch(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Make authenticated PATCH request"""
+        _assert_graph_target(url)
         token = await self._get_token()
         async with self._http_session() as client:
             req_headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -980,6 +1342,7 @@ class GraphClient:
 
     async def _delete(self, url: str) -> None:
         """Make authenticated DELETE request"""
+        _assert_graph_target(url)
         token = await self._get_token()
         async with self._http_session() as client:
             headers = {"Authorization": f"Bearer {token}"}
@@ -1006,69 +1369,73 @@ class GraphClient:
                     return True
         return False
 
-    async def discover_users(self) -> List[Dict[str, Any]]:
-        """Fetch all users from Entra ID. Skips Guest users and system mailboxes —
-        afi.ai treats these as out-of-scope for backup."""
-        # ``assignedPlans`` is a directory property returned INLINE — adding it
-        # to this one bulk call costs zero extra requests, so we learn every
-        # user's license coverage at onboarding without any per-workload probe.
-        #
-        # $select MUST be embedded in the URL, NOT passed via params: the
-        # hardened pager's _safe_first_page_params DROPS $select for absolute
-        # URLs (keeps only $top), so passing it in params silently made Graph
-        # return just the default field set — no assignedPlans, no department/
-        # userType/etc. — which is why license detection saw nothing. $top is
-        # embedded too; the @odata.nextLink carries both forward on later pages.
-        _user_select = (
-            "id,displayName,mail,userPrincipalName,jobTitle,department,"
-            "accountEnabled,createdDateTime,userType,assignedPlans"
-        )
-        result = await self._get(
-            f"{self.GRAPH_URL}/users?$top=999&$select={_user_select}"
-        )
-        all_value = result.get("value", [])
-        while "@odata.nextLink" in result:
-            result = await self._get(result["@odata.nextLink"])
-            all_value.extend(result.get("value", []))
+    async def discover_users_paged(self) -> AsyncIterator[List[Dict[str, Any]]]:
+        """Stream Entra ID users one Graph page at a time.
 
-        users = []
+        Yields a list of normalized ENTRA_USER resource dicts per Graph page so
+        a caller (the discovery worker) can stage each page separately and never
+        materialize all ~10k+ users at once. Skips Guest users and system
+        mailboxes — afi.ai treats these as out-of-scope for backup. This is the
+        single source of truth for user normalization; ``discover_users``
+        delegates to it.
+        """
         skipped_guest = 0
         skipped_system = 0
-        for u in all_value:
-            user_type = (u.get("userType") or "").lower()
-            display_name = u.get("displayName") or u.get("mail") or u.get("userPrincipalName") or "Unknown"
-            upn = u.get("userPrincipalName")
-            if user_type == "guest":
-                skipped_guest += 1
-                continue
-            if self._is_system_mailbox(display_name, upn):
-                skipped_system += 1
-                continue
-            is_enabled = u.get("accountEnabled", True)
-            # License coverage from assignedPlans — computed here, inline, at
-            # onboarding. Downstream (tier-2 discovery) uses it to mark a
-            # workload license_missing and SKIP its Graph probe.
-            from shared.licensing import derive_licensed_services
-            licensed_services = derive_licensed_services(u.get("assignedPlans"))
-            users.append({
-                "external_id": u.get("id"),
-                "display_name": display_name,
-                "email": u.get("mail") or upn,
-                "type": "ENTRA_USER",
-                "metadata": {
-                    "user_principal_name": upn,
-                    "job_title": u.get("jobTitle"),
-                    "department": u.get("department"),
-                    "account_enabled": is_enabled,
-                    "user_type": u.get("userType"),
-                    "created_at": u.get("createdDateTime"),
-                    "licensed_services": licensed_services,
-                },
-                "_account_enabled": is_enabled,  # For discovery worker to filter
-            })
+        async for result in self._iter_pages(
+            f"{self.GRAPH_URL}/users",
+            params={
+                "$top": "999",
+                "$count": "true",
+                "$select": "id,displayName,mail,userPrincipalName,jobTitle,department,accountEnabled,createdDateTime,userType,assignedPlans",
+            },
+        ):
+            batch = []
+            for u in result.get("value", []):
+                user_type = (u.get("userType") or "").lower()
+                display_name = u.get("displayName") or u.get("mail") or u.get("userPrincipalName") or "Unknown"
+                upn = u.get("userPrincipalName")
+                if user_type == "guest":
+                    skipped_guest += 1
+                    continue
+                if self._is_system_mailbox(display_name, upn):
+                    skipped_system += 1
+                    continue
+                is_enabled = u.get("accountEnabled", True)
+                from shared.licensing import derive_licensed_services
+                licensed_services = derive_licensed_services(u.get("assignedPlans"))
+                batch.append({
+                    "external_id": u.get("id"),
+                    "display_name": display_name,
+                    "email": u.get("mail") or upn,
+                    "type": "ENTRA_USER",
+                    "metadata": {
+                        "user_principal_name": upn,
+                        "job_title": u.get("jobTitle"),
+                        "department": u.get("department"),
+                        "account_enabled": is_enabled,
+                        "user_type": u.get("userType"),
+                        "created_at": u.get("createdDateTime"),
+                        "licensed_services": licensed_services,
+                    },
+                    # Informational only: discovery stages every listed
+                    # account DISCOVERED regardless of accountEnabled.
+                    "_account_enabled": is_enabled,
+                })
+            yield batch
         if skipped_guest or skipped_system:
             print(f"[GraphClient] discover_users: skipped {skipped_guest} guest(s), {skipped_system} system account(s)")
-        return users
+
+
+    async def discover_users(self) -> List[Dict[str, Any]]:
+        """Fetch all users from Entra ID. Skips Guest users and system mailboxes —
+        afi.ai treats these as out-of-scope for backup.
+
+        Thin wrapper over ``discover_users_paged`` — flattens every page into one
+        list so existing list-callers keep working unchanged."""
+        out: List[Dict[str, Any]] = []
+        async for batch in self.discover_users_paged():
+            out.extend(batch)
+        return out
     
     @staticmethod
     def _classify_group(g: Dict[str, Any]) -> str:
@@ -1165,135 +1532,201 @@ class GraphClient:
     #   3. Build resource records based on userPurpose value
     # ------------------------------------------------------------------
 
-    async def discover_mailboxes(self, kinds: Optional[set] = None) -> List[Dict[str, Any]]:
-        """
-        Discover all mailboxes by enriching users with userPurpose.
+    async def discover_mailboxes_paged(self, kinds: Optional[set] = None) -> AsyncIterator[List[Dict[str, Any]]]:
+        """Stream mailboxes one Graph users-page at a time.
+
+        Same enrichment as ``discover_mailboxes`` (userPurpose → resource type,
+        with a /messages probe fallback) but the per-user mailboxSettings/messages
+        round-trips happen INSIDE the generator, scoped to the current users page.
+        That bounds worker memory to one Graph page of users — the largest tenant
+        never materializes all ~10k users (or their mailbox probes) at once.
 
         userPurpose → resource type mapping:
           "user"      → MAILBOX
           "shared"    → SHARED_MAILBOX
           "room"      → ROOM_MAILBOX
           "equipment" → ROOM_MAILBOX
-          None/other  → skipped (no mailbox)
+          missing/None/other (on a 200) → MAILBOX (the 200 proves a mailbox
+                                          exists even when userPurpose is absent)
+
+        Classification per user (driven by the mailboxSettings batch status):
+          200 → mailbox exists; map userPurpose (default MAILBOX). No probe.
+          404 → no mailbox → skip. No probe (this drops the redundant second
+                404 the old per-user /messages fallback used to pay).
+          403/401 → cannot read mailboxSettings (likely missing
+                MailboxSettings.Read.All) → AMBIGUOUS → /messages fallback.
+          429 → throttled even after the batch helper exhausted its internal
+                retries → could-not-determine → /messages fallback (so a
+                transient throttle never silently drops a real mailbox).
+          500/502/503/504 → transient server/gateway errors → /messages
+                fallback (stale-mark safety: transient errors must not drop
+                real mailboxes from the discovered set).
+          other → skip (counted, not probed).
+
+        The /messages fallback is itself batched and only covers the ambiguous
+        403/401/429/5xx users: a 200 with a non-empty `value` proves the mailbox
+        is reachable → emit as MAILBOX with mailbox_purpose="probed".
 
         `kinds`, if supplied, restricts the result to those resource type
         strings — e.g. {"SHARED_MAILBOX","ROOM_MAILBOX"} for Tier 1, which
         excludes per-user MAILBOX rows (those are emitted as USER_MAIL Tier 2
-        children later, on demand).
+        children later, on demand). This is the single source of truth for
+        mailbox normalization; ``discover_mailboxes`` delegates to it.
         """
-        # Step 1: Fetch all users (no $filter — get everyone). Add userType so we
-        # can drop guests; afi.ai never backs up guest mailboxes (they live in their
-        # home tenant).
-        users_result = await self._get(
+        from shared.graph_batch import BatchRequest
+
+        # Step 1: Fetch users a page at a time (no $filter — get everyone). Add
+        # userType so we can drop guests; afi.ai never backs up guest mailboxes
+        # (they live in their home tenant).
+
+        def _make_resource(user: Dict[str, Any], rtype: str, purpose: Optional[str]) -> Dict[str, Any]:
+            email = user.get("mail")
+            return {
+                "external_id": user.get("id"),
+                "display_name": user.get("displayName", email),
+                "email": email,
+                "type": rtype,
+                "metadata": {
+                    "user_principal_name": user.get("userPrincipalName"),
+                    "job_title": user.get("jobTitle"),
+                    "department": user.get("department"),
+                    "account_enabled": user.get("accountEnabled", True),
+                    "created_at": user.get("createdDateTime"),
+                    "mailbox_purpose": purpose,
+                },
+                # Informational only: discovery stages every listed mailbox
+                # DISCOVERED regardless of accountEnabled (rooms/shared are
+                # account-disabled by design).
+                "_account_enabled": user.get("accountEnabled", True),
+            }
+
+        def _rtype_from_purpose(purpose: Optional[str]) -> str:
+            if purpose == "shared":
+                return "SHARED_MAILBOX"
+            if purpose in ("room", "equipment"):
+                return "ROOM_MAILBOX"
+            # "user", missing, None, or anything else on a confirmed-200 mailbox.
+            return "MAILBOX"
+
+        skipped_guest = 0
+        skipped_system = 0
+        skipped_no_mail = 0
+        skipped_404 = 0
+        skipped_other = 0
+        throttled_count = 0
+        transient_5xx_count = 0
+        total_found = 0
+        total_probed = 0
+        async for users_result in self._iter_pages(
             f"{self.GRAPH_URL}/users",
             params={"$top": "999", "$count": "true",
                     "$select": "id,displayName,mail,userPrincipalName,jobTitle,department,accountEnabled,createdDateTime,userType"},
-        )
-        all_users_raw = users_result.get("value", [])
-        while "@odata.nextLink" in users_result:
-            users_result = await self._get(users_result["@odata.nextLink"])
-            all_users_raw.extend(users_result.get("value", []))
-        # Drop guests + system mailboxes BEFORE the per-user mailboxSettings round-trip
-        # to avoid wasted API calls on tenant infrastructure accounts.
-        all_users = []
-        skipped_guest = 0
-        skipped_system = 0
-        for u in all_users_raw:
-            if (u.get("userType") or "").lower() == "guest":
-                skipped_guest += 1
-                continue
-            if self._is_system_mailbox(u.get("displayName"), u.get("userPrincipalName")):
-                skipped_system += 1
-                continue
-            all_users.append(u)
-        if skipped_guest or skipped_system:
-            print(f"[GraphClient] discover_mailboxes: skipped {skipped_guest} guest(s), {skipped_system} system account(s) before enrichment")
-        mailboxes = []
-
-        # Step 2: Enrich each user with userPurpose
-        semaphore = asyncio.Semaphore(10)
-
-        async def _enrich_one_user(user: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-            async with semaphore:
-                email = user.get("mail")
-                if not email:
-                    return None
-
-                # Try mailboxSettings.userPurpose first — gives us the precise
-                # mailbox type (user / shared / room / equipment). Common cause
-                # of failure: app lacks MailboxSettings.Read.All. We fall back
-                # to a /messages probe in that case so a missing scope doesn't
-                # silently drop every mailbox in the tenant.
-                purpose: Optional[str] = None
-                try:
-                    result = await self._get(
-                        f"{self.GRAPH_URL}/users/{user['id']}/mailboxSettings",
-                        params={"$select": "userPurpose"},
-                    )
-                    purpose = result.get("userPurpose") if result else None
-                except Exception:
-                    purpose = None
-
-                if purpose == "user":
-                    rtype = "MAILBOX"
-                elif purpose == "shared":
-                    rtype = "SHARED_MAILBOX"
-                elif purpose in ("room", "equipment"):
-                    rtype = "ROOM_MAILBOX"
-                else:
-                    # Fallback: probe /messages directly. This is the actual
-                    # endpoint backup_mailbox uses, so success here proves the
-                    # mailbox is backup-able regardless of the userPurpose
-                    # field's accessibility. Cost: one extra HEAD-style GET
-                    # per user-without-purpose, which is acceptable for the
-                    # ~1x/discovery-cycle frequency.
-                    try:
-                        probe = await self._get(
-                            f"{self.GRAPH_URL}/users/{user['id']}/messages",
-                            params={"$top": "1", "$select": "id"},
-                        )
-                        if probe and "value" in probe:
-                            # Mailbox reachable. Without userPurpose we can't
-                            # distinguish user vs shared vs room — assume MAILBOX
-                            # (user) since that's the dominant case. UI can let
-                            # users reclassify as needed.
-                            rtype = "MAILBOX"
-                            purpose = "user (probed)"
-                        else:
-                            return None
-                    except Exception:
-                        return None  # truly no mailbox
-
-                print(f"[GraphClient] {email} → userPurpose={purpose} → {rtype}")
-
-                return {
-                    "external_id": user.get("id"),
-                    "display_name": user.get("displayName", email),
-                    "email": email,
-                    "type": rtype,
-                    "metadata": {
-                        "user_principal_name": user.get("userPrincipalName"),
-                        "job_title": user.get("jobTitle"),
-                        "department": user.get("department"),
-                        "account_enabled": user.get("accountEnabled", True),
-                        "created_at": user.get("createdDateTime"),
-                        "mailbox_purpose": purpose,
-                    },
-                    "_account_enabled": user.get("accountEnabled", True),  # For discovery worker
-                }
-
-        tasks = [_enrich_one_user(u) for u in all_users]
-        results = await asyncio.gather(*tasks, return_exceptions=False)
-
-        for r in results:
-            if r:
-                if kinds and r["type"] not in kinds:
+        ):
+            # Drop guests + system mailboxes BEFORE building any batch request so
+            # we never pay a round-trip on tenant infrastructure accounts.
+            page_users: List[Dict[str, Any]] = []
+            for u in users_result.get("value", []):
+                if (u.get("userType") or "").lower() == "guest":
+                    skipped_guest += 1
                     continue
-                mailboxes.append(r)
+                if self._is_system_mailbox(u.get("displayName"), u.get("userPrincipalName")):
+                    skipped_system += 1
+                    continue
+                if not u.get("mail"):
+                    # No mail field — same as the old behavior (returned None,
+                    # never emitted). Don't build a batch request for it.
+                    skipped_no_mail += 1
+                    continue
+                page_users.append(u)
 
-        print(f"[GraphClient] discover_mailboxes: found {len(mailboxes)} mailboxes "
-              f"({[m['type'] for m in mailboxes]})")
-        return mailboxes
+            by_id: Dict[str, Dict[str, Any]] = {u["id"]: u for u in page_users}
+
+            page_results: List[Dict[str, Any]] = []
+            page_probed = 0
+
+            if page_users:
+                # --- Primary: one batched mailboxSettings GET per page-user. ---
+                settings_reqs = [
+                    BatchRequest(
+                        id=u["id"], method="GET",
+                        url=f"/users/{u['id']}/mailboxSettings?$select=userPurpose",
+                    )
+                    for u in page_users
+                ]
+                settings_resp = await self.batch(settings_reqs)
+
+                fallback_ids: List[str] = []
+                for uid, user in by_id.items():
+                    resp = settings_resp.get(uid)
+                    status = resp.status if resp is not None else None
+                    if status == 200:
+                        purpose = (resp.body or {}).get("userPurpose")
+                        rtype = _rtype_from_purpose(purpose)
+                        res = _make_resource(user, rtype, purpose)
+                        if not (kinds and res["type"] not in kinds):
+                            page_results.append(res)
+                    elif status == 404:
+                        skipped_404 += 1
+                    elif status in (401, 403):
+                        fallback_ids.append(uid)
+                    elif status == 429:
+                        throttled_count += 1
+                        fallback_ids.append(uid)
+                    elif status in (500, 502, 503, 504):
+                        # Transient server/gateway error — route to /messages
+                        # fallback instead of dropping silently (stale-mark
+                        # safety: a transient 5xx must not drop a real mailbox).
+                        transient_5xx_count += 1
+                        fallback_ids.append(uid)
+                    else:
+                        skipped_other += 1
+
+                # --- Fallback: batched /messages existence probe for the
+                # ambiguous 401/403/429/5xx users. NO $top (validator rejects
+                # it) — the default page is enough to test existence. ---
+                if fallback_ids:
+                    probe_reqs = [
+                        BatchRequest(
+                            id=uid, method="GET",
+                            url=f"/users/{uid}/messages?$select=id",
+                        )
+                        for uid in fallback_ids
+                    ]
+                    probe_resp = await self.batch(probe_reqs)
+                    for uid in fallback_ids:
+                        resp = probe_resp.get(uid)
+                        if resp is not None and resp.status == 200 and (resp.body or {}).get("value"):
+                            page_probed += 1
+                            res = _make_resource(by_id[uid], "MAILBOX", "probed")
+                            if not (kinds and res["type"] not in kinds):
+                                page_results.append(res)
+                        # else: no mailbox / still unreadable → skip.
+
+            total_found += len(page_results)
+            total_probed += page_probed
+            yield page_results
+
+        print(
+            f"[GraphClient] discover_mailboxes: emitted {total_found} "
+            f"(fallback-probed {total_probed}); skipped "
+            f"guest={skipped_guest} system={skipped_system} no_mail={skipped_no_mail} "
+            f"no_mailbox(404)={skipped_404} other={skipped_other} "
+            f"throttled={throttled_count} transient_5xx={transient_5xx_count}"
+        )
+
+    async def discover_mailboxes(self, kinds: Optional[set] = None) -> List[Dict[str, Any]]:
+        """
+        Discover all mailboxes by enriching users with userPurpose.
+
+        Thin wrapper over ``discover_mailboxes_paged`` — flattens every page into
+        one list so existing list-callers keep working unchanged. See
+        ``discover_mailboxes_paged`` for the userPurpose → resource type mapping
+        and the `kinds` filter semantics.
+        """
+        out: List[Dict[str, Any]] = []
+        async for batch in self.discover_mailboxes_paged(kinds=kinds):
+            out.extend(batch)
+        return out
 
     async def discover_onedrive(self) -> List[Dict[str, Any]]:
         """Discover OneDrive sites for all users in parallel (bounded by Semaphore(10)).
@@ -1387,9 +1820,29 @@ class GraphClient:
             "Authorization": f"Bearer {token}",
             "Accept": "application/json;odata=nometadata",
         }
+        # SPO admin API throttles aggressively when the tenant's app is
+        # already busy (e.g. a OneDrive walk in flight). A 429 on page
+        # N>1 used to abort the whole scope — observed on the very run
+        # cert auth first worked (2026-07-14: page 1 → 200 OK, page 2 →
+        # 429 → "Scoped discovery 'sharepoint' failed"). Honor
+        # Retry-After with a bounded wait budget per run.
+        throttle_budget = int(os.getenv("SHAREPOINT_SITES_429_RETRIES", "8"))
         async with self._http_session() as client:
             while next_url:
+                _assert_graph_target(next_url)  # Check 17 SSRF guard
                 resp = await client.get(next_url, headers=headers)
+                if resp.status_code in (429, 503) and throttle_budget > 0:
+                    throttle_budget -= 1
+                    wait_s = min(
+                        float(resp.headers.get("Retry-After") or 30), 300.0
+                    )
+                    print(
+                        f"[GraphClient] SharePoint sites page throttled "
+                        f"({resp.status_code}); waiting {wait_s:.0f}s "
+                        f"({throttle_budget} retries left)"
+                    )
+                    await asyncio.sleep(wait_s)
+                    continue
                 if resp.status_code in (401, 403):
                     raise RuntimeError(
                         f"SharePoint admin API rejected the cert-signed token ({resp.status_code}): "
@@ -1578,7 +2031,10 @@ class GraphClient:
                     async with _chat_semaphore:
                         chats_result = await self._get(
                             f"{self.GRAPH_URL}/users/{user_id}/chats",
-                            params={"$top": "999"}
+                            # Graph caps $top at 50 on /chats — anything
+                            # higher is a 400. Pagination below still
+                            # enumerates everything via @odata.nextLink.
+                            params={"$top": "50"}
                         )
                     user_chats_raw.extend(chats_result.get("value", []))
 
@@ -2041,6 +2497,7 @@ class GraphClient:
         user_principal_name: Optional[str] = None,
         user_display_name: Optional[str] = None,
         licensed_services: Optional[Dict[str, bool]] = None,
+        include_archive: bool = True,
     ) -> List[Dict[str, Any]]:
         """Discover the five fixed content categories for one Entra user.
 
@@ -2076,7 +2533,12 @@ class GraphClient:
         # or `httpx.ConnectError`. Permanent errors (404/403/423) carry
         # license / consent meaning and must NOT be retried — they
         # produce a stable INACCESSIBLE marker row instead.
-        _PERMANENT_STATUSES = ("400", "401", "403", "404", "410", "423")
+        # 400 is deliberately NOT permanent: it means WE sent a malformed
+        # request (e.g. the $top=999 /chats regression), not that the user
+        # lacks a license. It falls through to the discovery_pending marker
+        # so the row self-heals on the next successful discovery instead of
+        # being stamped license_missing forever.
+        _PERMANENT_STATUSES = ("401", "403", "404", "410", "423")
         _TRANSIENT_STATUSES = ("500", "502", "503", "504")
 
         def _classify(err_msg: str) -> str:
@@ -2361,7 +2823,7 @@ class GraphClient:
         ]
         # Archive is additive and flag-gated: when off, no extra Graph call is
         # made and no USER_ARCHIVE row is emitted (zero prod exposure).
-        if archive_graph.ARCHIVE_BACKUP_ENABLED:
+        if include_archive and archive_graph.ARCHIVE_BACKUP_ENABLED:
             probes.append(_archive())
         results = await asyncio.gather(*probes)
         return [r for r in results if r]
@@ -2403,6 +2865,28 @@ class GraphClient:
                 },
             })
         return rows
+
+    async def get_exchange_settings(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """Probe a user's Exchange settings for an in-place Online Archive
+        (Task 1.2, USER_ARCHIVE pilot — docs/superpowers/plans/2026-07-20-
+        online-archive-backup.md doc §1).
+
+        GET /{ARCHIVE_GRAPH_VERSION}/users/{id}/settings/exchange. The
+        version segment MUST come from settings.ARCHIVE_GRAPH_VERSION
+        (default "beta") — never hardcode "beta" — so GA is a config flip.
+        Returns None on 404 (no archive / not licensed for Exchange
+        Online). Any other error (429/5xx/etc.) propagates so the caller
+        (ensure_tier2_children) can decide to skip quietly this run
+        rather than create-then-orphan a child.
+        """
+        from shared.config import settings as _s
+        url = f"https://graph.microsoft.com/{_s.ARCHIVE_GRAPH_VERSION}/users/{user_id}/settings/exchange"
+        try:
+            return await self._get(url)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return None
+            raise
 
     async def get_conditional_access_policy(self, policy_id: str) -> Optional[Dict[str, Any]]:
         """Re-fetch a single CA policy by ID — used by the backup handler when
@@ -2506,13 +2990,24 @@ class GraphClient:
         """
         # Convert slashes to commas for Graph API
         graph_site_id = site_id.replace("/", ",")
-        url = f"{self.GRAPH_URL}/sites/{graph_site_id}/drive/root/delta"
-        if delta_token:
-            url = delta_token
-
+        bare_url = f"{self.GRAPH_URL}/sites/{graph_site_id}/drive/root/delta"
+        url = bare_url
         # No $select or $expand — delta endpoint ignores them
         params = {"$top": "999"}
-        result = await self._get(url, params=params)
+        if delta_token:
+            # Verbatim resume — httpx>=0.28 REPLACES the query when params
+            # is passed, stripping token=… (ITO-10277).
+            url = delta_token
+            params = None
+        try:
+            result = await self._get(url, params=params)
+        except Exception as e:
+            # One-shot resync on an expired token (410 resyncRequired) — the
+            # _backup_files_parallel caller keeps the stored token on failure.
+            if not (delta_token and _is_resync_gone(e)):
+                raise
+            url, params = bare_url, {"$top": "999"}
+            result = await self._get(url, params=params)
         all_value = result.get("value", [])
 
         # Follow pagination
@@ -2545,9 +3040,12 @@ class GraphClient:
         """
         graph_site_id = site_id.replace("/", ",")
         url = f"{self.GRAPH_URL}/sites/{graph_site_id}/drive/root/delta"
-        if delta_token:
-            url = delta_token
         params = {"$top": "999"}
+        if delta_token:
+            # Verbatim resume — httpx>=0.28 REPLACES the query when params
+            # is passed, stripping token=… (ITO-10277).
+            url = delta_token
+            params = None
         while url:
             page = await self._get(url, params=params)
             params = None
@@ -2580,6 +3078,49 @@ class GraphClient:
             url = page.get("@odata.nextLink")
         return out
 
+    async def get_drive_item_by_path(
+        self, drive_id: str, drive_path: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch a driveItem by its path within a drive. Returns None on
+        404. Used to recover the created item when a streaming
+        uploadSession's final chunk resolves ambiguously (committed
+        server-side but the session already finalized), so ACL replay
+        still gets a real driveItem (ITO-10282)."""
+        from urllib.parse import quote as _qseg
+        quoted = "/".join(
+            _qseg(seg, safe="") for seg in drive_path.split("/") if seg
+        )
+        try:
+            return await self._get(
+                f"{self.GRAPH_URL}/drives/{drive_id}/root:/{quoted}"
+            )
+        except Exception as exc:
+            # Same discipline as _is_resync_gone: match the status code /
+            # Graph error code, never a bare "404" substring (URLs and
+            # ids in messages routinely contain 404).
+            if getattr(getattr(exc, "response", None), "status_code", 0) == 404:
+                return None
+            if "itemnotfound" in str(exc).lower():
+                return None
+            raise
+
+    async def get_sharepoint_site_default_drive_id(self, site_id: str) -> str:
+        """Resolve a site's default document library to its Graph drive id.
+
+        The SharePoint restore path's simple PUT targets
+        ``/sites/{id}/drive/root:`` and lets Graph resolve the default
+        drive implicitly, but ``createUploadSession`` (the streaming
+        large-file path, ITO-10282) needs the explicit ``/drives/{id}``
+        form — so resolve the same default drive up front."""
+        graph_site_id = site_id.replace("/", ",")
+        drive = await self._get(f"{self.GRAPH_URL}/sites/{graph_site_id}/drive")
+        drive_id = (drive or {}).get("id")
+        if not drive_id:
+            raise RuntimeError(
+                f"site {site_id} returned no default drive id"
+            )
+        return drive_id
+
     async def iter_drive_items_by_id(
         self,
         drive_id: str,
@@ -2590,12 +3131,32 @@ class GraphClient:
         ``iter_sharepoint_site_drive_items`` but targets ``/drives/{id}``
         directly so multi-library SharePoint sites can walk each drive
         independently."""
-        url = f"{self.GRAPH_URL}/drives/{drive_id}/root/delta"
-        if delta_token:
-            url = delta_token
+        bare_url = f"{self.GRAPH_URL}/drives/{drive_id}/root/delta"
+        url = bare_url
         params = {"$top": "999"}
+        if delta_token:
+            # Resume the deltaLink VERBATIM. httpx>=0.28 REPLACES the URL
+            # query when params is passed — sending $top here stripped
+            # token=… and silently turned every incremental into a full
+            # re-walk + full re-transfer (ITO-10277, ~41.5GB/night on
+            # IT OPS NOTES).
+            url = delta_token
+            params = None
+        # ONE re-bootstrap per walk: with tokens actually reaching Graph
+        # again, an expired one answers 410 resyncRequired — uncaught that
+        # PARTIALs the walk and the held cursor retries the same dead token
+        # every run. Mirrors the mail/OneDrive resync arms.
+        resynced = False
         while url:
-            page = await self._get(url, params=params)
+            try:
+                page = await self._get(url, params=params)
+            except Exception as e:
+                if _is_resync_gone(e) and delta_token and not resynced:
+                    resynced = True
+                    url = bare_url
+                    params = {"$top": "999"}
+                    continue
+                raise
             params = None
             for item in (page.get("value") or []):
                 # Tag with drive id so the backup-worker's file-row
@@ -3020,6 +3581,7 @@ class GraphClient:
         }
 
         async with self._http_session() as client:
+            _assert_graph_target(url)  # Check 17 SSRF guard
             resp = await client.get(url, headers=headers, params=params)
             if resp.status_code == 403 or resp.status_code == 401:
                 print(f"[GraphClient] SP REST denied for {site_web_url} (status={resp.status_code}); is AllSites.Read granted on THIS app registration?")
@@ -3135,6 +3697,7 @@ class GraphClient:
         backoff = 1.0  # seconds; doubled per consecutive transient failure
         async with self._http_session() as client:
             while next_url:
+                _assert_graph_target(next_url)  # Check 17 SSRF guard
                 try:
                     resp = await client.get(
                         next_url,
@@ -3180,6 +3743,7 @@ class GraphClient:
             "Accept": "application/json;odata=nometadata",
         }
         async with self._http_session() as client:
+            _assert_graph_target(url)  # Check 17 SSRF guard
             resp = await client.get(url, headers=headers)
             if resp.status_code >= 400:
                 return None
@@ -3200,6 +3764,7 @@ class GraphClient:
         safe_path = server_relative_url.replace("'", "''")
         url = f"{site_web_url.rstrip('/')}/_api/web/GetFileByServerRelativeUrl('{safe_path}')/$value"
         async with self._http_session() as client:
+            _assert_graph_target(url)  # Check 17 SSRF guard
             resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
             resp.raise_for_status()
             return resp.content
@@ -3252,12 +3817,14 @@ class GraphClient:
         """
         graph_site_id = site_id.replace("/", ",")
         url = f"{self.GRAPH_URL}/sites/{graph_site_id}/lists/{list_id}/items/delta"
-        if delta_token:
-            url = delta_token
-
         # Expand both fields (list-row columns) AND driveItem so library
         # items come back with the drive/item id needed to download bytes.
         params = {"$expand": "fields,driveItem", "$top": "999"}
+        if delta_token:
+            # Verbatim resume — httpx>=0.28 REPLACES the query when params
+            # is passed, stripping token=… (ITO-10277).
+            url = delta_token
+            params = None
         result = await self._get(url, params=params)
         all_value = result.get("value", [])
 
@@ -3269,17 +3836,6 @@ class GraphClient:
 
         result["value"] = all_value
         return result
-
-    async def download_drive_item_bytes(self, drive_id: str, item_id: str) -> bytes:
-        """Stream a SharePoint/OneDrive driveItem's content as raw bytes.
-        Graph API: GET /drives/{drive-id}/items/{item-id}/content
-        """
-        token = await self._get_token()
-        url = f"{self.GRAPH_URL}/drives/{drive_id}/items/{item_id}/content"
-        async with self._http_session() as client:
-            resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
-            resp.raise_for_status()
-            return resp.content
 
     async def get_site_permissions(self, site_id: str) -> Dict[str, Any]:
         """
@@ -3317,7 +3873,7 @@ class GraphClient:
         url = delta_token or base
 
         # $top=50 is Graph's max for channel messages — $top>50 returns 400.
-        params = {"$top": "50"}
+        params = None if delta_token else {"$top": "50"}
         try:
             result = await self._get(url, params=params)
         except httpx.HTTPStatusError as e:
@@ -3329,7 +3885,7 @@ class GraphClient:
                     f"[GraphClient] channel delta token expired "
                     f"({e.response.status_code}) — full resync {channel_id[:12]}"
                 )
-                result = await self._get(base, params=params)
+                result = await self._get(base, params={"$top": "50"})
             else:
                 raise
         all_value = result.get("value", [])
@@ -3350,7 +3906,7 @@ class GraphClient:
         """
         return await self._get(
             f"{self.GRAPH_URL}/teams/{team_id}/channels/{channel_id}/messages/{message_id}/replies",
-            params={"$top": "999"}
+            params={"$top": "50"}  # chatMessage cap; higher 400s
         )
 
     async def get_teams_chats(self, delta_token: str = None) -> Dict[str, Any]:
@@ -3363,11 +3919,14 @@ class GraphClient:
 
         Kept API-compatible: callers may still pass delta_token from a previous
         nextLink response and it'll be used verbatim."""
+        params = {"$top": "999", "$expand": "members,permission"}
         if delta_token:
+            # Verbatim resume — httpx>=0.28 REPLACES the query when params
+            # is passed (ITO-10277).
             url = delta_token
+            params = None
         else:
             url = f"{self.GRAPH_URL}/chats"
-        params = {"$top": "999", "$expand": "members,permission"}
         result = await self._get(url, params=params)
         all_value = result.get("value", [])
 
@@ -3449,7 +4008,7 @@ class GraphClient:
         Graph API: GET /chats/{chat-id}/messages
         """
         url = f"{self.GRAPH_URL}/chats/{chat_id}/messages"
-        params = {"$top": "999"}
+        params = {"$top": "50"}  # chatMessage cap; higher 400s
         result = await self._get(url, params=params)
         all_value = result.get("value", [])
 
@@ -3462,7 +4021,12 @@ class GraphClient:
         result["value"] = all_value
         return result
 
-    async def count_chat_messages(self, chat_id: str) -> Optional[int]:
+    async def count_chat_messages(
+        self,
+        chat_id: str,
+        max_pages: Optional[int] = None,
+        stats: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
         """Return Graph's authoritative message count for a chat thread.
 
         Used by the audit-service's nightly integrity verifier (plan P4)
@@ -3471,22 +4035,56 @@ class GraphClient:
         the call (permission, 404, throttle) so the caller skips.
 
         Graph's chat-messages endpoint does NOT support `$count=true`, so
-        we paginate and tally. With `$top=999` this is typically 1-3
-        round trips per chat — acceptable for a once-a-day sweep.
+        we paginate and tally. `$top` is capped at 50 for chatMessage
+        collections (higher 400s) — which is ~20x the pages the old (400ing)
+        `$top=999` would have needed, so a busy chat is NOT "a handful of
+        round trips": a 100k-message chat is 2,000 requests.
+
+        `max_pages` bounds those round trips. A truncated walk returns
+        **None** — an unknown count, never a partial that a caller could
+        compare against a DB count and false-flag as a gap. Pass a dict as
+        `stats` to opt into the detail:
+
+            pages          requests actually spent (charge your run budget)
+            capped         True when max_pages truncated the walk
+            partial_total  messages seen so far — a LOWER BOUND on the real
+                           total, which can prove a gap but never disprove one
+            error          exception class name when Graph refused
+
+        Bounded by tests/shared/test_chat_count_page_budget.py.
         """
+        pages = 0
+        total = 0
+        capped = False
+        if stats is not None:
+            stats.update({"pages": 0, "capped": False, "partial_total": 0})
         try:
             url = f"{self.GRAPH_URL}/chats/{chat_id}/messages"
-            params = {"$top": "999"}
-            total = 0
+            params = {"$top": "50"}
             result = await self._get(url, params=params)
+            pages += 1
             total += len(result.get("value", []) or [])
             while "@odata.nextLink" in result:
+                if max_pages is not None and pages >= max_pages:
+                    capped = True
+                    break
                 next_url = result["@odata.nextLink"]
                 result = await self._get(next_url)
+                pages += 1
                 total += len(result.get("value", []) or [])
-            return total
-        except Exception:
+            return None if capped else total
+        except Exception as exc:
+            if stats is not None:
+                stats["error"] = type(exc).__name__
             return None
+        finally:
+            if stats is not None:
+                # pages is what the caller's budget is charged, even on the
+                # error path: a tenant that 403s every chat still costs one
+                # request per chat.
+                stats["pages"] = max(pages, 1)
+                stats["capped"] = capped
+                stats["partial_total"] = total
 
     async def get_group_profile(self, group_id: str) -> Dict[str, Any]:
         """
@@ -3692,9 +4290,12 @@ class GraphClient:
         every realistic retention need without paginating the full multi-decade
         history of recurring meetings."""
         if delta_token:
-            # delta token contains the full next URL including the preserved window
+            # delta token contains the full next URL including the preserved
+            # window. Resume VERBATIM: httpx>=0.28 REPLACES the query when
+            # params is passed — $top here stripped BOTH token=… and the
+            # startDateTime/endDateTime bounds (ITO-10277).
             url = delta_token
-            params = {"$top": "999"}
+            params = None
         else:
             url = f"{self.GRAPH_URL}/users/{user_id}/calendarView/delta"
             now = datetime.utcnow()
@@ -4373,9 +4974,10 @@ class GraphClient:
         """Stream the bytes of a resolved driveItem via its
         @microsoft.graph.downloadUrl. Range-resumes on transport drops.
 
-        Pass `source_url_for_cache` if you'd like a permanent-4xx
-        result to be added to the worker-lifetime unreachable cache
-        (so a subsequent reference to the same source URL fails fast).
+        Pass `source_url_for_cache` (the share URL this driveItem came
+        from) so an expired pre-signed downloadUrl can be re-resolved for
+        a fresh one instead of losing the bytes. It is never marked
+        unreachable from here — see _stream_download_url.
         """
         download_url = drive_item.get("@microsoft.graph.downloadUrl")
         if not download_url:
@@ -4422,15 +5024,45 @@ class GraphClient:
         source_url_for_cache: Optional[str] = None,
     ) -> Optional[bytes]:
         """Internal: stream a (resolved) download URL with Range-resume.
-        Caches permanent 4xx into the unreachable-URL cache when
-        source_url_for_cache is provided."""
+
+        Never writes to the unreachable-URL cache: a status from the CDN
+        describes the pre-signed downloadUrl, not the source share. On a
+        401/403 (expired signature) it re-resolves source_url_for_cache for
+        a fresh URL, bounded by SHARED_URL_DOWNLOADURL_MAX_REFRESHES."""
         max_resumes = int(os.getenv("SHARED_URL_STREAM_MAX_RESUMES", "6"))
+        max_url_refreshes = int(
+            os.getenv("SHARED_URL_DOWNLOADURL_MAX_REFRESHES", "2")
+        )
+        url_refreshes = 0
+        refresh_pending = False
         label = (source_url_for_cache or download_url)[:60]
         buf = bytearray()
         resume_attempt = 0
         try:
             async with self._http_session() as client:
                 while True:
+                    if refresh_pending:
+                        # Re-resolve the share for a new pre-signed URL. Done
+                        # OUTSIDE the stream ctx so we're not holding a CDN
+                        # connection open across a Graph round-trip.
+                        refresh_pending = False
+                        fresh_item = await self.resolve_share_to_drive_item(
+                            source_url_for_cache
+                        )
+                        fresh_url = (fresh_item or {}).get(
+                            "@microsoft.graph.downloadUrl"
+                        )
+                        if not fresh_url:
+                            print(
+                                f"[GraphClient] shared URL re-resolve yielded "
+                                f"no downloadUrl ({label}…); giving up this run"
+                            )
+                            return None
+                        download_url = fresh_url
+                        if fresh_item.get("size"):
+                            expected_size = int(fresh_item["size"])
+                        # Fresh signature invalidates any partial body.
+                        buf = bytearray()
                     headers: Dict[str, str] = {}
                     if buf:
                         headers["Range"] = f"bytes={len(buf)}-"
@@ -4492,15 +5124,34 @@ class GraphClient:
                                         f"{resp.status_code} ({label}…): "
                                         f"{body[:160]!r}"
                                     )
-                                    # Permanent 4xx — record in worker-
-                                    # lifetime unreachable cache so the
-                                    # next reference to this URL fails
-                                    # fast without burning Graph budget.
+                                    # 401/403 = the ~1h pre-signed
+                                    # @microsoft.graph.downloadUrl expired
+                                    # before this queued download reached the
+                                    # front of the semaphore. Property of the
+                                    # SIGNATURE, not of the share — re-resolve
+                                    # for a fresh URL.
                                     if (
                                         source_url_for_cache
-                                        and resp.status_code in (400, 401, 403, 404, 410, 423)
+                                        and resp.status_code in (401, 403)
+                                        and url_refreshes < max_url_refreshes
                                     ):
-                                        self._mark_url_unreachable(source_url_for_cache)
+                                        url_refreshes += 1
+                                        refresh_pending = True
+                                        print(
+                                            f"[GraphClient] shared URL "
+                                            f"signature rejected (HTTP "
+                                            f"{resp.status_code}) — re-resolving "
+                                            f"({url_refreshes}/"
+                                            f"{max_url_refreshes}) ({label}…)"
+                                        )
+                                        continue
+                                    # Deliberately NOT _mark_url_unreachable:
+                                    # that cache is worker-lifetime + TTL-less
+                                    # and callers persist it into the tenant URL
+                                    # cache, so a CDN-side guess here skips
+                                    # these bytes on EVERY future backup. Only
+                                    # Graph-side resolve failures
+                                    # (resolve_share_to_drive_item) may write it.
                                     return None
                             else:
                                 if resp.status_code != 206:
@@ -4544,10 +5195,8 @@ class GraphClient:
                         )
                         await asyncio.sleep(backoff)
         except httpx.HTTPStatusError as e:
-            if e.response.status_code in (400, 401, 403, 404, 410, 423):
-                if source_url_for_cache:
-                    self._mark_url_unreachable(source_url_for_cache)
-                return None
+            # Same reasoning as the in-stream 4xx branch: a CDN-side status
+            # never marks the source share URL unreachable.
             print(f"[GraphClient] shared URL download failed ({label}…): HTTP {e.response.status_code}")
             return None
         except Exception as e:
@@ -5065,43 +5714,83 @@ class GraphClient:
         (Graph returns these fields for free, we just add them to
         ``$select``), but lets callers build a fingerprint per folder
         for incremental skip decisions.
+
+        ``sizeInBytes`` is a BETA-only mailFolder property: requesting
+        it on v1.0 400s ("Could not find a property named
+        'sizeInBytes'"). From the 2026-07-15 deploy that added it to the
+        v1.0 ``$select`` until 2026-08-03 every USER_MAIL run's tree
+        fetch failed, which silently disabled per-folder delta tokens
+        AND fingerprint skips — each backup re-pulled the entire mailbox
+        from Graph (~38 min / 82k messages for one pilot user) and
+        re-persisted a full row set per snapshot. The v1.0 walk now
+        never asks for it; a best-effort beta call after the walk fills
+        real sizes for TOP-LEVEL folders (see the enrichment block),
+        and everything else keeps ``sizeInBytes: 0`` so the
+        "total|unread|size" fingerprint format stays comparable.
+
+        If Graph still rejects the stats ``$select`` (future property
+        drift), we degrade once to the path-only select and return
+        plain-string entries even under ``with_stats=True`` — callers
+        build fingerprints only from dict entries, so a degraded tree
+        yields conservative "drain everything" behavior instead of
+        all-zero fingerprints that would wrongly SKIP every folder.
         """
         sel_base = "id,displayName,childFolderCount"
         sel_stats = (
-            sel_base + ",totalItemCount,unreadItemCount,sizeInBytes"
+            sel_base + ",totalItemCount,unreadItemCount"
             if with_stats else sel_base
         )
+        stats_degraded = False
+
+        async def _fetch_roots(url: str, params: Dict[str, str]):
+            nonlocal sel_stats, stats_degraded
+            try:
+                return await self._get(url, params=dict(params, **{"$select": sel_stats}))
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code in (403, 404):
+                    return None
+                if e.response.status_code == 400 and with_stats and not stats_degraded:
+                    # Property-drift guard (see docstring). Downgrade the
+                    # select for this walk — child fetches read sel_stats
+                    # at call time, so they inherit the downgrade.
+                    stats_degraded = True
+                    sel_stats = sel_base
+                    try:
+                        return await self._get(url, params=dict(params, **{"$select": sel_base}))
+                    except httpx.HTTPStatusError as e2:
+                        if e2.response.status_code in (403, 404):
+                            return None
+                        raise
+                raise
+
         if well_known_root:
             root_url = f"{self.GRAPH_URL}/users/{user_id}/mailFolders/{well_known_root}"
-            try:
-                root = await self._get(root_url, params={"$select": sel_stats})
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code in (403, 404):
-                    return {}
-                raise
+            root = await _fetch_roots(root_url, {})
+            if root is None:
+                return {}
             roots = [root]
         else:
-            try:
-                top = await self._get(
-                    f"{self.GRAPH_URL}/users/{user_id}/mailFolders",
-                    params={"$top": "200", "$select": sel_stats},
-                )
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code in (403, 404):
-                    return {}
-                raise
+            top = await _fetch_roots(
+                f"{self.GRAPH_URL}/users/{user_id}/mailFolders",
+                {"$top": "200"},
+            )
+            if top is None:
+                return {}
             roots = top.get("value", []) or []
 
         tree: Dict[str, Any] = {}
 
         def _entry(folder: Dict[str, Any], path: str) -> Any:
-            if not with_stats:
+            if not with_stats or stats_degraded:
                 return path
             return {
                 "path": path,
                 "totalItemCount": int(folder.get("totalItemCount") or 0),
                 "unreadItemCount": int(folder.get("unreadItemCount") or 0),
-                "sizeInBytes": int(folder.get("sizeInBytes") or 0),
+                # BETA-only on mailFolder — not in the v1.0 $select.
+                # Seeded 0 here; the post-walk beta enrichment overwrites
+                # it for top-level folders when the beta call succeeds.
+                "sizeInBytes": 0,
             }
 
         # PERF #13: prewarm folder paths breadth-first with parallel fetches
@@ -5226,6 +5915,31 @@ class GraphClient:
             if not current_level:
                 break
             current_level = await _fetch_children_batched(current_level, parent_paths)
+
+        # ── Beta size enrichment (top-level folders only) ───────────────
+        # sizeInBytes exists only on the BETA mailFolder type. The
+        # skip-by-fingerprint token (total|unread|size) needs size to
+        # catch count-neutral changes — draft body edits, an add+delete
+        # in the same folder between runs — that totalItemCount /
+        # unreadItemCount cannot see. One best-effort beta call re-arms
+        # that for top-level folders (Inbox, Sent Items, Drafts, and
+        # Deleted Items all live at the top level); nested folders keep
+        # size 0 and rely on counts plus the USER_MAIL_FULL_RESCAN_DAYS
+        # net. Strictly advisory: any failure (beta drift, throttling)
+        # leaves the tree exactly as the v1.0 walk built it.
+        if with_stats and not stats_degraded and not well_known_root and tree:
+            try:
+                beta = await self._get(
+                    f"{self.GRAPH_URL.replace('/v1.0', '/beta')}/users/{user_id}/mailFolders",
+                    params={"$top": "200", "$select": "id,sizeInBytes"},
+                )
+                for f in beta.get("value", []) or []:
+                    fid = f.get("id")
+                    entry = tree.get(fid)
+                    if fid and isinstance(entry, dict):
+                        entry["sizeInBytes"] = int(f.get("sizeInBytes") or 0)
+            except Exception:
+                pass
 
         return tree
 
@@ -5548,6 +6262,28 @@ class GraphClient:
                 )
             return resp.json()
 
+    @staticmethod
+    async def _upload_session_next_offset(client, upload_url: str) -> Optional[int]:
+        """Consult an uploadSession's nextExpectedRanges after an ambiguous
+        chunk failure. Returns the next byte offset Graph expects, or None
+        when the session can't be queried (network error, or session
+        already completed/expired — GET then 404s).
+
+        Needed because a chunk PUT that times out AFTER committing
+        server-side answers the blind Content-Range replay with 416/409;
+        without this resync the restore fails even though the bytes landed.
+        """
+        try:
+            st = await client.get(upload_url)
+            if st.status_code != 200:
+                return None
+            ranges = (st.json() or {}).get("nextExpectedRanges") or []
+            if not ranges:
+                return None
+            return int(str(ranges[0]).split("-", 1)[0])
+        except Exception:
+            return None
+
     async def upload_large_file_to_drive(
         self,
         drive_id: str,
@@ -5604,6 +6340,7 @@ class GraphClient:
                     "Content-Range": f"bytes {offset}-{end}/{total_size}",
                 }
                 attempt = 0
+                throttle_attempts = 0
                 while True:
                     attempt += 1
                     try:
@@ -5614,11 +6351,27 @@ class GraphClient:
                         await asyncio.sleep(min(2 ** attempt, 30))
                         continue
                     if resp.status_code in (429, 503):
+                        # Bounded: a stuck throttle must fail the file
+                        # loudly, not hold the worker slot forever.
+                        throttle_attempts += 1
+                        if throttle_attempts > 10:
+                            raise RuntimeError(
+                                f"upload chunk {offset}-{end} throttled "
+                                f"persistently ({resp.status_code} × {throttle_attempts})"
+                            )
                         await asyncio.sleep(_parse_retry_after(resp))
                         continue
                     if resp.status_code >= 500 and attempt < 3:
                         await asyncio.sleep(min(2 ** attempt, 30))
                         continue
+                    if resp.status_code in (409, 416):
+                        # Replayed Content-Range after a mid-PUT timeout:
+                        # 416/409 means the original PUT may have committed.
+                        # Resync on nextExpectedRanges — if Graph already
+                        # advanced past this chunk, the bytes landed.
+                        nxt = await self._upload_session_next_offset(c, upload_url)
+                        if nxt is not None and nxt >= end + 1:
+                            break
                     if resp.status_code >= 400:
                         raise RuntimeError(
                             f"upload chunk {offset}-{end} {resp.status_code}: {resp.text[:300]}"
@@ -5704,6 +6457,7 @@ class GraphClient:
                     ),
                 }
                 attempt = 0
+                throttle_attempts = 0
                 while True:
                     attempt += 1
                     try:
@@ -5718,11 +6472,27 @@ class GraphClient:
                         await asyncio.sleep(min(2 ** attempt, 30))
                         continue
                     if resp.status_code in (429, 503):
+                        # Bounded: a stuck throttle must fail the file
+                        # loudly, not hold the worker slot forever.
+                        throttle_attempts += 1
+                        if throttle_attempts > 10:
+                            raise RuntimeError(
+                                f"upload chunk {offset}-{end} throttled "
+                                f"persistently ({resp.status_code} × {throttle_attempts})"
+                            )
                         await asyncio.sleep(_parse_retry_after(resp))
                         continue
                     if resp.status_code >= 500 and attempt < 3:
                         await asyncio.sleep(min(2 ** attempt, 30))
                         continue
+                    if resp.status_code in (409, 416):
+                        # Replayed Content-Range after a mid-PUT timeout:
+                        # 416/409 means the original PUT may have committed.
+                        # Resync on nextExpectedRanges — if Graph already
+                        # advanced past this chunk, the bytes landed.
+                        nxt = await self._upload_session_next_offset(c, upload_url)
+                        if nxt is not None and nxt >= end + 1:
+                            return {}
                     if resp.status_code >= 400:
                         raise RuntimeError(
                             f"upload chunk {offset}-{end} "
@@ -6021,11 +6791,44 @@ class GraphClient:
                     "Content-Length": str(len(chunk)),
                     "Content-Range": f"bytes {start}-{end}/{total}",
                 }
-                r = await client.put(upload_url, content=chunk, headers=headers)
-                if r.status_code not in (200, 201, 202):
-                    raise RuntimeError(
-                        f"uploadSession chunk failed at {start}-{end}: HTTP {r.status_code}"
-                    )
+                # Same retry semantics as the drive uploadSession loops:
+                # one 429 mid-attachment used to permanently fail the
+                # whole message's restore.
+                attempt = 0
+                throttle_attempts = 0
+                while True:
+                    attempt += 1
+                    try:
+                        r = await client.put(upload_url, content=chunk, headers=headers)
+                    except (httpx.ConnectError, httpx.ReadTimeout,
+                            httpx.RemoteProtocolError):
+                        if attempt >= 3:
+                            raise
+                        await asyncio.sleep(min(2 ** attempt, 30))
+                        continue
+                    if r.status_code in (429, 503):
+                        throttle_attempts += 1
+                        if throttle_attempts > 10:
+                            raise RuntimeError(
+                                f"uploadSession chunk {start}-{end} throttled "
+                                f"persistently ({r.status_code} × {throttle_attempts})"
+                            )
+                        await asyncio.sleep(_parse_retry_after(r))
+                        continue
+                    if r.status_code >= 500 and attempt < 3:
+                        await asyncio.sleep(min(2 ** attempt, 30))
+                        continue
+                    if r.status_code in (409, 416):
+                        # Replay of a chunk that actually committed before
+                        # the transport error — resync on the session.
+                        nxt = await self._upload_session_next_offset(client, upload_url)
+                        if nxt is not None and nxt >= end + 1:
+                            break
+                    if r.status_code not in (200, 201, 202):
+                        raise RuntimeError(
+                            f"uploadSession chunk failed at {start}-{end}: HTTP {r.status_code}"
+                        )
+                    break
                 start = end + 1
 
     async def list_messages_in_folder(
@@ -6058,13 +6861,27 @@ class GraphClient:
         lastModifiedDateTime, @microsoft.graph.downloadUrl, etc.).
         """
         # Use /drives/{drive-id}/root/delta — works for any drive type
-        url = f"{self.GRAPH_URL}/drives/{drive_id}/root/delta"
-        if delta_token:
-            url = delta_token
-
+        bare_url = f"{self.GRAPH_URL}/drives/{drive_id}/root/delta"
+        url = bare_url
         # No $select or $expand — delta endpoint ignores them and returns empty
         params = {"$top": "999"}
-        result = await self._get(url, params=params)
+        if delta_token:
+            # Verbatim resume — httpx>=0.28 REPLACES the query when params
+            # is passed, stripping token=… (ITO-10277).
+            url = delta_token
+            params = None
+        try:
+            result = await self._get(url, params=params)
+        except Exception as e:
+            # One-shot resync: an expired token 410s (resyncRequired). The
+            # live callers (backup_onedrive, _backup_files_parallel) keep the
+            # stored token on failure, so without this arm the resource
+            # retries the same dead token every nightly run. The full walk
+            # ends in a fresh terminal deltaLink the caller persists.
+            if not (delta_token and _is_resync_gone(e)):
+                raise
+            url, params = bare_url, {"$top": "999"}
+            result = await self._get(url, params=params)
         all_value = result.get("value", [])
 
         # Follow pagination
@@ -6160,16 +6977,32 @@ class GraphClient:
             even though they have a 'file' facet — these are cloud-native objects.
 
         Returns: (download_url, size_bytes, quick_xor_hash_or_none)
-        Raises: RuntimeError if no URL can be obtained after retries.
-        Raises: RuntimeError("no_download_url") if item is not downloadable at all.
+        Raises: RuntimeError if the item itself is not downloadable (callers
+        string-match 'downloadUrl' in that message to skip cloud-native
+        objects silently — the message contract matters).
+        Raises: GraphRetryExhaustedError if the fetch itself kept failing
+        (429 storm, 5xx, transport). This is NOT proof the item is
+        non-downloadable: callers must count/retry it, never skip silently
+        (a 429 storm otherwise drops ordinary files from a "successful"
+        snapshot).
         """
         # For app-only access, do NOT use $select - Graph ignores it or strips downloadUrl
         # for application permission tokens. Get the full item and extract what we need.
         url = f"{self.GRAPH_URL}/drives/{drive_id}/items/{item_id}"
         last_error = None
+        fetch_failed = False  # True when the LAST attempt never saw the item
         for attempt in range(max_attempts):
+            item = None
             try:
                 item = await self._get(url)
+            except Exception as e:
+                last_error = str(e)
+                fetch_failed = True
+                if attempt == 0:
+                    print(f"[GraphClient] get_download_url attempt {attempt+1}/{max_attempts} for "
+                          f"item {item_id}: EXCEPTION: {e}")
+            if item is not None:
+                fetch_failed = False
                 download_url = item.get("@microsoft.graph.downloadUrl")
                 size = item.get("size", 0)
                 qxh = (item.get("file") or {}).get("hashes", {}).get("quickXorHash")
@@ -6183,16 +7016,23 @@ class GraphClient:
                       f"file_facet={'yes' if file_facet else 'no'}, "
                       f"size={size}, keys={keys}")
                 if not file_facet:
-                    raise RuntimeError(f"Item {item_id} has no 'file' facet — not downloadable")
+                    # No 'file' facet — retrying can't grow one. Break to
+                    # the terminal (non-downloadable) RuntimeError below.
+                    last_error = f"Item {item_id} has no 'file' facet — not downloadable"
+                    break
                 last_error = "downloadUrl missing despite $select; retrying"
-            except Exception as e:
-                last_error = str(e)
-                if attempt == 0:
-                    print(f"[GraphClient] get_download_url attempt {attempt+1}/{max_attempts} for "
-                          f"item {item_id}: EXCEPTION: {e}")
             if attempt < max_attempts - 1:
                 await asyncio.sleep(2 ** attempt)
-        # Final attempt failed — check if this item type is fundamentally non-downloadable
+        if fetch_failed:
+            # We never got a clean look at the item — transient exhaustion,
+            # not a cloud-native object. Distinct type so callers can't
+            # confuse it with the skip-silently case.
+            raise GraphRetryExhaustedError(
+                f"get_download_url exhausted {max_attempts} attempts for "
+                f"item {item_id}: {last_error}"
+            )
+        # Item fetched fine but Graph never produced a URL — fundamentally
+        # non-downloadable (Whiteboard / OneNote / Loop / package).
         raise RuntimeError(f"Could not obtain downloadUrl for item {item_id}: {last_error}")
 
     async def get_group_mailbox_messages(self, group_id: str, delta_token: str = None) -> Dict[str, Any]:
@@ -6201,10 +7041,12 @@ class GraphClient:
         Graph API: GET /groups/{id}/messages/delta
         """
         url = f"{self.GRAPH_URL}/groups/{group_id}/messages/delta"
-        if delta_token:
-            url = delta_token
-
         params = {"$top": "999"}
+        if delta_token:
+            # Verbatim resume — httpx>=0.28 REPLACES the query when params
+            # is passed, stripping token=… (ITO-10277).
+            url = delta_token
+            params = None
         result = await self._get(url, params=params)
         all_value = result.get("value", [])
 
@@ -6404,6 +7246,7 @@ class GraphClient:
         Follows 302 redirects implicitly via httpx."""
         from shared.graph_rate_limiter import graph_rate_limiter
         token = await self._get_token()
+        _assert_graph_target(url)  # Check 17 SSRF guard
         async with self._http_session() as client:
             await graph_rate_limiter.acquire(reason="graph_get_bytes")
             resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})

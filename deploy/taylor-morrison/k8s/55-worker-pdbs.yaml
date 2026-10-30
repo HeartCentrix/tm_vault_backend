@@ -1,0 +1,49 @@
+# 55-worker-pdbs.yaml — 8/20 Gold-wedge prevention #3 (2026-08-25).
+#
+# maxUnavailable: 0 blocks ALL voluntary evictions of backup workers —
+# descheduler v0.35 evicts via the eviction API, so the PDB is the exclusion
+# mechanism. An evicted mid-drain worker orphans its shard leases: redelivered
+# messages ack-drop against the claim fence and the reconciler needs
+# heartbeat-stale + lease-expired + 15min enqueue age before recovery, so a
+# single descheduler pass can cost hours of re-drain (or, pre-2026-08-25
+# guards, a permanent wedge). Deployment ROLLOUTS are unaffected (they replace
+# pods via the deployment strategy, not the eviction API) — the Gold-window
+# deploy rule (never roll workers in [T-30m, T+90m] of 02:07/10:07/18:07Z)
+# still applies to those.
+#
+# Replaces the out-of-band `backup-worker` PDB (minAvailable: 1, ITO-9603,
+# created 2026-07-06 in-cluster only): with 10 replicas, minAvailable 1 still
+# allowed 9 concurrent evictions — no protection at all for in-flight shards.
+# The heavy pool previously had NO PDB.
+#
+# Node drains for maintenance: `kubectl drain` will block on these pods.
+# That is intentional — delete the pods explicitly (accepting the shard
+# re-drain) or wait for a quiet window, but nothing evicts a draining
+# worker silently anymore.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: backup-worker
+  namespace: itops
+  labels: { app: backup-worker, stack: tmvault }
+spec:
+  maxUnavailable: 0
+  # Protect only pods doing useful work: crash-looping/not-ready pods stay
+  # evictable so node drains don't hang on a pod that drains nothing.
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels: { app: backup-worker }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: backup-worker-heavy
+  namespace: itops
+  labels: { app: backup-worker-heavy, stack: tmvault }
+spec:
+  maxUnavailable: 0
+  # Protect only pods doing useful work: crash-looping/not-ready pods stay
+  # evictable so node drains don't hang on a pod that drains nothing.
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels: { app: backup-worker-heavy }

@@ -16,6 +16,45 @@ from shared.models import Tenant, TenantStatus
 from shared.database import async_session_factory
 
 
+# Resource families reported back so the caller can drop a family it could not
+# fully enumerate out of the stale-mark set (see _prepare_azure_staging_rows).
+ARM_FAMILY_VMS = "vms"
+ARM_FAMILY_SQL = "sql_dbs"
+ARM_FAMILY_PG_FLEXIBLE = "postgres_flexible"
+ARM_FAMILY_PG_SINGLE = "postgres_single"
+
+
+async def _arm_list(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: Dict[str, str],
+    *,
+    family: str,
+    label: str,
+    degraded: set,
+    errors: List[str],
+) -> Optional[List[Dict[str, Any]]]:
+    """GET an ARM list endpoint, returning its 'value' array — or None when the
+    call failed.
+
+    ARM error bodies (401/403 on one subscription's provider, 404 for a server
+    deleted mid-walk, 429/503) carry no 'value', so a non-2xx must never be read
+    as an empty collection: that is what mass-marked Azure resources
+    INACCESSIBLE. Raising instead threw away every subscription already walked
+    and refreshed nothing tenant-wide, so record the family as degraded and let
+    the walk continue with what it can see.
+    """
+    try:
+        resp = await client.get(url, headers=headers)
+        resp.raise_for_status()
+        return resp.json().get("value", [])
+    except Exception as exc:
+        degraded.add(family)
+        errors.append(f"{label}: {exc}")
+        print(f"[AzureDiscovery] Warning: failed to list {label}: {exc}")
+        return None
+
+
 async def discover_azure_tenant(tenant: Tenant) -> Dict[str, Any]:
     """
     Enumerate all subscriptions, VMs, SQL servers, Postgres servers
@@ -23,8 +62,13 @@ async def discover_azure_tenant(tenant: Tenant) -> Dict[str, Any]:
 
     As we discover SQL servers, we auto-assign our SP as Entra admin
     (requires Directory.ReadWrite.All).
+
+    Partial results are returned with "degraded_families"/"errors" populated;
+    the caller must not treat a degraded family as authoritatively enumerated.
     """
     arm_token = await _get_arm_access_token(tenant)
+    degraded: set = set()
+    errors: List[str] = []
 
     async with httpx.AsyncClient() as client:
         headers = {"Authorization": f"Bearer {arm_token}"}
@@ -34,9 +78,23 @@ async def discover_azure_tenant(tenant: Tenant) -> Dict[str, Any]:
             "https://management.azure.com/subscriptions?api-version=2022-12-01",
             headers=headers,
         )
+        # The subscription list is the root of the walk: an error body has no
+        # 'value' and .get("value", []) turned that into a silently EMPTY
+        # inventory that stale-marked every Azure resource INACCESSIBLE while
+        # the run read COMPLETED/SUCCESS. Nothing can be enumerated without it,
+        # so this one call still fails the run loudly. Everything below degrades
+        # per resource family instead.
+        subs_resp.raise_for_status()
         subscriptions = subs_resp.json().get("value", [])
 
-        discovered = {"subscriptions": [], "vms": [], "sql_dbs": [], "postgres_servers": []}
+        discovered = {
+            "subscriptions": [],
+            "vms": [],
+            "sql_dbs": [],
+            "postgres_servers": [],
+            "degraded_families": [],
+            "errors": [],
+        }
 
         for sub in subscriptions:
             sub_id = sub["subscriptionId"]
@@ -45,12 +103,17 @@ async def discover_azure_tenant(tenant: Tenant) -> Dict[str, Any]:
             })
 
             # VMs
-            vms_resp = await client.get(
+            vms = await _arm_list(
+                client,
                 f"https://management.azure.com/subscriptions/{sub_id}"
                 f"/providers/Microsoft.Compute/virtualMachines?api-version=2023-09-01",
-                headers=headers,
+                headers,
+                family=ARM_FAMILY_VMS,
+                label=f"VMs in subscription {sub_id}",
+                degraded=degraded,
+                errors=errors,
             )
-            for vm in vms_resp.json().get("value", []):
+            for vm in vms or []:
                 discovered["vms"].append({
                     "id": vm.get("id", ""),
                     "name": vm.get("name", ""),
@@ -61,14 +124,18 @@ async def discover_azure_tenant(tenant: Tenant) -> Dict[str, Any]:
                 })
 
             # SQL servers
-            sql_resp = await client.get(
+            sql_servers = await _arm_list(
+                client,
                 f"https://management.azure.com/subscriptions/{sub_id}"
                 f"/providers/Microsoft.Sql/servers?api-version=2022-05-01-preview",
-                headers=headers,
+                headers,
+                family=ARM_FAMILY_SQL,
+                label=f"SQL servers in subscription {sub_id}",
+                degraded=degraded,
+                errors=errors,
             )
-            sql_servers = sql_resp.json().get("value", [])
 
-            for server in sql_servers:
+            for server in sql_servers or []:
                 # Auto-assign our SP as Entra admin — the magic step.
                 # Imports from shared/ so discovery-worker actually has the
                 # module on its PYTHONPATH (the old services.tenant_service
@@ -84,12 +151,17 @@ async def discover_azure_tenant(tenant: Tenant) -> Dict[str, Any]:
                 server_fqdn = server.get("properties", {}).get("fullyQualifiedDomainName", "")
                 server_rg = server_id.split("/")[4] if server_id else ""
 
-                dbs_resp = await client.get(
+                sql_dbs = await _arm_list(
+                    client,
                     f"https://management.azure.com{server_id}"
                     f"/databases?api-version=2022-05-01-preview",
-                    headers=headers,
+                    headers,
+                    family=ARM_FAMILY_SQL,
+                    label=f"databases on SQL server {server_id}",
+                    degraded=degraded,
+                    errors=errors,
                 )
-                for db in dbs_resp.json().get("value", []):
+                for db in sql_dbs or []:
                     db_name = db.get("name", "")
                     if db_name != "master":
                         discovered["sql_dbs"].append({
@@ -105,13 +177,18 @@ async def discover_azure_tenant(tenant: Tenant) -> Dict[str, Any]:
                         })
 
             # PostgreSQL Flexible Servers (2026 standard)
-            pg_resp = await client.get(
+            pg_servers = await _arm_list(
+                client,
                 f"https://management.azure.com/subscriptions/{sub_id}"
                 f"/providers/Microsoft.DBforPostgreSQL/flexibleServers"
                 f"?api-version=2023-03-01-preview",
-                headers=headers,
+                headers,
+                family=ARM_FAMILY_PG_FLEXIBLE,
+                label=f"PostgreSQL flexible servers in subscription {sub_id}",
+                degraded=degraded,
+                errors=errors,
             )
-            for pg in pg_resp.json().get("value", []):
+            for pg in pg_servers or []:
                 pg_name = pg.get("name", "")
                 pg_id = pg.get("id", "")
                 pg_rg = pg_id.split("/")[4] if pg_id else ""
@@ -124,12 +201,17 @@ async def discover_azure_tenant(tenant: Tenant) -> Dict[str, Any]:
                     print(f"[AzureDiscovery] Warning: Failed to provision PostgreSQL server {pg_name}: {e}")
 
                 # Enumerate databases on this server
-                dbs_resp = await client.get(
+                pg_dbs = await _arm_list(
+                    client,
                     f"https://management.azure.com{pg_id}"
                     f"/databases?api-version=2023-03-01-preview",
-                    headers=headers,
+                    headers,
+                    family=ARM_FAMILY_PG_FLEXIBLE,
+                    label=f"databases on PostgreSQL flexible server {pg_id}",
+                    degraded=degraded,
+                    errors=errors,
                 )
-                for db in dbs_resp.json().get("value", []):
+                for db in pg_dbs or []:
                     db_name = db.get("name", "")
                     if db_name not in ("postgres", "azure_maintenance", "azure_sys"):
                         discovered["postgres_servers"].append({
@@ -142,8 +224,11 @@ async def discover_azure_tenant(tenant: Tenant) -> Dict[str, Any]:
                             "database_name": db_name,
                         })
 
-                # If no databases found, add the server itself with default database
-                if not discovered["postgres_servers"] or all(p.get("server_id") != pg_id for p in discovered["postgres_servers"]):
+                # If no databases found, add the server itself with default database.
+                # Rows carry the server ARM id under "id" — the old "server_id"
+                # key never existed on these dicts, so the check was always true
+                # and a redundant default-db row was appended for EVERY server.
+                if all(p.get("id") != pg_id for p in discovered["postgres_servers"]):
                     discovered["postgres_servers"].append({
                         "id": pg_id,
                         "name": pg_name,
@@ -156,13 +241,18 @@ async def discover_azure_tenant(tenant: Tenant) -> Dict[str, Any]:
 
             # PostgreSQL Single Servers (deprecated, but still discover for legacy customers)
             # Note: Microsoft is retiring Single Server, customers should migrate to Flexible
-            single_pg_resp = await client.get(
+            single_pg_servers = await _arm_list(
+                client,
                 f"https://management.azure.com/subscriptions/{sub_id}"
                 f"/providers/Microsoft.DBforPostgreSQL/servers"
                 f"?api-version=2017-12-01",
-                headers=headers,
+                headers,
+                family=ARM_FAMILY_PG_SINGLE,
+                label=f"PostgreSQL single servers in subscription {sub_id}",
+                degraded=degraded,
+                errors=errors,
             )
-            for pg in single_pg_resp.json().get("value", []):
+            for pg in single_pg_servers or []:
                 pg_name = pg.get("name", "")
                 pg_id = pg.get("id", "")
                 pg_rg = pg_id.split("/")[4] if pg_id else ""
@@ -177,6 +267,10 @@ async def discover_azure_tenant(tenant: Tenant) -> Dict[str, Any]:
                     "database_name": pg.get("properties", {}).get("fullyQualifiedDomainName", pg_name),
                 })
 
+    # Degraded families are reported, never swallowed: the caller logs them,
+    # keeps what WAS enumerated, and skips stale-marking those types.
+    discovered["degraded_families"] = sorted(degraded)
+    discovered["errors"] = errors
     return discovered
 
 
