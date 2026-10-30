@@ -12,12 +12,13 @@ import uuid
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, Depends, HTTPException, Query
-from sqlalchemy import select, and_, func, or_, text
+from sqlalchemy import select, and_, cast, exists, func, or_, text, Text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from shared.database import async_session_factory, init_db, close_db
-from shared.models import SnapshotItem, Snapshot, Resource, Tenant
+from shared.models import ChatItemVersion, SnapshotItem, Snapshot, Resource, Tenant
+from shared.chat_catalogue import materialize_chat_items
 
 from shared.audit_middleware import AuditMiddleware  # Ops/Data Check 3: mutation-audit backstop
 app = FastAPI(title="Full-Text Search Service", version="1.0.0")
@@ -69,6 +70,7 @@ async def search_snapshots(
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
+    user: dict = Depends(verified_user),
 ):
     """
     Full-text search across all backup snapshot items.
@@ -87,10 +89,7 @@ async def search_snapshots(
     - dateFrom/dateTo: Filter by backup date range (ISO 8601)
     """
     # Build search conditions
-    filters = []
-
-    if tenantId:
-        filters.append(SnapshotItem.tenant_id == uuid.UUID(tenantId))
+    filters = [SnapshotItem.tenant_id.in_(_suggestion_tenant_scope(user, tenantId))]
 
     if itemType:
         filters.append(SnapshotItem.item_type == itemType.upper())
@@ -123,6 +122,7 @@ async def search_snapshots(
         .join(Snapshot, SnapshotItem.snapshot_id == Snapshot.id)
         .join(Resource, Snapshot.resource_id == Resource.id)
         .join(Tenant, Resource.tenant_id == Tenant.id)
+        .where(SnapshotItem.tenant_id == Tenant.id)
     )
 
     if filters:
@@ -147,8 +147,9 @@ async def search_snapshots(
     rows = result.all()
 
     # Format results
+    hydrated = await materialize_chat_items(db, [row[0] for row in rows]) if rows else []
     items = []
-    for snapshot_item, snapshot, resource, tenant in rows:
+    for snapshot_item, (_, snapshot, resource, tenant) in zip(hydrated, rows):
         items.append(format_search_result(snapshot_item, snapshot, resource, tenant, q))
 
     return {
@@ -280,6 +281,10 @@ async def reindex_snapshots(
 async def index_snapshot_item(item: SnapshotItem, db: AsyncSession):
     """Index a single snapshot item for full-text search"""
     try:
+        # Captured versions are authoritative; the mutable shared cache only
+        # hydrates legacy links. Materialization also rejects broken format-1 links.
+        if item.chat_version_id is not None or item.item_type == "TEAMS_CHAT_MESSAGE":
+            item, = await materialize_chat_items(db, [item])
         # SnapshotItem ORM aliases the JSON column to `extra_data` (the DB
         # column is named ``metadata``); use the attribute the ORM exposes.
         metadata = getattr(item, "extra_data", None) or {}
@@ -290,7 +295,7 @@ async def index_snapshot_item(item: SnapshotItem, db: AsyncSession):
         # the 2026-05-13 Level 2 refactor; the body / sender / payload
         # live in chat_thread_messages. Hydrate them so search continues
         # to index chat content.
-        if item.item_type in ("TEAMS_CHAT_MESSAGE",) and not raw_data:
+        if item.item_type == "TEAMS_CHAT_MESSAGE" and item.chat_version_id is None and not raw_data:
             try:
                 row = (await db.execute(text(
                     "SELECT ctm.body_content, ctm.from_display_name, "
@@ -417,14 +422,18 @@ def build_text_search_filters(search_terms: List[str]) -> list:
         # Search in name
         name_filter = SnapshotItem.name.ilike(f"%{term}%")
 
-        # Search in metadata JSONB
-        # PostgreSQL JSONB containment operator
-        metadata_filter = text(
-            "snapshot_items.metadata::text ILIKE :term"
-        ).bindparams(term=f"%{term}%")
+        metadata_filter = cast(SnapshotItem.extra_data, Text).ilike(f"%{term}%")
 
-        # Combine with OR (match name OR metadata)
-        filters.append(or_(name_filter, metadata_filter))
+        # Filter against the captured payload before count/pagination without
+        # copying heavy historical bodies into each thin snapshot link.
+        captured_filter = exists(select(ChatItemVersion.id).where(
+            ChatItemVersion.id == SnapshotItem.chat_version_id,
+            ChatItemVersion.tenant_id == SnapshotItem.tenant_id,
+            ChatItemVersion.chat_id == SnapshotItem.extra_data["chat_id"].as_string(),
+            ChatItemVersion.item_type == SnapshotItem.item_type,
+            cast(ChatItemVersion.payload, Text).ilike(f"%{term}%"),
+        ))
+        filters.append(or_(name_filter, metadata_filter, captured_filter))
 
     # All terms must match (AND)
     return filters
