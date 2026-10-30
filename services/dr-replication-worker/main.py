@@ -6,6 +6,9 @@ skipped_concurrent placeholders) with dr_replication_status=pending, and
 initiates blob-to-blob server-side copy from primary to DR region.
 Azure handles the actual transfer over Microsoft's backbone fiber.
 
+Catalogue snapshots instead stream exact captured dependencies into a verified
+recovery archive. Automatic catalogue restore routing remains explicitly gated.
+
 Key principles:
 - Asynchronous: Primary backup succeeds BEFORE DR replication runs
 - Server-side copy: Bytes flow via Azure backbone, never through this worker
@@ -17,13 +20,14 @@ import logging
 import os
 import time
 import traceback
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from typing import List
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from azure.storage.blob.aio import BlobClient
 from azure.storage.blob import generate_blob_sas, BlobSasPermissions
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, or_, select
 
 from shared.config import settings
 from shared.database import async_session_factory, init_db
@@ -122,8 +126,12 @@ def _dr_replicable_snapshot():
 def _dr_pending_retryable():
     """SQL predicate: DR-side state says this snapshot still needs a copy."""
     return and_(
-        Snapshot.dr_replication_status.in_(("pending", "failed")),
-        Snapshot.dr_replication_attempts < MAX_REPLICATION_ATTEMPTS,
+        or_(and_(Snapshot.dr_replication_status.in_(("pending", "failed")),
+                 Snapshot.dr_replication_attempts < MAX_REPLICATION_ATTEMPTS),
+            and_(Snapshot.dr_replication_status == "in_progress",
+                 func.json_extract_path_text(Snapshot.extra_data, "chat_inventory_format") == "1")),
+        func.coalesce(func.json_extract_path_text(Snapshot.extra_data, "chat_catalogue_dr_nonretryable"),
+                      "false").notin_(("true", "t", "1")),
     )
 
 
@@ -305,6 +313,10 @@ async def replicate_snapshot(snapshot: Snapshot, tenant: Tenant, session):
             "(0 items) — not replicating",
             snapshot.id,
         )
+        return
+
+    if (getattr(snapshot, "extra_data", None) or {}).get("chat_inventory_format") == 1:
+        await _replicate_catalogue_snapshot(snapshot, tenant, session)
         return
 
     snapshot.dr_replication_status = "in_progress"
@@ -516,6 +528,144 @@ async def replicate_snapshot(snapshot: Snapshot, tenant: Tenant, session):
             snapshot.id, snapshot.dr_replication_attempts,
         )
         snapshot.dr_error = f"Permanently failed after {MAX_REPLICATION_ATTEMPTS} attempts: {snapshot.dr_error}"
+
+
+async def _catalogue_dr_target(tenant, container):
+    from shared.chat_catalogue import ChatCatalogueIntegrityError
+    from shared.chat_catalogue_dr import AzureCatalogueDRStore
+    from shared.azure_storage import read_encryption_scope_state
+    if not tenant.dr_region_enabled or not tenant.dr_storage_account_name or not tenant.dr_storage_account_key_encrypted:
+        raise ChatCatalogueIntegrityError("catalogue DR target credentials/region are not configured")
+    key = decrypt_secret(tenant.dr_storage_account_key_encrypted)
+    shard = _create_dr_shard(tenant.dr_storage_account_name, key)
+    target = AzureCatalogueDRStore(backend_id=f"dr-azure:{tenant.dr_storage_account_name}",
+                                  name="catalogue-dr", shards=[shard])
+    try:
+        await target.ensure_container(container)
+        props = await shard.get_async_client().get_container_client(container).get_container_properties()
+        scope = getattr(getattr(props, "encryption_scope", None), "default_encryption_scope", None)
+        if scope == "$account-encryption-key":
+            scope = None
+        uri = None
+        if scope:
+            observed = await read_encryption_scope_state(container, shard=shard)
+            if (observed.get("error") or observed.get("scope") != scope or
+                str(observed.get("state")).lower() != "enabled" or not observed.get("key_uri")):
+                raise ChatCatalogueIntegrityError("DR customer encryption scope cannot be verified")
+            uri = observed["key_uri"]
+        encryption = {"mode": "azure_server_side", "scope": scope, "key_uri": uri}
+        await target.verify_encryption(container, None, encryption)
+        return target, encryption
+    except BaseException:
+        await target.close()
+        raise
+
+
+async def _replicate_catalogue_snapshot(snapshot, tenant, session):
+    """Archive safely; never conflate verified archival with automated DR restore."""
+    from types import SimpleNamespace
+    from sqlalchemy.orm.attributes import set_committed_value
+    from shared.chat_catalogue import ChatCatalogueIntegrityError
+    from shared.chat_catalogue_dr import FORMAT, replicate_catalogue_snapshot
+    from shared.db_retry import run_catalogue_transaction
+    from shared.models import ChatCataloguePin
+    from shared.storage.router import router
+
+    if (snapshot.extra_data or {}).get("chat_catalogue_dr_nonretryable"):
+        return
+    snapshot_id, tenant_id = snapshot.id, tenant.id
+    owner_id = uuid4()
+    tenant_config = SimpleNamespace(**{name: getattr(tenant, name) for name in
+        ("dr_region_enabled", "dr_storage_account_name", "dr_storage_account_key_encrypted")})
+    # Release the scanner's read transaction before pins or external storage I/O.
+    await session.commit()
+    fields = ("dr_replication_status", "dr_replication_attempts", "dr_error", "dr_blob_path", "dr_replicated_at", "extra_data")
+
+    async def mark(db, *, starting=False, archived=None, error=None):
+        row = await db.scalar(select(Snapshot).where(Snapshot.id == snapshot_id).with_for_update())
+        resource = await db.get(Resource, row.resource_id) if row else None
+        if row is None or resource is None or resource.tenant_id != tenant_id:
+            raise ChatCatalogueIntegrityError("catalogue DR snapshot ownership no longer exists")
+        def state(claimed):
+            return {**{name: getattr(row, name) for name in fields}, "claimed": claimed}
+        metadata = row.extra_data or {}
+        if starting:
+            now = await db.scalar(select(func.clock_timestamp()))
+            if row.dr_replication_status == "in_progress":
+                previous, started = metadata.get("chat_catalogue_dr_attempt_id"), metadata.get("chat_catalogue_dr_started_at")
+                try:
+                    previous = UUID(previous) if previous else None
+                except (ValueError, TypeError):
+                    previous = None
+                try:
+                    started = datetime.fromisoformat(started) if started else None
+                except (ValueError, TypeError):
+                    started = None
+                live_pin = await db.scalar(select(ChatCataloguePin.id).where(
+                    ChatCataloguePin.owner_kind == "dr", ChatCataloguePin.owner_id == previous,
+                    or_(ChatCataloguePin.expires_at.is_(None), ChatCataloguePin.expires_at > now)).limit(1)) if previous else None
+                # Pins renew during long copies. Grace covers target setup before pin acquisition.
+                if live_pin or (started and started.utcoffset() is not None and now - started < timedelta(minutes=5)):
+                    return state(False)
+            if (row.dr_replication_attempts or 0) >= MAX_REPLICATION_ATTEMPTS:
+                row.dr_replication_status = "failed"
+                row.dr_error = "Catalogue DR attempt budget exhausted after interrupted archival"
+                await db.flush()
+                return state(False)
+            row.dr_replication_attempts = (row.dr_replication_attempts or 0) + 1
+            row.extra_data = {**metadata, "chat_catalogue_dr_attempt_id": str(owner_id),
+                              "chat_catalogue_dr_started_at": now.isoformat()}
+        elif metadata.get("chat_catalogue_dr_attempt_id") != str(owner_id):
+            return state(False)
+        row.dr_replication_status = "in_progress" if starting else "failed"
+        row.dr_error, row.dr_blob_path, row.dr_replicated_at = error, None, None
+        if archived is not None:
+            row.extra_data = {**(row.extra_data or {}), "chat_catalogue_dr_archive": archived}
+        row.extra_data = {**(row.extra_data or {}), "chat_catalogue_dr_nonretryable":
+                          bool(not starting and archived and archived.get("verified"))}
+        await db.flush()
+        return state(True)
+
+    initial = await run_catalogue_transaction(async_session_factory, lambda db: mark(db, starting=True))
+    for name in fields:
+        set_committed_value(snapshot, name, initial[name])
+    if not initial["claimed"]:
+        return
+    archived = (initial["extra_data"] or {}).get("chat_catalogue_dr_archive")
+    target = None
+    try:
+        if not archived or not archived.get("verified"):
+            container = azure_storage_manager.get_container_name(str(tenant_id), "teams") + "-dr"
+            target, encryption = await _catalogue_dr_target(tenant_config, container)
+            result = await replicate_catalogue_snapshot(session_factory=async_session_factory,
+                snapshot_id=snapshot_id, tenant_id=tenant_id, source_router=router,
+                target=target, target_container=container, encryption=encryption, owner_id=owner_id)
+            archived = {**asdict(result), "format": FORMAT, "verified": True,
+                        "verified_at": datetime.now(timezone.utc).isoformat()}
+        error = "Catalogue DR archive verified; automatic restore routing is unsupported"
+    except asyncio.CancelledError:
+        try:
+            interrupted = await asyncio.shield(run_catalogue_transaction(async_session_factory,
+                lambda db: mark(db, error="Catalogue DR archive interrupted; primary retained")))
+            for name in fields:
+                set_committed_value(snapshot, name, interrupted[name])
+        except Exception:
+            logger.exception("[catalogue-dr] Could not record interrupted archive")
+        raise
+    except Exception as exc:
+        error = f"Catalogue DR archive failed: {type(exc).__name__}: {exc}"[:1000]
+        archived = None
+        logger.warning("[catalogue-dr] snapshot %s archive failed: %s", snapshot_id, error)
+    finally:
+        if target is not None:
+            try:
+                await target.close()
+            except Exception:
+                logger.warning("[catalogue-dr] DR storage client cleanup failed")
+    saved = await run_catalogue_transaction(async_session_factory,
+        lambda db: mark(db, archived=archived, error=error))
+    for name in fields:
+        set_committed_value(snapshot, name, saved[name])
 
 
 def _create_dr_shard(account_name: str, account_key: str) -> AzureStorageShard:
@@ -896,6 +1046,10 @@ async def main():
     except Exception as e:
         logger.error("[main] Database initialization failed: %s\n%s", e, traceback.format_exc())
         raise
+
+    # Seaweed reads must retain their envelope-decryption seam in this worker.
+    from shared.crypto.bootstrap import install as install_crypto
+    await install_crypto(async_session_factory)
 
     # Start replication scan loop
     async def scan_loop():
