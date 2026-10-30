@@ -1059,9 +1059,10 @@ async def _revert_snapshot_storage(db: AsyncSession, snapshot) -> dict:
     bytes_total = 0
     blobs_deleted = 0
     blob_errors = 0
+    from shared.blob_gc import is_catalogue_blob_path
     for _item_id, blob_path, backend_id, size in items:
         bytes_total += int(size or 0)
-        if not blob_path or not backend_id:
+        if not blob_path or not backend_id or is_catalogue_blob_path(blob_path):
             continue
         try:
             store = _storage_router.get_store_by_id(str(backend_id))

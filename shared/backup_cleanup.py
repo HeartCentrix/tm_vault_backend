@@ -137,7 +137,8 @@ from uuid import UUID
 from sqlalchemy import delete as sa_delete, select, text, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from shared.models import ChatUrlCache, Snapshot, SnapshotItem, SnapshotStatus
+from shared.models import ChatUrlCache, Snapshot, SnapshotItem, SnapshotStatus, SnapshotChatInventory
+from shared.blob_gc import is_catalogue_blob_path
 
 logger = logging.getLogger(__name__)
 
@@ -812,6 +813,9 @@ async def select_deletable_blob_paths(
     retained: Dict[str, str] = {}
     survivors: Set[str] = set()
     for path, slot in by_path.items():
+        if is_catalogue_blob_path(path):
+            retained[path] = "catalogue_owned"
+            continue
         owner = _owning_snapshot_id(path)
         if owner is not None and owner not in doomed_set:
             retained[path] = RETAIN_FOREIGN_OWNER
@@ -1797,6 +1801,8 @@ async def cleanup_cancelled_snapshots(
     else:
         async with session_factory() as session:
             if delete_db_rows:
+                await session.execute(sa_delete(SnapshotChatInventory).where(
+                    SnapshotChatInventory.snapshot_id.in_(reapable_ids)))
                 await session.execute(
                     sa_delete(SnapshotItem).where(
                         SnapshotItem.snapshot_id.in_(reapable_ids)

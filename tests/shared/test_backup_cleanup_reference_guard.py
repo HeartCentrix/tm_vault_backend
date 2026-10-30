@@ -825,3 +825,14 @@ def test_retained_paths_are_counted_distinctly_from_skipped_deletes():
     assert stats["blobs_retained"] == 2
     assert stats["blob_paths_retained"] == 1
     assert stats["retained_reasons"]["foreign_owner"] == 1
+
+
+def test_catalogue_generations_are_left_to_their_exclusive_collector():
+    path = "chat-catalogue/v1/tenant/generation"
+    doomed = uuid.uuid4()
+    db = _GuardDB()
+    plan = _plan(db, doomed=[doomed], protected_roots=set(),
+                 candidates=[_cand(path, snapshot_id=doomed)])
+    assert not plan.deletable
+    assert plan.retained[path] == "catalogue_owned"
+    assert not db.statements  # No expensive legacy heap probe for catalogue paths.

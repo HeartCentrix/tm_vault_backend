@@ -948,16 +948,35 @@ async def _rehydrate_reuse_heir(
             (id, snapshot_id, tenant_id, external_id, parent_external_id,
              item_type, name, folder_path, content_hash, content_checksum,
              content_size, blob_path, encryption_key_id, backup_version,
-             metadata, is_deleted, indexed_at, backend_id, created_at)
+             metadata, is_deleted, indexed_at, backend_id, chat_version_id, created_at)
         SELECT gen_random_uuid(),
                CAST(:heir AS UUID),
                tenant_id, external_id, parent_external_id,
                item_type, name, folder_path, content_hash, content_checksum,
                content_size, blob_path, encryption_key_id, backup_version,
-               metadata, is_deleted, indexed_at, backend_id, NOW()
+               metadata, is_deleted, indexed_at, backend_id, chat_version_id, NOW()
           FROM snapshot_items
          WHERE snapshot_id = CAST(:did AS UUID)
         ON CONFLICT DO NOTHING
+    """), {"heir": str(heir_id), "did": str(doomed_id)})
+
+    # Catalogue rows are exact immutable links; transfer their inventories too.
+    await session.execute(text("""
+        INSERT INTO snapshot_chat_inventories
+            (snapshot_id, chat_id, tenant_id, inventory_id, capture_attempt_id,
+             coverage_status, started_at, finished_at, failure_reason, uploaded_bytes)
+        SELECT CAST(:heir AS UUID), chat_id, tenant_id, inventory_id, capture_attempt_id,
+               coverage_status, started_at, finished_at, failure_reason, 0
+          FROM snapshot_chat_inventories WHERE snapshot_id = CAST(:did AS UUID)
+        ON CONFLICT DO NOTHING
+    """), {"heir": str(heir_id), "did": str(doomed_id)})
+    await session.execute(text("""
+        UPDATE snapshots AS heir
+           SET extra_data = (COALESCE(heir.extra_data::jsonb, '{}'::jsonb)
+                             || '{"chat_inventory_format": 1}'::jsonb)::json
+          FROM snapshots AS source
+         WHERE heir.id = CAST(:heir AS UUID) AND source.id = CAST(:did AS UUID)
+           AND source.extra_data::jsonb ->> 'chat_inventory_format' = '1'
     """), {"heir": str(heir_id), "did": str(doomed_id)})
 
     # 3. Promote the heir to a full snapshot FIRST — BEFORE repointing the

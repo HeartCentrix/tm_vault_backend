@@ -123,6 +123,10 @@ class _ChainDB:
             return self._pick_heir(p)
         if sql.startswith("INSERT INTO snapshot_items"):
             return self._copy_items(p)
+        # This fixture models legacy inventories; catalogue transfer is covered
+        # by the real PostgreSQL catalogue retention roundtrip.
+        if sql.startswith("INSERT INTO snapshot_chat_inventories") or sql.startswith("UPDATE snapshots AS heir"):
+            return _Result([])
         if "reuse_rehydrated_from" in sql:            # step 4 — promote
             return self._promote(sql, p)
         if sql.startswith("UPDATE snapshots"):        # step 3 — repoint

@@ -544,6 +544,9 @@ async def startup():
 
     # Phase 2: Retention cleanup — FLAT/GFS snapshot pruning per SLA policy (daily)
     scheduler.add_job(run_retention_cleanup, "interval", hours=24)
+    scheduler.add_job(run_chat_catalogue_cleanup, "interval", minutes=5,
+                      id="chat_catalogue_cleanup", max_instances=1, coalesce=True,
+                      replace_existing=True)
 
     # Stale-snapshot sweep — close out snapshots that have been
     # IN_PROGRESS for >30min with no live handler. This happens when a
@@ -4468,6 +4471,19 @@ async def retry_failed_snapshots():
 
 
 # ── Phase 2: Retention Cleanup ──
+
+async def run_chat_catalogue_cleanup():
+    """Reclaim a bounded batch of unreachable catalogue-owned generations."""
+    from shared.chat_catalogue_gc import collect_chat_catalogue
+    from shared.storage.router import router
+    try:
+        result = await collect_chat_catalogue(session_factory=async_session_factory,
+                                              storage=router, limit=100)
+        if result.objects_deleted or result.deletion_failures:
+            print(f"[CHAT_CATALOGUE_GC] deleted={result.objects_deleted} failed={result.deletion_failures}")
+    except Exception as exc:
+        print(f"[CHAT_CATALOGUE_GC] deferred: {type(exc).__name__}")
+
 
 async def run_retention_cleanup():
     """Daily: apply FLAT/GFS retention rules, delete snapshots outside the window.
