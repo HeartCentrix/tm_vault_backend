@@ -635,7 +635,8 @@ async def _replicate_catalogue_snapshot(snapshot, tenant, session):
     target = None
     try:
         if not archived or not archived.get("verified"):
-            container = azure_storage_manager.get_container_name(str(tenant_id), "teams") + "-dr"
+            # Catalogue retention follows restore-point reachability, not legacy workload age rules.
+            container = f"chat-catalogue-dr-{UUID(str(tenant_id)).hex}"
             target, encryption = await _catalogue_dr_target(tenant_config, container)
             result = await replicate_catalogue_snapshot(session_factory=async_session_factory,
                 snapshot_id=snapshot_id, tenant_id=tenant_id, source_router=router,

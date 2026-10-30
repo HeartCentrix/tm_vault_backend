@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -85,6 +85,25 @@ def _captured(version):
 
 def _logical_size(item):
     return item.content.size if item.content else len(_json(_payload(item.payload)))
+
+
+def _complete_empty_resource(snapshot):
+    metadata = snapshot.get("extra_data")
+    scopes = metadata.get("chat_catalogue_scopes") if isinstance(metadata, dict) else None
+    evidence = scopes.get("resource") if isinstance(scopes, dict) else None
+    if (snapshot.get("status") != "COMPLETED" or snapshot.get("item_count") != 0 or
+        snapshot.get("bytes_total") != 0 or not isinstance(evidence, dict) or
+        evidence.get("complete") is not True or evidence.get("failure_reason") is not None or
+        any(type(evidence.get(name)) is not int or evidence[name] != 0
+            for name in ("planned_chats", "completed_chats")) or
+        evidence.get("selection_sha256") != hashlib.sha256(b"[]").hexdigest()):
+        return False
+    try:
+        started = datetime.fromisoformat(evidence["started_at"])
+        finished = datetime.fromisoformat(evidence["finished_at"])
+        return started.utcoffset() == finished.utcoffset() == timedelta(0) and started <= finished
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def _policy_matches(policy, encryption):
@@ -374,7 +393,10 @@ class _Index:
     def _validate(self):
         tenant, snapshot = self.header["tenant_id"], self.header["snapshot"]
         if not self.count("association"):
-            raise ChatCatalogueIntegrityError("DR snapshot has no terminal inventory association")
+            empty = all(self.count(kind) == 0 for kind in
+                ("link", "version", "object", "inventory", "inventory_item", "replica", "attempt"))
+            if not empty or not _complete_empty_resource(snapshot):
+                raise ChatCatalogueIntegrityError("DR snapshot has no terminal inventory or complete empty-resource scope")
         for kind, references in (("version", "'inventory_item','link'"), ("object", "'version'"), ("inventory", "'association'")):
             unused = self.db.execute(f"SELECT key FROM records WHERE kind=? EXCEPT SELECT ref FROM records WHERE kind IN ({references})", (kind,)).fetchone()
             if unused is not None:

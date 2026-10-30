@@ -273,6 +273,96 @@ async def test_genuinely_empty_complete_inventory_has_a_recoverable_manifest(sto
         assert [item async for item in recovered.iter_items()] == []
 
 
+async def capture_zero_chat_resource(store, monkeypatch):
+    from shared import chat_capture_graph, chat_catalogue_entry
+    scope = await store.new_scope()
+    class Source:
+        permission_scope_hash = "a" * 64
+        list_calls = 0
+        async def iter_chats(self):
+            self.list_calls += 1
+            if False:
+                yield {}
+    source = Source()
+    @asynccontextmanager
+    async def pinned(client, *, principal_id):
+        assert principal_id == scope.principal_id
+        yield source
+    monkeypatch.setattr(chat_capture_graph, "pinned_chat_source", pinned)
+    storage = SimpleNamespace(active_backend_id=lambda: str(scope.backend_id),
+        get_store_by_id=lambda *_: pytest.fail("zero-chat capture accessed binary storage"))
+    result = await chat_catalogue_entry.run_chat_catalogue_resource(resource_id=scope.resource_id,
+        snapshot_id=scope.snapshot_id, writer_enabled=True, graph_client=object(),
+        session_factory=store.factory, storage=storage)
+    assert source.list_calls == 2 and result["outcome"] == "complete" and result["item_count"] == 0
+    async with store.factory.begin() as session:
+        snapshot = await session.get(Snapshot, scope.snapshot_id)
+        # The existing worker owns terminal settlement after this coordinator.
+        snapshot.status = "COMPLETED"
+        snapshot.item_count, snapshot.bytes_total = result["item_count"], result["bytes_total"]
+        evidence = snapshot.extra_data["chat_catalogue_scopes"]["resource"]
+        assert evidence["complete"] is True and evidence["planned_chats"] == evidence["completed_chats"] == 0
+        assert list((await session.scalars(select(SnapshotChatInventory))).all()) == []
+    return scope, storage
+
+
+@pytest.mark.asyncio
+async def test_zero_visible_chat_coordinator_result_archives_and_recovers_without_chat_associations(store, monkeypatch, tmp_path):
+    scope, storage = await capture_zero_chat_resource(store, monkeypatch)
+    target = DiskTarget(tmp_path)
+    result = await archive(store, scope, storage, target)
+    assert result.item_count == result.object_count == 0
+    async with api().load_catalogue_dr_manifest(target=target, container=result.container,
+        path=result.path, expected_sha256=result.sha256, tenant_id=scope.tenant_id,
+        snapshot_id=scope.snapshot_id) as recovered:
+        assert recovered.snapshot["extra_data"]["chat_catalogue_scopes"]["resource"]["complete"] is True
+        for kind in ("association", "inventory", "inventory_item", "version", "link", "object", "replica"):
+            assert [row async for row in recovered.iter_records(kind)] == []
+        assert [item async for item in recovered.iter_items()] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["missing", "incomplete", "planned", "selection", "failure", "interval"])
+async def test_zero_chat_archive_requires_complete_untampered_resource_scope_evidence(store, monkeypatch, tmp_path, fault):
+    scope, storage = await capture_zero_chat_resource(store, monkeypatch)
+    async with store.factory.begin() as session:
+        snapshot = await session.get(Snapshot, scope.snapshot_id)
+        scopes = dict(snapshot.extra_data["chat_catalogue_scopes"])
+        evidence = dict(scopes["resource"])
+        if fault == "missing":
+            scopes.pop("resource")
+        else:
+            change = {"incomplete": {"complete": False}, "planned": {"planned_chats": 1},
+                "selection": {"selection_sha256": "f" * 64}, "failure": {"failure_reason": "enumeration gap"},
+                "interval": {"finished_at": "not-a-UTC-interval"}}[fault]
+            scopes["resource"] = evidence | change
+        snapshot.extra_data = {**snapshot.extra_data, "chat_catalogue_scopes": scopes}
+    target = DiskTarget(tmp_path)
+    with pytest.raises(Exception, match="resource|scope|inventory|empty"):
+        await archive(store, scope, storage, target)
+    assert not any("manifest-" in path for path in target.written)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["link", "version", "object", "inventory"])
+async def test_empty_resource_evidence_cannot_hide_captured_dependencies_without_associations(store, monkeypatch, tmp_path, kind):
+    scope, storage = await capture_zero_chat_resource(store, monkeypatch)
+    target = DiskTarget(tmp_path)
+    result = await archive(store, scope, storage, target)
+    path = target.local(result.container, result.path)
+    records = [json.loads(line) for line in path.read_bytes().splitlines()]
+    records.insert(-1, {"type": kind, "data": {"id": str(uuid4())}})
+    encoded = b"".join(json.dumps(record, sort_keys=True, separators=(",", ":")).encode() + b"\n" for record in records[:-1])
+    records[-1].update(record_count=len(records) - 1, sha256=hashlib.sha256(encoded).hexdigest())
+    forged = encoded + json.dumps(records[-1], sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    path.write_bytes(forged)
+    with pytest.raises(Exception, match="inventory|empty.resource|scope"):
+        async with api().load_catalogue_dr_manifest(target=target, container=result.container,
+            path=result.path, expected_sha256=hashlib.sha256(forged).hexdigest(), tenant_id=scope.tenant_id,
+            snapshot_id=scope.snapshot_id):
+            pytest.fail("empty resource proof hid unassociated captured dependencies")
+
+
 @pytest.mark.asyncio
 async def test_source_backend_object_identity_must_match_descriptor_registry_key(store, monkeypatch, tmp_path):
     scope, _, _, router, _ = await capture_binary(store, monkeypatch)
@@ -503,6 +593,50 @@ async def test_new_format_worker_never_marks_drready_without_automatic_restore_r
         snapshot = await session.get(Snapshot, scope.snapshot_id)
         assert snapshot.dr_replication_attempts == 1
         assert target.written == writes
+
+
+@pytest.mark.asyncio
+async def test_catalogue_archive_cannot_match_actual_legacy_dr_lifecycle_deletion_rules(store, monkeypatch, tmp_path):
+    from copy import deepcopy
+    import azure.identity.aio
+    import azure.mgmt.storage.aio
+    scope, _, _, router, _ = await capture_binary(store, monkeypatch)
+    target = DiskTarget(tmp_path)
+    module = await configure_dr_worker(store, scope, router, target, monkeypatch)
+    async with store.factory() as session:
+        await module.replicate_snapshot(await session.get(Snapshot, scope.snapshot_id),
+                                        await session.get(Tenant, scope.tenant_id), session)
+    async with store.factory.begin() as session:
+        snapshot = await session.get(Snapshot, scope.snapshot_id)
+        receipt = snapshot.extra_data["chat_catalogue_dr_archive"]
+        session.add(SlaPolicy(tenant_id=scope.tenant_id, name="Finite synthetic retention", enabled=True,
+            retention_hot_days=1, retention_cool_days=2, retention_archive_days=3))
+    rules = []
+    class Credential:
+        def __init__(self, *args, **kwargs):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+    class Management(Credential):
+        def __init__(self, *args, **kwargs):
+            self.management_policies = SimpleNamespace(create_or_update=self.save)
+        async def save(self, **kwargs):
+            rules.extend(deepcopy(kwargs["parameters"]["policy"]["rules"]))
+    monkeypatch.setattr(azure.identity.aio, "ClientSecretCredential", Credential)
+    monkeypatch.setattr(azure.mgmt.storage.aio, "StorageManagementClient", Management)
+    monkeypatch.setattr(module.settings, "AZURE_ARM_CLIENT_ID", "synthetic-only")
+    monkeypatch.setattr(module.settings, "AZURE_ARM_CLIENT_SECRET", "synthetic-only")
+    monkeypatch.setattr(module.settings, "AZURE_ARM_TENANT_ID", "synthetic-only")
+    monkeypatch.setattr(module, "decrypt_secret", lambda _: "synthetic-only")
+    monkeypatch.setattr(module, "_create_dr_shard", lambda *args: SimpleNamespace(account_name="syntheticdr"))
+    await module.reconcile_dr_lifecycle_policies()
+    expiry = [rule for rule in rules if "delete" in rule["definition"]["actions"]["baseBlob"]]
+    assert expiry  # Exercise finite deletion, not an empty/no-op policy.
+    locations = [receipt["container"] + "/" + path for path in target.written]
+    assert not any(location.startswith(prefix) for rule in expiry
+        for prefix in rule["definition"]["filters"]["prefixMatch"] for location in locations)
 
 
 @pytest.mark.asyncio
