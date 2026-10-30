@@ -5,7 +5,7 @@ from typing import Optional, Tuple
 from sqlalchemy import (
     Column, String, DateTime, Boolean, Integer, BigInteger,
     Text, ForeignKey, Enum as SAEnum, JSON, ARRAY, func, LargeBinary,
-    Index, text as sql_text,
+    Index, UniqueConstraint, text as sql_text,
 )
 from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import relationship, synonym
@@ -640,6 +640,8 @@ class SnapshotItem(Base):
     # Storage backend that holds this item's blob. Permanent — wins over
     # system_config.active_backend_id during passthrough restores.
     backend_id = Column(UUID(as_uuid=True), ForeignKey("storage_backends.id"), nullable=False)
+    chat_version_id = Column(UUID(as_uuid=True), ForeignKey("chat_item_versions.id", ondelete="RESTRICT",
+                             name="fk_snapshot_items_chat_version"), nullable=True, index=True)
     created_at = Column(DateTime, default=utcnow)
 
 
@@ -1613,3 +1615,146 @@ class AppSettings(Base):
     job_retry_delay_minutes = Column(Integer, nullable=False, server_default="5")
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     __table_args__ = (CheckConstraint("id = 1", name="ck_app_settings_singleton"),)
+
+
+class ChatCaptureAttempt(Base):
+    __tablename__ = "chat_capture_attempts"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # Preserve upload ownership after snapshot deletion; a null owner fences publication.
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey("snapshots.id", ondelete="SET NULL"), index=True)
+    resource_id = Column(UUID(as_uuid=True), ForeignKey("resources.id"), nullable=False)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
+    chat_id = Column(Text, nullable=False)
+    folder_path = Column(Text, nullable=False)
+    principal_id = Column(Text, nullable=False)
+    permission_scope_hash = Column(String(64), nullable=False)
+    authentication_context_sha256 = Column(String(64), nullable=False)
+    backend_id = Column(UUID(as_uuid=True), ForeignKey("storage_backends.id"), nullable=False)
+    partition_id = Column(UUID(as_uuid=True), nullable=True)
+    generation = Column(BigInteger, nullable=False)
+    state = Column(String(24), nullable=False, default="CREATED")
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    staged_inventory_id = Column(UUID(as_uuid=True), ForeignKey("chat_inventories.id", use_alter=True,
+        name="fk_chat_attempt_staged_inventory", deferrable=True, initially="DEFERRED"), nullable=False)
+    evidence = Column(JSON, nullable=True)
+    evidence_history = Column(JSON, nullable=False, default=list)
+    failure_reason = Column(Text)
+    reused_inventory = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", "chat_id", "generation", name="uq_chat_attempt_generation"),
+        CheckConstraint("generation >= 0", name="ck_chat_attempt_generation"),
+        CheckConstraint("state IN ('CREATED','ENUMERATING','CONTENT_PENDING','VERIFYING','READY','PUBLISHED','PARTIAL','FAILED','SUPERSEDED')", name="ck_chat_attempt_state"),
+    )
+
+
+class ChatBlobObject(Base):
+    __tablename__ = "chat_blob_objects"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
+    backend_id = Column(UUID(as_uuid=True), ForeignKey("storage_backends.id"), nullable=False)
+    container = Column(Text, nullable=False)
+    path = Column(Text, nullable=False)
+    sha256 = Column(String(64), nullable=False)
+    size = Column(BigInteger, nullable=False)
+    encryption_key_id = Column(Text)
+    backup_version = Column(Integer)
+    state = Column(String(16), nullable=False, default="STAGING")
+    capture_attempt_id = Column(UUID(as_uuid=True), ForeignKey("chat_capture_attempts.id", ondelete="SET NULL"), index=True)
+    uploaded_bytes = Column(BigInteger, nullable=False, default=0)
+    upload_deadline = Column(DateTime(timezone=True))
+    quiescent_after = Column(DateTime(timezone=True))
+    deletion_task_id = Column(UUID(as_uuid=True))
+    deletion_requested_at = Column(DateTime(timezone=True))
+    deletion_attempts = Column(Integer, nullable=False, default=0)
+    deletion_error = Column(Text)
+    deleted_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    __table_args__ = (
+        UniqueConstraint("backend_id", "container", "path", name="uq_chat_blob_location"),
+        CheckConstraint("state IN ('STAGING','LIVE','DELETING','DELETED')", name="ck_chat_blob_state"),
+        CheckConstraint("size >= 0 AND uploaded_bytes >= 0 AND deletion_attempts >= 0", name="ck_chat_blob_counts"),
+    )
+
+
+class ChatItemVersion(Base):
+    __tablename__ = "chat_item_versions"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
+    chat_id = Column(Text, nullable=False)
+    logical_key = Column(String(64), nullable=False)
+    item_type = Column(Text, nullable=False)
+    graph_id = Column(Text, nullable=False)
+    parent_graph_id = Column(Text)
+    payload_sha256 = Column(String(64), nullable=False)
+    version_sha256 = Column(String(64), nullable=False)
+    payload = Column(JSON, nullable=False)
+    content = Column(JSON)
+    object_id = Column(UUID(as_uuid=True), ForeignKey("chat_blob_objects.id", ondelete="RESTRICT"), index=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "chat_id", "logical_key", "version_sha256", name="uq_chat_item_version"),
+        CheckConstraint("item_type NOT IN ('CHAT_ATTACHMENT','CHAT_HOSTED_CONTENT') OR parent_graph_id IS NOT NULL", name="ck_chat_version_parent"),
+    )
+
+
+class ChatInventory(Base):
+    __tablename__ = "chat_inventories"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    capture_attempt_id = Column(UUID(as_uuid=True), ForeignKey("chat_capture_attempts.id"), nullable=False, unique=True)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
+    chat_id = Column(Text, nullable=False)
+    authentication_context_sha256 = Column(String(64), nullable=False)
+    state = Column(String(16), nullable=False, default="STAGING")
+    membership_sha256 = Column(String(64))
+    representation_sha256 = Column(String(64))
+    item_count = Column(BigInteger, nullable=False, default=0)
+    logical_bytes = Column(BigInteger, nullable=False, default=0)
+    evidence = Column(JSON)
+    failure_reason = Column(Text)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    __table_args__ = (
+        CheckConstraint("state IN ('STAGING','PARTIAL','COMPLETE')", name="ck_chat_inventory_state"),
+        CheckConstraint("item_count >= 0 AND logical_bytes >= 0", name="ck_chat_inventory_counts"),
+        CheckConstraint("state <> 'COMPLETE' OR (membership_sha256 IS NOT NULL AND representation_sha256 IS NOT NULL AND evidence IS NOT NULL)", name="ck_chat_inventory_complete_evidence"),
+        Index("uq_chat_complete_inventory", "tenant_id", "chat_id", "authentication_context_sha256", "membership_sha256", "representation_sha256",
+              unique=True, postgresql_where=sql_text("state = 'COMPLETE'")),
+    )
+
+
+class ChatInventoryItem(Base):
+    __tablename__ = "chat_inventory_items"
+    inventory_id = Column(UUID(as_uuid=True), ForeignKey("chat_inventories.id", ondelete="CASCADE"), primary_key=True)
+    logical_key = Column(String(64), primary_key=True)
+    version_id = Column(UUID(as_uuid=True), ForeignKey("chat_item_versions.id", ondelete="RESTRICT"), nullable=False, index=True)
+
+
+class SnapshotChatInventory(Base):
+    __tablename__ = "snapshot_chat_inventories"
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey("snapshots.id", ondelete="CASCADE"), primary_key=True)
+    chat_id = Column(Text, primary_key=True)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
+    inventory_id = Column(UUID(as_uuid=True), ForeignKey("chat_inventories.id", ondelete="RESTRICT"), nullable=False, index=True)
+    capture_attempt_id = Column(UUID(as_uuid=True), ForeignKey("chat_capture_attempts.id"), nullable=False)
+    coverage_status = Column(String(16), nullable=False)
+    started_at = Column(DateTime(timezone=True), nullable=False)
+    finished_at = Column(DateTime(timezone=True), nullable=False)
+    failure_reason = Column(Text)
+    uploaded_bytes = Column(BigInteger, nullable=False, default=0)
+    __table_args__ = (CheckConstraint("coverage_status IN ('PARTIAL','COMPLETE')", name="ck_snapshot_chat_coverage"),)
+
+
+class ChatCataloguePin(Base):
+    __tablename__ = "chat_catalogue_pins"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    inventory_id = Column(UUID(as_uuid=True), ForeignKey("chat_inventories.id", ondelete="RESTRICT"), index=True)
+    object_id = Column(UUID(as_uuid=True), ForeignKey("chat_blob_objects.id", ondelete="RESTRICT"), index=True)
+    owner_kind = Column(String(32), nullable=False)
+    owner_id = Column(UUID(as_uuid=True), nullable=False)
+    generation = Column(BigInteger, nullable=False)
+    expires_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    __table_args__ = (
+        CheckConstraint("(inventory_id IS NULL) <> (object_id IS NULL)", name="ck_chat_pin_target"),
+        CheckConstraint("generation >= 0", name="ck_chat_pin_generation"),
+    )

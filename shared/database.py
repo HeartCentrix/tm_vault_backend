@@ -60,6 +60,9 @@ REQUIRED_TABLES = (
     # both expect the table to exist before issuing their INSERT /
     # SELECT FOR UPDATE SKIP LOCKED.
     "onedrive_file_retries",
+    "chat_capture_attempts", "chat_blob_objects", "chat_item_versions",
+    "chat_inventories", "chat_inventory_items", "snapshot_chat_inventories",
+    "chat_catalogue_pins",
 )
 
 REQUIRED_COLUMNS = {
@@ -72,7 +75,7 @@ REQUIRED_COLUMNS = {
         "retention_mode",
     ),
     "resources": ("resource_hash",),
-    "snapshot_items": ("parent_external_id", "backend_id"),
+    "snapshot_items": ("parent_external_id", "backend_id", "chat_version_id"),
     "snapshots": ("backend_id",),
     "jobs": ("retry_reason", "pre_toggle_job_id"),
     "resource_discovery_staging": (
@@ -80,6 +83,13 @@ REQUIRED_COLUMNS = {
         "azure_resource_group",
         "azure_region",
     ),
+    "chat_capture_attempts": ("generation", "state", "expires_at", "staged_inventory_id", "evidence", "folder_path"),
+    "chat_blob_objects": ("state", "sha256", "capture_attempt_id", "deletion_task_id"),
+    "chat_item_versions": ("logical_key", "version_sha256", "payload", "content", "object_id"),
+    "chat_inventories": ("state", "membership_sha256", "representation_sha256", "evidence"),
+    "chat_inventory_items": ("inventory_id", "logical_key", "version_id"),
+    "snapshot_chat_inventories": ("inventory_id", "coverage_status", "capture_attempt_id", "uploaded_bytes"),
+    "chat_catalogue_pins": ("inventory_id", "object_id", "generation", "expires_at"),
 }
 
 logger = logging.getLogger(__name__)
@@ -196,6 +206,29 @@ async def _has_required_columns(conn) -> bool:
     return True
 
 
+async def _has_required_catalogue_constraints(conn) -> bool:
+    """Tables/columns alone cannot conceal an unapplied or failed 0011 migration."""
+    result = await conn.execute(text("""
+        SELECT EXISTS (
+            SELECT 1 FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid
+            JOIN pg_namespace n ON n.oid=t.relnamespace
+            WHERE n.nspname=:schema AND t.relname='snapshot_items'
+              AND c.conname='fk_snapshot_items_chat_version' AND c.convalidated
+        ) AND EXISTS (
+            SELECT 1 FROM pg_index i JOIN pg_class x ON x.oid=i.indexrelid
+            JOIN pg_namespace n ON n.oid=x.relnamespace
+            WHERE n.nspname=:schema AND x.relname='ix_snapshot_items_chat_version_id'
+              AND i.indisvalid
+        ) AND EXISTS (
+            SELECT 1 FROM pg_index i JOIN pg_class x ON x.oid=i.indexrelid
+            JOIN pg_namespace n ON n.oid=x.relnamespace
+            WHERE n.nspname=:schema AND x.relname='uq_chat_complete_inventory'
+              AND i.indisvalid AND i.indisunique AND i.indpred IS NOT NULL
+        )
+    """), {"schema": settings.DB_SCHEMA})
+    return bool(result.scalar())
+
+
 async def wait_for_schema_ready(
     timeout_seconds: int = SCHEMA_READY_TIMEOUT_SECONDS,
     poll_interval_seconds: float = SCHEMA_READY_POLL_INTERVAL_SECONDS,
@@ -206,7 +239,8 @@ async def wait_for_schema_ready(
     while monotonic() < deadline:
         try:
             async with engine.connect() as conn:
-                if await _has_required_tables(conn) and await _has_required_columns(conn):
+                if (await _has_required_tables(conn) and await _has_required_columns(conn)
+                    and await _has_required_catalogue_constraints(conn)):
                     return True
         except Exception as exc:  # pragma: no cover - defensive startup logging
             last_error = exc
@@ -1763,6 +1797,11 @@ async def init_db() -> None:
                     await conn.execute(text("ROLLBACK TO SAVEPOINT alter_sp"))  # Already converted
 
             await conn.run_sync(Base.metadata.create_all)
+            # Existing hot snapshot_items needs the explicit additive migration;
+            # create_all cannot add its column/FK/index and boot must not build it.
+            if (not await _has_required_columns(conn) or
+                not await _has_required_catalogue_constraints(conn)):
+                raise RuntimeError("Chat catalogue schema is incomplete; apply Alembic revision 0011")
 
         # Enum value additions (e.g. jobstatus PENDING/CANCELLING) must run
         # OUTSIDE a transaction. Chat-export indexes that reference those
