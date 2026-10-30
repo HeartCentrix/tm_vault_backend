@@ -290,12 +290,16 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                 return await capture_chat_inventory(scope=scope, graph_client=source, storage=storage,
                     session_factory=session_factory, folder_path=_folder(chats[cid]),
                     exclude_message=exclude_message, scope_filter_hash=scope_filter_hash)
-            for start in range(0, len(keys), concurrency):
-                await cancel_check()
-                results = await asyncio.gather(*(capture(cid) for cid in keys[start:start + concurrency]),
-                    return_exceptions=True)
-                await cancel_check()
-                for cid, result in zip(keys[start:start + concurrency], results):
+            remaining = iter(keys)
+            async def worker():
+                nonlocal completed
+                for cid in remaining:
+                    await cancel_check()
+                    try:
+                        result = await capture(cid)
+                    except (Exception, asyncio.CancelledError) as exc:
+                        result = exc
+                    await cancel_check()
                     if isinstance(result, asyncio.CancelledError):
                         raise result
                     if isinstance(result, ChatCatalogueWorkLeaseMoved):
@@ -321,6 +325,13 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                         completed += 1
                     else:
                         errors.append(result.failure_reason or "chat capture has incomplete coverage")
+            workers = [asyncio.create_task(worker()) for _ in range(min(concurrency, len(keys)))]
+            try:
+                await asyncio.gather(*workers)
+            finally:
+                for task in workers:
+                    task.cancel()
+                await asyncio.gather(*workers, return_exceptions=True)
             final_chats = set(await _chat_list(source))
             if (allowed is None and final_chats != set(chats)) or (allowed is not None and allowed - final_chats):
                 errors.append("chat visibility changed during resource capture")
