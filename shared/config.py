@@ -650,6 +650,11 @@ class Settings:
         ))
 
         # ── USER_CHATS cross-replica partition ──
+        # Immutable catalogue writing is opt-in. Adopted resources fail
+        # closed when disabled; they never return to history-union writes.
+        self.CHAT_CATALOGUE_WRITER_ENABLED = os.getenv(
+            "CHAT_CATALOGUE_WRITER_ENABLED", "false",
+        ).lower() in ("true", "1", "yes")
         # Whale-user chat backups (a single user with hundreds of chats
         # across many teams + 1:1s) partition by chat-id batches so
         # multiple backup_worker replicas drain the same user's chats in

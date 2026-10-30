@@ -48,6 +48,7 @@ except ImportError:
 
 
 from shared.worker_logging import ensure_worker_stdout_logging  # noqa: E402
+from shared.chat_catalogue import ChatCatalogueWorkLeaseMoved
 
 # This worker logs via print(); shared.* modules log via logging. Without a
 # handler the "[CARRY_FORWARD] waiting" early-warning line (the pg_locks
@@ -5821,6 +5822,11 @@ class BackupWorker:
             result = await handler(graph_client, resource, snapshot, tenant, message)
             # Handler finished — finalize phase ahead (DB writes + audit).
             await _update_job_pct(job_id, 95)
+        except ChatCatalogueWorkLeaseMoved:
+            # A replacement owner (or an active same-snapshot peer) owns
+            # settlement. ACK this delivery without failing its live work.
+            print(f"[{self.worker_id}] catalogue ownership moved; deferring snapshot {snapshot.id}")
+            return
         except Exception as e:
             _is_cancel = isinstance(e, JobCancelledMidFlight) or (
                 "cancelled mid-flight" in str(e).lower()
@@ -6016,7 +6022,9 @@ class BackupWorker:
                     await self._finalize_bulk_parent_if_complete(s, job_id)
             else:
                 async with async_session_factory() as s:
-                    await self.update_job_status(s, job_id, JobStatus.COMPLETED, result)
+                    _catalogue_status = result.get("status") if result.get("chat_inventory_format") == 1 else None
+                    await self.update_job_status(s, job_id,
+                        JobStatus.FAILED if _catalogue_status == "FAILED" else JobStatus.COMPLETED, result)
 
             # Stamp from the COMMITTED row: the inline settle (USER_*) or a
             # sweep may have landed PARTIAL/FAILED where the in-memory
@@ -6028,19 +6036,21 @@ class BackupWorker:
 
             # Audit event — fire-and-forget over HTTP, no DB session needed.
             await self.audit_logger.log(
-                action="BACKUP_COMPLETED",
+                action=("BACKUP_FAILED" if result.get("chat_inventory_format") == 1 and result.get("status") == "FAILED" else "BACKUP_COMPLETED"),
                 tenant_id=str(tenant.id),
                 org_id=str(tenant.org_id) if hasattr(tenant, 'org_id') and tenant.org_id else None,
                 actor_type="WORKER",
                 resource_id=str(resource.id),
                 resource_type=resource_type,
                 resource_name=resource.display_name or resource.email or str(resource.id),
-                outcome="SUCCESS",
+                outcome=({"PARTIAL": "PARTIAL", "FAILED": "FAILURE"}.get(result.get("status"), "SUCCESS")
+                    if result.get("chat_inventory_format") == 1 else "SUCCESS"),
                 job_id=str(job_id),
                 snapshot_id=str(snapshot.id),
                 details={
                     "item_count": result.get("item_count", 0),
                     "bytes_added": result.get("bytes_added", 0),
+                    **({"snapshot_status": result.get("status")} if result.get("chat_inventory_format") == 1 else {}),
                 },
             )
 
@@ -6505,6 +6515,102 @@ class BackupWorker:
             return await self._backup_generic_parallel(resources, graph_client, tenant, message, job_id)
 
     # ==================== Tier 2 per-user content backup ====================
+
+    async def _maybe_backup_chat_catalogue(self, resource, snapshot, tenant, graph_client, message, job_id):
+        """Own new-format capture and settlement before any legacy chat path."""
+        from shared.chat_catalogue_entry import (
+            ChatCatalogueAdoptionError, catalogue_snapshot_result,
+            lock_chat_catalogue_snapshot, run_chat_catalogue_resource,
+        )
+        from shared.db_retry import run_catalogue_transaction
+        from shared.storage.router import router
+
+        partition_id = None
+        try:
+            enabled = bool(getattr(settings, "CHAT_CATALOGUE_WRITER_ENABLED", False))
+            policy = await self.get_sla_policy(resource, message) if enabled else None
+            exclusions = await self.get_policy_exclusions(policy.id) if policy is not None else []
+            predicate, filter_hash = None, None
+            if exclusions:
+                compiled = self._compile_exclusions(exclusions)
+                filter_hash = hashlib.sha256(json.dumps(exclusions, sort_keys=True,
+                    separators=(",", ":"), default=str).encode()).hexdigest()
+                def predicate(raw):
+                    candidate = dict(raw)
+                    candidate.setdefault("name", (raw.get("body") or {}).get("content", "")[:120] or "")
+                    candidate["folderPath"] = raw.get("_chat_folder_path", "")
+                    return self._item_is_excluded_compiled("CHAT_MESSAGE", candidate, compiled)
+
+            partition_raw = (message or {}).get("partitionId")
+            partition_id = uuid.UUID(str(partition_raw)) if partition_raw else None
+            record = _partition_lease_record(partition_id) if partition_id else None
+            token = record["lease"].token if record and not record.get("stolen") else None
+            async def cancel_check():
+                await _raise_if_job_cancelled(job_id)
+            result = await run_chat_catalogue_resource(resource_id=resource.id, snapshot_id=snapshot.id,
+                writer_enabled=enabled, graph_client=graph_client, session_factory=async_session_factory,
+                storage=router, partition_filter=(message or {}).get("partitionFilter"),
+                partition_id=partition_id, policy_id=policy.id if policy is not None else None,
+                exclude_message=predicate, scope_filter_hash=filter_hash, check_cancelled=cancel_check,
+                concurrency=max(1, int(os.getenv("USER_CHATS_PARALLEL_CHATS", "32"))),
+                snapshot_lease_token=getattr(snapshot, "lease_token", None), partition_lease_token=token)
+            if result is None or result.get("resumed_terminal"):
+                return result
+
+            async def settle(session):
+                live = await lock_chat_catalogue_snapshot(session, snapshot_id=snapshot.id,
+                    snapshot_lease_token=result.get("_snapshot_lease_token"), partition_id=partition_id,
+                    partition_lease_token=result.get("_partition_lease_token"),
+                    job_lease_token=result.get("_job_lease_token"))
+                if live.status != SnapshotStatus.IN_PROGRESS:
+                    return await catalogue_snapshot_result(session, snapshot.id)
+                live.item_count = result["item_count"]
+                live.new_item_count = result["new_item_count"]
+                live.bytes_total = result["bytes_total"]
+                live.bytes_added = result["bytes_added"]
+                if result["outcome"] != "complete":
+                    reason = result.get("failure_reason") or "chat capture has incomplete coverage"
+                    live.extra_data = {**(live.extra_data or {}),
+                        SNAPSHOT_DEGRADED_REASON_KEY: reason, "failure_reason": reason}
+                if result["outcome"] == "failed" and not result.get("partitioned"):
+                    live.status = await _coerce_snapshot_terminal_on_cancel(live, SnapshotStatus.FAILED)
+                    live.completed_at = datetime.utcnow()
+                    if live.started_at:
+                        live.duration_secs = int((live.completed_at - live.started_at).total_seconds())
+                else:
+                    await self._settle_inline_snapshot_finalize(session, live, resource)
+                await session.flush()
+                status = live.status
+                return {**result, "status": status.value,
+                    "failed": result["outcome"] == "failed" or status == SnapshotStatus.FAILED}
+
+            result = await run_catalogue_transaction(async_session_factory, settle)
+            if result.get("resumed_terminal"):
+                return result
+            if not result.get("partitioned"):
+                result.update(snapshots_total=1, snapshots_completed=int(result["status"] == "COMPLETED"),
+                    snapshots_partial=int(result["status"] == "PARTIAL"), snapshots_failed=int(result["status"] == "FAILED"))
+            if partition_id and result.get("outcome") != "complete":
+                self._shard_failure_ledger()[str(partition_id)] = {
+                    "reason": "EnumerationFailed", "message": result.get("failure_reason") or "incomplete chat coverage"}
+            async with async_session_factory() as session:
+                live = await session.get(Snapshot, snapshot.id)
+                live_resource = await session.get(Resource, resource.id)
+                if live is not None and live_resource is not None:
+                    status, terminal = resource_stamp_for_snapshot(live.status, live.extra_data)
+                    await self.update_resource_backup_info(session, live_resource, job_id, live.id,
+                        result, status=status, terminal=terminal)
+            return result
+        except ChatCatalogueWorkLeaseMoved:
+            if partition_id:
+                _note_partition_lease_stolen(self.worker_id, partition_id)
+            raise
+        except JobCancelledMidFlight:
+            raise
+        except ChatCatalogueAdoptionError as exc:
+            raise EnumerationFailed(str(exc)) from exc
+        except Exception as exc:
+            raise EnumerationFailed(f"catalogue capture did not complete ({type(exc).__name__})") from exc
 
     async def _backup_user_content_parallel(
         self,
@@ -11967,6 +12073,11 @@ class BackupWorker:
                 # inline and return a lightweight attachment-candidate
                 # list. Cuts peak memory O(all-items) → O(one-chunk).
                 try:
+                    if resource.type == ResourceType.USER_CHATS:
+                        catalogue_result = await self._maybe_backup_chat_catalogue(
+                            resource, snapshot, tenant, graph_client, message, job_id)
+                        if catalogue_result is not None:
+                            return catalogue_result
                     items_data = await _fetch_for(resource, snapshot)
                 except EnumerationFailed as enum_exc:
                     # Enumeration died (Graph 401/5xx mid-walk, or a
@@ -12692,7 +12803,7 @@ class BackupWorker:
         # snapshot. Re-raise it — fail_snapshot stamps cancelled_at for the
         # whole-resource path; the shard handler settles the row FAILED.
         for _r in results:
-            if isinstance(_r, JobCancelledMidFlight):
+            if isinstance(_r, (JobCancelledMidFlight, ChatCatalogueWorkLeaseMoved)):
                 raise _r
 
         # Per-resource BACKUP_COMPLETED / BACKUP_FAILED used to fire
@@ -12702,6 +12813,8 @@ class BackupWorker:
         # the partition finalizer emits exactly once at line 8534. This
         # closure ran inside both flows, so emitting again here
         # produced 2–6× duplicate audit rows per attempt.
+        if len(results) == 1 and isinstance(results[0], dict) and results[0].get("chat_inventory_format") == 1:
+            return results[0]
         item_count = sum(r.get("item_count", 0) for r in results if isinstance(r, dict))
         bytes_added = sum(r.get("bytes_added", 0) for r in results if isinstance(r, dict))
         return {"item_count": item_count, "bytes_added": bytes_added}
@@ -16065,7 +16178,7 @@ class BackupWorker:
         # link, calendar's and contacts' token maps). PARTIAL/FAILED runs
         # never promote, so the next run re-enumerates from the last
         # successful position.
-        if snap.status == SnapshotStatus.COMPLETED:
+        if snap.status == SnapshotStatus.COMPLETED and (snap.extra_data or {}).get("chat_inventory_format") != 1:
             _res_row = await session.get(Resource, resource.id)
             if _res_row is not None:
                 _new_ed, _promoted = promote_pending_cursors_for_type(
@@ -17229,8 +17342,14 @@ class BackupWorker:
                     UPDATE snapshots s SET
                         status = (CASE
                             WHEN c.terminal < e.n THEN s.status
+                            WHEN c.completed = 0
+                             AND s.extra_data->>'chat_inventory_format' = '1'
+                             AND EXISTS (SELECT 1 FROM snapshot_items si WHERE si.snapshot_id = s.id)
+                                                 THEN 'PARTIAL'::snapshotstatus
                             WHEN c.completed = 0 THEN 'FAILED'::snapshotstatus
                             WHEN c.failed > 0 OR c.lossy > 0
+                              OR (s.extra_data->>'chat_inventory_format' = '1'
+                                  AND NULLIF(s.extra_data->>'degraded_reason', '') IS NOT NULL)
                                                  THEN 'PARTIAL'::snapshotstatus
                             ELSE 'COMPLETED'::snapshotstatus
                         END),
@@ -17343,7 +17462,11 @@ class BackupWorker:
         # lacks inputs (flags mail_carry_forward_failed instead).
         # (on the preempted path new_status is the reaper's stale value; if
         # no partition completed the integrity block below re-derives FAILED)
-        if new_status in ("COMPLETED", "PARTIAL") and not (
+        async with async_session_factory() as _format_session:
+            _format_snapshot = await _format_session.get(Snapshot, snapshot_id)
+            catalogue_format = bool(_format_snapshot and
+                (_format_snapshot.extra_data or {}).get("chat_inventory_format") == 1)
+        if not catalogue_format and new_status in ("COMPLETED", "PARTIAL") and not (
             preempted and int(partitions_completed or 0) == 0
         ):
             try:
@@ -17371,9 +17494,9 @@ class BackupWorker:
                         snapshot_id,
                         {"mail_carry_forward_failed": True, "mail_carry_forward_pending": True},
                     )
-        elif new_status == "FAILED" or (
+        elif not catalogue_format and (new_status == "FAILED" or (
             preempted and int(partitions_completed or 0) == 0
-        ):
+        )):
             # A FAILED snapshot is never a carry prior: cursors any shard
             # advanced past fresh rows would strand those rows forever.
             try:
@@ -17428,11 +17551,16 @@ class BackupWorker:
                 # showed full inventory as "newly added" on the Activity
                 # row even when reuse paths inside the partition handler
                 # never touched Graph.
-                delta_items, delta_bytes = await self._compute_snapshot_delta_from_prior(
-                    session, snapshot_id, snap.resource_id,
-                    persisted_count, persisted_bytes,
-                    current_job_id=snap.job_id,
-                )
+                if catalogue_format:
+                    from shared.chat_catalogue_entry import catalogue_snapshot_result
+                    _catalogue_counts = await catalogue_snapshot_result(session, snapshot_id, force_recount=True)
+                    delta_items, delta_bytes = _catalogue_counts["new_item_count"], _catalogue_counts["bytes_added"]
+                else:
+                    delta_items, delta_bytes = await self._compute_snapshot_delta_from_prior(
+                        session, snapshot_id, snap.resource_id,
+                        persisted_count, persisted_bytes,
+                        current_job_id=snap.job_id,
+                    )
                 snap.item_count = persisted_count
                 snap.new_item_count = delta_items
                 snap.bytes_total = persisted_bytes
@@ -17500,7 +17628,9 @@ class BackupWorker:
                 _d_lossy = int(getattr(derived_row, "lossy", 0) or 0)
                 _d_pending = int(getattr(derived_row, "pending", 0) or 0)
                 if _d_n > 0 and _d_pending == 0:
-                    if _d_failed == _d_n:
+                    if _d_failed == _d_n and catalogue_format and persisted_count:
+                        _derived_status = SnapshotStatus.PARTIAL
+                    elif _d_failed == _d_n:
                         _derived_status = SnapshotStatus.FAILED
                     # LOSSY BEFORE ALL-COMPLETED: a shard that lost files
                     # still reports COMPLETED (partition status stays a
@@ -17583,9 +17713,9 @@ class BackupWorker:
                         (snap.completed_at - snap.started_at).total_seconds()
                     )
                 await session.commit()
-                if snap.status == SnapshotStatus.FAILED or (
+                if not catalogue_format and (snap.status == SnapshotStatus.FAILED or (
                     snap.extra_data or {}
-                ).get("cancelled_at"):
+                ).get("cancelled_at")):
                     # FAILED / cancel landed AFTER the pre-reconcile rewind
                     # hook (integrity downgrade, cancel coercion): never a
                     # prior, so rewind every shard's cursors (idempotent).
@@ -17657,7 +17787,7 @@ class BackupWorker:
             # cursor — promote the pending cursor stashed at enumeration.
             # PARTIAL/FAILED never promote (that's the jrue/jlucas
             # lost-baseline bug). Best-effort, own session.
-            if new_status == "COMPLETED" and resource is not None:
+            if new_status == "COMPLETED" and resource is not None and not catalogue_format:
                 try:
                     async with async_session_factory() as _ps:
                         _res_row = await _ps.get(Resource, resource.id)
@@ -18373,6 +18503,9 @@ class BackupWorker:
                 await self._backup_user_content_parallel(
                     [resource], graph_client, tenant, synth_msg, job_id,
                 )
+        except ChatCatalogueWorkLeaseMoved:
+            _note_partition_lease_stolen(self.worker_id, partition_id)
+            return
         except Exception as e:
             print(
                 f"[{self.worker_id}] [PARTITION] {partition_id} "
@@ -25400,6 +25533,8 @@ class BackupWorker:
             async with async_session_factory() as _s:
                 snap = await _s.get(Snapshot, snapshot.id)
                 if snap is not None:
+                    if result.get("chat_inventory_format") == 1:
+                        return result
                     if snap.status == SnapshotStatus.FAILED:
                         reason = (snap.extra_data or {}).get("failure_reason")
                         raise EnumerationFailed(reason or "Tier-2 content backup failed")
@@ -29172,6 +29307,24 @@ class BackupWorker:
         a contradictory state, and any consumer reading status
         during that window gets a wrong answer.
         """
+        if result.get("chat_inventory_format") == 1:
+            # New-format handler already settled under its original work
+            # lease. Never let this detached outer object promote PARTIAL
+            # or overwrite logical/delta counters with stale observations.
+            live = await session.get(Snapshot, snapshot.id, populate_existing=True)
+            if live is None or (live.extra_data or {}).get("chat_inventory_format") != 1:
+                raise ChatCatalogueWorkLeaseMoved("catalogue snapshot no longer exists")
+            if live.status not in {SnapshotStatus.IN_PROGRESS, SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL, SnapshotStatus.FAILED}:
+                raise ChatCatalogueWorkLeaseMoved("catalogue snapshot was claimed for deletion")
+            if live.status == SnapshotStatus.IN_PROGRESS and not (live.extra_data or {}).get("partitioned"):
+                raise EnumerationFailed("catalogue snapshot was not settled by its capture owner")
+            for field in ("status", "type", "item_count", "new_item_count", "bytes_total", "bytes_added",
+                    "completed_at", "duration_secs", "extra_data"):
+                setattr(snapshot, field, getattr(live, field))
+            result.update(status=live.status.value, failed=live.status == SnapshotStatus.FAILED)
+            if live.status != SnapshotStatus.IN_PROGRESS:
+                lease_unregister("snapshots", live.id)
+            return
         extra = snapshot.extra_data or {}
         if extra.get("partitioned") is True:
             # Last-finisher owns this snapshot's terminal state.
