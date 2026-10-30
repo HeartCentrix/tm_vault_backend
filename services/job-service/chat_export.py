@@ -467,7 +467,7 @@ def _job_snapshot(job: Job) -> dict:
         op = job.result or {}
         out["download"] = {
             "url": op.get("signed_url"),
-            "sizeBytes": op.get("total_bytes"),
+            "sizeBytes": op.get("size_bytes", op.get("total_bytes")),
             "sha256": op.get("sha256"),
             "filename": f"teams-chat-{str(job.id)[:8]}.zip",
             "supportsRange": True,

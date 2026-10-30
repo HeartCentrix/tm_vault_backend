@@ -177,6 +177,11 @@ async def _execute_export_job(sess, job_id, spec, job):
 
 
 async def _run_pipeline(sess, job_id, spec, scope, job, *, read_lease=None) -> None:
+    catalogue_export = bool(getattr(scope, "catalogue_snapshot_ids", ()))
+    if catalogue_export and read_lease is None:
+        from shared.chat_catalogue import ChatCatalogueIntegrityError
+        raise ChatCatalogueIntegrityError("catalogue thread export has no durable read lease")
+    artifact_route = {}
     await publish(
         job_id, "progress",
         {"stage": "rendering", "percent": 20,
@@ -272,10 +277,19 @@ async def _run_pipeline(sess, job_id, spec, scope, job, *, read_lease=None) -> N
         container = "exports"
         blob_path = f"{job_id}/export.zip"
         shard = azure_storage_manager.get_default_shard()
-        up_result = await upload_blob_with_retry_from_file(
-            container, blob_path, tmp_path,
-            shard=shard, max_retries=3,
-        )
+        if catalogue_export:
+            from shared.chat_capture_storage import upload_catalogue_export_artifact
+            zip_size = os.stat(tmp_path).st_size
+            up_result = await upload_catalogue_export_artifact(session_factory=async_session_factory,
+                job_id=job_id, shard=shard, container=container, path=blob_path,
+                filename=tmp_path, size=zip_size, metadata={"job_id": str(job_id)})
+            artifact_route = {"chat_catalogue_format": 1, "backend_id": up_result.get("backend_id"),
+                "size_bytes": zip_size, "encryption_key_id": up_result.get("encryption_key_id")}
+        else:
+            up_result = await upload_blob_with_retry_from_file(
+                container, blob_path, tmp_path,
+                shard=shard, max_retries=3,
+            )
         if not up_result.get("success"):
             raise RuntimeError(f"blob upload failed: {up_result.get('error')}")
     finally:
@@ -339,6 +353,7 @@ async def _run_pipeline(sess, job_id, spec, scope, job, *, read_lease=None) -> N
                 "total_msgs": len(render_messages),
                 "total_bytes": summary["total_bytes"],
                 "sha256": summary["sha256"],
+                **artifact_route,
             },
         )
     )
@@ -351,7 +366,7 @@ async def _run_pipeline(sess, job_id, spec, scope, job, *, read_lease=None) -> N
         await publish(
             job_id, "complete",
             {"url": download_url,
-             "sizeBytes": summary["total_bytes"],
+             "sizeBytes": artifact_route.get("size_bytes", summary["total_bytes"]),
              "sha256": summary["sha256"]},
         )
     except Exception:

@@ -3111,36 +3111,10 @@ class RestoreWorker:
 
     async def _upload_catalogue_export_artifact(self, shard, container, path, filename, size, metadata, message):
         """Default export route with explicit tenant crypto; never mutate a shared facade."""
-        from shared.azure_storage import upload_blob_with_retry_from_file, _StoreFacade
-        from shared.chat_catalogue import ChatCatalogueIntegrityError
-        backend_id = getattr(shard, "backend_id", None)
-        if not backend_id:
-            raise ChatCatalogueIntegrityError("catalogue export target backend is unavailable")
-        store = getattr(shard, "_store", None)
-        if store is not None:
-            from shared.storage.router import router
-            # The default facade can contain a default/default shard clone.
-            # The recorded artifact route and downloader use the base store.
-            store = router.get_store_by_id(str(backend_id))
-            shard = _StoreFacade(store)
-        if getattr(store, "kind", None) != "seaweedfs":
-            result = await upload_blob_with_retry_from_file(container, path, filename,
-                shard=shard, file_size=size, metadata=metadata)
-            return {**result, "backend_id": str(backend_id)}
-        from shared.chat_capture_storage import require_catalogue_write_encryption, _stored_encryption
-        async with async_session_factory.begin() as session:
-            required = await require_catalogue_write_encryption(session, store)
-            tenant_id = await session.scalar(select(Job.tenant_id).where(Job.id == uuid.UUID(str(message["jobId"]))))
-            if tenant_id is None:
-                raise ChatCatalogueIntegrityError("catalogue export target has no owned tenant for encryption")
-        await store.ensure_container(container)
-        info = await store.upload_from_file(container, path, filename, size,
-            metadata={**metadata, "tenant_id": str(tenant_id), "plaintext_size": str(size)},
-            overwrite=False, tenant_id=str(tenant_id))
-        if (str(info.backend_id), info.container, info.path) != (str(store.backend_id), container, path):
-            raise ChatCatalogueIntegrityError("catalogue export upload receipt differs from its selected target")
-        key_id, _ = await _stored_encryption(store, container, path, encryption_required=required)
-        return {"success": True, "backend_id": str(info.backend_id), "encryption_key_id": key_id}
+        from shared.chat_capture_storage import upload_catalogue_export_artifact
+        return await upload_catalogue_export_artifact(session_factory=async_session_factory,
+            job_id=message["jobId"], shard=shard, container=container, path=path,
+            filename=filename, size=size, metadata=metadata)
 
     async def _check_catalogue_export_active(self, message, lease):
         lease.assert_valid()
