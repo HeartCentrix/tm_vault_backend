@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 import importlib
 import os
 import secrets
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -31,7 +32,25 @@ class Bytes(httpx.AsyncByteStream):
 
 
 @pytest.fixture
-def source_factory(monkeypatch):
+def pacing_clock(monkeypatch):
+    """Keep real token buckets, advancing their clock instead of waiting."""
+    module = importlib.import_module("shared.graph_ratelimit")
+    clock = {"now": 0.0}
+
+    async def refill_timeout(awaitable, *, timeout):
+        awaitable.close()
+        clock["now"] += timeout
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(module, "time", SimpleNamespace(
+        monotonic=lambda: clock["now"], time=module.time.time))
+    monkeypatch.setattr(module, "asyncio", SimpleNamespace(
+        Condition=asyncio.Condition, wait_for=refill_timeout, TimeoutError=asyncio.TimeoutError))
+    return clock
+
+
+@pytest.fixture
+def source_factory(monkeypatch, pacing_clock):
     """Real adapter and clients; replace only HTTP transport and pacing."""
     requests, clients = [], []
     original_client = httpx.AsyncClient
@@ -39,7 +58,7 @@ def source_factory(monkeypatch):
     state = {}
 
     @asynccontextmanager
-    async def make(handler):
+    async def make(handler, *, principal_id="user", tenant_id="tenant", application_id="app"):
         module = importlib.import_module("shared.chat_capture_graph")
 
         async def transport(request):
@@ -67,14 +86,130 @@ def source_factory(monkeypatch):
             return 0
 
         monkeypatch.setattr(graph_rate_limiter, "acquire", no_pacing)
-        base = GraphClient("app", "secret", "tenant")
-        async with module.pinned_chat_source(base, principal_id="user") as source:
+        base = GraphClient(application_id, "secret", tenant_id)
+        async with module.pinned_chat_source(base, principal_id=principal_id) as source:
             state["source"] = source
             state["base"] = base
             yield source
         assert base._http is None
 
     return make, requests, clients, tokens, state
+
+
+async def test_chat_pacing_is_shared_across_sources_and_request_types(source_factory, pacing_clock):
+    make, *_ = source_factory
+    sent = []
+    chat_id = "19:shared/chat@thread.v2"
+
+    def handler(request):
+        sent.append(pacing_clock["now"])
+        if request.url.path.endswith("/$value"):
+            return httpx.Response(200, content=b"hosted")
+        return httpx.Response(200, json={"value": []})
+
+    async with make(handler, principal_id="alice") as first:
+        async with make(handler, principal_id="bob", application_id="other-app") as second:
+            assert [page async for page in first.iter_message_pages(chat_id)] == [[]]
+            assert [item async for item in second.iter_hosted_contents(chat_id, "message")] == []
+            async with first.open_hosted(chat_id, "message", "hosted") as (stream, _, _):
+                assert b"".join([chunk async for chunk in stream]) == b"hosted"
+            assert [page async for page in second.iter_message_pages("another-chat")] == [[]]
+    assert sent == [0.0, 1.0, 2.0, 2.0]
+
+
+async def test_user_chat_lists_have_separate_shared_pacing(source_factory, pacing_clock):
+    make, *_ = source_factory
+    sent = []
+
+    def handler(request):
+        sent.append(pacing_clock["now"])
+        return httpx.Response(200, json={"value": []})
+
+    async with make(handler) as first:
+        async with make(handler, application_id="other-app") as second:
+            async with make(handler, principal_id="other-user") as other_user:
+                assert [chat async for chat in first.iter_chats()] == []
+                assert [page async for page in first.iter_message_pages("chat")] == [[]]
+                assert [chat async for chat in second.iter_chats()] == []
+                assert [chat async for chat in other_user.iter_chats()] == []
+    assert sent == [0.0, 0.0, 1.0, 1.0]
+
+
+async def test_chat_pacing_is_separate_between_tenants(source_factory, pacing_clock):
+    make, *_ = source_factory
+    sent = []
+
+    def handler(request):
+        sent.append(pacing_clock["now"])
+        return httpx.Response(200, json={"value": []})
+
+    async with make(handler) as first:
+        async with make(handler, tenant_id="other-tenant") as second:
+            assert [page async for page in first.iter_message_pages("chat")] == [[]]
+            assert [page async for page in second.iter_message_pages("chat")] == [[]]
+            assert [page async for page in first.iter_message_pages("chat")] == [[]]
+    assert sent == [0.0, 0.0, 1.0]
+
+
+@pytest.mark.parametrize("collection", ["messages", "chats"])
+async def test_resource_pacing_is_released_after_last_source_closes(source_factory, pacing_clock, collection):
+    make, *_ = source_factory
+    sent = []
+
+    def handler(request):
+        sent.append(pacing_clock["now"])
+        return httpx.Response(200, json={"value": []})
+
+    async def read(source):
+        if collection == "messages":
+            assert [page async for page in source.iter_message_pages("chat")] == [[]]
+        else:
+            assert [chat async for chat in source.iter_chats()] == []
+
+    async with make(handler) as first:
+        async with make(handler) as second:
+            await read(first)
+            await read(second)
+        await read(first)
+    # Retaining the closed sources must not retain their limiter ownership.
+    assert first._closed and second._closed
+    async with make(handler) as third:
+        await read(third)
+    assert sent == [0.0, 1.0, 2.0, 2.0]
+
+
+@pytest.mark.parametrize("budget", ["global", "stream", "app"])
+async def test_file_requests_keep_existing_budgets_without_chat_pacing(source_factory, pacing_clock, monkeypatch, budget):
+    make, *_ = source_factory
+    sent = []
+
+    def handler(request):
+        sent.append(pacing_clock["now"])
+        if request.url.host.endswith("sharepoint.com"):
+            return httpx.Response(200, content=b"file")
+        if request.url.path.startswith("/v1.0/drives/"):
+            return httpx.Response(200, json={"id": "chat", "parentReference": {"driveId": "chats"}})
+        return httpx.Response(200, json={"value": []})
+
+    async with make(handler) as source:
+        from shared.graph_ratelimit import AsyncTokenBucket
+        bucket = AsyncTokenBucket(2, capacity=1)
+        if budget == "global":
+            from shared.graph_rate_limiter import graph_rate_limiter
+
+            async def acquire_global(*, reason):
+                await bucket.acquire()
+
+            monkeypatch.setattr(graph_rate_limiter, "acquire", acquire_global)
+        else:
+            setattr(source._pacing_policy, budget + "_bucket", bucket)
+        assert [page async for page in source.iter_message_pages("chat")] == [[]]
+        await source.refresh_file("chats", "chat")
+        item = {"@microsoft.graph.downloadUrl": "https://tenant.sharepoint.com/v1.0/users/user/chats/chat/messages"}
+        for _ in range(2):
+            async with source.open_file(item) as (stream, _, _):
+                assert b"".join([chunk async for chunk in stream]) == b"file"
+    assert sent == [0.0, 0.5, 1.0, 1.5]
 
 
 async def test_full_paging_uses_user_scope_and_top_50(source_factory):
@@ -191,9 +326,10 @@ async def test_same_host_cursor_cannot_change_principal(source_factory):
     assert not any("/users/other/" in r.url.path for r in requests)
 
 
-async def test_fixed_app_under_throttling(source_factory, monkeypatch):
+async def test_fixed_app_under_throttling(source_factory, pacing_clock, monkeypatch):
     make, requests, *_ = source_factory
     calls = 0
+    sent = []
 
     async def migration_forbidden(*args):
         raise AssertionError("capture must not rotate applications")
@@ -203,6 +339,7 @@ async def test_fixed_app_under_throttling(source_factory, monkeypatch):
     def handler(request):
         nonlocal calls
         calls += 1
+        sent.append(pacing_clock["now"])
         if calls == 1:
             return httpx.Response(429, headers={"Retry-After": "0"})
         return httpx.Response(200, json={"value": []})
@@ -210,6 +347,7 @@ async def test_fixed_app_under_throttling(source_factory, monkeypatch):
     async with make(handler) as source:
         assert [p async for p in source.iter_message_pages("chat")] == [[]]
     assert calls == 2
+    assert sent == [0.0, 1.0]
     bearers = {r.headers["Authorization"] for r in requests if r.url.host == "graph.microsoft.com"}
     assert len(bearers) == 1
 

@@ -13,11 +13,16 @@ import hashlib
 import json
 from typing import AsyncIterator
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit
+from weakref import WeakValueDictionary
 
 import httpx
 
 from shared.graph_client import GraphClient
-from shared.graph_ratelimit import parse_retry_after
+from shared.graph_ratelimit import AsyncTokenBucket, parse_retry_after
+
+
+# Active sources own these buckets; closing the last source releases its entries.
+_RESOURCE_BUCKETS: WeakValueDictionary[tuple[str, str, str], AsyncTokenBucket] = WeakValueDictionary()
 
 
 class ChatGraphError(RuntimeError):
@@ -128,6 +133,7 @@ class StrictChatGraphSource:
             tenant_id=self._initial_tenant, application_id=self._initial_app, principal_id=principal_id)
         self._closed = False
         self._pacing_policy = client._policy
+        self._resource_buckets: dict[tuple[str, str, str], AsyncTokenBucket] = {}
 
     async def _context(self) -> str:
         if self._closed:
@@ -142,12 +148,34 @@ class StrictChatGraphSource:
             raise ChatGraphError("capture authorization token unavailable") from None
         return token
 
-    async def _pace(self):
+    async def _pace(self, url: str):
         from shared.graph_rate_limiter import graph_rate_limiter
         await graph_rate_limiter.acquire(reason="chat_catalogue_capture")
         policy = self._pacing_policy
         await policy.stream_bucket.acquire()
         await policy.app_bucket.acquire()
+        parsed = urlsplit(url)
+        if parsed.hostname != "graph.microsoft.com":
+            return
+        parts = _path_scope(parsed.path)
+        if parts[:3] != ("", "v1.0", "users") or len(parts) < 5 or parts[4] != "chats":
+            return
+        if len(parts) == 5:
+            key = (self._initial_tenant, "user_chats", parts[3])
+        elif (len(parts) in (7, 9, 11) and parts[6] == "messages"
+              and (len(parts) == 7 or parts[8] == "hostedContents")
+              and (len(parts) != 11 or parts[10] == "$value")):
+            key = (self._initial_tenant, "chat", parts[5])
+        else:
+            return
+        bucket = self._resource_buckets.get(key)
+        if bucket is None:
+            bucket = _RESOURCE_BUCKETS.get(key)
+            if bucket is None:
+                bucket = AsyncTokenBucket(1, capacity=1)
+                _RESOURCE_BUCKETS[key] = bucket
+            self._resource_buckets[key] = bucket
+        await bucket.acquire()
 
     async def _pause(self, response: httpx.Response | None, attempt: int):
         delay = parse_retry_after(response.headers.get("Retry-After")) if response is not None else None
@@ -158,7 +186,7 @@ class StrictChatGraphSource:
         for attempt in range(5):
             token = await self._context()
             client = await self._client._get_shared_http()
-            await self._pace()
+            await self._pace(url)
             try:
                 response = await client.get(url, params=params, headers={"Authorization": f"Bearer {token}"}, follow_redirects=False)
             except httpx.TransportError:
@@ -272,7 +300,7 @@ class StrictChatGraphSource:
             _target(url, graph=graph)
             if graph:
                 headers["Authorization"] = f"Bearer {await self._context()}"
-                await self._pace()
+            await self._pace(url)
             try:
                 async with client.stream("GET", url, headers=headers, follow_redirects=False) as response:
                     await self._context()
@@ -351,4 +379,5 @@ async def pinned_chat_source(base_client: GraphClient, *, principal_id: str):
         yield source
     finally:
         source._closed = True
+        source._resource_buckets.clear()
         await client.aclose()
