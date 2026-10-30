@@ -28,6 +28,7 @@ from workers.chat_export_worker.packager.thread_packager import (
 )
 
 log = logging.getLogger("chat-export.thread")
+_ACTIVE_EXPORT_STATUSES = (JobStatus.PENDING, JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.RETRYING)
 
 
 class BlobAttachmentSource(AttachmentSource):
@@ -111,15 +112,26 @@ class BlobAttachmentSource(AttachmentSource):
 
 
 async def _update_job(sess, job_id, **values):
-    await sess.execute(update(Job).where(Job.id == job_id).values(**values))
+    stmt = update(Job).where(Job.id == job_id)
+    if values.get("status") == JobStatus.CANCELLED:
+        stmt = stmt.where(Job.status == JobStatus.CANCELLING)
+    result = await sess.execute(stmt.values(**values))
     await sess.commit()
+    return bool(result.rowcount)
 
 
 async def _check_cancelled(sess, job_id) -> bool:
     from sqlalchemy import select
     from shared.models import Job, JobStatus
     st = (await sess.execute(select(Job.status).where(Job.id == job_id))).scalar_one()
-    return st == JobStatus.CANCELLING
+    return st in (JobStatus.CANCELLING, JobStatus.CANCELLED)
+
+
+async def _settle_cancellation(sess, job_id):
+    """A cancellation request may settle; another owner's terminal result may not."""
+    changed = await _update_job(sess, job_id, status=JobStatus.CANCELLED)
+    if changed or await _check_cancelled(sess, job_id):
+        await publish(job_id, "cancelled", {})
 
 
 async def consume_thread(message: aio_pika.IncomingMessage) -> None:
@@ -132,8 +144,7 @@ async def consume_thread(message: aio_pika.IncomingMessage) -> None:
         async with async_session_factory() as sess:
             job = (await sess.execute(select(Job).where(Job.id == job_id))).scalar_one()
             if job.status == JobStatus.CANCELLING:
-                await _update_job(sess, job_id, status=JobStatus.CANCELLED)
-                await publish(job_id, "cancelled", {})
+                await _settle_cancellation(sess, job_id)
                 return
             if job.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
                 # Terminal already — e.g. a broker redelivery after a crash
@@ -169,10 +180,13 @@ async def _execute_export_job(sess, job_id, spec, job):
         await sess.rollback()
         code = str(exc) if isinstance(exc, ValueError) else (
             "capture_integrity_error" if isinstance(exc, ChatCatalogueIntegrityError) else "pipeline_error")
-        await sess.execute(update(Job).where(Job.id == job_id)
-            .where(Job.status.notin_([JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]))
+        failed = await sess.execute(update(Job).where(Job.id == job_id)
+            .where(Job.status.in_(_ACTIVE_EXPORT_STATUSES))
             .values(status=JobStatus.FAILED, result={"error": {"code": code, "message": str(exc)}}))
         await sess.commit()
+        if not failed.rowcount:
+            await _settle_cancellation(sess, job_id)
+            return
         await publish(job_id, "error", {"code": code, "message": str(exc)})
 
 
@@ -242,8 +256,7 @@ async def _run_pipeline(sess, job_id, spec, scope, job, *, read_lease=None) -> N
     }
 
     if await _check_cancelled(sess, job_id):
-        await _update_job(sess, job_id, status=JobStatus.CANCELLED)
-        await publish(job_id, "cancelled", {})
+        await _settle_cancellation(sess, job_id)
         return
 
     tmp_fd, tmp_path = tempfile.mkstemp(prefix=f"chat-export-{job_id}-", suffix=".zip")
@@ -269,8 +282,7 @@ async def _run_pipeline(sess, job_id, spec, scope, job, *, read_lease=None) -> N
             read_lease.assert_valid()
         await publish(job_id, "progress", {"stage": "uploading", "percent": 85})
         if await _check_cancelled(sess, job_id):
-            await _update_job(sess, job_id, status=JobStatus.CANCELLED)
-            await publish(job_id, "cancelled", {})
+            await _settle_cancellation(sess, job_id)
             return
 
         account = settings.AZURE_STORAGE_ACCOUNT_NAME
@@ -279,6 +291,8 @@ async def _run_pipeline(sess, job_id, spec, scope, job, *, read_lease=None) -> N
         shard = azure_storage_manager.get_default_shard()
         if catalogue_export:
             from shared.chat_capture_storage import upload_catalogue_export_artifact
+            # Raw backend keys retain the exports prefix used by lifecycle cleanup.
+            blob_path = f"exports/{blob_path}"
             zip_size = os.stat(tmp_path).st_size
             up_result = await upload_catalogue_export_artifact(session_factory=async_session_factory,
                 job_id=job_id, shard=shard, container=container, path=blob_path,
@@ -336,13 +350,13 @@ async def _run_pipeline(sess, job_id, spec, scope, job, *, read_lease=None) -> N
 
     # Fence the final write against a cancel that landed between the
     # post-upload check and here — an unconditional update would silently
-    # overwrite CANCELLING with COMPLETED.
+    # overwrite a cancellation or another owner's terminal result.
     if read_lease is not None:
         read_lease.assert_valid()
     upd = await sess.execute(
         update(Job)
         .where(Job.id == job_id)
-        .where(Job.status != JobStatus.CANCELLING)
+        .where(Job.status.in_(_ACTIVE_EXPORT_STATUSES))
         .values(
             status=JobStatus.COMPLETED,
             result={
@@ -359,8 +373,7 @@ async def _run_pipeline(sess, job_id, spec, scope, job, *, read_lease=None) -> N
     )
     await sess.commit()
     if (upd.rowcount or 0) == 0:
-        await _update_job(sess, job_id, status=JobStatus.CANCELLED)
-        await publish(job_id, "cancelled", {})
+        await _settle_cancellation(sess, job_id)
         return
     try:
         await publish(

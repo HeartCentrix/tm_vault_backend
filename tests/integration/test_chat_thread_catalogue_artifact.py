@@ -132,7 +132,7 @@ async def test_thread_consumer_uploads_encrypted_zip_with_exact_download_route_o
             assert job.status == models.JobStatus.COMPLETED
             assert envelope.is_encrypted(saved["bytes"])
             assert result["chat_catalogue_format"] == 1 and result["backend_id"] == str(target_backend)
-            assert result["container"] == "exports" and result["blob_path"] == f"{export_id}/export.zip"
+            assert result["container"] == "exports" and result["blob_path"] == f"exports/{export_id}/export.zip"
             assert result["encryption_key_id"] == str(UUID(bytes=key_id))
             assert tenants == [str(store.tenant)] and target._tenant_id is None and clone._tenant_id == "default"
             decoded = b"".join([chunk async for chunk in target.download_stream(result["container"], result["blob_path"])])
@@ -145,3 +145,73 @@ async def test_thread_consumer_uploads_encrypted_zip_with_exact_download_route_o
                 messages = [archive.read(name) for name in archive.namelist() if not name.startswith("_meta/")]
                 assert any(b"captured thread content" in value for value in messages)
         assert not list((await db.scalars(select(models.ChatCataloguePin))).all())
+
+
+async def run_upload_terminal_race(store, thread_consumer, monkeypatch, status, *, replacement=None, fail_upload=False):
+    import shared.chat_capture_storage as storage_module
+    scope, _, _ = await store.capture([message("upload race body")])
+    export_id = uuid4()
+    async with store.factory.begin() as db:
+        await db.execute(update(models.Snapshot).where(models.Snapshot.id == scope.snapshot_id)
+            .values(status=models.SnapshotStatus.COMPLETED))
+        parent = await db.scalar(select(models.SnapshotItem).where(models.SnapshotItem.snapshot_id == scope.snapshot_id))
+        spec = {"resourceId": str(scope.resource_id), "snapshotIds": [str(scope.snapshot_id)],
+            "itemIds": [str(parent.id)], "exportFormat": "JSON"}
+        db.add(models.Job(id=export_id, type=models.JobType.EXPORT, tenant_id=store.tenant,
+            status=models.JobStatus.PENDING, spec=spec))
+    sentinel = {"existing_terminal_result": "preserved"}
+    async def upload(**kwargs):
+        assert Path(kwargs["filename"]).stat().st_size > 0
+        async with store.factory.begin() as db:
+            assert list((await db.scalars(select(models.ChatCataloguePin))).all())
+            await db.execute(update(models.Job).where(models.Job.id == export_id).values(status=status,
+                result=sentinel if status in {models.JobStatus.COMPLETED, models.JobStatus.FAILED} else None))
+        if fail_upload:
+            raise RuntimeError("injected upload failure after cancellation")
+        return {"success": True, "backend_id": str(store.backend), "encryption_key_id": None}
+    if replacement is not None:
+        original = thread_consumer._update_job
+        async def moved_owner(sess, job_id, **values):
+            async with store.factory.begin() as db:
+                await db.execute(update(models.Job).where(models.Job.id == export_id).values(status=replacement, result=sentinel))
+            return await original(sess, job_id, **values)
+        monkeypatch.setattr(thread_consumer, "_update_job", moved_owner)
+    monkeypatch.setattr(storage_module, "upload_catalogue_export_artifact", upload)
+    monkeypatch.setattr(thread_consumer.azure_storage_manager, "get_default_shard", lambda: object())
+    monkeypatch.setattr(thread_consumer, "async_session_factory", store.factory)
+    events = AsyncMock()
+    monkeypatch.setattr(thread_consumer, "publish", events)
+    async with store.factory() as db:
+        job = await db.get(models.Job, export_id)
+        await thread_consumer._execute_export_job(db, str(export_id), spec, job)
+    async with store.factory() as db:
+        job = await db.get(models.Job, export_id)
+        assert not list((await db.scalars(select(models.ChatCataloguePin))).all())
+        return job.status, job.result, events
+
+
+@pytest.mark.parametrize("status", [models.JobStatus.CANCELLED, models.JobStatus.CANCELLING,
+    models.JobStatus.COMPLETED, models.JobStatus.FAILED])
+async def test_upload_terminal_race_does_not_publish_or_overwrite_terminal_result(store, thread_consumer, monkeypatch, status):
+    actual, result, events = await run_upload_terminal_race(store, thread_consumer, monkeypatch, status)
+    expected = models.JobStatus.CANCELLED if status == models.JobStatus.CANCELLING else status
+    assert actual == expected
+    assert result == ({"existing_terminal_result": "preserved"} if status in {models.JobStatus.COMPLETED, models.JobStatus.FAILED} else None)
+    assert all(call.args[1] != "complete" for call in events.await_args_list)
+    if status in {models.JobStatus.COMPLETED, models.JobStatus.FAILED}:
+        assert all(call.args[1] != "cancelled" for call in events.await_args_list)
+
+
+@pytest.mark.parametrize("replacement", [models.JobStatus.COMPLETED, models.JobStatus.FAILED])
+async def test_zero_row_cancellation_settlement_cannot_change_replacement_terminal(store, thread_consumer, monkeypatch, replacement):
+    actual, result, events = await run_upload_terminal_race(store, thread_consumer, monkeypatch,
+        models.JobStatus.CANCELLING, replacement=replacement)
+    assert actual == replacement and result == {"existing_terminal_result": "preserved"}
+    assert all(call.args[1] not in {"complete", "cancelled"} for call in events.await_args_list)
+
+
+async def test_upload_failure_after_cancelling_settles_cancelled_instead_of_failed(store, thread_consumer, monkeypatch):
+    actual, result, events = await run_upload_terminal_race(store, thread_consumer, monkeypatch,
+        models.JobStatus.CANCELLING, fail_upload=True)
+    assert actual == models.JobStatus.CANCELLED and result is None
+    assert all(call.args[1] not in {"complete", "error"} for call in events.await_args_list)
