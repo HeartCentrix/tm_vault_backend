@@ -188,8 +188,6 @@ class StrictChatGraphSource:
         url = self._client.GRAPH_URL + path
         collection_path = _path_scope(urlsplit(url).path)
         seen = set()
-        observed_count = 0
-        reported_count = None
         while True:
             parsed = urlsplit(url)
             canonical = parsed._replace(
@@ -204,12 +202,11 @@ class StrictChatGraphSource:
             values = data.get("value")
             if "error" in data or not isinstance(values, list) or any(not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"] for row in values):
                 raise ChatGraphError("malformed Graph collection page")
-            observed_count += len(values)
             if "@odata.count" in data:
                 count = data["@odata.count"]
-                if type(count) is not int or count < 0 or (reported_count is not None and count != reported_count):
-                    raise ChatGraphError("Graph collection page count changed")
-                reported_count = count
+                if type(count) is not int or count < 0:
+                    raise ChatGraphError("malformed Graph page count")
+                # Teams may emit per-page counts; completion follows nextLink exhaustion.
             next_url = data.get("@odata.nextLink")
             if "@odata.nextLink" in data and (not isinstance(next_url, str) or not next_url):
                 raise ChatGraphError("malformed Graph page cursor")
@@ -217,8 +214,6 @@ class StrictChatGraphSource:
                 _target(next_url, graph=True)
                 if _path_scope(urlsplit(next_url).path) != collection_path:
                     raise ChatGraphError("Graph page cursor changed collection scope")
-            elif reported_count is not None and observed_count != reported_count:
-                raise ChatGraphError("Graph collection page ended before declared count")
             yield values
             if next_url is None:
                 return

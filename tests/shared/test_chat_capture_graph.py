@@ -123,12 +123,35 @@ async def test_next_link_equivalent_path_encoding_is_accepted(source_factory):
         assert [p async for p in source.iter_message_pages(chat_id)] == [[], [{"id": "message", "chatId": chat_id}]]
 
 
-@pytest.mark.parametrize("payload", [{}, {"value": None}, {"value": {}}, {"value": [None]}, {"value": [{"id": ""}]}, {"value": [], "@odata.nextLink": ""}, {"value": [], "error": {"message": "not complete"}}, {"value": [], "@odata.count": 1}])
+@pytest.mark.parametrize("payload", [{}, {"value": None}, {"value": {}}, {"value": [None]}, {"value": [{"id": ""}]}, {"value": [], "@odata.nextLink": ""}, {"value": [], "error": {"message": "not complete"}}, {"value": [], "@odata.count": -1}])
 async def test_malformed_page_never_looks_complete(source_factory, payload):
     make, *_ = source_factory
     async with make(lambda request: httpx.Response(200, json=payload)) as source:
         with pytest.raises(RuntimeError, match="collection|page|cursor"):
             _ = [page async for page in source.iter_message_pages("chat")]
+
+
+@pytest.mark.parametrize("collection", ["chats", "messages", "hosted"])
+async def test_teams_page_counts_are_not_treated_as_collection_totals(source_factory, collection):
+    make, requests, *_ = source_factory
+    path = {"chats": "/users/user/chats", "messages": "/users/user/chats/chat/messages",
+        "hosted": "/users/user/chats/chat/messages/message/hostedContents"}[collection]
+
+    def handler(request):
+        if "$skiptoken" not in request.url.params:
+            return httpx.Response(200, json={"value": [{"id": "one"}, {"id": "two"}],
+                "@odata.count": 2, "@odata.nextLink": "https://graph.microsoft.com/v1.0" + path + "?$skiptoken=next"})
+        return httpx.Response(200, json={"value": [{"id": "three"}], "@odata.count": 1})
+
+    async with make(handler) as source:
+        if collection == "chats":
+            ids = [row["id"] async for row in source.iter_chats()]
+        elif collection == "hosted":
+            ids = [row["id"] async for row in source.iter_hosted_contents("chat", "message")]
+        else:
+            ids = [row["id"] for page in [page async for page in source.iter_message_pages("chat")] for row in page]
+        assert ids == ["one", "two", "three"]
+    assert len([r for r in requests if r.url.host == "graph.microsoft.com"]) == 2
 
 
 async def test_cursor_cycle_is_rejected(source_factory):
