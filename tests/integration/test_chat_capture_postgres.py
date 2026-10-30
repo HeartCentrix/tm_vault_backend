@@ -446,3 +446,50 @@ async def test_metadata_only_card_is_complete_without_binary_download(store, ada
     assert result.outcome == "complete" and result.item_count == 2
     assert result.uploaded_bytes == 0 and adapters.source.downloads == 0
     assert not adapters.storage.uploads
+
+
+async def test_shared_file_reuses_object_after_each_principals_own_byte_verification(store, adapters, monkeypatch):
+    from shared.chat_catalogue_identity import ChatCaptureScope
+    from shared.models import (ChatInventory, Job, JobStatus, JobType, Resource,
+                               ResourceType, Snapshot)
+
+    adapters.source.messages = [message(attached=True)]
+    alice_scope, alice = await run_capture(store, adapters)
+    bob_resource, bob_job, bob_snapshot = uuid4(), uuid4(), uuid4()
+    async with store.factory.begin() as session:
+        session.add(Resource(id=bob_resource, tenant_id=store.tenant, type=ResourceType.USER_CHATS,
+            external_id="principal-beta", display_name="Other synthetic principal",
+            extra_data={"user_id": "principal-beta", "chat_inventory_format": 1}))
+        await session.flush()
+        session.add(Job(id=bob_job, type=JobType.BACKUP, tenant_id=store.tenant,
+            resource_id=bob_resource, status=JobStatus.RUNNING))
+        await session.flush()
+        session.add(Snapshot(id=bob_snapshot, resource_id=bob_resource, job_id=bob_job,
+            backend_id=store.backend, extra_data={"chat_inventory_format": 1}))
+    bob_scope = ChatCaptureScope(bob_snapshot, bob_resource, store.tenant, alice_scope.chat_id,
+        "principal-beta", "b" * 64, store.backend)
+    adapters.source.permission_scope_hash = "b" * 64
+
+    @asynccontextmanager
+    async def pinned(base, *, principal_id):
+        assert principal_id == "principal-beta"
+        yield adapters.source
+
+    monkeypatch.setattr(adapters.capture, "pinned_chat_source", pinned)
+    bob = await adapters.capture.capture_chat_inventory(scope=bob_scope, graph_client=object(),
+        storage=adapters.storage, session_factory=store.factory)
+    assert alice.outcome == bob.outcome == "complete"
+    assert alice.inventory_id != bob.inventory_id
+    # Each principal actually downloads its accessible source bytes before
+    # cross-context storage reuse; tags alone cannot authorize that reuse.
+    assert adapters.source.downloads == 2
+    assert len(adapters.storage.uploads) == 1
+    assert alice.uploaded_bytes == 3 and bob.uploaded_bytes == 0
+    async with store.factory() as session:
+        assert await session.scalar(select(func.count()).select_from(ChatBlobObject)) == 1
+        assert await session.scalar(select(func.count()).select_from(ChatItemVersion).where(
+            ChatItemVersion.item_type == "CHAT_ATTACHMENT")) == 1
+        inventories = list((await session.scalars(select(ChatInventory).where(ChatInventory.state == "COMPLETE"))).all())
+        assert len({inventory.authentication_context_sha256 for inventory in inventories}) == 2
+        links = list((await session.scalars(select(SnapshotItem).where(SnapshotItem.item_type == "CHAT_ATTACHMENT"))).all())
+        assert len(links) == 2 and links[0].chat_version_id == links[1].chat_version_id

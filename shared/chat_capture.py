@@ -192,11 +192,16 @@ async def _retained(*, scope, keeper, factory, storage, item_type, graph_id, par
     if checksum is None and not (source.get("source_etag") or source.get("source_ctag")):
         return None
     async def find(session):
+        complete_candidate = ChatInventory.state == "COMPLETE"
+        if checksum is None:
+            # Fast tag-only reuse stays in the same observed visibility scope.
+            # Cross-context reuse requires this capture's actual source bytes.
+            complete_candidate = and_(complete_candidate,
+                ChatInventory.authentication_context_sha256 == authentication_context_fingerprint(scope))
         retained_membership = exists(select(ChatInventoryItem.logical_key).join(
             ChatInventory, ChatInventory.id == ChatInventoryItem.inventory_id).where(
                 ChatInventoryItem.version_id == ChatItemVersion.id,
-                or_(ChatInventory.id == keeper.lease.staged_inventory_id,
-                    and_(ChatInventory.state == "COMPLETE", ChatInventory.authentication_context_sha256 == authentication_context_fingerprint(scope)))))
+                or_(ChatInventory.id == keeper.lease.staged_inventory_id, complete_candidate)))
         query = select(ChatItemVersion).where(ChatItemVersion.tenant_id == scope.tenant_id,
             ChatItemVersion.chat_id == scope.chat_id, ChatItemVersion.logical_key == key, retained_membership)
         for field, value in source.items():
