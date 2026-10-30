@@ -70,12 +70,14 @@ async def test_rehydrates_in_copy_then_promote_then_repoint_order():
     result = await _rehydrate_reuse_heir(sess, doomed, doomed_ids={doomed})
 
     assert result == heir_id
-    assert len(sess.executed) == 4
+    assert len(sess.executed) == 6
     assert "FOR UPDATE" in sess.executed[0]                                   # select heir
     assert "INSERT INTO snapshot_items" in sess.executed[1]                   # copy items
-    # promote (nulls reuse cols + carries the cursor) MUST precede the repoint.
-    assert "delta_token = COALESCE(h.delta_token, d.delta_token)" in sess.executed[2]
-    assert "reuse_of_snapshot_id = CASE" in sess.executed[3]                  # repoint siblings
+    assert "INSERT INTO snapshot_chat_inventories" in sess.executed[2]
+    assert "chat_inventory_format" in sess.executed[3]
+    # Promotion (nulls reuse cols + carries cursor) MUST precede repoint.
+    assert "delta_token = COALESCE(h.delta_token, d.delta_token)" in sess.executed[4]
+    assert "reuse_of_snapshot_id = CASE" in sess.executed[5]                  # repoint siblings
 
 
 @pytest.mark.asyncio
@@ -85,7 +87,7 @@ async def test_promote_carries_delta_cursor_forward_p4b():
     sess = _FakeSession(heir_first=_obj(heir_id))
     await _rehydrate_reuse_heir(sess, doomed, doomed_ids={doomed})
 
-    promote = sess.executed[2]  # promotion is the 3rd statement (after select + copy)
+    promote = next(sql for sql in sess.executed if "delta_token = COALESCE" in sql)
     # P4b: the heir inherits the doomed row's incremental cursor when it has none.
     assert "delta_token = COALESCE(h.delta_token, d.delta_token)" in promote
     assert "delta_tokens_json" in promote

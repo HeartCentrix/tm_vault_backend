@@ -324,6 +324,14 @@ class _ChatDB(_FakeDB):
         self.durable_updated_at = datetime(2026, 8, 11, 18, 11, 57)
         self.durable_changing = False
 
+    async def get(self, model, identifier):
+        # Format dispatch reads the same fixture rows by identity first.
+        if model is _ss.Snapshot:
+            return self._snapshot if identifier == self._snapshot.id else None
+        if model is _ss.Resource:
+            return self._resource if identifier == self._resource.id else None
+        raise AssertionError(f"unexpected identity lookup: {model}")
+
     async def execute(self, sql, params=None):
         s = str(sql)
         self.calls.append((s, params))
@@ -355,7 +363,7 @@ class _ChatDB(_FakeDB):
 def _chat_fakes(sibs):
     snap = SimpleNamespace(
         id=sibs[0], resource_id=uuid.uuid4(),
-        status=SimpleNamespace(value="COMPLETED"),
+        status=SimpleNamespace(value="COMPLETED"), extra_data={},
         created_at=datetime(2026, 8, 11, 18, 11, 57),
     )
     res = SimpleNamespace(
@@ -378,7 +386,7 @@ def _run_chats(db, count_db, **kw):
     _ss._count_session_factory = lambda: _FakeSessionCtx(count_db)
     try:
         return asyncio.run(_ss.list_snapshot_messages(
-            snapshot_id=str(uuid.uuid4()), db=db, **call))
+            snapshot_id=str(db._snapshot.id), db=db, **call))
     finally:
         _ss._count_session_factory = prev
 
