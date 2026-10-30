@@ -83,7 +83,7 @@ REQUIRED_COLUMNS = {
         "azure_resource_group",
         "azure_region",
     ),
-    "chat_capture_attempts": ("generation", "state", "expires_at", "staged_inventory_id", "evidence", "folder_path"),
+    "chat_capture_attempts": ("generation", "state", "expires_at", "staged_inventory_id", "evidence", "folder_path", "snapshot_lease_token", "job_lease_token", "partition_lease_token"),
     "chat_blob_objects": ("state", "sha256", "capture_attempt_id", "deletion_task_id"),
     "chat_item_versions": ("logical_key", "version_sha256", "payload", "content", "object_id"),
     "chat_inventories": ("state", "membership_sha256", "representation_sha256", "evidence"),

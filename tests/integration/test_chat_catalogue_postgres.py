@@ -742,3 +742,47 @@ async def test_publication_does_not_retain_all_heavy_message_payloads(store):
         tracemalloc.stop()
     assert result.item_count == 300
     assert peak < 12 * 1024 * 1024, f"publication retained {peak / 1024 / 1024:.1f} MiB"
+
+
+@pytest.mark.parametrize("graph_type", [None, "reference", ""])
+async def test_materialized_binary_mime_uses_verified_captured_content_type(store, graph_type):
+    scope = await store.new_scope()
+    lease = await store.begin(scope)
+    child = await store.binary(lease)
+    child = replace(child, payload={"contentType": graph_type, "captured_content_type": "image/png"})
+    items = [parent_for(child), child]
+    await store.stage(lease, items)
+    await store.observe(scope, lease, items)
+    await store.publish(lease)
+    async with store.factory() as session:
+        link = await session.scalar(select(models.SnapshotItem).where(
+            models.SnapshotItem.snapshot_id == scope.snapshot_id, models.SnapshotItem.item_type == "CHAT_ATTACHMENT"))
+        hydrated, = await api().materialize_chat_items(session, [link])
+        assert hydrated.extra_data["content_type"] == "image/png"
+
+
+@pytest.mark.parametrize("owner", ["job", "snapshot", "partition"])
+async def test_capture_publication_rejects_reclaimed_work_lease(store, owner):
+    scope = await store.new_scope()
+    partition_id = None
+    if owner == "partition":
+        partition_id = uuid4()
+        async with store.factory.begin() as session:
+            snap = await session.get(models.Snapshot, scope.snapshot_id)
+            session.add(models.SnapshotPartition(id=partition_id, snapshot_id=scope.snapshot_id,
+                tenant_id=scope.tenant_id, resource_id=scope.resource_id, job_id=snap.job_id,
+                partition_type="CHATS", partition_index=0, status="IN_PROGRESS",
+                payload={"chat_ids": [scope.chat_id]}, lease_token=1,
+                lease_owner_id=uuid4(), lease_expires_at=datetime.now(timezone.utc)+timedelta(minutes=5)))
+        scope = replace(scope, partition_id=partition_id)
+    lease = await store.begin(scope)
+    await store.stage(lease, [message()])
+    await store.observe(scope, lease, [message()])
+    async with store.factory.begin() as session:
+        snap = await session.get(models.Snapshot, scope.snapshot_id)
+        model, identifier = {"job": (models.Job, snap.job_id), "snapshot": (models.Snapshot, snap.id),
+                             "partition": (models.SnapshotPartition, partition_id)}[owner]
+        await session.execute(update(model).where(model.id == identifier).values(
+            lease_token=model.lease_token+1, lease_owner_id=uuid4()))
+    with pytest.raises(api().ChatCatalogueConflict, match="lease|fence|eligible|partition"):
+        await store.publish(lease)

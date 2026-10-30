@@ -44,6 +44,10 @@ class ChatCatalogueConflict(RuntimeError):
     """Capture no longer owns an eligible snapshot/chat fence."""
 
 
+class ChatCatalogueWorkLeaseMoved(ChatCatalogueConflict):
+    """Caller lost ownership; it must not settle a replacement worker's run."""
+
+
 class ChatCatalogueIntegrityError(RuntimeError):
     """Persisted catalogue, source evidence or physical links disagree."""
 
@@ -59,7 +63,8 @@ def _scope(attempt):
         raise ChatCatalogueConflict("capture snapshot was deleted")
     return ChatCaptureScope(attempt.snapshot_id, attempt.resource_id, attempt.tenant_id,
         attempt.chat_id, attempt.principal_id, attempt.permission_scope_hash,
-        attempt.backend_id, attempt.partition_id)
+        attempt.backend_id, attempt.partition_id, snapshot_lease_token=attempt.snapshot_lease_token,
+        job_lease_token=attempt.job_lease_token, partition_lease_token=attempt.partition_lease_token)
 
 
 async def _locked(session, model, *conditions, shared=False):
@@ -92,12 +97,17 @@ async def _eligible(session, scope, parents):
         resource.archived_at is not None or resource.deletion_queued_at is not None or
         str(getattr(resource.status, "value", resource.status)) == "PENDING_DELETION"):
         raise ChatCatalogueConflict("snapshot, job or capture scope is no longer eligible")
+    if scope.partition_id is None:
+        if ((scope.job_lease_token is not None and int(job.lease_token or 0) != scope.job_lease_token) or
+                (scope.snapshot_lease_token is not None and int(snapshot.lease_token or 0) != scope.snapshot_lease_token)):
+            raise ChatCatalogueWorkLeaseMoved("capture parent work lease fence changed")
     if scope.partition_id is not None:
         partition = await _locked(session, SnapshotPartition, SnapshotPartition.id == scope.partition_id, shared=True)
         if (partition is None or partition.snapshot_id != scope.snapshot_id or
             partition.tenant_id != scope.tenant_id or partition.resource_id != scope.resource_id or
-            partition.status != "IN_PROGRESS" or scope.chat_id not in (partition.payload or {}).get("chat_ids", [])):
-            raise ChatCatalogueConflict("capture partition is no longer eligible")
+            partition.status != "IN_PROGRESS" or scope.chat_id not in (partition.payload or {}).get("chat_ids", []) or
+            (scope.partition_lease_token is not None and int(partition.lease_token or 0) != scope.partition_lease_token)):
+            raise ChatCatalogueWorkLeaseMoved("capture partition is no longer eligible")
 
 
 async def _attempt(session, lease, *, terminal_ok=False):
@@ -108,13 +118,13 @@ async def _attempt(session, lease, *, terminal_ok=False):
     parents = await _lock_scope(session, scope)
     attempt = await _locked(session, ChatCaptureAttempt, ChatCaptureAttempt.id == lease.attempt_id)
     if attempt is None or attempt.generation != lease.generation:
-        raise ChatCatalogueConflict("capture fence was superseded")
+        raise ChatCatalogueWorkLeaseMoved("capture fence was superseded")
     if terminal_ok and attempt.state in _TERMINAL:
         return attempt, scope
     now = await session.scalar(select(func.clock_timestamp()))
     if (attempt.state not in _ACTIVE or attempt.staged_inventory_id != lease.staged_inventory_id or
         attempt.expires_at <= now):
-        raise ChatCatalogueConflict("capture fence is expired or terminal")
+        raise ChatCatalogueWorkLeaseMoved("capture fence is expired or terminal")
     await _eligible(session, scope, parents)
     if attempt.authentication_context_sha256 != authentication_context_fingerprint(scope):
         raise ChatCatalogueIntegrityError("capture authentication context changed")
@@ -147,10 +157,16 @@ async def begin_capture(session, *, scope: ChatCaptureScope, folder_path: str | 
     generation = previous.generation + 1 if previous else 1
     expires = now + timedelta(minutes=5)
     auth = authentication_context_fingerprint(scope)
+    # Partition ownership is independent of a coordinator's parent lease.
+    partition = await session.get(SnapshotPartition, scope.partition_id) if scope.partition_id else None
+    job_token = int(parents[0].lease_token or 0) if partition is None else None
+    snapshot_token = int(parents[1].lease_token or 0) if partition is None else None
     session.add(ChatCaptureAttempt(id=attempt_id, snapshot_id=scope.snapshot_id,
         resource_id=scope.resource_id, tenant_id=scope.tenant_id, chat_id=scope.chat_id, folder_path=folder_path,
         principal_id=scope.principal_id, permission_scope_hash=scope.permission_scope_hash,
         authentication_context_sha256=auth, backend_id=scope.backend_id, partition_id=scope.partition_id,
+        snapshot_lease_token=snapshot_token, job_lease_token=job_token,
+        partition_lease_token=int(partition.lease_token or 0) if partition is not None else None,
         generation=generation, expires_at=expires, staged_inventory_id=inventory_id))
     await session.flush()
     session.add(ChatInventory(id=inventory_id, capture_attempt_id=attempt_id, tenant_id=scope.tenant_id,
@@ -172,7 +188,7 @@ async def renew_capture(session, *, lease: CaptureLease, lease_seconds: int = 30
 
 async def _check_expiry(session, attempt):
     if attempt.expires_at <= await session.scalar(select(func.clock_timestamp())):
-        raise ChatCatalogueConflict("capture lease expired while waiting for database work")
+        raise ChatCatalogueWorkLeaseMoved("capture lease expired while waiting for database work")
 
 
 def _descriptor_json(content):
@@ -612,7 +628,7 @@ async def materialize_chat_items(session, items: list) -> list:
             payload.pop("chat_catalogue_expected_children", None)
             metadata = ({"raw": payload, "chatId": version.chat_id} if version.item_type in _MESSAGE_TYPES
                         else {**payload, "chat_id": version.chat_id, "parent_item_id": version.parent_graph_id,
-                            "content_type": payload.get("contentType", payload.get("content_type")),
+                            "content_type": payload.get("captured_content_type") or payload.get("contentType") or payload.get("content_type"),
                             "content_url": payload.get("contentUrl", payload.get("content_url")),
                             "resolved": captured.content is not None})
             values.update(external_id=version.graph_id, parent_external_id=version.parent_graph_id or version.chat_id,

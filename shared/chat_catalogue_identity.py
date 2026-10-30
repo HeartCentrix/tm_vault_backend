@@ -146,12 +146,18 @@ class ChatCaptureScope:
     permission_scope_hash: str
     backend_id: UUID
     partition_id: UUID | None = None
+    snapshot_lease_token: int | None = None
+    job_lease_token: int | None = None
+    partition_lease_token: int | None = None
 
     def __post_init__(self) -> None:
         for name in ("snapshot_id", "resource_id", "tenant_id", "backend_id"):
             _uuid(getattr(self, name), name)
         if self.partition_id is not None:
             _uuid(self.partition_id, "partition_id")
+        for name in ("snapshot_lease_token", "job_lease_token", "partition_lease_token"):
+            if getattr(self, name) is not None:
+                _count(getattr(self, name), name)
         for name in ("chat_id", "principal_id", "permission_scope_hash"):
             _text(getattr(self, name), name)
 

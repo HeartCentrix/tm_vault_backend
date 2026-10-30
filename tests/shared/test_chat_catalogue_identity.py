@@ -354,7 +354,7 @@ def test_stage_counts_cannot_report_more_new_versions_than_successfully_staged_i
 
 def test_specified_dataclass_field_contract_is_exact():
     contracts = {
-        "ChatCaptureScope": "snapshot_id resource_id tenant_id chat_id principal_id permission_scope_hash backend_id partition_id",
+        "ChatCaptureScope": "snapshot_id resource_id tenant_id chat_id principal_id permission_scope_hash backend_id partition_id snapshot_lease_token job_lease_token partition_lease_token",
         "CaptureLease": "attempt_id generation expires_at staged_inventory_id",
         "CapturedChatItem": "item_type graph_id parent_graph_id payload content",
         "ChatContentDescriptor": "object_id backend_id container path sha256 size encryption_key_id backup_version inline_b64 source_drive_id source_item_id source_etag source_ctag",
