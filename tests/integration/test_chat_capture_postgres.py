@@ -493,3 +493,47 @@ async def test_shared_file_reuses_object_after_each_principals_own_byte_verifica
         assert len({inventory.authentication_context_sha256 for inventory in inventories}) == 2
         links = list((await session.scalars(select(SnapshotItem).where(SnapshotItem.item_type == "CHAT_ATTACHMENT"))).all())
         assert len(links) == 2 and links[0].chat_version_id == links[1].chat_version_id
+
+
+class PlainSeaweedStorage(EncryptedSeaweedStorage):
+    async def upload_from_file(self, container, path, file_path, size, metadata=None, overwrite=True, *, tenant_id=None):
+        return await Storage.upload_from_file(self, container, path, file_path, size, metadata, overwrite)
+
+
+@pytest.mark.parametrize("config_row", [True, False])
+async def test_required_encryption_does_not_upload_when_bootstrap_left_runtime_off(store, adapters, monkeypatch, config_row):
+    from shared.crypto import runtime
+    from shared.models import EncryptionConfig
+    monkeypatch.setattr(runtime, "is_write_enabled", lambda: False)
+    monkeypatch.setenv("BACKUP_ENCRYPTION_ENABLED", "true")
+    if config_row:
+        async with store.factory.begin() as session:
+            session.add(EncryptionConfig(id="singleton", provider="env", enabled=True))
+    adapters.source.messages = [message(attached=True)]
+    adapters.storage = PlainSeaweedStorage(store.backend)
+    _, result = await run_capture(store, adapters)
+    assert result.outcome == "partial"
+    assert adapters.storage.uploads == []
+    async with store.factory() as session:
+        assert not list((await session.scalars(select(ChatBlobObject).where(ChatBlobObject.state == "LIVE"))).all())
+
+
+async def test_required_encryption_intent_is_not_lost_if_runtime_changes_during_upload(store, adapters, monkeypatch):
+    from shared.crypto import runtime
+    from shared.models import EncryptionConfig
+    state = {"write_enabled": True}
+    monkeypatch.setattr(runtime, "is_write_enabled", lambda: state["write_enabled"])
+    async with store.factory.begin() as session:
+        session.add(EncryptionConfig(id="singleton", provider="env", enabled=True))
+    adapters.source.messages = [message(attached=True)]
+    adapters.storage = PlainSeaweedStorage(store.backend)
+    upload = adapters.storage.upload_from_file
+    async def changed(*args, **kwargs):
+        result = await upload(*args, **kwargs)
+        state["write_enabled"] = False
+        return result
+    monkeypatch.setattr(adapters.storage, "upload_from_file", changed)
+    _, result = await run_capture(store, adapters)
+    assert result.outcome == "partial"
+    async with store.factory() as session:
+        assert not list((await session.scalars(select(ChatBlobObject).where(ChatBlobObject.state == "LIVE"))).all())

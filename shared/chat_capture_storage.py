@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 import inspect
+import os
 from uuid import UUID, uuid4
 
 from sqlalchemy import func, select
@@ -11,7 +12,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from shared.chat_catalogue import ChatCatalogueConflict, renew_capture
 from shared.chat_catalogue_identity import ChatContentDescriptor
-from shared.models import ChatBlobObject
+from shared.models import ChatBlobObject, EncryptionConfig
 from shared.db_retry import run_catalogue_transaction
 
 
@@ -31,7 +32,7 @@ async def _retry_pause(attempt):
     await asyncio.sleep(2 ** attempt)
 
 
-async def _stored_encryption(store, container, path):
+async def _stored_encryption(store, container, path, *, encryption_required=False):
     if store.kind != "seaweedfs":
         # AzureBlobStore uses backend-native SSE; TMVE is a Seaweed transform.
         return None, 1
@@ -48,7 +49,7 @@ async def _stored_encryption(store, container, path):
                 await closed
     if envelope.is_encrypted(header):
         return str(UUID(bytes=envelope.read_key_id(header))), int(header[4])
-    if runtime.is_write_enabled():
+    if encryption_required or runtime.is_write_enabled():
         raise ChatStorageCaptureError("required encrypted catalogue object was stored without its envelope")
     return None, 1
 
@@ -77,6 +78,14 @@ async def upload_capture_content(*, scope, lease, spooled, storage, session_fact
         path = f"chat-catalogue/v1/{scope.tenant_id}/{object_id}"
         async def reserve(session):
             await renew_capture(session, lease=lease)
+            required = False
+            if store.kind == "seaweedfs":
+                from shared.crypto import runtime
+                config = await session.get(EncryptionConfig, "singleton")
+                required = bool(config.enabled) if config is not None else os.getenv(
+                    "BACKUP_ENCRYPTION_ENABLED", "false").strip().lower() in {"true", "1", "yes", "on"}
+                if required and not runtime.is_write_enabled():
+                    raise ChatStorageCaptureError("configured encryption runtime is unavailable")
             now = await session.scalar(select(func.clock_timestamp()))
             deadline = now + timedelta(seconds=UPLOAD_TIMEOUT_SECONDS)
             session.add(ChatBlobObject(id=object_id, tenant_id=scope.tenant_id,
@@ -84,7 +93,8 @@ async def upload_capture_content(*, scope, lease, spooled, storage, session_fact
                 sha256=spooled.sha256, size=spooled.size, state="STAGING",
                 capture_attempt_id=lease.attempt_id, upload_deadline=deadline,
                 quiescent_after=deadline + timedelta(seconds=UPLOAD_QUIESCENCE_SECONDS)))
-        await run_catalogue_transaction(session_factory, reserve)
+            return required
+        encryption_required = await run_catalogue_transaction(session_factory, reserve)
         try:
             metadata = {"tenant_id": str(scope.tenant_id), "sha256": spooled.sha256,
                         "plaintext_size": str(spooled.size), "chat_catalogue_format": "1"}
@@ -96,7 +106,8 @@ async def upload_capture_content(*, scope, lease, spooled, storage, session_fact
                 container, path, spooled.path, spooled.size, **kwargs), UPLOAD_TIMEOUT_SECONDS)
             if (str(info.backend_id), info.container, info.path) != (str(scope.backend_id), container, path):
                 raise ChatStorageCaptureError("upload receipt differs from the owned object location")
-            key_id, frame_version = await _stored_encryption(store, container, path)
+            key_id, frame_version = await _stored_encryption(store, container, path,
+                encryption_required=encryption_required)
             descriptor = ChatContentDescriptor(object_id, scope.backend_id, container,
                 path, spooled.sha256, spooled.size, key_id, frame_version, None,
                 source_drive_id, source_item_id, source_etag, source_ctag)
