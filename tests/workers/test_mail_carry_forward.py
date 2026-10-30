@@ -404,7 +404,7 @@ def test_gather_propagates_a_mid_flight_cancel_instead_of_swallowing_it():
     # JobCancelledMidFlight into a result element: the shard settled COMPLETED
     # and the union carry ran on a cancelled snapshot.
     tail = _parallel_gather_tail()
-    assert "isinstance(_r, JobCancelledMidFlight)" in tail
+    assert re.search(r"isinstance\(_r,\s*(?:\([^)]*\bJobCancelledMidFlight\b[^)]*\)|JobCancelledMidFlight)\s*\)", tail)
     assert tail.index("raise _r") < tail.index("item_count = sum(")
 
 

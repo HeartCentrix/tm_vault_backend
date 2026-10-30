@@ -137,7 +137,8 @@ def test_partitioned_sharepoint_loss_becomes_snapshot_partial_without_a_new_stat
     assert _SRC.count(") AS lossy,") == 2, (
         "the finalizer has two derivations; both need the lossy term"
     )
-    d = _region("_d_lossy = int(", 900)
+    start = _SRC.index("_d_lossy = int(")
+    d = _SRC[start:_SRC.index("if snap.status != _derived_status:", start)]
     order = d.find("_d_failed > 0 or _d_lossy > 0")
     allc = d.find("_d_completed == _d_n")
     assert order != -1 and (allc == -1 or order < allc), (
