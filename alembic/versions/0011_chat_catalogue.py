@@ -106,6 +106,7 @@ def upgrade():
         ("ix_chat_capture_attempts_snapshot_id", "chat_capture_attempts(snapshot_id)"),
         ("ix_chat_blob_objects_capture_attempt_id", "chat_blob_objects(capture_attempt_id)"),
         ("ix_chat_item_versions_object_id", "chat_item_versions(object_id)"),
+        ("ix_chat_item_versions_parent_lookup", "chat_item_versions(tenant_id,chat_id,md5(graph_id),item_type)"),
         ("ix_chat_inventory_items_version_id", "chat_inventory_items(version_id)"),
         ("ix_snapshot_chat_inventories_inventory_id", "snapshot_chat_inventories(inventory_id)"),
         ("ix_chat_catalogue_pins_inventory_id", "chat_catalogue_pins(inventory_id)"),

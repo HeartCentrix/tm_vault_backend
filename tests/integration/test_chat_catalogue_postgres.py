@@ -786,3 +786,40 @@ async def test_capture_publication_rejects_reclaimed_work_lease(store, owner):
             lease_token=model.lease_token+1, lease_owner_id=uuid4()))
     with pytest.raises(api().ChatCatalogueConflict, match="lease|fence|eligible|partition"):
         await store.publish(lease)
+
+
+async def test_single_child_staging_fetches_only_its_parent_from_inventory(store):
+    import json
+    scope = await store.new_scope()
+    lease = await store.begin(scope)
+    child = CapturedChatItem("CHAT_ATTACHMENT", "card", "parent-1",
+        {"contentType": "application/vnd.microsoft.card.adaptive", "content": "{}"}, None)
+    parents = [message("small", graph_id=f"parent-{i}") for i in range(500)]
+    parents[1] = parent_for(child, parent=parents[1])
+    for start in range(0, len(parents), 100):
+        await store.stage(lease, parents[start:start+100])
+    selected = []
+    def record(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("SELECT chat_item_versions.graph_id,"):
+            selected.append((statement, parameters))
+    event.listen(store.engine.sync_engine, "before_cursor_execute", record)
+    try:
+        assert (await store.stage(lease, [child])).staged_items == 1
+    finally:
+        event.remove(store.engine.sync_engine, "before_cursor_execute", record)
+    assert selected
+    async with store.factory() as session:
+        connection = await session.connection()
+        driver = (await connection.get_raw_connection()).driver_connection
+        for statement, parameters in selected:
+            explained = await driver.fetchval("EXPLAIN (ANALYZE, FORMAT JSON) " + statement, *parameters)
+            if isinstance(explained, str):
+                explained = json.loads(explained)
+            assert explained[0]["Plan"]["Actual Rows"] == 1
+            nodes = [explained[0]["Plan"]]
+            filtered = 0
+            while nodes:
+                node = nodes.pop()
+                filtered += node.get("Rows Removed by Filter", 0)
+                nodes.extend(node.get("Plans", []))
+            assert filtered < 20, f"unrelated parent records inspected: {filtered}"

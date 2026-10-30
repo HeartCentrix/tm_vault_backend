@@ -1697,6 +1697,7 @@ class ChatItemVersion(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     __table_args__ = (
         UniqueConstraint("tenant_id", "chat_id", "logical_key", "version_sha256", name="uq_chat_item_version"),
+        Index("ix_chat_item_versions_parent_lookup", "tenant_id", "chat_id", func.md5(graph_id), "item_type"),
         CheckConstraint("item_type NOT IN ('CHAT_ATTACHMENT','CHAT_HOSTED_CONTENT') OR parent_graph_id IS NOT NULL", name="ck_chat_version_parent"),
     )
 

@@ -18,6 +18,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -309,10 +310,14 @@ async def stage_versions(session, *, lease: CaptureLease, items: list[CapturedCh
         .where(ChatInventoryItem.inventory_id == inventory.id, ChatInventoryItem.logical_key.in_(keyed)))).all())
     existing_links = {r.external_id: r for r in (await session.scalars(select(SnapshotItem).where(
         SnapshotItem.snapshot_id == scope.snapshot_id, SnapshotItem.external_id.in_(keyed)))).all()}
+    # Fixed-width candidates use the parent lookup index; exact IDs remain authoritative.
+    parent_ids = {item.parent_graph_id for item in items if item.parent_graph_id is not None}
     prior_parents = (await session.execute(select(ChatItemVersion.graph_id, ChatItemVersion.item_type,
         ChatItemVersion.parent_graph_id).join(ChatInventoryItem,
         ChatInventoryItem.version_id == ChatItemVersion.id).where(ChatInventoryItem.inventory_id == inventory.id,
-        ChatItemVersion.item_type.in_(_MESSAGE_TYPES)))).all()
+        ChatItemVersion.tenant_id == scope.tenant_id, ChatItemVersion.chat_id == scope.chat_id,
+        func.md5(ChatItemVersion.graph_id).in_([hashlib.md5(identifier.encode()).hexdigest() for identifier in parent_ids]),
+        ChatItemVersion.graph_id.in_(parent_ids), ChatItemVersion.item_type.in_(_MESSAGE_TYPES)))).all() if parent_ids else []
     parents = _parents(scope, [*items, *prior_parents])
     entries, links = [], []
     for key, (version_hash, item) in sorted(keyed.items()):

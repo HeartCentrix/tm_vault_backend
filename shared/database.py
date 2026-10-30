@@ -224,6 +224,11 @@ async def _has_required_catalogue_constraints(conn) -> bool:
             JOIN pg_namespace n ON n.oid=x.relnamespace
             WHERE n.nspname=:schema AND x.relname='uq_chat_complete_inventory'
               AND i.indisvalid AND i.indisunique AND i.indpred IS NOT NULL
+        ) AND EXISTS (
+            SELECT 1 FROM pg_index i JOIN pg_class x ON x.oid=i.indexrelid
+            JOIN pg_namespace n ON n.oid=x.relnamespace
+            WHERE n.nspname=:schema AND x.relname='ix_chat_item_versions_parent_lookup'
+              AND i.indisvalid
         )
     """), {"schema": settings.DB_SCHEMA})
     return bool(result.scalar())
