@@ -23,7 +23,9 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import pathlib
-import re
+from types import SimpleNamespace
+
+from shared.chat_attachment_copy import LEGACY_CHAT_ATTACHMENT_COPY_SQL
 import sys
 
 import pytest
@@ -40,21 +42,15 @@ def _p8_src() -> str:
     return _SRC[start:end]
 
 
-def _sql_text(src: str) -> str:
-    """Concatenate the adjacent string literals of the INSERT so the
-    predicate can be matched regardless of line wrapping."""
-    return " ".join(re.findall(r'"((?:[^"\\]|\\.)*)"', src))
-
-
 # ---------------------------------------------------------------- source pins
 
 def test_p8_predicate_no_longer_wraps_parent_in_coalesce_in_subselect():
-    sql = _sql_text(_p8_src())
+    sql = LEGACY_CHAT_ATTACHMENT_COPY_SQL
     assert "COALESCE(src.parent_external_id, split_part(src.external_id, '::', 1)) IN" not in sql
 
 
 def test_p8_predicate_is_union_of_two_index_sargable_branches():
-    sql = _sql_text(_p8_src())
+    sql = LEGACY_CHAT_ATTACHMENT_COPY_SQL
     assert "UNION ALL" in sql
     assert "src.parent_external_id = ANY(" in sql
     assert "src.parent_external_id IS NULL" in sql
@@ -65,7 +61,7 @@ def test_p8_predicate_is_union_of_two_index_sargable_branches():
     # idempotency contract unchanged
     assert "ON CONFLICT (snapshot_id, external_id, item_type) DO NOTHING" in sql
     # still a DISTINCT ON over the union so forwarded attachments collapse
-    assert "DISTINCT ON (u.external_id, u.item_type)" in sql
+    assert "DISTINCT ON (external_id, item_type)" in sql
 
 
 def test_p8_still_runs_under_the_micro_carry_forward_slot():
@@ -89,7 +85,8 @@ def bw():
 
 
 class _Result:
-    rowcount = 3
+    def one(self):
+        return SimpleNamespace(inserted_count=3, provenance_gap=False, target_valid=True)
 
 
 class _FakeSession:
@@ -105,7 +102,7 @@ class _FakeSession:
         self.committed = True
 
 
-async def test_p8_copy_runs_union_insert_in_slot_and_returns_rowcount(bw, monkeypatch):
+async def test_p8_copy_runs_union_insert_in_slot_and_returns_inserted_count(bw, monkeypatch):
     sess = _FakeSession()
     slot_calls = []
 
@@ -124,7 +121,7 @@ async def test_p8_copy_runs_union_insert_in_slot_and_returns_rowcount(bw, monkey
     assert slot_calls[0][1]["what"] == "P8 attachment copy"
     assert len(sess.calls) == 1
     sql, params = sess.calls[0]
-    assert sql.lstrip().upper().startswith("INSERT INTO SNAPSHOT_ITEMS")
+    assert "INSERT INTO snapshot_items" in sql
     assert "UNION ALL" in sql
     assert "src.parent_external_id = ANY(" in sql
     assert "COALESCE(src.parent_external_id, split_part(src.external_id, '::', 1)) IN" not in sql

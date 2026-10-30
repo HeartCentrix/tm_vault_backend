@@ -1843,23 +1843,10 @@ async def _copy_chat_attachment_rows_to_snapshot(
     target_snapshot_id: str,
     chat_id: str,
 ) -> int:
-    """Per-snapshot CHAT_ATTACHMENT / CHAT_HOSTED_CONTENT pointer rows for
-    claim-skipped users (plan P8).
+    """Give a legacy snapshot independently retained chat attachment rows.
 
-    Today, attachment rows are only persisted in the FIRST drainer's
-    snapshot. Akshat's skip-claim path writes message pointer rows but no
-    attachment rows -- so Akshat's UI would show attachment chips via the
-    tenant-wide /attachments fallback (snapshot-service:2273), but if
-    Amit's snapshot is later deleted (retention, GDPR, account
-    deactivation), Akshat loses the chips entirely.
-
-    Fix: INSERT ... SELECT from any existing tenant CHAT_ATTACHMENT /
-    CHAT_HOSTED_CONTENT row whose parent_external_id is a message in this
-    chat thread, with new id + target snapshot_id. The blob_path is
-    reused (same SeaweedFS blob, no upload). Idempotent via WHERE NOT
-    EXISTS on (target_snapshot_id, external_id, item_type).
-
-    Returns the number of rows actually inserted.
+    Reuse stored bytes; report unknown chat provenance through the caller's
+    partial-failure accounting. Return the number of rows actually inserted.
     """
     if not tenant_id or not target_snapshot_id or not chat_id:
         return 0
@@ -1873,77 +1860,14 @@ async def _copy_chat_attachment_rows_to_snapshot(
         # poll — see file-version site.
         wait_base_s=0.25, wait_jitter_s=0.5,
     ) as s:
-        # Race-free idempotent copy: rely on the (snapshot_id, external_id,
-        # item_type) unique index via ON CONFLICT DO NOTHING. Two shards
-        # claiming different chats on the same partitioned snapshot may
-        # both reference the same source attachment (e.g. an attachment
-        # forwarded between chats); the old NOT EXISTS subquery raced
-        # because it evaluated at SELECT time while the unique constraint
-        # fires at INSERT time. DISTINCT ON also collapses any intra-call
-        # duplicates the source SELECT itself produces (one source row per
-        # snapshot it's been kept in, but only one destination row needed).
-        result = await s.execute(
-            text(
-                "INSERT INTO snapshot_items ("
-                "  id, snapshot_id, tenant_id, item_type, external_id, "
-                "  parent_external_id, name, folder_path, content_hash, "
-                "  content_checksum, content_size, blob_path, "
-                "  encryption_key_id, backup_version, metadata, is_deleted, "
-                "  indexed_at, backend_id, created_at"
-                ") "
-                "SELECT DISTINCT ON (u.external_id, u.item_type) "
-                "       gen_random_uuid(), :tsid, :tid, u.item_type, "
-                "       u.external_id, "
-                "       COALESCE(u.parent_external_id, split_part(u.external_id, '::', 1)), "
-                "       u.name, "
-                "       u.folder_path, u.content_hash, "
-                "       u.content_checksum, u.content_size, "
-                "       u.blob_path, u.encryption_key_id, "
-                "       COALESCE(u.backup_version, 1), u.metadata, "
-                "       COALESCE(u.is_deleted, false), u.indexed_at, "
-                "       u.backend_id, NOW() "
-                # 2026-10-15: index-sargable shape. The previous predicate
-                # `COALESCE(parent_external_id, split_part(external_id, '::', 1))
-                # IN (subselect)` cannot use any index, so EVERY per-chat copy
-                # walked the tenant's ~19.4M attachment rows (~13 min on the
-                # IO-bound primary) while holding one of the six cluster-wide
-                # carry-forward slots; ~80% of calls hit CARRY_FORWARD_WAIT_MAX_S
-                # and silently lost their pointer rows. Only 272 rows carry a
-                # NULL parent_external_id, so split the predicate into two
-                # branches that both hit idx_snapshot_items_parent_ext (the
-                # partial index on parent_external_id WHERE item_type IN
-                # (CHAT_ATTACHMENT, CHAT_HOSTED_CONTENT)): measured 372 ms /
-                # 189 shared buffers on prod vs ~795 s before.
-                "  FROM ( "
-                "        SELECT src.* FROM snapshot_items src "
-                "         WHERE src.tenant_id = :tid "
-                "           AND src.item_type IN ('CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT') "
-                "           AND src.parent_external_id = ANY(ARRAY( "
-                "                 SELECT m.message_external_id "
-                "                   FROM chat_thread_messages m "
-                "                   JOIN chat_threads t ON t.id = m.chat_thread_id "
-                "                  WHERE t.tenant_id = :tid AND t.chat_id = :cid)) "
-                "        UNION ALL "
-                "        SELECT src.* FROM snapshot_items src "
-                "         WHERE src.tenant_id = :tid "
-                "           AND src.item_type IN ('CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT') "
-                "           AND src.parent_external_id IS NULL "
-                "           AND split_part(src.external_id, '::', 1) = ANY(ARRAY( "
-                "                 SELECT m.message_external_id "
-                "                   FROM chat_thread_messages m "
-                "                   JOIN chat_threads t ON t.id = m.chat_thread_id "
-                "                  WHERE t.tenant_id = :tid AND t.chat_id = :cid)) "
-                "       ) u "
-                "ON CONFLICT (snapshot_id, external_id, item_type) DO NOTHING"
-            ),
-            {
-                "tsid": target_snapshot_id,
-                "tid": tenant_id,
-                "cid": chat_id,
-            },
+        from shared.chat_attachment_copy import copy_legacy_chat_attachments
+
+        inserted = await copy_legacy_chat_attachments(
+            s, tenant_id=tenant_id, target_snapshot_id=target_snapshot_id,
+            chat_id=chat_id,
         )
         await s.commit()
-        return result.rowcount or 0
+        return inserted
 
 
 async def _is_job_cancelled(job_id) -> bool:
