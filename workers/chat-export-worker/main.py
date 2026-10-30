@@ -158,6 +158,10 @@ async def main() -> None:
     start_http_server(9102)
     await health_server()
     await startup_router(required=True)
+    from shared.crypto import bootstrap as enc_bootstrap
+    from shared.database import async_session_factory
+    if await enc_bootstrap.install(async_session_factory):
+        log.info("at-rest encryption hook installed")
     try:
         await _reclaim_orphan_jobs()
     except Exception:
