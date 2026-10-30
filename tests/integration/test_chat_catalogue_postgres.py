@@ -721,3 +721,24 @@ async def test_migration_builds_and_attaches_valid_indexes_for_partitioned_snaps
     async with store.engine.connect() as conn:
         assert await conn.scalar(text("SELECT indisvalid FROM pg_index WHERE indexrelid=to_regclass('ix_snapshot_items_chat_version_id')"))
         assert await conn.scalar(text("SELECT count(*) FROM pg_inherits WHERE inhparent=to_regclass('ix_snapshot_items_chat_version_id')")) == 2
+
+
+async def test_publication_does_not_retain_all_heavy_message_payloads(store):
+    import gc
+    import tracemalloc
+    scope = await store.new_scope()
+    lease = await store.begin(scope)
+    items = [message("x" * 65536, graph_id=f"memory-{i}") for i in range(300)]
+    for start in range(0, len(items), 100):
+        await store.stage(lease, items[start:start + 100])
+    await store.observe(scope, lease, items)
+    del items
+    gc.collect()
+    tracemalloc.start()
+    try:
+        result = await store.publish(lease)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert result.item_count == 300
+    assert peak < 12 * 1024 * 1024, f"publication retained {peak / 1024 / 1024:.1f} MiB"

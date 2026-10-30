@@ -22,7 +22,7 @@ import json
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
-from sqlalchemy import delete, func, or_, select, text, update
+from sqlalchemy import and_, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 
@@ -31,7 +31,7 @@ from shared.chat_catalogue_identity import (
     ChatCaptureScope, ChatContentDescriptor, StageResult,
     _digest, _payload, authentication_context_fingerprint,
     canonical_payload_sha256, canonical_version_fingerprint,
-    qualified_chat_item_key, source_inventory_fingerprint,
+    qualified_chat_item_key,
 )
 from shared.models import (
     ChatBlobObject, ChatCaptureAttempt, ChatInventory, ChatInventoryItem,
@@ -361,11 +361,28 @@ async def record_capture_evidence(session, *, lease: CaptureLease, evidence: Cap
 
 
 async def _staged(session, inventory, scope):
-    rows = (await session.execute(select(ChatInventoryItem.logical_key, ChatItemVersion)
-        .join(ChatItemVersion, ChatItemVersion.id == ChatInventoryItem.version_id)
-        .where(ChatInventoryItem.inventory_id == inventory.id).order_by(ChatInventoryItem.logical_key))).all()
-    items, expected = [], set()
-    for key, version in rows:
+    # Lock narrow object records in one deterministic order. Heavy source JSON
+    # is validated in bounded batches rather than retained for the whole chat.
+    object_ids = select(ChatItemVersion.object_id).join(ChatInventoryItem,
+        ChatInventoryItem.version_id == ChatItemVersion.id).where(
+        ChatInventoryItem.inventory_id == inventory.id, ChatItemVersion.object_id.is_not(None))
+    objects = {obj.id: obj for obj in (await session.scalars(select(ChatBlobObject).where(
+        ChatBlobObject.id.in_(object_ids)).order_by(ChatBlobObject.id).with_for_update()
+        .execution_options(populate_existing=True))).all()}
+    statement = select(ChatInventoryItem.logical_key, ChatItemVersion,
+        SnapshotItem.id.label("link_id"), SnapshotItem.chat_version_id.label("link_version"),
+        SnapshotItem.tenant_id.label("link_tenant"), SnapshotItem.item_type.label("link_type"),
+        SnapshotItem.parent_external_id.label("link_parent"), SnapshotItem.is_deleted.label("link_deleted"),
+        SnapshotItem.content_size.label("link_size"), SnapshotItem.extra_data.label("link_metadata")) \
+        .join(ChatItemVersion, ChatItemVersion.id == ChatInventoryItem.version_id) \
+        .outerjoin(SnapshotItem, and_(SnapshotItem.snapshot_id == scope.snapshot_id,
+            SnapshotItem.external_id == ChatInventoryItem.logical_key)) \
+        .where(ChatInventoryItem.inventory_id == inventory.id).order_by(ChatInventoryItem.logical_key)
+    rows = await session.stream(statement.execution_options(yield_per=25))
+    expected, observations, representations, coverage, parents_to_check = set(), {}, [], [], []
+    logical_bytes = durable = 0
+    async for row in rows:
+        key, version = row[0], row[1]
         item = _captured(version)
         if (version.tenant_id != scope.tenant_id or version.chat_id != scope.chat_id or
             key != version.logical_key or key != qualified_chat_item_key(scope.chat_id, item.item_type, item.graph_id, item.parent_graph_id) or
@@ -373,24 +390,52 @@ async def _staged(session, inventory, scope):
             version.payload_sha256 != canonical_payload_sha256(item.payload) or
             version.object_id != (item.content.object_id if item.content else None)):
             raise ChatCatalogueIntegrityError("inventory version identity or canonical hash differs")
-        items.append(item)
-        expected.add((key, version.id))
-    links = list((await session.scalars(select(SnapshotItem).outerjoin(ChatItemVersion,
-        ChatItemVersion.id == SnapshotItem.chat_version_id).where(SnapshotItem.snapshot_id == scope.snapshot_id,
-        or_(SnapshotItem.extra_data["chat_id"].as_string() == scope.chat_id, ChatItemVersion.chat_id == scope.chat_id)))).all())
-    actual = {(row.external_id, row.chat_version_id) for row in links}
-    if actual != expected or len(links) != len(expected) or any(row.tenant_id != scope.tenant_id for row in links):
-        raise ChatCatalogueIntegrityError("snapshot/chat links do not exactly match staged logical keys and versions")
-    parents = _parents(scope, items)
-    by_key = {key: item for (key, _), item in zip(rows, items)}
-    for link in links:
-        item = by_key[link.external_id]
-        if (link.item_type != item.item_type or link.is_deleted or
-            (link.extra_data or {}).get("chat_id") != scope.chat_id or
-            link.content_size != _logical_size(item) or
-            link.parent_external_id != _parent_key(scope, item, parents)):
+        if key in observations or row.link_id is None or row.link_version != version.id or row.link_tenant != scope.tenant_id:
+            raise ChatCatalogueIntegrityError("snapshot/chat links do not exactly match staged logical keys and versions")
+        size = _logical_size(item)
+        if (row.link_type != item.item_type or row.link_deleted or row.link_size != size or
+                (row.link_metadata or {}).get("chat_id") != scope.chat_id):
             raise ChatCatalogueIntegrityError("snapshot link parent, type, visibility or logical size differs")
-    return rows, items, expected
+        content = item.content
+        if content and content.object_id:
+            obj = objects.get(content.object_id)
+            if obj is None or not _object_matches(obj, content, scope) or obj.state in {"DELETING", "DELETED"}:
+                raise ChatCatalogueIntegrityError("required catalogue object is retired or its descriptor differs")
+        durable += int(content is not None and (content.object_id is None or objects[content.object_id].state == "LIVE"))
+        source = ([content.source_drive_id, content.source_item_id, content.source_etag,
+                   content.source_ctag, content.sha256, content.size] if content else None)
+        observations[key] = _digest([_payload(item.payload), source])
+        expected.add((key, version.id))
+        representations.append((key, version.version_sha256))
+        logical_bytes += size
+        # Coverage needs child IDs and classifications, never body/card bytes.
+        payload = {}
+        if item.item_type in _MESSAGE_TYPES:
+            manifest = item.payload.get("chat_catalogue_expected_children")
+            payload["chat_catalogue_expected_children"] = manifest
+            for field in ("attachments", "hostedContents"):
+                children = item.payload.get(field, ())
+                payload[field] = ([{"id": child.get("id"), "contentType": child.get("contentType", "")}
+                    if isinstance(child, Mapping) else None for child in children]
+                    if isinstance(children, (tuple, list)) else None)
+        narrow = SimpleNamespace(item_type=item.item_type, graph_id=item.graph_id,
+            parent_graph_id=item.parent_graph_id, payload=payload, content=True if content is not None else None)
+        coverage.append(narrow)
+        parents_to_check.append((row.link_parent, narrow))
+    await rows.close()
+    count = await session.scalar(select(func.count()).select_from(SnapshotItem).outerjoin(ChatItemVersion,
+        ChatItemVersion.id == SnapshotItem.chat_version_id).where(SnapshotItem.snapshot_id == scope.snapshot_id,
+        or_(SnapshotItem.extra_data["chat_id"].as_string() == scope.chat_id, ChatItemVersion.chat_id == scope.chat_id)))
+    if count != len(expected):
+        raise ChatCatalogueIntegrityError("snapshot/chat links do not exactly match staged logical keys and versions")
+    parents = _parents(scope, coverage)
+    for link_parent, item in parents_to_check:
+        if link_parent != _parent_key(scope, item, parents):
+            raise ChatCatalogueIntegrityError("snapshot link parent, type, visibility or logical size differs")
+    required, gaps = _coverage(scope, coverage)
+    return SimpleNamespace(expected=expected, item_count=len(expected), logical_bytes=logical_bytes,
+        source_hash=_digest(["chat-source-inventory-v1", authentication_context_fingerprint(scope), sorted(observations.items())]),
+        representation_hash=_digest(representations), durable=durable, required=required, gaps=gaps, objects=objects)
 
 
 def _result(attempt, association, inventory, uploaded_bytes=None):
@@ -463,15 +508,12 @@ async def publish_inventory(session, *, lease: CaptureLease) -> CaptureResult:
         inventory.tenant_id != scope.tenant_id or inventory.chat_id != scope.chat_id or
         inventory.authentication_context_sha256 != authentication_context_fingerprint(scope)):
         raise ChatCatalogueIntegrityError("staged inventory scope differs")
-    rows, items, expected = await _staged(session, inventory, scope)
-    objects = await _objects(session, items, scope)
+    staged = await _staged(session, inventory, scope)
+    expected, objects = staged.expected, staged.objects
     await _check_expiry(session, attempt)
-    source_hash = source_inventory_fingerprint(scope=scope, items=items)
-    representation_hash = _digest([(key, version.version_sha256) for key, version in rows])
+    source_hash, representation_hash = staged.source_hash, staged.representation_hash
     evidence = _evidence(attempt.evidence)
-    durable = sum(item.content is not None and (item.content.object_id is None or
-                  objects[item.content.object_id].state == "LIVE") for item in items)
-    required, gaps = _coverage(scope, items)
+    durable, required, gaps = staged.durable, staged.required, staged.gaps
     complete = (not attempt.failure_reason and evidence is not None and evidence.satisfies_completeness_conditions and
                 evidence.membership_sha256 == source_hash and evidence.required_content_count == required and
                 evidence.durable_content_count == durable and required == durable and not gaps)
@@ -479,14 +521,14 @@ async def publish_inventory(session, *, lease: CaptureLease) -> CaptureResult:
     started = evidence.started_at if evidence else attempt.created_at
     finished = evidence.finished_at if evidence else now
     reason = None if complete else attempt.failure_reason or "source coverage, reconciliation or durable content is incomplete"
-    if not complete and not items:
+    if not complete and not staged.item_count:
         attempt.state, attempt.failure_reason = "FAILED", reason
         await session.flush()
         return CaptureResult("failed", None, False, 0, 0, 0, started, finished, reason)
     inventory.membership_sha256 = source_hash
     inventory.representation_sha256 = representation_hash
-    inventory.item_count = len(items)
-    inventory.logical_bytes = sum(_logical_size(item) for item in items)
+    inventory.item_count = staged.item_count
+    inventory.logical_bytes = staged.logical_bytes
     inventory.evidence = {**(attempt.evidence or {}), "validation_gaps": gaps,
         "persisted_required_content_count": required, "persisted_durable_content_count": durable,
         "persisted_membership_sha256": source_hash}
