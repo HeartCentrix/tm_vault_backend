@@ -175,8 +175,11 @@ def test_archived_keep_last_keeps_a_real_backup():
 def test_legitimately_empty_resource_still_keeps_its_snapshots():
     """A genuinely empty mailbox produces real COMPLETED 0-item snapshots.
     Those are the true state — the keep set must not collapse to nothing."""
-    snaps = [_snap("empty-today", hours_ago=1, item_count=0),
-             _snap("empty-yesterday", days_ago=1, item_count=0)]
+    snaps = [_snap("empty-today", item_count=0),
+             _snap("empty-yesterday", item_count=0)]
+    # Different calendar buckets even during the first hour after UTC midnight.
+    for snapshot, day in zip(snaps, (3, 2)):
+        snapshot.started_at = snapshot.created_at = datetime(2026, 1, day, 12)
     keep = _gfs_keep_ids(snaps, _policy(retention_mode="GFS", gfs_daily_count=2))
     assert keep == {"empty-today", "empty-yesterday"}
 
