@@ -17,7 +17,7 @@ _SOURCE_CHAT = """COALESCE(
         AND msg.item_type IN ('TEAMS_CHAT_MESSAGE', 'TEAMS_MESSAGE', 'TEAMS_MESSAGE_REPLY'))
 )"""
 
-LEGACY_CHAT_ATTACHMENT_COPY_SQL = f"""
+LEGACY_CHAT_ATTACHMENT_SELECTION_CTES = f"""
 WITH RECURSIVE target_scope AS MATERIALIZED (
     SELECT s.id FROM snapshots s JOIN resources r ON r.id = s.resource_id
      WHERE s.id = :tsid AND r.tenant_id = :tid
@@ -87,7 +87,11 @@ WITH RECURSIVE target_scope AS MATERIALIZED (
 ), chosen AS MATERIALIZED (
     SELECT id, external_id, item_type, message_id
       FROM inspected WHERE source_chat_id = :cid
-), payloads AS MATERIALIZED (
+)
+"""
+
+LEGACY_CHAT_ATTACHMENT_COPY_SQL = LEGACY_CHAT_ATTACHMENT_SELECTION_CTES + """
+, payloads AS MATERIALIZED (
     SELECT src.*, chosen.message_id
       FROM chosen JOIN snapshot_items src ON src.id = chosen.id
 ), guard AS MATERIALIZED (
