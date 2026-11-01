@@ -9456,12 +9456,15 @@ class BackupWorker:
                             else:
                                 chat_meta[cid] = dict(cached)
 
+                    from shared.chat_presentation import captured_topic_observation, chat_presentation_enabled
+                    _captured_labels_enabled = chat_presentation_enabled()
                     for ch in fresh_chats:
                         cid = ch.get("id")
                         if not cid:
                             continue
                         ctype = ch.get("chatType", "unknown")
-                        topic = ch.get("topic")
+                        topic = (captured_topic_observation(ch, chat_meta.get(cid, {}))
+                            if _captured_labels_enabled else ch.get("topic"))
                         emails, names = member_lookup.get(cid, ([], []))
                         uids = chat_user_ids.get(cid) or []
                         display_name = _compose_chat_name_local(

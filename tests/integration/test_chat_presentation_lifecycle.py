@@ -99,7 +99,7 @@ async def test_replacement_capture_reopens_aborted_plan_and_excludes_old_drafts(
     for kind in ['CHAT_LABELS', 'CHAT_PRESENTATION']:
         await drain_labels(store, next(item for item in tasks if item.kind == kind), terminal=False)
     async with store.factory() as db:
-        assert (await db.get(models.SnapshotChatPresentation, (scope.snapshot_id, 'chat-a'))).folder_path == 'chats/Replacement'
+        assert (await db.get(models.SnapshotChatPresentation, (scope.snapshot_id, 'chat-a'))).folder_path == 'chats/Stored'
 
 
 @pytest.mark.parametrize('messages', [1, 1000])
@@ -128,3 +128,24 @@ async def test_published_marker_without_its_receipt_cannot_be_read_as_complete(s
         (await db.get(models.Snapshot, scope.snapshot_id)).extra_data = {'chat_presentation_format': 1}
     async with store.factory() as db:
         assert not await presentation_ready(db, scope.snapshot_id)
+
+
+@pytest.mark.parametrize('provenance,expected', [('fallback', 'chats/Planning'),
+    ('current_topic_cleared', 'chats/Untitled chat #1234')])
+async def test_first_presentation_capture_preserves_a_known_unmarked_carried_name(store, provenance, expected):
+    old = await legacy(store, [('chat-a', 'chats/Planning', {})])
+    async with store.factory.begin() as db:
+        (await db.get(models.Snapshot, old.snapshot_id)).status = models.SnapshotStatus.COMPLETED
+    current = await legacy(store, [])
+    async with store.factory.begin() as db:
+        carry = await enqueue(db, CopyRequest('CHAT_CARRY', 'giant', current.snapshot_id,
+            params={'prior_snapshot_id': str(old.snapshot_id)}))
+        labels = await enqueue(db, CopyRequest('CHAT_LABELS', 'micro', current.snapshot_id,
+            params={'labels': [{'chat_id': 'chat-a', 'folder_path': 'chats/Untitled chat #1234',
+                'quality': 0, 'provenance': provenance}]}))
+        publish = await enqueue(db, CopyRequest('CHAT_PRESENTATION', 'giant', current.snapshot_id))
+        (await db.get(models.CopyWorkflow, carry.workflow_id)).state = 'WAITING'
+    for task in [carry, labels, publish]:
+        await drain_labels(store, task, terminal=False)
+    async with store.factory() as db:
+        assert (await db.get(models.SnapshotChatPresentation, (current.snapshot_id, 'chat-a'))).folder_path == expected

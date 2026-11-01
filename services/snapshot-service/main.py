@@ -403,13 +403,14 @@ async def _catalogue_page(db, snapshot, *, page, size, item_type=None, chat_id=N
         stmt = stmt.where(SnapshotItem.item_type.in_(["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"]))
     if item_type:
         stmt = stmt.where(SnapshotItem.item_type == item_type)
-    if chat_id:
+    if chat_id or (folder is not None and messages_only):
         from shared.chat_presentation import chat_message_statement, ChatSelectionError
         try:
             await chat_message_statement(db, snapshot_ids=[snapshot.id], chat_id=chat_id, thread_path=folder)
         except ChatSelectionError as exc:
             raise HTTPException(400, detail={'error': str(exc)}) from exc
-        stmt = stmt.where(ChatItemVersion.chat_id == chat_id)
+        if chat_id:
+            stmt = stmt.where(ChatItemVersion.chat_id == chat_id)
     if folder is not None and not chat_id:
         stmt = stmt.where(SnapshotItem.folder_path == folder)
     if query:

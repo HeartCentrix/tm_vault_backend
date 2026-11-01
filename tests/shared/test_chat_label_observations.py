@@ -38,3 +38,12 @@ def test_already_resolved_user_specific_and_late_author_names_stay_separate():
     assert labels['alice']['folder_path'] == 'chats/Bob'
     assert labels['bob']['folder_path'] == 'chats/Alice'
     assert labels['late']['quality'] == 1
+
+
+def test_refresh_missing_topic_keeps_cache_while_explicit_clear_replaces_it():
+    from shared.chat_presentation import captured_topic_observation
+    assert captured_topic_observation({'id': 'a'}, {'topic': 'Planning'}) == 'Planning'
+    assert captured_topic_observation({'id': 'a', 'topic': None}, {'topic': 'Planning'}) is None
+    assert captured_topic_observation({'id': 'a', 'topic': ''}, {'topic': 'Planning'}) == ''
+    assert captured_topic_observation({'id': 'a', 'topic': {}}, {'topic': 'Planning'}) == 'Planning'
+    assert captured_topic_observation({'id': 'a', 'topic': 'New'}, {'topic': 'Planning'}) == 'New'

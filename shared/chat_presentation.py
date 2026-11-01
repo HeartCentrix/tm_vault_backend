@@ -26,6 +26,14 @@ def chat_presentation_enabled():
     return os.getenv('CHAT_PRESENTATION_ENABLED', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
 
 
+def captured_topic_observation(observed, cached):
+    """Missing or malformed metadata is not an explicit topic clear."""
+    topic = observed.get('topic')
+    if 'topic' in observed and (topic is None or isinstance(topic, str)):
+        return topic
+    return cached.get('topic')
+
+
 def label_observations(chat_meta, *, owned_chat_ids, current_chats=()):
     """Resolve only owned labels from evidence already fetched by this user."""
     current = {row.get('id'): row for row in current_chats}
@@ -154,7 +162,8 @@ def child_chat_id(item=SnapshotItem):
     camel = func.nullif(item.extra_data['chatId'].as_string(), '')
     parent = aliased(SnapshotItem)
     identity = message_chat_id(parent)
-    proven = select(case((func.count(func.distinct(identity)) == 1, func.min(identity)))).where(
+    proven = select(case(((func.count(func.distinct(identity)) == 1)
+        & (func.count() == func.count(identity)), func.min(identity)))).where(
         parent.snapshot_id == item.snapshot_id, parent.external_id == item.parent_external_id,
         parent.item_type.in_(MESSAGE_TYPES)).correlate(item).scalar_subquery()
     return case((snake.is_not(None) & camel.is_not(None) & (snake != camel), None),
@@ -336,9 +345,10 @@ async def presentation_ready(session, snapshot_id):
     """A persisted receipt remains required after a producer-flag rollback."""
     plan = await session.get(ChatPresentationPlan, UUID(str(snapshot_id)))
     if plan is None:
-        row = (await session.execute(select(Snapshot.id, Snapshot.extra_data).where(
-            Snapshot.id == UUID(str(snapshot_id))))).one_or_none()
-        return row is not None and (row.extra_data or {}).get('chat_presentation_format') != 1
+        snapshot = await session.get(Snapshot, UUID(str(snapshot_id)), populate_existing=True)
+        # No surviving snapshot means no publication obligation; terminal writers
+        # independently require the snapshot row. A marked snapshot needs its receipt.
+        return snapshot is None or (snapshot.extra_data or {}).get('chat_presentation_format') != 1
     metadata = await session.scalar(select(Snapshot.extra_data).where(Snapshot.id == plan.snapshot_id))
     if plan.state == 'ABORTED':
         return bool((metadata or {}).get('copy_required_failed'))

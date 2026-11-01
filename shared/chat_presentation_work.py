@@ -67,8 +67,14 @@ async def prepare_presentation_manifest(session, task, params):
             SnapshotItem.item_type.in_(MESSAGE_TYPES), identity.is_(None)).limit(1))
         if unknown:
             raise ChatSelectionError('CHAT_IDENTITY_UNAVAILABLE')
+        stored = func.nullif(SnapshotItem.folder_path, '')
+        known = stored.startswith('chats/') & (stored != literal('chats/') + identity)
+        for prefix in ('chats/Untitled chat #', 'chats/Untitled group #',
+                       'chats/1-on-1 Chat (19:', 'chats/Group Chat (19:', 'chats/Chat '):
+            known = known & ~stored.startswith(prefix)
         identities = select(identity.label('chat_id'),
-            func.max(func.nullif(SnapshotItem.folder_path, '')).label('stored_path')).where(
+            func.max(stored).label('stored_path'),
+            func.max(case((known, stored))).label('known_path')).where(
             SnapshotItem.snapshot_id == workflow.target_snapshot_id,
             SnapshotItem.item_type.in_(MESSAGE_TYPES)).group_by(identity).subquery()
         draft = ChatPresentationDraft
@@ -94,7 +100,11 @@ async def prepare_presentation_manifest(session, task, params):
         prior = prior.distinct(saved.chat_id).order_by(saved.chat_id, previous.created_at.desc(), previous.id.desc()).subquery()
         retain = (prior.c.quality > func.coalesce(winners.c.quality, -1)) & (
             (func.coalesce(winners.c.provenance, '') != 'current_topic_cleared') | (prior.c.quality < 3))
-        path = case((retain, prior.c.folder_path), else_=winners.c.folder_path)
+        retain_stored = (identities.c.known_path.is_not(None)
+            & (func.coalesce(winners.c.quality, 0) < 2)
+            & (func.coalesce(winners.c.provenance, '') != 'current_topic_cleared'))
+        path = case((retain, prior.c.folder_path), (retain_stored, identities.c.known_path),
+            else_=winners.c.folder_path)
         path = func.coalesce(path, identities.c.stored_path, literal('chats/') + identities.c.chat_id)
         other, producer = aliased(ChatPresentationDraft), aliased(CopyWorkflow)
         conflict = exists(select(other.chat_id).join(producer, producer.id == other.workflow_id).where(
@@ -103,8 +113,9 @@ async def prepare_presentation_manifest(session, task, params):
             other.capture_attempt == producer.capture_attempt, other.quality == winners.c.quality,
             other.folder_path != winners.c.folder_path)).correlate(identities, winners)
         payload = func.json_build_object('chat_id', identities.c.chat_id, 'folder_path', path,
-            'quality', func.coalesce(case((retain, prior.c.quality), else_=winners.c.quality), 0),
-            'provenance', case((retain, 'retained_history'), else_=func.coalesce(winners.c.provenance, 'legacy_stored')),
+            'quality', func.coalesce(case((retain, prior.c.quality), (retain_stored, 2), else_=winners.c.quality), 0),
+            'provenance', case((retain, 'retained_history'), (retain_stored, 'legacy_stored'),
+                else_=func.coalesce(winners.c.provenance, 'legacy_stored')),
             'conflicted', func.coalesce(winners.c.conflicted, False) | conflict)
         selected = select(literal(task.id), func.row_number().over(order_by=identities.c.chat_id),
             payload, literal(0)).select_from(identities.outerjoin(winners,

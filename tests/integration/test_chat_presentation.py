@@ -85,6 +85,11 @@ async def test_catalogue_equal_titles_keep_separate_chat_identities(store, snaps
     async with store.factory.begin() as db:
         groups = await snapshot_api.list_snapshot_chat_groups(str(scope.snapshot_id), db=db)
         assert {g["chatId"] for g in groups} == {"chat-a", "chat-b"}
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as ambiguous:
+            await snapshot_api.list_snapshot_messages(str(scope.snapshot_id), db=db,
+                page=1, size=50, chatId=None, folder='chats/Planning', search=None, presentation=True)
+        assert ambiguous.value.detail == {'error': 'AMBIGUOUS_CHAT_PATH'}
         from shared.chat_presentation import chat_message_statement, ChatSelectionError
         with pytest.raises(ChatSelectionError, match="AMBIGUOUS_CHAT_PATH"):
             await chat_message_statement(db, snapshot_ids=[scope.snapshot_id], thread_path="chats/Planning")
@@ -422,3 +427,25 @@ async def test_generic_chat_identity_hydrates_thin_pointers_without_changing_sto
     async with store.factory() as db:
         assert await db.scalar(select(models.SnapshotItem.extra_data).where(
             models.SnapshotItem.snapshot_id == scope.snapshot_id)) == {}
+
+
+async def test_unknown_competing_parent_cannot_prove_a_legacy_childs_chat(store, export_api, export_scope):
+    from fastapi import HTTPException
+    from shared.chat_presentation import ChatSelectionError
+    scope = await legacy(store, [('chat-a', 'chats/Same', {})])
+    async with store.factory.begin() as db:
+        db.add_all([
+            models.SnapshotItem(snapshot_id=scope.snapshot_id, tenant_id=scope.tenant_id,
+                backend_id=scope.backend_id, external_id='message-0', parent_external_id='unknown-message',
+                item_type='TEAMS_MESSAGE_REPLY', name='Unknown reply', extra_data={}),
+            models.SnapshotItem(snapshot_id=scope.snapshot_id, tenant_id=scope.tenant_id,
+                backend_id=scope.backend_id, external_id='child', parent_external_id='message-0',
+                item_type='CHAT_ATTACHMENT', name='file.pdf', content_size=7, blob_path='objects/file', extra_data={})])
+    async with store.factory() as db:
+        with pytest.raises(HTTPException) as estimate:
+            await export_api._resolve_counts(db, resource_id=str(scope.resource_id),
+                snapshot_ids=[str(scope.snapshot_id)], thread_path=None, item_ids=[], chat_id='chat-a')
+        assert estimate.value.detail == {'error': 'CHAT_CHILD_IDENTITY_UNAVAILABLE'}
+        with pytest.raises(ChatSelectionError, match='CHAT_CHILD_IDENTITY_UNAVAILABLE'):
+            await export_scope.resolve(db, resource_id=scope.resource_id,
+                snapshot_ids=[scope.snapshot_id], thread_path=None, item_ids=[], chat_id='chat-a')

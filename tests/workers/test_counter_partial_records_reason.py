@@ -156,7 +156,7 @@ class _FakeSnapshot:
 
 
 class _FakeSession:
-    async def get(self, _model, _pk):
+    async def get(self, _model, _pk, **_kwargs):
         return None
 
     async def commit(self):
