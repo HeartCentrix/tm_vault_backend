@@ -431,10 +431,10 @@ async def _catalogue_item_response(db, snapshot, *, page, size, item_type=None, 
         totalElements=total, totalPages=max(1, (total + size - 1) // size), size=size, number=page)
 
 
-async def _catalogue_groups(db, snapshot):
+async def _catalogue_groups(db, snapshot, *, offset=0, limit=None):
     await _assert_catalogue_links(db, snapshot)
     messages = ["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"]
-    rows = (await db.execute(select(SnapshotChatInventory.chat_id,
+    statement = (select(SnapshotChatInventory.chat_id,
         ChatCaptureAttempt.folder_path, func.count(SnapshotItem.id).label("count"),
         func.max(cast(ChatItemVersion.payload["createdDateTime"].as_string(), DateTime(timezone=True))).label("last_message_at"))
         .join(ChatCaptureAttempt, ChatCaptureAttempt.id == SnapshotChatInventory.capture_attempt_id)
@@ -445,7 +445,10 @@ async def _catalogue_groups(db, snapshot):
         .where(SnapshotChatInventory.snapshot_id == snapshot.id)
         .group_by(SnapshotChatInventory.chat_id, ChatCaptureAttempt.folder_path)
         .order_by(func.max(cast(ChatItemVersion.payload["createdDateTime"].as_string(), DateTime(timezone=True))).desc().nullslast(),
-            SnapshotChatInventory.chat_id))).all()
+            SnapshotChatInventory.chat_id))
+    if limit is not None:
+        statement = statement.offset(offset).limit(limit)
+    rows = (await db.execute(statement)).all()
     return [{"chatId": r.chat_id, "displayName": (r.folder_path or f"chats/{r.chat_id}").removeprefix("chats/"),
         "folderPath": r.folder_path or f"chats/{r.chat_id}", "count": int(r.count),
         "lastMessageAt": r.last_message_at.isoformat() if r.last_message_at else None} for r in rows]
@@ -3619,19 +3622,35 @@ async def list_snapshot_contact_folders(
 async def list_snapshot_chat_groups(
     snapshot_id: str,
     db: AsyncSession = Depends(get_db),
+    page: Optional[int] = None,
+    size: int = 500,
 ):
     """Captured conversations, identified by chat ID rather than display path.
 
     Catalogue labels come from their capture attempt. Legacy labels come from
     this restore point's stored paths, with mixed aliases exposed explicitly.
     """
+    if page is not None and (page < 1 or not 1 <= size <= 500):
+        raise HTTPException(400, detail="Invalid conversation page or size")
     catalogue = await _catalogue_snapshot(db, snapshot_id, resolve_chat_sibling=True)
     if catalogue is not None:
-        if (catalogue.extra_data or {}).get("chat_inventory_format") == 1:
-            return await _catalogue_groups(db, catalogue)
         snapshot_id = str(catalogue.id)
-    from shared.chat_presentation import list_chat_presentations
-    return await list_chat_presentations(db, UUID(snapshot_id))
+    options = {"offset": (page - 1) * size, "limit": size} if page is not None else {}
+    from shared.chat_presentation import list_chat_presentations, message_chat_id, MESSAGE_TYPES
+    if catalogue is not None and (catalogue.extra_data or {}).get("chat_inventory_format") == 1:
+        groups = await _catalogue_groups(db, catalogue, **options)
+        total = await db.scalar(select(func.count()).select_from(SnapshotChatInventory).where(
+            SnapshotChatInventory.snapshot_id == catalogue.id)) if page is not None else len(groups)
+    else:
+        groups = await list_chat_presentations(db, UUID(snapshot_id), **options)
+        total = await db.scalar(select(func.count(func.distinct(message_chat_id()))).join(Snapshot,
+            Snapshot.id == SnapshotItem.snapshot_id).join(Resource, Resource.id == Snapshot.resource_id).where(
+            SnapshotItem.snapshot_id == UUID(snapshot_id), SnapshotItem.item_type.in_(MESSAGE_TYPES),
+            or_(SnapshotItem.tenant_id.is_(None), SnapshotItem.tenant_id == Resource.tenant_id))) if page is not None else len(groups)
+    if page is None:
+        return groups
+    return {"content": groups, "total": int(total or 0), "page": page, "size": size,
+        "hasMore": page * size < int(total or 0)}
 
 
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/azure-db/export")

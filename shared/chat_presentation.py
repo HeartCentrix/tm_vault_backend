@@ -240,14 +240,14 @@ async def chat_restore_items(session, *, snapshot_ids, chat_id, folder_paths=(),
     return [row for row in rows if row.id not in excluded]
 
 
-async def list_chat_presentations(session, snapshot_id):
+async def list_chat_presentations(session, snapshot_id, *, offset=0, limit=None):
     """Legacy compatibility reads only this snapshot's stored labels.
 
     MAX preserves the existing representative rule; aliases disclose mixed
     historical presentation instead of inventing a verified original topic.
     """
     identity = message_chat_id()
-    rows = (await session.execute(select(identity.label("chat_id"),
+    statement = (select(identity.label("chat_id"),
         func.count().label("count"), func.max(func.nullif(SnapshotItem.folder_path, "")).label("path"),
         func.array_agg(func.distinct(SnapshotItem.folder_path)).label("aliases"))
         .join(Snapshot, Snapshot.id == SnapshotItem.snapshot_id)
@@ -255,14 +255,18 @@ async def list_chat_presentations(session, snapshot_id):
         .where(SnapshotItem.snapshot_id == UUID(str(snapshot_id)),
             SnapshotItem.item_type.in_(MESSAGE_TYPES), identity.is_not(None),
             (SnapshotItem.tenant_id.is_(None) | (SnapshotItem.tenant_id == Resource.tenant_id)))
-        .group_by(identity).order_by(identity))).all()
+        .group_by(identity).order_by(identity))
+    if limit is not None:
+        statement = statement.offset(offset).limit(limit)
+    rows = (await session.execute(statement)).all()
     snapshot = await session.get(Snapshot, UUID(str(snapshot_id)))
     captured = {}
     if (snapshot.extra_data or {}).get('chat_presentation_format') == 1:
         if not await presentation_ready(session, snapshot_id):
             raise ChatSelectionError('CHAT_PRESENTATION_INTEGRITY_GAP')
         captured = {label.chat_id: label for label in (await session.scalars(
-            select(SnapshotChatPresentation).where(SnapshotChatPresentation.snapshot_id == snapshot.id))).all()}
+            select(SnapshotChatPresentation).where(SnapshotChatPresentation.snapshot_id == snapshot.id,
+                SnapshotChatPresentation.chat_id.in_([row.chat_id for row in rows])))).all()}
         if set(captured) != {row.chat_id for row in rows}:
             raise ChatSelectionError('CHAT_PRESENTATION_INTEGRITY_GAP')
     result = []

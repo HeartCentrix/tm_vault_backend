@@ -377,3 +377,14 @@ async def test_generic_job_persists_the_chat_selector_instead_of_whole_snapshot_
         job = await db.get(models.Job, UUID(result['jobId']))
         assert job.spec['chatId'] == 'chat-a'
         assert job.spec.get('item_ids', []) == []
+
+
+async def test_conversation_pagination_keeps_identical_titles_as_distinct_rows(store, snapshot_api):
+    scope = await legacy(store, [('chat-a', 'chats/Same', {}), ('chat-b', 'chats/Same', {})])
+    async with store.factory.begin() as db:
+        first = await snapshot_api.list_snapshot_chat_groups(str(scope.snapshot_id), db=db, page=1, size=1)
+        second = await snapshot_api.list_snapshot_chat_groups(str(scope.snapshot_id), db=db, page=2, size=1)
+        assert first['hasMore'] and not second['hasMore']
+        assert first['total'] == second['total'] == 2
+        assert first['content'][0]['chatId'] != second['content'][0]['chatId']
+        assert first['content'][0]['displayName'] == second['content'][0]['displayName'] == 'Same'
