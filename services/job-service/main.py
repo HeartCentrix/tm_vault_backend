@@ -2314,9 +2314,15 @@ def assert_selection_not_empty(body: Optional[dict], item_ids, *, action: str) -
     ("Select at least one item or folder") — applied here to the two routes
     that actually persist the Job and publish to the restore queues.
     """
+    body = body or {}
+    if body.get('chatId') is not None:
+        chat_id, paths = body['chatId'], body.get('folderPaths') or []
+        if (not isinstance(chat_id, str) or not chat_id.strip() or item_ids
+            or not isinstance(paths, list) or len(paths) > 1 or body.get('restoreType') == 'EXPORT_PST'):
+            raise HTTPException(400, detail={'error': 'INVALID_CHAT_SELECTION'})
+        return
     if item_ids:
         return
-    body = body or {}
     if body.get("folderPaths"):
         return
     scope = _declared_scope(body)
@@ -2350,6 +2356,17 @@ def assert_selection_not_empty(body: Optional[dict], item_ids, *, action: str) -
             ),
         },
     )
+
+
+async def _chat_request_statement(db, request, snapshot_ids):
+    if not request.get('chatId'):
+        return None
+    from shared.chat_presentation import chat_message_statement, ChatSelectionError
+    try:
+        return await chat_message_statement(db, snapshot_ids=snapshot_ids, chat_id=request['chatId'],
+            thread_path=next(iter(request.get('folderPaths') or []), None))
+    except (ChatSelectionError, ValueError) as exc:
+        raise HTTPException(400, detail={'error': str(exc)}) from exc
 
 
 @app.post("/api/v1/jobs/restore")
@@ -2410,6 +2427,7 @@ async def trigger_restore(
         # restore-worker delegates to shared.folder_resolver instead of
         # treating itemIds as the authoritative selection.
         "folderPaths": request.get("folderPaths") or [],
+        "chatId": request.get("chatId"),
         "excludedItemIds": request.get("excludedItemIds") or [],
         # SharePoint/OneDrive/Teams/Group restore conflict handling.
         # OVERWRITE replaces in-place; SEPARATE_FOLDER lands under
@@ -2443,6 +2461,7 @@ async def trigger_restore(
     scope_targets = await authorize_export_scope(
         db, user, snapshot_ids=snapshot_ids, item_ids=item_ids,
     )
+    chat_statement = await _chat_request_statement(db, request, snapshot_ids)
     dest_targets = await authorize_restore_destinations(db, user, spec)
     for _dest_key, _dest_res in dest_targets.items():
         # Persist the canonical Resource.id we authorized, so the worker's own
@@ -2488,7 +2507,10 @@ async def trigger_restore(
     total_bytes = 0
     try:
         from sqlalchemy import func as _func
-        if item_ids:
+        if chat_statement is not None:
+            stmt = sa_select(_func.coalesce(_func.sum(SnapshotItem.content_size), 0)).where(
+                SnapshotItem.id.in_(chat_statement.with_only_columns(SnapshotItem.id)))
+        elif item_ids:
             stmt = sa_select(_func.coalesce(_func.sum(SnapshotItem.content_size), 0)).where(
                 SnapshotItem.id.in_([_parse_uuid(i, "itemId") for i in item_ids])
             )
@@ -2561,7 +2583,11 @@ async def trigger_restore(
             # routing decision sees the same bytes the worker will
             # actually process. Legacy paths (itemIds only, or just a
             # snapshot) fall back to the simple aggregate.
-            if (spec.get("folderPaths") or spec.get("excludedItemIds")) and snapshot_ids:
+            if chat_statement is not None:
+                q = sa_select(sa_func.coalesce(sa_func.sum(SnapshotItem.content_size), 0)).where(
+                    SnapshotItem.id.in_(chat_statement.with_only_columns(SnapshotItem.id)))
+                total_bytes = int((await db.execute(q)).scalar() or 0)
+            elif (spec.get("folderPaths") or spec.get("excludedItemIds")) and snapshot_ids:
                 from shared.folder_resolver import resolve_selection
                 resolved = await resolve_selection(
                     db,
@@ -2689,6 +2715,7 @@ async def trigger_export(
     scope_targets = await authorize_export_scope(
         db, user, snapshot_ids=snapshot_ids, item_ids=item_ids
     )
+    chat_statement = await _chat_request_statement(db, request, snapshot_ids)
 
     tenant_id = None
     resource_id = None
@@ -2777,7 +2804,11 @@ async def trigger_export(
         from sqlalchemy import func as sa_func, select as sa_select
         total_bytes = 0
         try:
-            if item_ids:
+            if chat_statement is not None:
+                q = sa_select(sa_func.coalesce(sa_func.sum(SnapshotItem.content_size), 0)).where(
+                    SnapshotItem.id.in_(chat_statement.with_only_columns(SnapshotItem.id)))
+                total_bytes = int((await db.execute(q)).scalar() or 0)
+            elif item_ids:
                 q = sa_select(sa_func.coalesce(sa_func.sum(SnapshotItem.content_size), 0)).where(
                     SnapshotItem.id.in_([UUID(x) for x in item_ids])
                 )

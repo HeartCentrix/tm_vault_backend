@@ -17,7 +17,7 @@ from sqlalchemy import select, func, distinct, and_, or_, text, String, cast, Da
 from sqlalchemy.orm import aliased
 
 from shared.database import get_db, init_db, close_db, AsyncSession, async_session_factory
-from shared.models import Snapshot, SnapshotItem, Resource, SnapshotType, SnapshotStatus, ResourceType, ResourceStatus, Job, ChatItemVersion, SnapshotChatInventory, ChatCaptureAttempt
+from shared.models import Snapshot, SnapshotItem, Resource, SnapshotType, SnapshotStatus, ResourceType, ResourceStatus, Job, ChatItemVersion, SnapshotChatInventory, ChatCaptureAttempt, ChatThread, ChatThreadMessage, SnapshotChatPresentation
 from shared.chat_catalogue import materialize_chat_items, ChatCatalogueIntegrityError
 from shared.snapshot_reuse import resolve_snapshot_items_target, SnapshotNotFound
 from shared.audit import internal_audit_headers
@@ -404,8 +404,13 @@ async def _catalogue_page(db, snapshot, *, page, size, item_type=None, chat_id=N
     if item_type:
         stmt = stmt.where(SnapshotItem.item_type == item_type)
     if chat_id:
+        from shared.chat_presentation import chat_message_statement, ChatSelectionError
+        try:
+            await chat_message_statement(db, snapshot_ids=[snapshot.id], chat_id=chat_id, thread_path=folder)
+        except ChatSelectionError as exc:
+            raise HTTPException(400, detail={'error': str(exc)}) from exc
         stmt = stmt.where(ChatItemVersion.chat_id == chat_id)
-    if folder is not None:
+    if folder is not None and not chat_id:
         stmt = stmt.where(SnapshotItem.folder_path == folder)
     if query:
         stmt = stmt.where(or_(SnapshotItem.name.ilike(f"%{query}%"),
@@ -565,6 +570,7 @@ async def _catalogue_message_response(db, snapshot, *, page, size, chat_id=None,
         sender = (raw.get("from") or {}).get("user") or {}
         result.append({"id": str(item.id), "snapshotId": str(item.snapshot_id),
             "externalId": item.external_id, "itemType": item.item_type,
+            "chatId": cid,
             "sender": sender.get("displayName") or "Unknown", "senderEmail": sender.get("userPrincipalName") or sender.get("id") or "",
             "body": body.get("content") or "", "bodyContentType": body.get("contentType") or "text",
             "date": raw.get("createdDateTime"), "chatTopic": (item.folder_path or f"chats/{cid}").removeprefix("chats/"),
@@ -575,6 +581,76 @@ async def _catalogue_message_response(db, snapshot, *, page, size, chat_id=None,
             "metadata": {"raw": raw}})
     return {"content": result, "totalElements": total, "totalPages": max(1, (total + size - 1) // size),
         "size": size, "number": page}
+
+
+async def _legacy_captured_message_response(db, snapshot, *, page, size, chat_id=None, folder=None, search=None):
+    """Hydrate only the selected inventory; labels never come from live cache."""
+    from copy import deepcopy
+    from shared.chat_presentation import (MESSAGE_TYPES, ChatSelectionError,
+        chat_message_statement, message_chat_id, presentation_ready)
+    try:
+        if chat_id or folder is not None:
+            selected = await chat_message_statement(db, snapshot_ids=[snapshot.id], chat_id=chat_id, thread_path=folder)
+        else:
+            selected = select(SnapshotItem).where(SnapshotItem.snapshot_id == snapshot.id,
+                SnapshotItem.item_type.in_(MESSAGE_TYPES))
+        if (snapshot.extra_data or {}).get('chat_presentation_format') == 1 and not await presentation_ready(db, snapshot.id):
+            raise ChatSelectionError('CHAT_PRESENTATION_INTEGRITY_GAP')
+    except ChatSelectionError as exc:
+        raise HTTPException(409 if 'INTEGRITY' in str(exc) else 400, detail={'error': str(exc)}) from exc
+    resource = await db.get(Resource, snapshot.resource_id)
+    identity = message_chat_id()
+    stmt = select(SnapshotItem, ChatThreadMessage, identity.label('chat_id')).outerjoin(ChatThread,
+        and_(ChatThread.tenant_id == resource.tenant_id, ChatThread.chat_id == identity,
+            ChatThread.archived_at.is_(None))).outerjoin(ChatThreadMessage,
+        and_(ChatThreadMessage.chat_thread_id == ChatThread.id,
+            ChatThreadMessage.message_external_id == SnapshotItem.external_id,
+            ChatThreadMessage.archived_at.is_(None))).where(
+        SnapshotItem.id.in_(selected.with_only_columns(SnapshotItem.id)),
+        or_(SnapshotItem.tenant_id.is_(None), SnapshotItem.tenant_id == resource.tenant_id))
+    if search:
+        stmt = stmt.where(or_(ChatThreadMessage.body_content.ilike(f'%{search}%'),
+            SnapshotItem.extra_data['raw']['body']['content'].as_string().ilike(f'%{search}%')))
+    total = await db.scalar(select(func.count()).select_from(stmt.order_by(None).subquery())) or 0
+    rows = (await db.execute(stmt.order_by(ChatThreadMessage.created_date_time.desc().nullslast(),
+        SnapshotItem.created_at.desc(), SnapshotItem.id).offset((page - 1) * size).limit(size))).all()
+    chats = {row.chat_id for row in rows if row.chat_id}
+    if (snapshot.extra_data or {}).get('chat_presentation_format') == 1:
+        labels = dict((await db.execute(select(SnapshotChatPresentation.chat_id,
+            SnapshotChatPresentation.folder_path).where(SnapshotChatPresentation.snapshot_id == snapshot.id,
+            SnapshotChatPresentation.chat_id.in_(chats)))).all())
+        if set(labels) != chats:
+            raise HTTPException(409, detail={'error': 'CHAT_PRESENTATION_INTEGRITY_GAP'})
+    else:
+        labels = dict((await db.execute(select(identity, func.max(SnapshotItem.folder_path)).where(
+            SnapshotItem.snapshot_id == snapshot.id, SnapshotItem.item_type.in_(MESSAGE_TYPES),
+            identity.in_(chats)).group_by(identity))).all())
+    result = []
+    for item, source, cid in rows:
+        metadata = item.extra_data if isinstance(item.extra_data, dict) else {}
+        raw = deepcopy((source.metadata_raw if source else None) or metadata.get('raw') or {})
+        if not isinstance(raw, dict):
+            raw = {}
+        body = raw.get('body') if isinstance(raw.get('body'), dict) else {}
+        text = source.body_content if source and source.body_content is not None else body.get('content') or ''
+        if text and 'hostedContents' in text:
+            text = _rewrite_hosted_content_urls(text, str(resource.tenant_id))
+        sender = (raw.get('from') or {}).get('user') or {}
+        name = (source.from_display_name if source else None) or sender.get('displayName') or 'Unknown'
+        path = labels.get(cid) or item.folder_path or f'chats/{cid or "Unknown"}'
+        result.append({'id': str(item.id), 'snapshotId': str(snapshot.id), 'externalId': item.external_id,
+            'itemType': item.item_type, 'chatId': cid, 'sender': name,
+            'senderEmail': sender.get('userPrincipalName') or sender.get('id') or '',
+            'body': text, 'bodyContentType': (source.body_content_type if source else None) or body.get('contentType') or 'text',
+            'date': source.created_date_time.isoformat() if source and source.created_date_time else raw.get('createdDateTime'),
+            'chatTopic': path.removeprefix('chats/'), 'channelName': '', 'folderPath': path,
+            'attachments': raw.get('attachments') or [], 'mentions': raw.get('mentions') or [],
+            'isDeleted': bool(item.is_deleted) or bool(source.deleted_date_time if source else raw.get('deletedDateTime')),
+            'isReply': item.item_type == 'TEAMS_MESSAGE_REPLY' or bool(raw.get('replyToId')),
+            'contentSize': item.content_size or 0, 'createdAt': item.created_at.isoformat() if item.created_at else '',
+            'name': name, 'metadata': {'raw': raw, 'chatId': cid}})
+    return {'content': result, 'totalElements': int(total), 'totalPages': max(1, (total + size - 1) // size),
+        'size': size, 'number': page}
 
 
 async def _get_power_bi_assembled_items(db: AsyncSession, snapshot_id: str) -> Optional[List[SnapshotItem]]:
@@ -2939,6 +3015,7 @@ async def list_snapshot_messages(
     chatId: Optional[str] = Query(None),
     folder: Optional[str] = Query(None, description="Filter to one chat by folder_path"),
     search: Optional[str] = Query(None, description="Case-insensitive substring match on body"),
+    presentation: bool = Query(False, description="Use exact captured inventory and presentation"),
     db: AsyncSession = Depends(get_db),
 ):
     """Return Teams chat messages joined to the tenant-singleton
@@ -2960,6 +3037,9 @@ async def list_snapshot_messages(
     if catalogue is not None:
         if (catalogue.extra_data or {}).get("chat_inventory_format") == 1:
             return await _catalogue_message_response(db, catalogue, page=page, size=size,
+                chat_id=chatId, folder=folder, search=search)
+        if chatId or presentation is True or (catalogue.extra_data or {}).get('chat_presentation_format') == 1:
+            return await _legacy_captured_message_response(db, catalogue, page=page, size=size,
                 chat_id=chatId, folder=folder, search=search)
         snapshot_id = str(catalogue.id)
     CHAT_TYPES = ("TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY")

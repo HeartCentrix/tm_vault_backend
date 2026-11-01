@@ -861,6 +861,7 @@ class RestoreWorker:
                             session, snapshot_ids, item_ids,
                             folder_paths=spec.get("folderPaths") or [],
                             excluded_item_ids=spec.get("excludedItemIds") or [],
+                            chat_id=spec.get("chatId"),
                         )
                         catalogue_operation = any(_catalogue_item(item) for item in items_to_restore)
                         print(f"[{self.worker_id}] fetched {len(items_to_restore)} snapshot items job={job_id}", flush=True)
@@ -978,6 +979,7 @@ class RestoreWorker:
         item_ids: List[str],
         folder_paths: Optional[List[str]] = None,
         excluded_item_ids: Optional[List[str]] = None,
+        chat_id: Optional[str] = None,
     ) -> List[SnapshotItem]:
         """Resolve the SnapshotItems a restore job should process.
 
@@ -1010,6 +1012,12 @@ class RestoreWorker:
         """
         folder_paths = folder_paths or []
         excluded_item_ids = excluded_item_ids or []
+        if chat_id:
+            from shared.chat_presentation import chat_restore_items
+            rows = await chat_restore_items(session, snapshot_ids=snapshot_ids, chat_id=chat_id,
+                folder_paths=folder_paths, item_ids=item_ids, excluded_item_ids=excluded_item_ids)
+            return await self._materialize_catalogue_selection(session, rows,
+                snapshot_ids=snapshot_ids, excluded_item_ids=excluded_item_ids)
 
         # Direct item_ids lookup bypasses snapshot resolution — used for
         # legacy single-item exports that pass exact ids.

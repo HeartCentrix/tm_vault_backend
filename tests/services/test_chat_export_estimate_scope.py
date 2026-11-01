@@ -37,6 +37,7 @@ os.environ.setdefault("AUDIT_SERVICE_URL", "http://localhost:8000")
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO_ROOT))
+sys.path.insert(0, str(_REPO_ROOT / 'services/job-service'))
 
 _CE_PATH = _REPO_ROOT / "services" / "job-service" / "chat_export.py"
 _spec = importlib.util.spec_from_file_location("chat_export_under_test", _CE_PATH)
@@ -76,6 +77,8 @@ class _Item:
         self.blob_path = kw.get("blob_path")
         self.content_size = kw.get("content_size", 0)
         self.created_at = kw.get("created_at", 0)
+        self.chat_id = self.parent_external_id if self.item_type in (
+            'TEAMS_CHAT_MESSAGE', 'TEAMS_MESSAGE') else 'chat-1'
 
 
 # ── criteria evaluator ────────────────────────────────────────────────────

@@ -125,6 +125,20 @@ def test_a_real_selection_is_allowed():
             ["22222222-2222-2222-2222-222222222222"])
 
 
+def test_chat_identity_is_an_explicit_selection_without_message_ids():
+    _guard({'selectionScope': 'SELECTED', 'chatId': 'chat-a'})
+
+
+@pytest.mark.parametrize('body', [
+    {'chatId': ''}, {'chatId': ['chat-a']}, {'chatId': 'chat-a', 'folderPaths': ['one', 'two']},
+    {'chatId': 'chat-a', 'restoreType': 'EXPORT_PST'},
+])
+def test_invalid_chat_selection_never_falls_back_to_whole_snapshot(body):
+    with pytest.raises(HTTPException) as caught:
+        _guard({**body, 'selectionScope': 'ALL'})
+    assert caught.value.detail['error'] == 'INVALID_CHAT_SELECTION'
+
+
 def test_declared_whole_resource_is_allowed():
     for value in ("ALL", "all", "FULL", "Everything"):
         _allows({"selectionScope": value, "itemIds": []})

@@ -173,7 +173,7 @@ async def _execute_export_job(sess, job_id, spec, job):
                 owner_kind="export", owner_id=UUID(str(job_id))) as read_lease:
             scope = await resolve(sess, resource_id=spec["resourceId"],
                 snapshot_ids=spec.get("snapshotIds") or [], thread_path=spec.get("threadPath"),
-                item_ids=spec.get("itemIds") or [])
+                item_ids=spec.get("itemIds") or [], chat_id=spec.get("chatId"))
             await _run_pipeline(sess, job_id, spec, scope, job, read_lease=read_lease)
     except Exception as exc:
         log.exception("job_failed id=%s", job_id)

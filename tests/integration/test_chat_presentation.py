@@ -6,7 +6,8 @@ import pytest
 from sqlalchemy import select
 
 from test_chat_catalogue_postgres import store, api, message
-from test_chat_catalogue_reads import snapshot_api
+from test_chat_catalogue_reads import snapshot_api, export_api, export_scope
+from test_chat_catalogue_generic_exports import restore_api
 from shared import models
 
 pytestmark = pytest.mark.integration
@@ -229,3 +230,150 @@ async def test_scheduler_gives_source_labels_a_turn_before_publication(store):
     async with store.factory.begin() as db:
         picked = await claim(db, owner_id=uuid4())
         assert picked.task_id == publish.id
+
+
+async def test_identity_export_and_estimate_agree_across_legacy_path_aliases(store, export_api, export_scope):
+    scope = await legacy(store, [('chat-a', 'chats/Old', {}), ('chat-a', 'chats/New', {}),
+        ('chat-b', 'chats/New', {})])
+    async with store.factory.begin() as db:
+        count, _, layout, _ = await export_api._resolve_counts(db, resource_id=str(scope.resource_id),
+            snapshot_ids=[str(scope.snapshot_id)], thread_path=None, item_ids=[], chat_id='chat-a')
+        selected = await export_scope.resolve(db, resource_id=scope.resource_id,
+            snapshot_ids=[scope.snapshot_id], thread_path=None, item_ids=[], chat_id='chat-a')
+        assert count == len(selected.messages) == 2
+        assert layout == selected.layout == 'single_thread'
+        legacy_subset = await export_scope.resolve(db, resource_id=scope.resource_id,
+            snapshot_ids=[scope.snapshot_id], thread_path='chats/Old', item_ids=[])
+        assert len(legacy_subset.messages) == 1
+
+
+async def test_catalogue_identity_exports_one_of_two_equal_titles(store, export_api, export_scope):
+    scope = await store.new_scope()
+    for chat_id in ['chat-a', 'chat-b']:
+        current = replace(scope, chat_id=chat_id)
+        async with store.factory.begin() as db:
+            lease = await api().begin_capture(db, scope=current, folder_path='chats/Same')
+        items = [message()]
+        await store.stage(lease, items)
+        await store.observe(current, lease, items)
+        await store.publish(lease)
+    async with store.factory.begin() as db:
+        count, _, _, _ = await export_api._resolve_counts(db, resource_id=str(scope.resource_id),
+            snapshot_ids=[str(scope.snapshot_id)], thread_path=None, item_ids=[], chat_id='chat-a')
+        selected = await export_scope.resolve(db, resource_id=scope.resource_id,
+            snapshot_ids=[scope.snapshot_id], thread_path=None, item_ids=[], chat_id='chat-a')
+        assert count == len(selected.messages) == 1
+        assert selected.messages[0].extra_data['chatId'] == 'chat-a'
+
+
+async def test_legacy_children_with_a_colliding_message_id_remain_chat_qualified(store, export_api, export_scope):
+    scope = await legacy(store, [('chat-a', 'chats/Same', {})])
+    other = await legacy(store, [('chat-b', 'chats/Same', {})])
+    async with store.factory.begin() as db:
+        for captured, size in [(scope, 3), (other, 9)]:
+            db.add(models.SnapshotItem(snapshot_id=captured.snapshot_id, tenant_id=captured.tenant_id,
+                backend_id=captured.backend_id, external_id='attachment', parent_external_id='message-0',
+                item_type='CHAT_ATTACHMENT', name=f'{captured.chat_id}.pdf', content_size=size,
+                blob_path=f'objects/{size}', extra_data={'chat_id': 'chat-a' if captured == scope else 'chat-b'}))
+    async with store.factory.begin() as db:
+        count, size, _, _ = await export_api._resolve_counts(db, resource_id=str(scope.resource_id),
+            snapshot_ids=[str(scope.snapshot_id)], thread_path=None, item_ids=[], chat_id='chat-a')
+        selected = await export_scope.resolve(db, resource_id=scope.resource_id,
+            snapshot_ids=[scope.snapshot_id], thread_path=None, item_ids=[], chat_id='chat-a')
+        assert count == len(selected.messages) == 1
+        assert size == 3
+        assert [a['size'] for a in selected.attachment_map['message-0']] == [3]
+
+
+async def test_published_legacy_message_page_uses_captured_label_and_exact_identity(store, snapshot_api):
+    scope = await legacy(store, [('chat-a', 'chats/Old', {}), ('chat-a', 'chats/Other alias', {}),
+        ('chat-b', 'chats/Old', {})])
+    labels = [{'chat_id': chat_id, 'folder_path': f'chats/Published {chat_id}', 'quality': 3,
+        'provenance': 'current_topic'} for chat_id in ['chat-a', 'chat-b']]
+    task, publish = await label_task(store, scope, labels, publication=True)
+    await drain_labels(store, task, terminal=False)
+    await drain_labels(store, publish)
+    async with store.factory.begin() as db:
+        thread = models.ChatThread(tenant_id=scope.tenant_id, chat_id='chat-a', chat_topic='Mutable latest name')
+        db.add(thread)
+        await db.flush()
+        db.add(models.ChatThreadMessage(chat_thread_id=thread.id, message_external_id='message-0',
+            body_content='Captured pointer body', metadata_raw={'id': 'message-0',
+                'body': {'content': 'Captured pointer body', 'contentType': 'text'}}))
+        db.add(models.ChatThreadMessage(chat_thread_id=thread.id, message_external_id='not-in-this-backup',
+            body_content='A later message'))
+    async with store.factory.begin() as db:
+        result = await snapshot_api.list_snapshot_messages(str(scope.snapshot_id), page=1, size=50,
+            chatId='chat-a', folder='chats/Published chat-a', search=None, db=db)
+        assert result['totalElements'] == 2
+        assert {row['chatId'] for row in result['content']} == {'chat-a'}
+        assert {row['chatTopic'] for row in result['content']} == {'Published chat-a'}
+        assert 'not-in-this-backup' not in {row['externalId'] for row in result['content']}
+        assert next(row for row in result['content'] if row['externalId'] == 'message-0')['body'] == 'Captured pointer body'
+        raw_paths = list((await db.scalars(select(models.SnapshotItem.folder_path).where(
+            models.SnapshotItem.snapshot_id == scope.snapshot_id))).all())
+        assert 'chats/Published chat-a' not in raw_paths
+
+
+async def test_legacy_child_without_metadata_uses_qualified_parent_not_its_title(store, export_scope):
+    scope = await legacy(store, [('chat-a', 'chats/One', {})])
+    async with store.factory.begin() as db:
+        db.add(models.SnapshotItem(snapshot_id=scope.snapshot_id, tenant_id=None, backend_id=scope.backend_id,
+            external_id='inline', parent_external_id='message-0', item_type='CHAT_HOSTED_CONTENT',
+            name='inline.png', content_size=3, blob_path='objects/inline', extra_data={}))
+    async with store.factory.begin() as db:
+        selected = await export_scope.resolve(db, resource_id=scope.resource_id,
+            snapshot_ids=[scope.snapshot_id], thread_path=None, item_ids=[], chat_id='chat-a')
+        assert selected.hosted_map['message-0'][0]['blob_path'] == 'objects/inline'
+
+
+@pytest.mark.parametrize('catalogue', [False, True])
+async def test_generic_restore_selection_uses_chat_identity_for_equal_titles(store, restore_api, catalogue):
+    if catalogue:
+        scope = await store.new_scope()
+        for chat_id in ['chat-a', 'chat-b']:
+            current = replace(scope, chat_id=chat_id)
+            async with store.factory.begin() as db:
+                lease = await api().begin_capture(db, scope=current, folder_path='chats/Same')
+            items = [message()]
+            await store.stage(lease, items)
+            await store.observe(current, lease, items)
+            await store.publish(lease)
+    else:
+        scope = await legacy(store, [('chat-a', 'chats/Same', {}), ('chat-b', 'chats/Same', {})])
+    async with store.factory.begin() as db:
+        (await db.get(models.Snapshot, scope.snapshot_id)).status = models.SnapshotStatus.COMPLETED
+    instance = restore_api.RestoreWorker.__new__(restore_api.RestoreWorker)
+    async with store.factory.begin() as db:
+        selected = await instance.fetch_snapshot_items(db, [str(scope.snapshot_id)], [], chat_id='chat-a')
+        assert len(selected) == 1
+        from shared.chat_presentation import item_chat_id
+        assert item_chat_id(selected[0]) == 'chat-a'
+
+
+@pytest.mark.parametrize('operation', ['trigger_restore', 'trigger_export'])
+async def test_generic_job_persists_the_chat_selector_instead_of_whole_snapshot_scope(store, monkeypatch, operation):
+    from contextlib import asynccontextmanager
+    from unittest.mock import AsyncMock
+    from uuid import UUID
+    from types import SimpleNamespace
+    import httpx
+    from test_chat_catalogue_reads import load
+    module = load('presentation_jobs_' + operation, 'services/job-service/main.py')
+    scope = await legacy(store, [('chat-a', 'chats/Same', {}), ('chat-b', 'chats/Same', {})])
+    async with store.factory() as db:
+        resource = await db.get(models.Resource, scope.resource_id)
+    monkeypatch.setattr(module, 'authorize_export_scope', AsyncMock(return_value={resource.id: resource}))
+    monkeypatch.setattr(module, 'authorize_restore_destinations', AsyncMock(return_value={}))
+    monkeypatch.setattr(module.settings, 'RABBITMQ_ENABLED', False)
+    @asynccontextmanager
+    async def audit_client(**kwargs):
+        yield SimpleNamespace(post=AsyncMock(return_value=SimpleNamespace(status_code=200)))
+    monkeypatch.setattr(httpx, 'AsyncClient', audit_client)
+    async with store.factory() as db:
+        result = await getattr(module, operation)({'snapshotIds': [str(scope.snapshot_id)], 'itemIds': [],
+            'selectionScope': 'SELECTED', 'chatId': 'chat-a', 'restoreType': 'EXPORT_ZIP'}, db=db,
+            user={'id': str(uuid4()), 'email': 'synthetic@example.invalid', 'roles': ['SUPER_ADMIN']})
+        job = await db.get(models.Job, UUID(result['jobId']))
+        assert job.spec['chatId'] == 'chat-a'
+        assert job.spec.get('item_ids', []) == []

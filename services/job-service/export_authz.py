@@ -231,7 +231,7 @@ DESTINATION_OPERATOR_KEYS = (
 # crossed by any of them.
 NON_DESTINATION_SPEC_KEYS = (
     "exportFormat", "includeAttachments", "preserveTree", "scope",
-    "folderPaths", "excludedItemIds", "contactFolders", "workloads",
+    "folderPaths", "excludedItemIds", "contactFolders", "workloads", "chatId",
     "format", "pstGranularity", "pstIncludeTypes", "includeNestedDetail",
     "entraSections", "includeGroupMembership", "includeAuMembership",
     "conflictMode", "targetFolder", "overwrite", "recoverMode",

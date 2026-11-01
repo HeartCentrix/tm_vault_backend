@@ -221,7 +221,7 @@ def _child(item_type, parent, ext, *, snapshot_id=S_NEW, tenant_id=T1,
         folder_path=THREAD,
         blob_path=blob,
         content_size=10,
-        extra_data={"content_type": "application/pdf", "name": name},
+        extra_data={"content_type": "application/pdf", "name": name, "chat_id": "chat-1"},
         created_at=created_at,
     )
 

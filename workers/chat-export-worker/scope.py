@@ -8,6 +8,8 @@ each row's ``extra_data['raw']`` from ``chat_thread_messages.metadata_raw``
 before handing the list to the renderer.
 """
 from dataclasses import dataclass
+from types import SimpleNamespace
+from copy import deepcopy
 import logging
 import mimetypes
 from sqlalchemy import select, text, tuple_
@@ -15,6 +17,8 @@ from sqlalchemy.orm import aliased
 from shared.models import SnapshotItem, Snapshot, Resource, SnapshotChatInventory
 from shared.chat_catalogue import materialize_chat_items, ChatCatalogueIntegrityError
 from shared.chat_catalogue_identity import qualified_chat_item_key
+from shared.chat_presentation import (chat_message_statement, captured_chat_path,
+    item_chat_id, filter_legacy_children)
 
 log = logging.getLogger("chat-export.scope")
 
@@ -105,10 +109,10 @@ async def _catalogue_scope(sess, msgs, *, layout, effective, catalogue_ids):
 
 
 async def resolve(sess, *, resource_id, snapshot_ids, thread_path: str | None,
-                  item_ids: list[str]) -> ResolvedScope:
-    if thread_path and item_ids:
+                  item_ids: list[str], chat_id: str | None = None) -> ResolvedScope:
+    if (thread_path or chat_id) and item_ids:
         raise ValueError("INVALID_SELECTION")
-    if not thread_path and not item_ids:
+    if not thread_path and not chat_id and not item_ids:
         raise ValueError("SCOPE_EMPTY")
 
     Sn = aliased(Snapshot)
@@ -122,7 +126,13 @@ async def resolve(sess, *, resource_id, snapshot_ids, thread_path: str | None,
     ]
     resource_ids = [resource_id, *child_ids]
 
-    if thread_path:
+    if chat_id:
+        q = await chat_message_statement(sess, snapshot_ids=snapshot_ids, chat_id=chat_id,
+            thread_path=thread_path, resource_ids=resource_ids)
+        msgs = list((await sess.execute(q.order_by(SnapshotItem.created_at.asc()))).scalars())
+        layout = "single_thread"
+        effective = await captured_chat_path(sess, snapshot_ids[0], chat_id)
+    elif thread_path:
         q = (select(SnapshotItem)
              .join(Sn, Sn.id == SnapshotItem.snapshot_id)
              .where(Sn.resource_id.in_(resource_ids))
@@ -143,13 +153,14 @@ async def resolve(sess, *, resource_id, snapshot_ids, thread_path: str | None,
             q = q.where(SnapshotItem.snapshot_id.in_(snapshot_ids))
         msgs = list((await sess.execute(q)).scalars())
         paths = {m.folder_path for m in msgs}
-        if len(paths) > 1:
-            raise ValueError("MULTI_THREAD_NOT_SUPPORTED_YET")
         if not paths:
             raise ValueError("SCOPE_EMPTY")
         effective = next(iter(paths))
         layout = "per_message"
 
+    selected_chats = {item_chat_id(item) for item in msgs}
+    if len(selected_chats) > 1:
+        raise ValueError("AMBIGUOUS_CHAT_PATH" if thread_path else "MULTI_THREAD_NOT_SUPPORTED_YET")
     if msgs:
         formats = (await sess.execute(select(Snapshot.id, Snapshot.extra_data)
             .where(Snapshot.id.in_({m.snapshot_id for m in msgs})))).all()
@@ -158,6 +169,10 @@ async def resolve(sess, *, resource_id, snapshot_ids, thread_path: str | None,
         if catalogue_ids:
             return await _catalogue_scope(sess, msgs, layout=layout, effective=effective,
                 catalogue_ids=catalogue_ids)
+
+    # Hydration must never dirty captured ORM rows in the export transaction.
+    msgs = [SimpleNamespace(**{attr.key: deepcopy(getattr(item, attr.key, None))
+        for attr in SnapshotItem.__mapper__.column_attrs}) for item in msgs]
 
     # Hydrate each message's raw payload from chat_thread_messages. The
     # renderer expects ``extra_data['raw']`` to carry the full Graph
@@ -191,7 +206,7 @@ async def resolve(sess, *, resource_id, snapshot_ids, thread_path: str | None,
             for m in msgs:
                 _hydrate_total += 1
                 raw = raw_by_key.get(
-                    (str(m.tenant_id), m.parent_external_id, m.external_id)
+                    (str(m.tenant_id), item_chat_id(m), m.external_id)
                 )
                 if raw is None:
                     _hydrate_missing += 1
@@ -334,7 +349,7 @@ async def resolve(sess, *, resource_id, snapshot_ids, thread_path: str | None,
                     "tenant_id, so every candidate row is being kept",
                     item_type, len(rows),
                 )
-                return _one_per_child(rows)
+                return _one_per_child(await filter_legacy_children(sess, rows, next(iter(selected_chats))))
             fallback = await _tenant_by_snapshot({
                 r.snapshot_id for r in rows
                 if r.tenant_id is None and r.snapshot_id is not None
@@ -360,7 +375,7 @@ async def resolve(sess, *, resource_id, snapshot_ids, thread_path: str | None,
                     sorted(str(t) for t in msg_tenant_ids),
                     [str(r.id) for r in dropped[:10]],
                 )
-            return _one_per_child(kept)
+            return _one_per_child(await filter_legacy_children(sess, kept, next(iter(selected_chats))))
 
         for a in await _scoped_children("CHAT_ATTACHMENT"):
             ed = a.extra_data or {}
