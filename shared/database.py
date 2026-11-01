@@ -65,6 +65,7 @@ REQUIRED_TABLES = (
     "chat_capture_attempts", "chat_blob_objects", "chat_item_versions",
     "chat_inventories", "chat_inventory_items", "snapshot_chat_inventories",
     "chat_catalogue_pins",
+    "chat_presentation_plans", "chat_presentation_drafts", "snapshot_chat_presentations",
 )
 
 REQUIRED_COLUMNS = {

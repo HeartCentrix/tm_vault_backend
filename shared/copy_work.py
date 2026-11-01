@@ -16,7 +16,7 @@ from shared.models import (CopyWorkflow, CopyWorkTask, CopyWorkInput, CopyWorkQu
 
 ACTIVE_WORKFLOWS = ('DRAINING', 'WAITING', 'RESUMING')
 TERMINAL_TASKS = ('COMPLETED', 'FAILED', 'CANCELLED')
-KINDS = {'CHAT_CARRY', 'MAIL_CARRY', 'FILE_VERSIONS', 'LEGACY_CHAT_ATTACHMENTS', 'CHAT_RENAME', 'ARCHIVE_CARRY'}
+KINDS = {'CHAT_CARRY', 'MAIL_CARRY', 'FILE_VERSIONS', 'LEGACY_CHAT_ATTACHMENTS', 'CHAT_RENAME', 'CHAT_LABELS', 'CHAT_PRESENTATION', 'ARCHIVE_CARRY'}
 
 
 class CopyWorkConflict(RuntimeError):
@@ -68,6 +68,15 @@ async def enqueue(session, request: CopyRequest) -> CopyWorkTask:
     if request.weight is not None and (type(request.weight) is not int or not 1 <= request.weight <= 8):
         raise ValueError('copy scheduling weight must be between 1 and 8')
     snapshot, resource, job = await _parent(session, request.target_snapshot_id)
+    if request.kind in {'CHAT_LABELS', 'CHAT_PRESENTATION'}:
+        from shared.chat_presentation_work import validate_labels
+        from shared.models import ResourceType
+        if request.kind == 'CHAT_LABELS':
+            validate_labels(request.params.get('labels'))
+        elif request.partition_id is not None:
+            raise CopyWorkConflict('chat presentation publication belongs to the snapshot')
+        if resource.type != ResourceType.USER_CHATS:
+            raise CopyWorkConflict('chat labels require a chat resource')
     # Existing job priority is numeric (1 is urgent); policy names never
     # determine eligibility. Every automatic fallback retains a positive share.
     scheduling_weight = request.weight if request.weight is not None else max(1, min(8, 6-int(job.priority or 5)))
@@ -115,6 +124,13 @@ async def enqueue(session, request: CopyRequest) -> CopyWorkTask:
         workflow.completed_at=None
     if workflow.state != 'DRAINING' or leaf.lease_token != workflow.parent_lease_token:
         raise CopyWorkConflict('copy workflow already sealed')
+    if request.kind in {'CHAT_LABELS', 'CHAT_PRESENTATION'}:
+        from shared.models import ChatPresentationPlan
+        if partition_id and not {label['chat_id'] for label in request.params['labels']}.issubset(
+                set((partition.payload or {}).get('chat_ids', []))):
+            raise CopyWorkConflict('chat label is outside the source partition')
+        await session.execute(insert(ChatPresentationPlan).values(snapshot_id=snapshot.id,
+            state='PENDING', published_count=0).on_conflict_do_nothing())
     from shared.database import CARRY_FORWARD_WAIT_MAX_S
     params = {**request.params, 'target_snapshot_id': str(snapshot.id)}
     # Derived source evidence is not part of the producer's idempotency key.
@@ -127,7 +143,7 @@ async def enqueue(session, request: CopyRequest) -> CopyWorkTask:
     params.pop('_copy_p8_source_count', None)
     digest = _key(workflow.id, workflow.capture_attempt, request.kind, params)
     large_inputs={key:value for key,value in params.items() if key in (
-        'file_ids','external_ids','excluded_paths','tombstoned_ids','keep_folder_ids','chat_ids','names')
+        'file_ids','external_ids','excluded_paths','tombstoned_ids','keep_folder_ids','chat_ids','names','labels')
         and isinstance(value,list) and len(value)>256}
     if request.kind=='CHAT_RENAME':
         ids,names=params.get('chat_ids',[]),params.get('names',[])
@@ -213,6 +229,10 @@ async def claim(session, *, owner_id, lease_seconds=90) -> CopyClaim | None:
     inserts = aliased(CopyWorkTask)
     candidates = candidates.where((CopyWorkTask.kind != 'CHAT_RENAME') | ~exists(select(inserts.id).where(
         inserts.workflow_id == CopyWorkTask.workflow_id, inserts.kind != 'CHAT_RENAME',
+        inserts.capture_attempt == CopyWorkTask.capture_attempt,
+        inserts.state.notin_(TERMINAL_TASKS))))
+    candidates = candidates.where((CopyWorkTask.kind != 'CHAT_PRESENTATION') | ~exists(select(inserts.id).where(
+        inserts.workflow_id == CopyWorkTask.workflow_id, inserts.kind != 'CHAT_PRESENTATION',
         inserts.capture_attempt == CopyWorkTask.capture_attempt,
         inserts.state.notin_(TERMINAL_TASKS))))
     active = candidates.subquery()

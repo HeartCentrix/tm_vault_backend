@@ -7,7 +7,8 @@ from uuid import UUID
 
 from sqlalchemy import case, func, select
 
-from shared.models import Resource, Snapshot, SnapshotItem, SnapshotStatus
+from shared.models import (ChatPresentationPlan, Resource, Snapshot,
+    SnapshotChatPresentation, SnapshotItem, SnapshotStatus)
 
 MESSAGE_TYPES = ("TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY")
 
@@ -59,7 +60,15 @@ async def chat_message_statement(session, *, snapshot_ids, chat_id=None,
             aliases = set((await session.scalars(select(SnapshotItem.snapshot_id).where(
                 SnapshotItem.snapshot_id.in_(snapshots), SnapshotItem.item_type.in_(MESSAGE_TYPES),
                 identity == chat_id, SnapshotItem.folder_path == thread_path).distinct())).all())
-            if aliases != set(snapshots):
+            captured_aliases = set((await session.scalars(select(SnapshotChatPresentation.snapshot_id)
+                .join(Snapshot, Snapshot.id == SnapshotChatPresentation.snapshot_id)
+                .join(ChatPresentationPlan, ChatPresentationPlan.snapshot_id == Snapshot.id)
+                .where(SnapshotChatPresentation.snapshot_id.in_(snapshots),
+                    SnapshotChatPresentation.chat_id == chat_id,
+                    SnapshotChatPresentation.folder_path == thread_path,
+                    Snapshot.extra_data['chat_presentation_format'].as_integer() == 1,
+                    ChatPresentationPlan.state == 'PUBLISHED'))).all())
+            if aliases | captured_aliases != set(snapshots):
                 raise ChatSelectionError("CHAT_ALIAS_MISMATCH")
         return stmt.where(identity == chat_id)
     stmt = stmt.where(SnapshotItem.id.in_(items)) if items else stmt.where(SnapshotItem.folder_path == thread_path)
@@ -88,11 +97,36 @@ async def list_chat_presentations(session, snapshot_id):
             SnapshotItem.item_type.in_(MESSAGE_TYPES), identity.is_not(None),
             (SnapshotItem.tenant_id.is_(None) | (SnapshotItem.tenant_id == Resource.tenant_id)))
         .group_by(identity).order_by(identity))).all()
+    snapshot = await session.get(Snapshot, UUID(str(snapshot_id)))
+    captured = {}
+    if (snapshot.extra_data or {}).get('chat_presentation_format') == 1:
+        if not await presentation_ready(session, snapshot_id):
+            raise ChatSelectionError('CHAT_PRESENTATION_INTEGRITY_GAP')
+        captured = {label.chat_id: label for label in (await session.scalars(
+            select(SnapshotChatPresentation).where(SnapshotChatPresentation.snapshot_id == snapshot.id))).all()}
+        if set(captured) != {row.chat_id for row in rows}:
+            raise ChatSelectionError('CHAT_PRESENTATION_INTEGRITY_GAP')
     result = []
     for row in rows:
         aliases = sorted(path for path in row.aliases if path)
         path = row.path or f"chats/{row.chat_id}"
+        label = captured.get(row.chat_id)
+        if label is not None:
+            path = label.folder_path
+            aliases = sorted(set(aliases) | {path})
         result.append({"chatId": row.chat_id, "displayName": path.removeprefix("chats/"),
             "folderPath": path, "folderAliases": aliases, "count": int(row.count),
-            "lastMessageAt": None, "presentationSource": "legacy_mixed" if len(aliases) > 1 else "legacy_stored"})
+            "lastMessageAt": None, "presentationSource": 'captured' if label else (
+                "legacy_mixed" if len(aliases) > 1 else "legacy_stored")})
     return result
+
+
+async def presentation_ready(session, snapshot_id):
+    """A persisted receipt remains required after a producer-flag rollback."""
+    plan = await session.get(ChatPresentationPlan, UUID(str(snapshot_id)))
+    if plan is None:
+        return True
+    if plan.state != 'PUBLISHED' or plan.published_count != plan.expected_count:
+        return False
+    snapshot = await session.get(Snapshot, plan.snapshot_id)
+    return snapshot is not None and (snapshot.extra_data or {}).get('chat_presentation_format') == 1

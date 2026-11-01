@@ -1748,6 +1748,43 @@ class SnapshotChatInventory(Base):
     __table_args__ = (CheckConstraint("coverage_status IN ('PARTIAL','COMPLETE')", name="ck_snapshot_chat_coverage"),)
 
 
+class ChatPresentationPlan(Base):
+    __tablename__ = "chat_presentation_plans"
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey("snapshots.id", ondelete="CASCADE"), primary_key=True)
+    state = Column(String(16), nullable=False, default="PENDING")
+    source_signature = Column(String(64))
+    task_id = Column(UUID(as_uuid=True))
+    expected_count = Column(BigInteger, nullable=False, default=0)
+    last_chat_id = Column(Text)
+    published_count = Column(BigInteger, nullable=False, default=0)
+    __table_args__ = (CheckConstraint("state IN ('PENDING','PUBLISHING','PUBLISHED','ABORTED')", name="ck_chat_presentation_plan_state"),)
+
+
+class ChatPresentationDraft(Base):
+    __tablename__ = "chat_presentation_drafts"
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey("snapshots.id", ondelete="CASCADE"), primary_key=True)
+    workflow_id = Column(UUID(as_uuid=True), ForeignKey("copy_workflows.id", ondelete="CASCADE"), primary_key=True)
+    capture_attempt = Column(BigInteger, primary_key=True)
+    chat_id = Column(Text, primary_key=True)
+    folder_path = Column(Text, nullable=False)
+    quality = Column(Integer, nullable=False)
+    provenance = Column(String(64), nullable=False)
+    conflicted = Column(Boolean, nullable=False, default=False)
+    accepted_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    __table_args__ = (CheckConstraint("quality BETWEEN 0 AND 3", name="ck_chat_presentation_draft_quality"),)
+
+
+class SnapshotChatPresentation(Base):
+    __tablename__ = "snapshot_chat_presentations"
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey("snapshots.id", ondelete="CASCADE"), primary_key=True)
+    chat_id = Column(Text, primary_key=True)
+    folder_path = Column(Text, nullable=False)
+    quality = Column(Integer, nullable=False)
+    provenance = Column(String(64), nullable=False)
+    conflicted = Column(Boolean, nullable=False, default=False)
+    policy_version = Column(Integer, nullable=False, default=1)
+
+
 class ChatCataloguePin(Base):
     __tablename__ = "chat_catalogue_pins"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

@@ -16,7 +16,7 @@ from shared.chat_attachment_copy import (
 
 
 KINDS = frozenset({"CHAT_CARRY", "MAIL_CARRY", "FILE_VERSIONS",
-                   "LEGACY_CHAT_ATTACHMENTS", "CHAT_RENAME", "ARCHIVE_CARRY"})
+                   "LEGACY_CHAT_ATTACHMENTS", "CHAT_RENAME", "CHAT_LABELS", "CHAT_PRESENTATION", "ARCHIVE_CARRY"})
 _CHAT_TYPES = "('TEAMS_CHAT_MESSAGE','TEAMS_MESSAGE','TEAMS_MESSAGE_REPLY','CHAT_MESSAGE','CHAT_ATTACHMENT','CHAT_HOSTED_CONTENT')"
 _LEGACY_FOLDERS = """(si.folder_path LIKE 'chats/Untitled chat #%'
  OR si.folder_path LIKE 'chats/Untitled group #%'
@@ -180,7 +180,7 @@ async def pin_intent_sources(session, task) -> None:
     and uses short statement/lock budgets. Exceeding a budget fails the required
     intent visibly; it never truncates sources. Full payloads freeze later.
     """
-    if task.kind == 'CHAT_RENAME':
+    if task.kind in {'CHAT_RENAME', 'CHAT_LABELS', 'CHAT_PRESENTATION'}:
         return
     scope, params = await _scope(session, task)
     p8 = task.kind == 'LEGACY_CHAT_ATTACHMENTS'
@@ -250,6 +250,9 @@ async def prepare_manifest(session, task) -> None:
     if scope["prepared"]:
         task.prepared, task.params = True, params
         return
+    if task.kind in {'CHAT_LABELS', 'CHAT_PRESENTATION'}:
+        from shared.chat_presentation_work import prepare_presentation_manifest
+        return await prepare_presentation_manifest(session, task, params)
     if task.kind in {"FILE_VERSIONS", "ARCHIVE_CARRY"} and not (
         params.get("prior_snapshot_id") or params.get("prior_snap_id")
     ):
@@ -333,6 +336,9 @@ async def copy_manifest_batch(session, task, *, limit: int) -> dict:
     scope, params = await _scope(session, task)
     if not scope["prepared"]:
         raise ValueError("copy manifest is not prepared")
+    if task.kind in {'CHAT_LABELS', 'CHAT_PRESENTATION'}:
+        from shared.chat_presentation_work import apply_label_batch
+        return await apply_label_batch(session, task, limit=limit)
     prefix = """WITH batch AS MATERIALIZED (
         SELECT * FROM copy_work_items WHERE task_id=:task_id AND ordinal>:checkpoint
           AND phase=(SELECT phase FROM copy_work_items WHERE task_id=:task_id AND ordinal>:checkpoint ORDER BY ordinal LIMIT 1)
