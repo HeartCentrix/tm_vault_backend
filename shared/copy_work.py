@@ -71,6 +71,8 @@ async def enqueue(session, request: CopyRequest) -> CopyWorkTask:
     if request.kind in {'CHAT_LABELS', 'CHAT_PRESENTATION'}:
         from shared.chat_presentation_work import validate_labels
         from shared.models import ResourceType
+        if (snapshot.extra_data or {}).get('chat_inventory_format') == 1:
+            raise CopyWorkConflict('catalogue snapshots already own their captured chat labels')
         if request.kind == 'CHAT_LABELS':
             validate_labels(request.params.get('labels'))
         elif request.partition_id is not None:

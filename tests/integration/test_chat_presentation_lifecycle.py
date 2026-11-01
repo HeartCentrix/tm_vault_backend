@@ -119,3 +119,12 @@ async def test_name_manifest_size_depends_on_conversations_not_message_count(sto
         assert (await db.get(models.ChatPresentationPlan, scope.snapshot_id)).expected_count == 1
         assert not list((await db.scalars(select(models.ChatPresentationDraft).where(
             models.ChatPresentationDraft.snapshot_id == scope.snapshot_id))).all())
+
+
+async def test_published_marker_without_its_receipt_cannot_be_read_as_complete(store):
+    from shared.chat_presentation import presentation_ready
+    scope = await legacy(store, [('chat-a', 'chats/Stored', {})])
+    async with store.factory.begin() as db:
+        (await db.get(models.Snapshot, scope.snapshot_id)).extra_data = {'chat_presentation_format': 1}
+    async with store.factory() as db:
+        assert not await presentation_ready(db, scope.snapshot_id)

@@ -4,13 +4,15 @@ Labels are presentation, never conversation identity. Callers authorize the
 requested snapshots before using these database-only helpers.
 """
 import hashlib
+from copy import deepcopy
+from types import SimpleNamespace
 import os
 from uuid import UUID
 
-from sqlalchemy import case, func, select, or_
+from sqlalchemy import case, func, select, or_, tuple_
 from sqlalchemy.orm import aliased
 
-from shared.models import (ChatCaptureAttempt, ChatPresentationPlan, Resource, Snapshot,
+from shared.models import (ChatThread, ChatThreadMessage, ChatCaptureAttempt, ChatPresentationPlan, Resource, Snapshot,
     SnapshotChatInventory, SnapshotChatPresentation, SnapshotItem, SnapshotStatus)
 
 MESSAGE_TYPES = ("TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY")
@@ -209,6 +211,10 @@ async def chat_restore_items(session, *, snapshot_ids, chat_id, folder_paths=(),
         thread_path=next(iter(folder_paths), None))
     messages = list((await session.scalars(stmt)).all())
     snapshots = list((await session.scalars(select(Snapshot).where(Snapshot.id.in_(_ids(snapshot_ids))))).all())
+    if any(snapshot.status not in (SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL)
+        or (snapshot.extra_data or {}).get('cancelled_at')
+        or (snapshot.extra_data or {}).get('finalize_cancelled') for snapshot in snapshots):
+        raise ChatSelectionError('selected chat snapshot is not an available restore point')
     tenants = set((await session.scalars(select(Resource.tenant_id).where(
         Resource.id.in_({snapshot.resource_id for snapshot in snapshots})))).all())
     if len(tenants) != 1:
@@ -243,6 +249,43 @@ async def chat_restore_items(session, *, snapshot_ids, chat_id, folder_paths=(),
         rows = messages + list(best.values())
     excluded = set(_ids(excluded_item_ids))
     return [row for row in rows if row.id not in excluded]
+
+
+async def hydrate_legacy_chat_pointers(session, rows):
+    """Detach legacy thin pointers before borrowing their qualified saved body.
+
+    Unversioned legacy pointers have only the existing singleton body available;
+    captured catalogue versions and already stored raw payloads remain untouched.
+    """
+    thin = [row for row in rows if row.item_type in MESSAGE_TYPES
+        and not getattr(row, 'chat_version_id', None) and not (row.extra_data or {}).get('raw')]
+    if not thin:
+        return rows
+    owners = dict((await session.execute(select(Snapshot.id, Resource.tenant_id).join(Resource,
+        Resource.id == Snapshot.resource_id).where(Snapshot.id.in_({row.snapshot_id for row in thin})))).all())
+    keys = []
+    for row in thin:
+        tenant = owners.get(row.snapshot_id)
+        if tenant is None or (row.tenant_id is not None and row.tenant_id != tenant):
+            raise ChatSelectionError('CHAT_TENANT_SCOPE_MISMATCH')
+        keys.append((tenant, item_chat_id(row), row.external_id))
+    bodies = {}
+    keys = list(dict.fromkeys(keys))
+    for start in range(0, len(keys), 256):
+        found = (await session.execute(select(ChatThread.tenant_id, ChatThread.chat_id,
+            ChatThreadMessage.message_external_id, ChatThreadMessage.metadata_raw).join(ChatThread,
+                ChatThread.id == ChatThreadMessage.chat_thread_id).where(
+                    tuple_(ChatThread.tenant_id, ChatThread.chat_id, ChatThreadMessage.message_external_id)
+                    .in_(keys[start:start + 256])))).all()
+        bodies.update(((tenant, chat, message), raw) for tenant, chat, message, raw in found)
+    detached = {}
+    for row in thin:
+        raw = bodies.get((owners[row.snapshot_id], item_chat_id(row), row.external_id))
+        if raw:
+            values = {column.key: getattr(row, column.key) for column in SnapshotItem.__mapper__.column_attrs}
+            values['extra_data'] = {**deepcopy(row.extra_data or {}), 'raw': deepcopy(raw)}
+            detached[row.id] = SimpleNamespace(**values)
+    return [detached.get(row.id, row) for row in rows]
 
 
 async def list_chat_presentations(session, snapshot_id, *, offset=0, limit=None):
@@ -293,7 +336,9 @@ async def presentation_ready(session, snapshot_id):
     """A persisted receipt remains required after a producer-flag rollback."""
     plan = await session.get(ChatPresentationPlan, UUID(str(snapshot_id)))
     if plan is None:
-        return True
+        row = (await session.execute(select(Snapshot.id, Snapshot.extra_data).where(
+            Snapshot.id == UUID(str(snapshot_id))))).one_or_none()
+        return row is not None and (row.extra_data or {}).get('chat_presentation_format') != 1
     metadata = await session.scalar(select(Snapshot.extra_data).where(Snapshot.id == plan.snapshot_id))
     if plan.state == 'ABORTED':
         return bool((metadata or {}).get('copy_required_failed'))

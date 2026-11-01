@@ -388,3 +388,37 @@ async def test_conversation_pagination_keeps_identical_titles_as_distinct_rows(s
         assert first['total'] == second['total'] == 2
         assert first['content'][0]['chatId'] != second['content'][0]['chatId']
         assert first['content'][0]['displayName'] == second['content'][0]['displayName'] == 'Same'
+
+
+async def test_catalogue_snapshots_reject_a_second_legacy_label_representation(store):
+    from shared.copy_work import CopyRequest, CopyWorkConflict, enqueue
+    scope = await store.new_scope()
+    async with store.factory.begin() as db:
+        with pytest.raises(CopyWorkConflict, match='catalogue'):
+            await enqueue(db, CopyRequest('CHAT_LABELS', 'micro', scope.snapshot_id, params={'labels': []}))
+
+
+async def test_generic_chat_identity_rejects_an_in_progress_restore_point(store, restore_api):
+    scope = await legacy(store, [('chat-a', 'chats/Stored', {})])
+    instance = restore_api.RestoreWorker.__new__(restore_api.RestoreWorker)
+    async with store.factory() as db:
+        with pytest.raises(ValueError, match='restore point'):
+            await instance.fetch_snapshot_items(db, [str(scope.snapshot_id)], [], chat_id='chat-a')
+
+
+async def test_generic_chat_identity_hydrates_thin_pointers_without_changing_stored_rows(store, restore_api):
+    scope = await legacy(store, [('chat-a', 'chats/Stored', {})])
+    async with store.factory.begin() as db:
+        (await db.get(models.Snapshot, scope.snapshot_id)).status = models.SnapshotStatus.COMPLETED
+        thread = models.ChatThread(tenant_id=scope.tenant_id, chat_id='chat-a')
+        db.add(thread)
+        await db.flush()
+        db.add(models.ChatThreadMessage(chat_thread_id=thread.id, message_external_id='message-0',
+            metadata_raw={'id': 'message-0', 'body': {'content': 'Saved message', 'contentType': 'text'}}))
+    instance = restore_api.RestoreWorker.__new__(restore_api.RestoreWorker)
+    async with store.factory.begin() as db:
+        rows = await instance.fetch_snapshot_items(db, [str(scope.snapshot_id)], [], chat_id='chat-a')
+        assert rows[0].extra_data['raw']['body']['content'] == 'Saved message'
+    async with store.factory() as db:
+        assert await db.scalar(select(models.SnapshotItem.extra_data).where(
+            models.SnapshotItem.snapshot_id == scope.snapshot_id)) == {}

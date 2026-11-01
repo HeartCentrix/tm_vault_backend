@@ -1013,9 +1013,10 @@ class RestoreWorker:
         folder_paths = folder_paths or []
         excluded_item_ids = excluded_item_ids or []
         if chat_id:
-            from shared.chat_presentation import chat_restore_items
+            from shared.chat_presentation import chat_restore_items, hydrate_legacy_chat_pointers
             rows = await chat_restore_items(session, snapshot_ids=snapshot_ids, chat_id=chat_id,
                 folder_paths=folder_paths, item_ids=item_ids, excluded_item_ids=excluded_item_ids)
+            rows = await hydrate_legacy_chat_pointers(session, rows)
             return await self._materialize_catalogue_selection(session, rows,
                 snapshot_ids=snapshot_ids, excluded_item_ids=excluded_item_ids)
 
