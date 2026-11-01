@@ -58,6 +58,7 @@ EXPECTED_CHAIN = [
     ("0009", "0008"),            # uq_tier2_child_per_parent     (archive origin)
     ("0010", "0009"),            # blob_reference_guard_indexes  (archive origin)
     ("0011", "0010"),            # immutable chat catalogue
+    ('0012', '0011'),
 ]
 
 # Substring that must appear in the module docstring of each pending revision,
@@ -68,6 +69,7 @@ PENDING_SUBJECTS = {
     "0009": "Tier-2 child",
     "0010": "blob reference guard",
     "0011": "chat catalogue",
+    "0012": "Durable database-copy",
 }
 
 

@@ -4,6 +4,8 @@ Manifest preparation is one consistent SQL statement and freezes full payloads,
 not mutable source IDs. Its scan/materialization cost still needs the caller's
 measured statement budget. Batches never read source payloads again.
 """
+import re
+
 from sqlalchemy import text
 
 from shared.chat_attachment_copy import (
@@ -76,6 +78,7 @@ def _selection(kind, params):
     prior = """WITH frozen_source AS MATERIALIZED (
         SELECT params->>'prior_snapshot_id' AS id FROM copy_work_tasks
          WHERE workflow_id=:workflow_id AND kind=:kind AND id<>:task_id
+           AND capture_attempt=(SELECT capture_attempt FROM copy_work_tasks WHERE id=:task_id)
            AND prepared AND (params::jsonb) ? 'prior_snapshot_id'
          ORDER BY id LIMIT 1
     ), source_choice AS MATERIALIZED (
@@ -91,7 +94,7 @@ def _selection(kind, params):
            AND NOT EXISTS (
                SELECT 1 FROM copy_workflows cw WHERE cw.target_snapshot_id=s.id
                  AND (cw.state IS DISTINCT FROM 'COMPLETED' OR EXISTS (
-                     SELECT 1 FROM copy_work_tasks ct WHERE ct.workflow_id=cw.id
+                     SELECT 1 FROM copy_work_tasks ct WHERE ct.workflow_id=cw.id AND ct.capture_attempt=cw.capture_attempt
                        AND ct.state IS DISTINCT FROM 'COMPLETED')))
            AND """ + source_where
     if kind == "CHAT_CARRY":
@@ -179,7 +182,7 @@ async def prepare_manifest(session, task) -> None:
         provenance += " AND (NOT EXISTS (SELECT 1 FROM frozen_source WHERE id IS NOT NULL) OR EXISTS (SELECT 1 FROM source_choice))"
     # Pins use RESTRICT FKs: a concurrent delete cannot commit before both
     # manifest payloads and their source references have been made durable.
-    result = (await session.execute(text(ctes + """,
+    statement = ctes + """,
         validity AS MATERIALIZED (
             SELECT (""" + provenance + """
                 AND (CAST(:prior AS uuid) IS NULL OR EXISTS (SELECT 1 FROM source_choice))
@@ -202,7 +205,16 @@ async def prepare_manifest(session, task) -> None:
         ) SELECT (SELECT ok FROM validity) AS ok,
                  (SELECT params FROM prepared_task) AS params,
                  (SELECT count(*) FROM stored) AS manifest_count
-    """), dict(binds, has_prior=task.kind not in {"LEGACY_CHAT_ATTACHMENTS", "CHAT_RENAME"}))).mappings().one()
+    """
+    # Large selectors stay as durable rows and are aggregated on the server;
+    # preparation never rebuilds every selector list in the worker heap.
+    allowed={'file_ids','external_ids','excluded_paths','tombstoned_ids','keep_folder_ids','chat_ids','names'}
+    for key in params.get('_copy_input_keys',[]):
+        if key not in allowed: raise ValueError('unsupported durable copy selector')
+        binding='cids' if key=='chat_ids' else key
+        expression="(SELECT array_agg(inp.payload->>'value' ORDER BY inp.ordinal) FROM copy_work_inputs inp WHERE inp.task_id=:task_id AND inp.input_key='"+key+"')"
+        statement=re.sub(r':'+binding+r'(?![A-Za-z0-9_])',expression,statement)
+    result = (await session.execute(text(statement),dict(binds,has_prior=task.kind not in {'LEGACY_CHAT_ATTACHMENTS','CHAT_RENAME'}))).mappings().one()
     if not result["ok"]:
         if task.kind == "LEGACY_CHAT_ATTACHMENTS":
             raise LegacyChatProvenanceGap("legacy chat attachment provenance is ambiguous")

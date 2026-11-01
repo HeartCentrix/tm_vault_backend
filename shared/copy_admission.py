@@ -88,6 +88,7 @@ async def _owned(session, claim):
     if (task is None or workflow is None or job is None or snapshot is None
         or task.workflow_id != workflow.id or workflow.state != 'WAITING'
         or task.state != 'RUNNING' or task.generation != claim.generation
+        or task.capture_attempt != workflow.capture_attempt
         or task.lease_owner_id != claim.owner_id):
         raise _Stale
     if (workflow.job_id != job.id or workflow.target_snapshot_id != snapshot.id

@@ -1768,13 +1768,14 @@ class CopyWorkflow(Base):
     """Durable ownership of a leaf's required database-copy continuation."""
     __tablename__ = 'copy_workflows'
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    tenant_id = Column(UUID(as_uuid=True), ForeignKey('tenants.id'), nullable=False)
-    resource_id = Column(UUID(as_uuid=True), ForeignKey('resources.id'), nullable=False)
-    job_id = Column(UUID(as_uuid=True), ForeignKey('jobs.id', ondelete='RESTRICT'), nullable=False)
-    target_snapshot_id = Column(UUID(as_uuid=True), ForeignKey('snapshots.id', ondelete='RESTRICT'), nullable=False)
-    partition_id = Column(UUID(as_uuid=True), ForeignKey('snapshot_partitions.id', ondelete='RESTRICT'))
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey('tenants.id', ondelete='CASCADE'), nullable=False)
+    resource_id = Column(UUID(as_uuid=True), ForeignKey('resources.id', ondelete='CASCADE'), nullable=False)
+    job_id = Column(UUID(as_uuid=True), ForeignKey('jobs.id', ondelete='CASCADE'), nullable=False)
+    target_snapshot_id = Column(UUID(as_uuid=True), ForeignKey('snapshots.id', ondelete='CASCADE'), nullable=False)
+    partition_id = Column(UUID(as_uuid=True), ForeignKey('snapshot_partitions.id', ondelete='CASCADE'))
     leaf_key = Column(String(80), nullable=False, unique=True)
     state = Column(String(16), nullable=False, default='DRAINING')
+    capture_attempt = Column(BigInteger, nullable=False, default=0, server_default='0')
     generation = Column(BigInteger, nullable=False, default=0)
     parent_lease_token = Column(BigInteger, nullable=False, default=0)
     snapshot_lease_token = Column(BigInteger, nullable=False, default=0)
@@ -1788,6 +1789,7 @@ class CopyWorkflow(Base):
         Index('ix_copy_workflow_snapshot_state', 'target_snapshot_id', 'state'),
         Index('ix_copy_workflow_partition_state', 'partition_id', 'state'),
         Index('ix_copy_workflow_job_state', 'job_id', 'state'),
+        Index('ix_copy_workflow_recovery', 'state', 'created_at', 'id'),
         CheckConstraint("state IN ('DRAINING','WAITING','RESUMING','COMPLETED','PARTIAL','FAILED','CANCELLED')", name='ck_copy_workflow_state'),
     )
 
@@ -1814,7 +1816,7 @@ class CopyWorkQueue(Base):
 class CopyWorkTask(Base):
     __tablename__ = 'copy_work_tasks'
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    workflow_id = Column(UUID(as_uuid=True), ForeignKey('copy_workflows.id', ondelete='RESTRICT'), nullable=False)
+    workflow_id = Column(UUID(as_uuid=True), ForeignKey('copy_workflows.id', ondelete='CASCADE'), nullable=False)
     tenant_id = Column(UUID(as_uuid=True), nullable=False)
     resource_id = Column(UUID(as_uuid=True), nullable=False)
     sla_policy_id = Column(UUID(as_uuid=True))
@@ -1823,6 +1825,7 @@ class CopyWorkTask(Base):
     tenant_queue_key = Column(String(64), ForeignKey('copy_work_queues.key'), nullable=False)
     idempotency_key = Column(String(64), nullable=False, unique=True)
     kind = Column(String(32), nullable=False)
+    capture_attempt = Column(BigInteger, nullable=False, default=0, server_default='0')
     lane = Column(String(8), nullable=False)
     params = Column(JSON, nullable=False, default=dict)
     state = Column(String(16), nullable=False, default='READY')
@@ -1871,3 +1874,12 @@ class CopyWorkControl(Base):
     tenant_capacity = Column(Integer, nullable=False, default=2)
     virtual_clock = Column(Float, nullable=False, default=0)
     __table_args__ = (CheckConstraint('micro_capacity > 0 AND giant_capacity > 0 AND total_capacity > 0 AND tenant_capacity > 0', name='ck_copy_control_capacity'),)
+
+
+class CopyWorkInput(Base):
+    """Large selector lists are durable bounded rows, not broker/task payloads."""
+    __tablename__ = 'copy_work_inputs'
+    task_id = Column(UUID(as_uuid=True), ForeignKey('copy_work_tasks.id', ondelete='CASCADE'), primary_key=True)
+    input_key = Column(String(32), primary_key=True)
+    ordinal = Column(BigInteger, primary_key=True)
+    payload = Column(JSON, nullable=False)
