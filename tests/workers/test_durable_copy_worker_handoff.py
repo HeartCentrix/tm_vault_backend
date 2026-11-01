@@ -40,6 +40,7 @@ def workflow(monkeypatch):
     module.DeferredCopy = DeferredCopy
     module.defer_current_copy = AsyncMock(return_value=DeferredCopy("task", "workflow"))
     module.has_pending_copy = AsyncMock(return_value=True)
+    module.copy_work_guards_enabled = lambda: False
     module.verify_copy_resume = AsyncMock(return_value=True)
     module.pending_copy_sql = lambda **kw: "NOT EXISTS (SELECT 1 FROM copy_workflows)"
     monkeypatch.setitem(sys.modules, "shared.copy_workflow", module)
@@ -140,7 +141,7 @@ async def test_user_leaf_seals_after_buffers_drain_and_returns_waiting(
     marker = {"copy_waiting": True, "copy_workflow_id": "workflow"}
 
     @contextmanager
-    def collection(snapshot_id, partition_id=None):
+    def collection(snapshot_id, partition_id=None, **expected):
         trace.append("collect")
         yield
         trace.append("released")
@@ -299,8 +300,17 @@ async def test_resume_uses_persisted_continuation_and_never_restarts_graph(
     workflow.finish_resume.assert_awaited_once_with(Session, wid, owner, failed=False)
 
 
+@pytest.mark.parametrize("environment,expected", [
+    ({}, {"concurrency": 2, "batch_size": 512, "statement_timeout_ms": 60000,
+          "lock_timeout_ms": 5000, "poll_s": 1, "recovery_s": 10}),
+    ({"COPY_WORK_CONCURRENCY": "4", "COPY_WORK_BATCH_ROWS": "128",
+      "COPY_WORK_STATEMENT_TIMEOUT_MS": "45000", "COPY_WORK_LOCK_TIMEOUT_MS": "2000",
+      "COPY_WORK_POLL_SECONDS": "0.25", "COPY_WORK_RECOVERY_SECONDS": "3.5"},
+     {"concurrency": 4, "batch_size": 128, "statement_timeout_ms": 45000,
+      "lock_timeout_ms": 2000, "poll_s": 0.25, "recovery_s": 3.5}),
+])
 async def test_existing_worker_starts_and_closes_copy_recovery_runner_when_guards_active(
-    monkeypatch, worker_module, workflow,
+    monkeypatch, worker_module, workflow, environment, expected,
 ):
     trace = []
     runtime = types.ModuleType("shared.copy_runtime")
@@ -308,11 +318,17 @@ async def test_existing_worker_starts_and_closes_copy_recovery_runner_when_guard
     class Runner:
         def __init__(self, factory, resume, **kwargs):
             assert resume.__name__ == "resume_copy_workflow"
+            assert kwargs == expected
             trace.append("constructed")
 
         async def start(self): trace.append("started")
         async def close(self): trace.append("closed")
 
+    for name in ("COPY_WORK_CONCURRENCY", "COPY_WORK_BATCH_ROWS", "COPY_WORK_STATEMENT_TIMEOUT_MS",
+                 "COPY_WORK_LOCK_TIMEOUT_MS", "COPY_WORK_POLL_SECONDS", "COPY_WORK_RECOVERY_SECONDS"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
     runtime.CopyWorkRunner = Runner
     workflow.copy_work_guards_enabled = lambda: True
     monkeypatch.setitem(sys.modules, "shared.copy_runtime", runtime)
@@ -326,3 +342,54 @@ async def test_existing_worker_starts_and_closes_copy_recovery_runner_when_guard
     worker._supervised_consume = AsyncMock()
     await worker.start()
     assert trace == ["constructed", "started", "closed"]
+
+
+def test_collection_binds_pre_capture_tokens_and_task_claim_before_source_work(worker_module, workflow):
+    from contextlib import contextmanager
+
+    snapshot_id, partition_id, owner = (uuid.uuid4() for _ in range(3))
+    observed = []
+
+    @contextmanager
+    def collection(snapshot, partition, **expected):
+        observed.append((snapshot, partition, expected))
+        yield object()
+
+    workflow.copy_collection = collection
+    worker_module._bind_partition_lease(partition_id, {
+        "snapshot_id": snapshot_id, "lease_owner_id": owner, "lease_token": 3,
+    })
+    try:
+        with worker_module._worker_copy_collection(
+            snapshot_id, partition_id, expected_snapshot_token=7, expected_job_token=11,
+        ):
+            # A later claim must never change the already captured expected generation.
+            worker_module._bind_partition_lease(partition_id, {
+                "snapshot_id": snapshot_id, "lease_owner_id": owner, "lease_token": 4,
+            })
+        assert observed == [(str(snapshot_id), partition_id, {
+            "expected_snapshot_token": 7, "expected_partition_token": 3, "expected_job_token": 11,
+        })]
+    finally:
+        worker_module._bind_partition_lease(partition_id, None)
+
+
+@pytest.mark.parametrize("name,value", [
+    ("COPY_WORK_CONCURRENCY", "0"), ("COPY_WORK_BATCH_ROWS", "0"),
+    ("COPY_WORK_STATEMENT_TIMEOUT_MS", "0"), ("COPY_WORK_LOCK_TIMEOUT_MS", "0"),
+    ("COPY_WORK_POLL_SECONDS", "0"), ("COPY_WORK_RECOVERY_SECONDS", "nan"),
+])
+async def test_worker_rejects_invalid_copy_limits_through_runtime_validation(
+    monkeypatch, worker_module, workflow, name, value,
+):
+    runtime = _load("copy_runtime_env_validation", "shared/copy_runtime.py")
+    monkeypatch.setitem(sys.modules, "shared.copy_runtime", runtime)
+    workflow.copy_work_guards_enabled = lambda: True
+    monkeypatch.setenv(name, value)
+    monkeypatch.setattr(runtime.CopyWorkRunner, "start", AsyncMock(
+        side_effect=AssertionError("invalid limits must fail before runner startup")))
+    worker = worker_module.BackupWorker.__new__(worker_module.BackupWorker)
+    worker.worker_id = "test-worker"
+    worker.initialize = AsyncMock()
+    with pytest.raises(ValueError, match="copy "):
+        await worker.start()

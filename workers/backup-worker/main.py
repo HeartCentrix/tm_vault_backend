@@ -1299,9 +1299,22 @@ _COPY_CAPTURE_LEAF = contextvars.ContextVar("copy_capture_leaf", default=None)
 
 
 @contextmanager
-def _worker_copy_collection(snapshot_id, partition_id=None, resource_id=None):
+def _worker_copy_collection(
+    snapshot_id, partition_id=None, resource_id=None, *,
+    expected_snapshot_token=None, expected_job_token=None,
+):
     from shared.copy_workflow import copy_collection
-    with copy_collection(str(snapshot_id), partition_id) as capture:
+    record = _partition_lease_record(partition_id) if partition_id else None
+    partition_token = record["lease"].token if record else None
+    with copy_collection(
+        str(snapshot_id), partition_id, expected_snapshot_token=expected_snapshot_token,
+        expected_partition_token=partition_token, expected_job_token=expected_job_token,
+    ) as capture:
+        if capture is not None and (
+            (partition_id is not None and partition_token is None)
+            or (partition_id is None and expected_snapshot_token is None)
+        ):
+            raise ChatCatalogueWorkLeaseMoved("copy capture has no claimed leaf generation")
         token = _COPY_CAPTURE_LEAF.set({
             "snapshot_id": str(snapshot_id), "partition_id": str(partition_id) if partition_id else None,
             "resource_id": str(resource_id) if resource_id else None,
@@ -4431,8 +4444,12 @@ class BackupWorker:
             from shared.copy_runtime import CopyWorkRunner
             self._copy_work_runner = CopyWorkRunner(
                 async_session_factory, self.resume_copy_workflow,
-                concurrency=2, batch_size=512, statement_timeout_ms=60000,
-                lock_timeout_ms=5000, poll_s=1, recovery_s=10,
+                concurrency=int(os.getenv("COPY_WORK_CONCURRENCY", "2")),
+                batch_size=int(os.getenv("COPY_WORK_BATCH_ROWS", "512")),
+                statement_timeout_ms=int(os.getenv("COPY_WORK_STATEMENT_TIMEOUT_MS", "60000")),
+                lock_timeout_ms=int(os.getenv("COPY_WORK_LOCK_TIMEOUT_MS", "5000")),
+                poll_s=float(os.getenv("COPY_WORK_POLL_SECONDS", "1")),
+                recovery_s=float(os.getenv("COPY_WORK_RECOVERY_SECONDS", "10")),
             )
             await self._copy_work_runner.start()
 
@@ -6107,7 +6124,11 @@ class BackupWorker:
 
         try:
             print(f"[{self.worker_id}] Calling handler for {resource_type}: {resource.display_name}")
-            with _worker_copy_collection(snapshot.id, message.get("partitionId"), resource.id):
+            with _worker_copy_collection(
+                snapshot.id, message.get("partitionId"), resource.id,
+                expected_snapshot_token=getattr(snapshot, "lease_token", None),
+                expected_job_token=getattr(job, "lease_token", None),
+            ):
                 result = await handler(graph_client, resource, snapshot, tenant, message)
                 if not (result or {}).get("copy_waiting"):
                     waiting = await self._seal_copy_handoff(snapshot, {
@@ -12383,7 +12404,11 @@ class BackupWorker:
                         resource, snapshot, tenant, graph_client, message, job_id)
                     if catalogue_result is not None:
                         return catalogue_result
-            with _worker_copy_collection(snapshot.id, message.get("partitionId"), resource.id):
+            with _worker_copy_collection(
+                snapshot.id, message.get("partitionId"), resource.id,
+                expected_snapshot_token=getattr(snapshot, "lease_token", None),
+                expected_job_token=message.get("_job_lease_token"),
+            ):
                 return await _capture_one(resource, snapshot)
 
         async def _capture_one(resource: Resource, snapshot: Snapshot) -> Dict:
@@ -17656,12 +17681,17 @@ class BackupWorker:
                 flush=True,
             )
             return None
-        from shared.copy_workflow import has_pending_copy
+        from shared.copy_workflow import has_pending_copy, copy_work_guards_enabled
+        copy_snapshot_head = None
         async with async_session_factory() as pending_session:
             if await has_pending_copy(pending_session, snapshot_id=snapshot_id):
                 return None
+            if copy_work_guards_enabled():
+                copy_snapshot_head = await pending_session.get(Snapshot, snapshot_id)
         from shared.copy_workflow import pending_copy_sql, verify_copy_resume
-        with _worker_copy_collection(snapshot_id) as capture:
+        with _worker_copy_collection(
+            snapshot_id, expected_snapshot_token=getattr(copy_snapshot_head, "lease_token", None),
+        ) as capture:
             if capture is not None:
                 async with async_session_factory() as check_session:
                     counts = (await check_session.execute(text(
@@ -18562,7 +18592,11 @@ class BackupWorker:
         try:
             async with tenant_sem:
                 async with self._onedrive_backup_semaphore:
-                    with _worker_copy_collection(snapshot_id, partition_id, resource_id):
+                    with _worker_copy_collection(
+                        snapshot_id, partition_id, resource_id,
+                        expected_snapshot_token=getattr(snapshot, "lease_token", None),
+                        expected_job_token=message.get("_job_lease_token"),
+                    ):
                         uploaded, uploaded_bytes = await self._useronedrive_backup_files(
                             graph_client, resource, snapshot, tenant, drive_id, file_items,
                         )
@@ -19555,7 +19589,11 @@ class BackupWorker:
                 # So we take the shard's contribution straight from
                 # the return dict rather than diffing snapshot counters
                 # (which stay at 0 mid-flight for SharePoint).
-                with _worker_copy_collection(snapshot_id, partition_id, resource_id):
+                with _worker_copy_collection(
+                    snapshot_id, partition_id, resource_id,
+                    expected_snapshot_token=getattr(snapshot, "lease_token", None),
+                    expected_job_token=message.get("_job_lease_token"),
+                ):
                     sp_result = await self.backup_sharepoint(
                         graph_client, resource_for_sp, snapshot, tenant, synth_msg,
                     )
@@ -21536,7 +21574,11 @@ class BackupWorker:
 
         async def backup_one_resource(resource: Resource):
             snapshot = await self.create_snapshot(resource, message, job_id)
-            with _worker_copy_collection(snapshot.id, message.get("partitionId"), resource.id):
+            with _worker_copy_collection(
+                snapshot.id, message.get("partitionId"), resource.id,
+                expected_snapshot_token=getattr(snapshot, "lease_token", None),
+                expected_job_token=message.get("_job_lease_token"),
+            ):
                 result = await _capture_copy_leaf(resource, snapshot)
                 if (result or {}).get("copy_waiting"):
                     return result
@@ -23039,7 +23081,11 @@ class BackupWorker:
 
         async def backup_one_mailbox(resource: Resource):
             snapshot = await self.create_snapshot(resource, message, job_id)
-            with _worker_copy_collection(snapshot.id, message.get("partitionId"), resource.id):
+            with _worker_copy_collection(
+                snapshot.id, message.get("partitionId"), resource.id,
+                expected_snapshot_token=getattr(snapshot, "lease_token", None),
+                expected_job_token=message.get("_job_lease_token"),
+            ):
                 result = await _capture_copy_leaf(resource, snapshot)
                 if (result or {}).get("copy_waiting"):
                     return result
@@ -23749,7 +23795,16 @@ class BackupWorker:
         async def backup_one(resource: Resource):
             snapshot = await self.create_snapshot(resource, message, job_id)
             from shared.copy_workflow import copy_collection
-            with copy_collection(snapshot.id, message.get("partitionId")) as capture:
+            _copy_partition_id = message.get("partitionId")
+            _copy_claim = _partition_lease_record(_copy_partition_id) if _copy_partition_id else None
+            with copy_collection(
+                snapshot.id, _copy_partition_id,
+                expected_snapshot_token=getattr(snapshot, "lease_token", None),
+                expected_partition_token=_copy_claim["lease"].token if _copy_claim else None,
+                expected_job_token=message.get("_job_lease_token"),
+            ) as capture:
+                if capture is not None and _copy_partition_id is not None and _copy_claim is None:
+                    raise ChatCatalogueWorkLeaseMoved("copy capture has no claimed partition generation")
                 result = await _capture_copy_leaf(resource, snapshot)
                 if (result or {}).get("copy_waiting"):
                     return result
@@ -27342,7 +27397,16 @@ class BackupWorker:
         FAILED snapshot — never a COMPLETED-empty one after a real error."""
         from archive_backup import run_archive_backup
         from shared.copy_workflow import copy_collection
-        with copy_collection(snapshot.id, (message or {}).get("partitionId")):
+        _copy_partition_id = (message or {}).get("partitionId")
+        _copy_claim = _partition_lease_record(_copy_partition_id) if _copy_partition_id else None
+        with copy_collection(
+            snapshot.id, _copy_partition_id,
+            expected_snapshot_token=getattr(snapshot, "lease_token", None),
+            expected_partition_token=_copy_claim["lease"].token if _copy_claim else None,
+            expected_job_token=(message or {}).get("_job_lease_token"),
+        ) as capture:
+            if capture is not None and _copy_partition_id is not None and _copy_claim is None:
+                raise ChatCatalogueWorkLeaseMoved("copy capture has no claimed partition generation")
             return await run_archive_backup(
                 graph_client, resource, snapshot, tenant,
                 worker_id=self.worker_id,

@@ -107,7 +107,8 @@ async def test_mail_cursor_checkpoints_stay_staged_until_no_copy_capture_is_drai
     worker.flush_version_rows = AsyncMock(return_value=0)
     async with store.factory() as session:
         snapshot = await session.get(models.Snapshot, scope.snapshot_id)
-    with bw._worker_copy_collection(scope.snapshot_id, resource_id=store.resource):
+    with bw._worker_copy_collection(scope.snapshot_id, resource_id=store.resource,
+                                    expected_snapshot_token=snapshot.lease_token):
         await worker._upsert_mail_folder_delta(store.resource, "inbox", "pending-cursor")
         await worker._persist_mail_delta_state(store.resource,
             new_tokens={"inbox": "pending-cursor"}, ok_token_keys={"inbox"},
@@ -164,3 +165,64 @@ async def test_partition_mail_union_is_queued_once_before_any_terminal_snapshot_
     async with store.factory() as session:
         snapshot = await session.get(models.Snapshot, scope.snapshot_id)
         assert snapshot.status == (models.SnapshotStatus.FAILED if failed else models.SnapshotStatus.COMPLETED)
+
+
+@pytest.mark.parametrize("partitioned", [False, True])
+async def test_stale_source_capture_cannot_attach_first_intent_to_replacement_workflow(store, monkeypatch, bw, partitioned):
+    import asyncio
+    import contextvars
+    import sys
+
+    scope, pid = await prepare(store, monkeypatch, bw, partition=partitioned)
+    async with store.factory() as session:
+        captured_snapshot = await session.get(models.Snapshot, scope.snapshot_id)
+    captured_token = captured_snapshot.lease_token
+    leaf_model = models.SnapshotPartition if pid else models.Snapshot
+    leaf_id = pid or scope.snapshot_id
+    async with store.factory() as session:
+        leaf = await session.get(leaf_model, leaf_id)
+        captured_leaf_token = leaf.lease_token
+    if pid:
+        bw._bind_partition_lease(pid, {"snapshot_id": scope.snapshot_id,
+                                     "lease_owner_id": leaf.lease_owner_id,
+                                     "lease_token": captured_leaf_token})
+    replacement_owner = uuid4()
+    replacement = []
+
+    async def replace_capture():
+        async with store.factory.begin() as session:
+            await session.execute(update(leaf_model).where(leaf_model.id == leaf_id)
+                                  .values(lease_token=captured_leaf_token + 1, lease_owner_id=replacement_owner))
+        # A different handler legitimately begins its own collection/workflow.
+        with copy_workflow.copy_collection(scope.snapshot_id, pid):
+            replacement.append(await copy_workflow.defer_current_copy("CHAT_CARRY", {
+                "target_snapshot_id": str(scope.snapshot_id), "replacement_capture": True,
+            }))
+
+    async def source_phase(graph, resource, snapshot, tenant, **kwargs):
+        assert snapshot.lease_token == captured_token
+        await asyncio.create_task(replace_capture(), context=contextvars.Context())
+        # The stale handler reaches its first copy only after the replacement claimed.
+        return await bw._carry_forward_prior_chat_snapshot_items(
+            tenant_id=str(store.tenant), resource_id=str(store.resource), target_snapshot_id=str(scope.snapshot_id))
+
+    monkeypatch.setitem(sys.modules, "archive_backup", SimpleNamespace(run_archive_backup=source_phase))
+    worker = bw.BackupWorker.__new__(bw.BackupWorker)
+    worker.worker_id = "stale-capture-worker"
+    try:
+        with pytest.raises(copy_workflow.CopyWorkConflict):
+            await worker.backup_archive(object(), SimpleNamespace(id=store.resource), captured_snapshot,
+                                        SimpleNamespace(id=store.tenant), {"partitionId": str(pid)} if pid else {})
+    finally:
+        if pid:
+            bw._bind_partition_lease(pid, None)
+    async with store.factory() as session:
+        workflow = await session.get(models.CopyWorkflow, replacement[0].workflow_id)
+        tasks = list((await session.scalars(select(models.CopyWorkTask))).all())
+        snapshot = await session.get(models.Snapshot, scope.snapshot_id)
+        assert workflow.state == "DRAINING" and workflow.parent_lease_token == captured_leaf_token + 1
+        assert len(tasks) == 1 and tasks[0].id == replacement[0].task_id
+        leaf = await session.get(leaf_model, leaf_id)
+        assert leaf.lease_token == captured_leaf_token + 1 and leaf.lease_owner_id == replacement_owner
+        if pid:
+            assert snapshot.lease_token == captured_token
