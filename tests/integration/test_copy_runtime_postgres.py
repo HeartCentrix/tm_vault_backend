@@ -129,9 +129,7 @@ async def unsealed(store, *, live=False, null_lease=False, cancelled=False):
         snapshot.lease_expires_at = None if null_lease else datetime.now(timezone.utc) - timedelta(seconds=1)
         if live:
             await db.execute(text('INSERT INTO worker_heartbeats VALUES (:id,NOW())'), {'id': owner})
-        source = await db.scalar(select(models.Snapshot.id).where(models.Snapshot.id != target.snapshot_id))
-        db.add(models.CopyWorkItem(task_id=task_id, ordinal=-1, phase=-1,
-                                  payload={'copy_source_pin': True}, source_snapshot_id=source))
+        # enqueue already pins its fixed predecessor before source drain.
         if cancelled:
             (await db.get(models.Job, snapshot.job_id)).status = models.JobStatus.CANCELLED
     return target, task_id, workflow_id

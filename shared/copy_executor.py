@@ -4,6 +4,7 @@ Manifest preparation is one consistent SQL statement and freezes full payloads,
 not mutable source IDs. Its scan/materialization cost still needs the caller's
 measured statement budget. Batches never read source payloads again.
 """
+import os
 import re
 
 from sqlalchemy import text
@@ -49,8 +50,15 @@ async def _scope(session, task):
 def _selection(kind, params):
     """Return CTEs, source selector and validity expression; values stay bound."""
     if kind == "LEGACY_CHAT_ATTACHMENTS":
+        selection = LEGACY_CHAT_ATTACHMENT_SELECTION_CTES
+        if params.get('_copy_p8_sources_fixed'):
+            # Filter before ranking/provenance resolution, so a newer source
+            # outside the intent cannot hide an older protected candidate.
+            selection = selection.replace('src.snapshot_id <> :tsid', """src.snapshot_id <> :tsid
+                AND EXISTS (SELECT 1 FROM copy_work_items pin WHERE pin.task_id=:task_id
+                    AND pin.ordinal<0 AND pin.source_snapshot_id=src.snapshot_id)""")
         return (
-            LEGACY_CHAT_ATTACHMENT_SELECTION_CTES + """,
+            selection + """,
             source_choice AS (SELECT NULL::uuid AS id),
             selected AS MATERIALIZED (
                 SELECT src.snapshot_id AS source_snapshot_id, 0 AS phase,
@@ -74,12 +82,14 @@ def _selection(kind, params):
             "true",
         )
     explicit = params.get("prior_snapshot_id") or params.get("prior_snap_id")
-    source_where = "s.id=CAST(:prior AS uuid)" if explicit else "true"
+    source_where = "s.id=CAST(:prior AS uuid)" if explicit else (
+        "false" if params.get('_copy_source_fixed') else "true")
     prior = """WITH frozen_source AS MATERIALIZED (
         SELECT params->>'prior_snapshot_id' AS id FROM copy_work_tasks
          WHERE workflow_id=:workflow_id AND kind=:kind AND id<>:task_id
            AND capture_attempt=(SELECT capture_attempt FROM copy_work_tasks WHERE id=:task_id)
-           AND prepared AND (params::jsonb) ? 'prior_snapshot_id'
+           AND (prepared OR COALESCE(params->>'_copy_source_fixed','false')='true')
+           AND (params::jsonb) ? 'prior_snapshot_id'
          ORDER BY id LIMIT 1
     ), source_choice AS MATERIALIZED (
         SELECT s.id FROM snapshots s
@@ -93,7 +103,7 @@ def _selection(kind, params):
                 OR s.id=CAST((SELECT id FROM frozen_source) AS uuid))
            AND NOT EXISTS (
                SELECT 1 FROM copy_workflows cw WHERE cw.target_snapshot_id=s.id
-                 AND (cw.state IS DISTINCT FROM 'COMPLETED' OR EXISTS (
+                 AND (cw.state IS DISTINCT FROM 'COMPLETED' OR cw.parent_settle_pending OR EXISTS (
                      SELECT 1 FROM copy_work_tasks ct WHERE ct.workflow_id=cw.id AND ct.capture_attempt=cw.capture_attempt
                        AND ct.state IS DISTINCT FROM 'COMPLETED')))
            AND """ + source_where
@@ -147,6 +157,91 @@ def _selection(kind, params):
          WHERE """ + filters[kind] + ")", "true")
 
 
+def _bindings(task, scope, params):
+    return dict(params, task_id=task.id, workflow_id=task.workflow_id, kind=task.kind,
+                 tid=scope["tenant_id"], rid=scope["resource_id"],
+                 tsid=scope["target_snapshot_id"], jid=str(scope["job_id"]) if scope["job_id"] else None,
+                 prior=params.get("prior_snapshot_id") or params.get("prior_snap_id"),
+                 cid=params.get("chat_id"), cids=params.get("chat_ids", params.get("cids", [])), names=params.get("names", []),
+                 legacy=bool(params.get("legacy_patterns_only", False)),
+                 excluded_paths=list(params.get("excluded_paths") or []),
+                 tombstoned_ids=list(params.get("tombstoned_ids") or []),
+                 whitelist=params.get("keep_folder_ids") is not None,
+                 keep_folder_ids=list(params.get("keep_folder_ids") or []),
+                 exclude_pathless=bool(params.get("exclude_pathless", False)),
+                 file_ids=list(params.get("file_ids") or []), external_ids=list(params.get("external_ids") or []))
+
+
+async def pin_intent_sources(session, task) -> None:
+    """Fix source scope before waiting; caller holds the workflow selection lock.
+
+    P8 pins narrow candidate snapshot IDs without ranking provenance or copying
+    payloads. Each intent is capped at COPY_INTENT_SOURCE_PIN_MAX (4096 default)
+    and uses short statement/lock budgets. Exceeding a budget fails the required
+    intent visibly; it never truncates sources. Full payloads freeze later.
+    """
+    if task.kind == 'CHAT_RENAME':
+        return
+    scope, params = await _scope(session, task)
+    p8 = task.kind == 'LEGACY_CHAT_ATTACHMENTS'
+    if params.get('_copy_p8_sources_fixed' if p8 else '_copy_source_fixed'):
+        return
+    if p8 and not params.get('chat_id'):
+        raise ValueError('legacy chat source intent requires chat_id')
+    if task.kind in {'FILE_VERSIONS', 'ARCHIVE_CARRY'} and not (
+            params.get('prior_snapshot_id') or params.get('prior_snap_id')):
+        raise ValueError('copy source snapshot must be fixed explicitly')
+    cap = int(os.getenv('COPY_INTENT_SOURCE_PIN_MAX', '4096'))
+    statement_ms = int(os.getenv('COPY_INTENT_SOURCE_STATEMENT_MS', '5000'))
+    lock_ms = int(os.getenv('COPY_INTENT_SOURCE_LOCK_MS', '1000'))
+    if min(cap, statement_ms, lock_ms) < 1:
+        raise ValueError('copy source pin limits and timeouts must be positive')
+    await session.execute(text("SELECT set_config('statement_timeout',:statement,true),"
+                               "set_config('lock_timeout',:lock,true)"),
+                          {'statement': f'{statement_ms}ms', 'lock': f'{lock_ms}ms'})
+    ctes, _ = _selection(task.kind, params)
+    ids = ('SELECT DISTINCT snapshot_id AS id FROM candidates ORDER BY snapshot_id LIMIT :pin_probe'
+           if p8 else 'SELECT id FROM source_choice WHERE id IS NOT NULL')
+    fixed_valid = 'true' if p8 else """(CAST(:prior AS uuid) IS NULL OR EXISTS (SELECT 1 FROM source_choice))
+        AND (NOT EXISTS (SELECT 1 FROM frozen_source WHERE id IS NOT NULL)
+             OR EXISTS (SELECT 1 FROM source_choice))"""
+    patch = ("jsonb_build_object('_copy_p8_sources_fixed',true,'_copy_p8_source_count',(SELECT count(*) FROM intent_source_ids))"
+             if p8 else "jsonb_build_object('_copy_source_fixed',true,'_copy_source_implicit',CAST(:implicit AS boolean),"
+             "'prior_snapshot_id',(SELECT id FROM source_choice))")
+    # selected/ranked/provenance CTEs remain unreferenced and are not executed.
+    row = (await session.execute(text(ctes + """,
+        intent_source_ids AS MATERIALIZED (""" + ids + """),
+        intent_locked_sources AS MATERIALIZED (
+            SELECT s.id FROM snapshots s JOIN resources r ON r.id=s.resource_id
+             WHERE s.id IN (SELECT id FROM intent_source_ids) AND r.tenant_id=:tid
+               AND s.status::text <> 'PENDING_DELETION'
+               AND (:allow_active OR (s.status::text IN ('COMPLETED','PARTIAL')
+                    AND s.extra_data->>'cancelled_at' IS NULL
+                    AND COALESCE(s.extra_data->>'copy_required_failed','false') <> 'true'))
+               AND (SELECT count(*) FROM intent_source_ids) <= :pin_cap
+             ORDER BY s.id FOR SHARE OF s
+        ), intent_valid AS MATERIALIZED (
+            SELECT (""" + fixed_valid + """
+                AND (SELECT count(*) FROM intent_source_ids) <= :pin_cap
+                AND NOT EXISTS (SELECT 1 FROM intent_source_ids ids WHERE NOT EXISTS (
+                    SELECT 1 FROM intent_locked_sources locked WHERE locked.id=ids.id))) AS ok
+        ), intent_pins AS (
+            INSERT INTO copy_work_items(task_id,ordinal,payload,source_snapshot_id,phase)
+            SELECT :task_id,-row_number() OVER(ORDER BY id),json_build_object('copy_source_pin',true),id,-1
+              FROM intent_locked_sources WHERE (SELECT ok FROM intent_valid)
+            ON CONFLICT(task_id,ordinal) DO NOTHING RETURNING ordinal
+        ), fixed_intent AS (
+            UPDATE copy_work_tasks SET params=(COALESCE(params::jsonb,'{}'::jsonb) || """ + patch + """)::json
+             WHERE id=:task_id AND (SELECT ok FROM intent_valid) RETURNING params
+        ) SELECT (SELECT ok FROM intent_valid) AS ok,(SELECT params FROM fixed_intent) AS params,
+                 (SELECT count(*) FROM intent_pins) AS pins
+    """), dict(_bindings(task, scope, params), pin_probe=cap + 1, pin_cap=cap,
+               allow_active=p8, implicit=not bool(params.get('prior_snapshot_id') or params.get('prior_snap_id'))))).mappings().one()
+    if not row['ok']:
+        raise ValueError('copy source intent is unavailable, being deleted, or exceeds its pin limit')
+    task.params = dict(row['params'])
+
+
 async def prepare_manifest(session, task) -> None:
     """Freeze selections and predecessor atomically; never commit internally."""
     if task.kind not in KINDS:
@@ -165,18 +260,7 @@ async def prepare_manifest(session, task) -> None:
         cids, names = params.get("chat_ids", params.get("cids", [])), params.get("names", [])
         if len(cids) != len(names) or len(set(cids)) != len(cids) or any(not v for v in cids + names):
             raise ValueError("rename requires distinct chat ids and matching nonempty names")
-    binds = dict(params, task_id=task.id, workflow_id=task.workflow_id, kind=task.kind,
-                 tid=scope["tenant_id"], rid=scope["resource_id"],
-                 tsid=scope["target_snapshot_id"], jid=str(scope["job_id"]) if scope["job_id"] else None,
-                 prior=params.get("prior_snapshot_id") or params.get("prior_snap_id"),
-                 cid=params.get("chat_id"), cids=params.get("chat_ids", params.get("cids", [])), names=params.get("names", []),
-                 legacy=bool(params.get("legacy_patterns_only", False)),
-                 excluded_paths=list(params.get("excluded_paths") or []),
-                 tombstoned_ids=list(params.get("tombstoned_ids") or []),
-                 whitelist=params.get("keep_folder_ids") is not None,
-                 keep_folder_ids=list(params.get("keep_folder_ids") or []),
-                 exclude_pathless=bool(params.get("exclude_pathless", False)),
-                 file_ids=list(params.get("file_ids") or []), external_ids=list(params.get("external_ids") or []))
+    binds = _bindings(task, scope, params)
     ctes, provenance = _selection(task.kind, params)
     if task.kind not in {"LEGACY_CHAT_ATTACHMENTS", "CHAT_RENAME"}:
         provenance += " AND (NOT EXISTS (SELECT 1 FROM frozen_source WHERE id IS NOT NULL) OR EXISTS (SELECT 1 FROM source_choice))"

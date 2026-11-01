@@ -11,7 +11,7 @@ from sqlalchemy import exists, func, select
 from sqlalchemy.orm import aliased
 from sqlalchemy.dialects.postgresql import insert
 
-from shared.models import (CopyWorkflow, CopyWorkTask, CopyWorkItem, CopyWorkInput, CopyWorkQueue, CopyWorkControl,
+from shared.models import (CopyWorkflow, CopyWorkTask, CopyWorkInput, CopyWorkQueue, CopyWorkControl,
                            Job, Resource, Snapshot, SnapshotPartition, SlaPolicy)
 
 ACTIVE_WORKFLOWS = ('DRAINING', 'WAITING', 'RESUMING')
@@ -81,13 +81,26 @@ async def enqueue(session, request: CopyRequest) -> CopyWorkTask:
         partition = await session.get(SnapshotPartition, partition_id)
         if partition is None or partition.snapshot_id != snapshot.id or partition.status != 'IN_PROGRESS':
             raise CopyWorkConflict('copy partition is no longer active')
+    # Serialize source choice without a parent/cancellation lock-order cycle.
+    # NO KEY UPDATE on the workflow remains compatible with child FK checks.
+    job = await session.scalar(select(Job).where(Job.id == job.id).with_for_update(read=True)
+                               .execution_options(populate_existing=True))
+    snapshot = await session.scalar(select(Snapshot).where(Snapshot.id == snapshot.id).with_for_update(read=True)
+                                    .execution_options(populate_existing=True))
+    if partition_id:
+        partition = await session.scalar(select(SnapshotPartition).where(SnapshotPartition.id == partition_id)
+            .with_for_update(read=True).execution_options(populate_existing=True))
+    if (job.status.value not in ('RUNNING', 'QUEUED', 'PENDING', 'RETRYING')
+        or snapshot.status.value != 'IN_PROGRESS' or (partition_id and partition.status != 'IN_PROGRESS')):
+        raise CopyWorkConflict('copy parent no longer permits source registration')
     leaf_key = 'partition:' + str(partition_id) if partition_id else 'snapshot:' + str(snapshot.id)
     await session.execute(insert(CopyWorkflow).values(id=uuid4(), leaf_key=leaf_key, tenant_id=resource.tenant_id,
         resource_id=resource.id, job_id=job.id, target_snapshot_id=snapshot.id, partition_id=partition_id,
         state='DRAINING', generation=0, parent_lease_token=partition.lease_token if partition_id else snapshot.lease_token,
         snapshot_lease_token=snapshot.lease_token, job_lease_token=job.lease_token, continuation={})
         .on_conflict_do_nothing(index_elements=['leaf_key']))
-    workflow = await session.scalar(select(CopyWorkflow).where(CopyWorkflow.leaf_key == leaf_key))
+    workflow = await session.scalar(select(CopyWorkflow).where(CopyWorkflow.leaf_key == leaf_key)
+        .with_for_update(key_share=True).execution_options(populate_existing=True))
     leaf = partition if partition_id else snapshot
     if workflow.state in ('FAILED','CANCELLED') and leaf.lease_token > workflow.parent_lease_token:
         # Retain old task diagnostics, but never replay an abandoned drain's
@@ -104,6 +117,14 @@ async def enqueue(session, request: CopyRequest) -> CopyWorkTask:
         raise CopyWorkConflict('copy workflow already sealed')
     from shared.database import CARRY_FORWARD_WAIT_MAX_S
     params = {**request.params, 'target_snapshot_id': str(snapshot.id)}
+    # Derived source evidence is not part of the producer's idempotency key.
+    # Re-enqueueing a returned task's params must reuse its original intent.
+    source_fixed = params.pop('_copy_source_fixed', False)
+    source_implicit = params.pop('_copy_source_implicit', False)
+    if source_fixed and (source_implicit or params.get('prior_snap_id')):
+        params.pop('prior_snapshot_id', None)
+    params.pop('_copy_p8_sources_fixed', None)
+    params.pop('_copy_p8_source_count', None)
     digest = _key(workflow.id, workflow.capture_attempt, request.kind, params)
     large_inputs={key:value for key,value in params.items() if key in (
         'file_ids','external_ids','excluded_paths','tombstoned_ids','keep_folder_ids','chat_ids','names')
@@ -139,16 +160,8 @@ async def enqueue(session, request: CopyRequest) -> CopyWorkTask:
                 {'task_id':task.id,'input_key':key,'ordinal':i,'payload':{'value':values[i]}}
                 for i in range(start,min(start+128,len(values)))])
                 .on_conflict_do_nothing(index_elements=['task_id','input_key','ordinal']))
-    prior_id = params.get('prior_snapshot_id') or params.get('prior_snap_id')
-    if prior_id:
-        # Pin before preparation, including empty selections. Serialize with
-        # retention's locked PENDING_DELETION requalification.
-        prior = await session.scalar(select(Snapshot).where(Snapshot.id == _uuid(prior_id)).with_for_update(read=True))
-        if prior is None or prior.resource_id != resource.id or prior.status.value not in ('COMPLETED', 'PARTIAL'):
-            raise CopyWorkConflict('copy predecessor is unavailable or being deleted')
-        await session.execute(insert(CopyWorkItem).values(task_id=task.id, ordinal=-1,
-            payload={'copy_source_pin': True}, source_snapshot_id=prior.id, phase=-1)
-            .on_conflict_do_nothing(index_elements=['task_id', 'ordinal']))
+    from shared.copy_executor import pin_intent_sources
+    await pin_intent_sources(session, task)
     return task
 
 

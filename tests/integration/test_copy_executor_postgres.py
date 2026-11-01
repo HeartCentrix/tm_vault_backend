@@ -39,7 +39,8 @@ async def store():
             "indexed_at timestamp, backend_id uuid, chat_version_id uuid, created_at timestamp, "
             "UNIQUE(snapshot_id,external_id,item_type))",
             "CREATE TABLE copy_workflows (id uuid PRIMARY KEY, tenant_id uuid, job_id uuid, resource_id uuid, "
-            "target_snapshot_id uuid REFERENCES snapshots(id), state text DEFAULT 'DRAINING', capture_attempt bigint DEFAULT 0)",
+            "target_snapshot_id uuid REFERENCES snapshots(id), state text DEFAULT 'DRAINING', capture_attempt bigint DEFAULT 0, "
+            "parent_settle_pending boolean DEFAULT false)",
             "CREATE TABLE copy_work_tasks (id uuid PRIMARY KEY, workflow_id uuid REFERENCES copy_workflows(id), "
             "kind text, params json, prepared boolean DEFAULT false, state text DEFAULT 'READY', capture_attempt bigint DEFAULT 0)",
             "CREATE TABLE copy_work_items (task_id uuid REFERENCES copy_work_tasks(id), ordinal bigint, "
