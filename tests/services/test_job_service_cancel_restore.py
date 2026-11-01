@@ -126,3 +126,23 @@ def test_cancel_backup_still_stamps_cancelled():
     assert len(stamped) == 1
     assert stamped[0][1]["jid"] == job.id
     assert job.status == JobStatus.CANCELLED
+
+
+def test_cancel_on_terminal_job_commits_remaining_copy_cancellation(monkeypatch):
+    job = _job(JobType.BACKUP)
+    job.status = JobStatus.COMPLETED
+
+    class Session(_FakeSession):
+        commits = 0
+
+        async def commit(self):
+            self.commits += 1
+
+    async def cancel_remaining_copy(session, *, job_id, reason):
+        assert job_id == job.id
+        return 1
+
+    monkeypatch.setattr(_js, "cancel_copy_work", cancel_remaining_copy)
+    session = Session(job)
+    asyncio.run(_js.cancel_job(str(job.id), session))
+    assert session.commits == 1

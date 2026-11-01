@@ -10,6 +10,11 @@ import asyncio
 
 from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
+from shared.copy_workflow import (
+    cancel_copy_work, copy_source_pinned_sql, initialize_copy_guards,
+)
+from shared.copy_observability import copy_work_summaries, copy_work_summary
+
 from sqlalchemy import select, func, text
 
 from shared.config import settings
@@ -747,6 +752,8 @@ async def lifespan(app: FastAPI):
         await conn.execute(text("SELECT 1"))
     await message_bus.connect()
     await startup_router()
+    from shared.database import async_session_factory as _copy_factory
+    await initialize_copy_guards(_copy_factory)
     # At-rest encryption hook so blob downloads decrypt (no-op unless
     # BACKUP_ENCRYPTION_* env is configured).
     try:
@@ -875,7 +882,7 @@ def _project_job_progress(job: "Job", roll: Optional[Dict]) -> int:
     return job.progress_pct or 0
 
 
-def _build_job_response(job: "Job", roll: Optional[Dict]) -> JobResponse:
+def _build_job_response(job: "Job", roll: Optional[Dict], copy_work: Optional[Dict] = None) -> JobResponse:
     return JobResponse(
         id=str(job.id),
         type=job.type.value if hasattr(job.type, "value") else str(job.type),
@@ -893,6 +900,7 @@ def _build_job_response(job: "Job", roll: Optional[Dict]) -> JobResponse:
         snapshotsCompleted=(roll or {}).get("snapshots_completed"),
         snapshotsFailed=(roll or {}).get("snapshots_failed"),
         snapshotsInProgress=(roll or {}).get("snapshots_in_progress"),
+        copy_work=copy_work,
     )
 
 
@@ -933,9 +941,10 @@ async def list_jobs(
 
     # Single bulk rollup query covers every job on this page.
     rollups = await _job_rollup_bulk(db, [j.id for j in jobs])
+    copy_summaries = await copy_work_summaries(db, job_ids=[j.id for j in jobs])
 
     return JobListResponse(
-        content=[_build_job_response(j, rollups.get(str(j.id))) for j in jobs],
+        content=[_build_job_response(j, rollups.get(str(j.id)), copy_summaries.get(str(j.id))) for j in jobs],
         totalPages=max(1, (total + size - 1) // size),
         totalElements=total,
         size=size, number=page,
@@ -952,7 +961,8 @@ async def get_job(job_id: str, db: AsyncSession = Depends(get_db)):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     rollups = await _job_rollup_bulk(db, [job.id])
-    return _build_job_response(job, rollups.get(str(job.id)))
+    copy_summary = await copy_work_summary(db, job_id=job.id)
+    return _build_job_response(job, rollups.get(str(job.id)), copy_summary)
 
 
 @app.get("/api/v1/jobs/{job_id}/progress", dependencies=[Depends(require_principal)])
@@ -979,6 +989,16 @@ async def _revert_snapshot_storage(db: AsyncSession, snapshot) -> dict:
     from shared.storage.router import router as _storage_router
     import logging as _logging
     _log = _logging.getLogger(__name__)
+
+    copy_guard = copy_source_pinned_sql("snapshots.id")
+    if copy_guard != "TRUE":
+        pinned = (await db.execute(text(f"""
+            SELECT 1 FROM snapshots
+             WHERE id = :sid AND NOT ({copy_guard}) FOR UPDATE
+        """), {"sid": snapshot.id})).first()
+        if pinned:
+            return {"items_reverted": 0, "bytes_reverted": 0,
+                    "blobs_deleted": 0, "blob_errors": 0, "copy_deferred": True}
 
     # Snapshot has no tenant_id column — pull both type + tenant_id off
     # the owning resource in one round-trip. Falls back to the snapshot's
@@ -1160,6 +1180,8 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
         # is safer than 500-ing the cancel button.
         print(f"[JOB_SERVICE] cancel advisory_xact_lock failed (continuing): {_le}")
 
+    cancelled_copy_workflows = await cancel_copy_work(db, job_id=job.id, reason="job_cancelled")
+
     if job.status not in (JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.RETRYING):
         # The targeted job is already terminal, but the batch it belonged
         # to may still be IN_PROGRESS because sibling jobs / partition
@@ -1187,6 +1209,8 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
                 )).all()
                 sib_ids = [r.id for r in sib_rows]
                 if sib_ids:
+                    for sibling_id in sib_ids:
+                        await cancel_copy_work(db, job_id=sibling_id, reason="batch_cancelled")
                     await db.execute(
                         text(
                             "UPDATE jobs SET status = 'CANCELLED', "
@@ -1265,6 +1289,8 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
                 f"job={job.id} failed (non-fatal): "
                 f"{type(_be).__name__}: {_be}"
             )
+        if cancelled_copy_workflows:
+            await db.commit()
         return
 
     job.status = JobStatus.CANCELLED
@@ -1450,6 +1476,8 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
                 )).all()
                 sib_ids = [r.id for r in sib_rows]
                 if sib_ids:
+                    for sibling_id in sib_ids:
+                        await cancel_copy_work(db, job_id=sibling_id, reason="batch_cancelled")
                     await db.execute(
                         text(
                             "UPDATE jobs "

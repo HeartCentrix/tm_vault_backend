@@ -280,6 +280,7 @@ class JobResponse(BaseModel):
     snapshotsCompleted: Optional[int] = None
     snapshotsFailed: Optional[int] = None
     snapshotsInProgress: Optional[int] = None
+    copy_work: Optional[Dict[str, Any]] = None
 
 
 class JobListResponse(BaseModel):
