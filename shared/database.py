@@ -5,8 +5,10 @@ import logging
 import os
 import random
 from contextlib import asynccontextmanager
+from inspect import isawaitable
 from time import monotonic
 from typing import AsyncGenerator
+from weakref import WeakKeyDictionary, WeakValueDictionary
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -1905,13 +1907,17 @@ GIANT_CARRY_FORWARD_BUCKETS = int(os.getenv("GIANT_CARRY_FORWARD_BUCKETS", "3"))
 # with the other's giant range and silently re-create the starvation
 # (2026-08-27 review). 1M is far above any plausible micro bucket count.
 GIANT_CARRY_FORWARD_LANE_BASE = 1_000_000
-# Retry cadence while queued for a slot. Each probe is one sub-millisecond
-# statement on a briefly-held pooled connection — cheap even with dozens of
-# waiters. Waits of an hour+ are legitimate (a giant baseline carry-forward
-# holds its bucket for the duration), so there is no default ceiling.
+# Two fast retries absorb brief contention; sustained contention backs off
+# to a capped cadence. Waits of an hour+ remain legitimate for giant copies,
+# so there is no default ceiling. Local followers never open DB sessions.
 CARRY_FORWARD_WAIT_BASE_S = float(os.getenv("CARRY_FORWARD_WAIT_BASE_S", "5"))
 CARRY_FORWARD_WAIT_JITTER_S = float(os.getenv("CARRY_FORWARD_WAIT_JITTER_S", "5"))
 CARRY_FORWARD_WAIT_MAX_S = float(os.getenv("CARRY_FORWARD_WAIT_MAX_S", "0"))  # 0 = no ceiling
+CARRY_FORWARD_WAIT_CAP_S = float(os.getenv("CARRY_FORWARD_WAIT_CAP_S", "30"))
+CARRY_FORWARD_FAST_RETRIES = 2
+_CARRY_FORWARD_CANCEL_POLL_S = 0.5
+# Weak values avoid retaining a lock's bound event loop after its tasks end.
+_CARRY_FORWARD_LOCAL_GATES = WeakKeyDictionary()
 _CARRY_FORWARD_LOG_INTERVAL_S = 60.0  # one wait line per minute per waiter
 # ⚠Monitoring note: try-lock waiters do NOT appear in pg_locks/pg_stat_activity
 # as advisory-lock waiters (the old live-diagnosis signal) — the
@@ -1933,6 +1939,16 @@ def carry_forward_bucket(key: str, *, lane: str = "micro") -> int:
     return digest % max(1, CARRY_FORWARD_BUCKETS)
 
 
+def _carry_forward_local_gate(lane: str, bucket: int) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    gates = _CARRY_FORWARD_LOCAL_GATES.setdefault(loop, WeakValueDictionary())
+    gate = gates.get((lane, bucket))
+    if gate is None:
+        gate = asyncio.Lock()
+        gates[(lane, bucket)] = gate
+    return gate
+
+
 @asynccontextmanager
 async def carry_forward_slot_session(
     key: str,
@@ -1942,79 +1958,140 @@ async def carry_forward_slot_session(
     what: str = "",
     wait_base_s: float | None = None,
     wait_jitter_s: float | None = None,
+    should_cancel=None,
 ) -> AsyncGenerator[AsyncSession, None]:
-    """Yield an open session whose transaction holds one of the
-    CARRY_FORWARD_BUCKETS cluster-wide carry-forward slots.
+    """Yield a session holding the key's existing transaction-scoped slot.
 
-    The caller runs its heavy statement(s) on the yielded session and
-    commits; the advisory lock is transaction-scoped and releases with that
-    commit (or any rollback/close). While QUEUED for a slot this helper
-    holds NO open transaction and therefore no pgbouncer server connection —
-    see the module comment above for the incident this prevents.
+    Probe pg_try_advisory_xact_lock in a fresh transaction. Misses roll
+    back and close before backoff. One local contender per
+    loop/lane/bucket probes; local followers wait without DB sessions.
+    The local permit lasts through the caller's copy and session close.
 
-    ``on_wait`` (if given) is invoked once per missed attempt so callers
-    with liveness/stall guards can count the queue wait as progress —
-    a queued copy is alive, not stalled. Exceptions from ``on_wait`` are
-    swallowed; exceptions from the DB (e.g. a killed connection) propagate
-    immediately rather than hanging.
+    Two fast retries preserve short MICRO waits (including per-site cadence
+    overrides); continued misses back off exponentially with capped jitter.
+    ``on_wait`` ticks liveness for DB misses and local waits; its exceptions
+    are ignored. DB exceptions propagate immediately.
 
-    ``wait_base_s`` / ``wait_jitter_s`` override the retry cadence per site:
-    MICRO copies that acquire a slot thousands of times per walk (per-file
-    version carry-forward, P8 per-chat attachment copy) must poll fast
-    (sub-second) or a 5-10s sleep per miss adds hours of wall clock to a
-    walk under light contention — try-lock polling has no FIFO wakeup.
-    Giant copies keep the default coarse cadence. A probe costs one
-    sub-millisecond statement, so even hundreds of fast pollers consume a
-    negligible fraction of one pooler slot.
-
-    ``lane="giant"`` routes whole-resource copies to the reserved giant
-    bucket range — fast-polling micro sites starved the archive giant off
-    every freed shared slot for 4h on the 8/26 and 8/27 Gold dispatches
-    (try-lock polling has no FIFO; fairness comes from partitioning).
+    ``should_cancel`` may be a sync or async bool callback; true raises
+    CancelledError. It is checked before probes and at most every 0.5s while
+    sleeping or locally queued. The optional wait ceiling bounds acquisition,
+    including local queueing and DB probes, but never the caller's copy.
+    Logs include only slot metadata, never key or caller-supplied ``what``.
     """
-    base = CARRY_FORWARD_WAIT_BASE_S if wait_base_s is None else wait_base_s
-    jitter = CARRY_FORWARD_WAIT_JITTER_S if wait_jitter_s is None else wait_jitter_s
+    base = max(0.0, CARRY_FORWARD_WAIT_BASE_S if wait_base_s is None else wait_base_s)
+    jitter = max(0.0, CARRY_FORWARD_WAIT_JITTER_S if wait_jitter_s is None else wait_jitter_s)
+    cap = max(0.001, CARRY_FORWARD_WAIT_CAP_S)
+    backoff = min(base, cap)
     bucket = carry_forward_bucket(key, lane=lane)
+    gate = _carry_forward_local_gate(lane, bucket)
     attempt = 0
     started = monotonic()
     last_log = started
-    while True:
-        async with async_session_factory() as session:
-            got = (await session.execute(
-                text("SELECT pg_try_advisory_xact_lock(:cls, :b)"),
-                {"cls": CARRY_FORWARD_LOCK_CLASS, "b": bucket},
-            )).scalar()
-            if got:
-                if attempt:
-                    logger.info(
-                        "[CARRY_FORWARD] slot bucket=%d lane=%s acquired after "
-                        "%d attempt(s) / %.0fs%s",
-                        bucket, lane, attempt, monotonic() - started,
-                        f" ({what})" if what else "",
-                    )
-                yield session
-                return
-            # Miss: end the transaction so transaction-mode pgbouncer
-            # releases the server connection before we sleep.
-            await session.rollback()
-        attempt += 1
+    deadline = started + CARRY_FORWARD_WAIT_MAX_S if CARRY_FORWARD_WAIT_MAX_S > 0 else None
+    wait_kind = "local" if gate.locked() else "database"
+    waited_locally = gate.locked()
+    acquired = False
+
+    def log(outcome):
+        logger.info(
+            "[CARRY_FORWARD] %s slot bucket=%d lane=%s attempts=%d elapsed=%.3fs",
+            outcome, bucket, lane, attempt, monotonic() - started,
+            extra={
+                "copy_slot_outcome": outcome,
+                "copy_slot_bucket": bucket,
+                "copy_slot_lane": lane,
+                "copy_slot_attempts": attempt,
+                "copy_slot_wait_s": max(0.0, monotonic() - started),
+                "copy_slot_wait_kind": wait_kind,
+            },
+        )
+
+    def wait_timeout():
+        log("timeout")
+        return RuntimeError(
+            f"carry-forward slot wait exceeded "
+            f"CARRY_FORWARD_WAIT_MAX_S={CARRY_FORWARD_WAIT_MAX_S:g}s "
+            f"(bucket={bucket}, lane={lane})"
+        )
+
+    async def check_wait():
+        if should_cancel is not None:
+            cancelled = should_cancel()
+            if isawaitable(cancelled):
+                cancelled = await cancelled
+            if cancelled:
+                raise asyncio.CancelledError
+        if deadline is not None and monotonic() >= deadline:
+            raise wait_timeout()
+
+    def tick_wait():
+        nonlocal last_log
         if on_wait is not None:
             try:
                 on_wait()
-            except Exception:  # noqa: BLE001 — liveness tick must never kill the wait
+            except Exception:  # noqa: BLE001 — liveness must not kill the wait
                 pass
         if monotonic() - last_log >= _CARRY_FORWARD_LOG_INTERVAL_S:
             last_log = monotonic()
-            logger.info(
-                "[CARRY_FORWARD] waiting for slot bucket=%d lane=%s "
-                "(attempt %d, %.0fs elapsed)%s",
-                bucket, lane, attempt, monotonic() - started,
-                f" ({what})" if what else "",
-            )
-        if CARRY_FORWARD_WAIT_MAX_S > 0 and (monotonic() - started) > CARRY_FORWARD_WAIT_MAX_S:
-            raise RuntimeError(
-                f"carry-forward slot wait exceeded "
-                f"CARRY_FORWARD_WAIT_MAX_S={CARRY_FORWARD_WAIT_MAX_S:.0f}s "
-                f"(bucket={bucket}, lane={lane}{', ' + what if what else ''})"
-            )
-        await asyncio.sleep(base + random.uniform(0, jitter))
+            log("waiting")
+
+    timeout = asyncio.timeout(CARRY_FORWARD_WAIT_MAX_S if deadline is not None else None)
+    try:
+        async with timeout:
+            await check_wait()
+            while True:
+                try:
+                    async with asyncio.timeout(_CARRY_FORWARD_CANCEL_POLL_S):
+                        await gate.acquire()
+                    break
+                except TimeoutError:
+                    tick_wait()
+                    await check_wait()
+            try:
+                while True:
+                    await check_wait()
+                    async with async_session_factory() as session:
+                        got = (await session.execute(
+                            text("SELECT pg_try_advisory_xact_lock(:cls, :b)"),
+                            {"cls": CARRY_FORWARD_LOCK_CLASS, "b": bucket},
+                        )).scalar()
+                        if got:
+                            await check_wait()
+                            timeout.reschedule(None)
+                            acquired = True
+                            if attempt or waited_locally:
+                                log("acquired")
+                            yield session
+                            return
+                        # Release the pooler connection before any wait.
+                        await session.rollback()
+                    attempt += 1
+                    wait_kind = "database"
+                    tick_wait()
+                    if attempt <= CARRY_FORWARD_FAST_RETRIES:
+                        delay = min(base, 0.25) + random.uniform(0, min(jitter, 0.5))
+                    else:
+                        # Keep random spread even after the exponential hits its cap.
+                        spread = min(jitter, cap / 2)
+                        delay = min(backoff, cap - spread) + random.uniform(0, spread)
+                        backoff = min(cap, backoff * 2)
+                    remaining = min(cap, delay)
+                    while remaining > 0:
+                        await check_wait()
+                        duration = remaining
+                        if deadline is not None:
+                            duration = min(duration, max(0.0, deadline - monotonic()))
+                        if should_cancel is not None:
+                            duration = min(duration, _CARRY_FORWARD_CANCEL_POLL_S)
+                        await asyncio.sleep(duration)
+                        remaining -= duration
+            finally:
+                gate.release()
+    except TimeoutError:
+        if timeout.expired():
+            raise wait_timeout() from None
+        raise
+    except asyncio.CancelledError:
+        if not acquired:
+            log("cancelled")
+        raise
