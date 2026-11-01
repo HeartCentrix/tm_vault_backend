@@ -3540,101 +3540,18 @@ async def list_snapshot_chat_groups(
     snapshot_id: str,
     db: AsyncSession = Depends(get_db),
 ):
-    """Distinct chats inside a USER_CHATS snapshot, with display name + count.
+    """Captured conversations, identified by chat ID rather than display path.
 
-    Aggregates pointer rows from this snapshot (+ siblings) by
-    parent_external_id = chat_id, then joins chat_threads for the
-    canonical chat_topic and chat_thread_messages for the newest message
-    timestamp. Powers the chats tab's left panel — clicking a row sets
-    ?chatId=<id> on the messages query.
-
-    Auto-resolves to the USER_CHATS sibling if the caller passed the
-    ENTRA_USER parent's snapshot id or a non-chat sibling's. Aggregating
-    across all prior USER_CHATS snapshots via the sibling helper means a
-    delta-only later run does not drop threads captured by an earlier
-    full run.
+    Catalogue labels come from their capture attempt. Legacy labels come from
+    this restore point's stored paths, with mixed aliases exposed explicitly.
     """
     catalogue = await _catalogue_snapshot(db, snapshot_id, resolve_chat_sibling=True)
     if catalogue is not None:
         if (catalogue.extra_data or {}).get("chat_inventory_format") == 1:
             return await _catalogue_groups(db, catalogue)
         snapshot_id = str(catalogue.id)
-    sibling_ids = await _resolve_sibling_snapshot_ids(
-        db, snapshot_id, target_child_type=ResourceType.USER_CHATS,
-    )
-    if not sibling_ids:
-        sibling_ids = [UUID(snapshot_id)]
-
-    # The aggregate query:
-    #   1. Pull pointer rows for these sibling snapshots, group by
-    #      chat_id (parent_external_id), counting distinct external_ids.
-    #   2. JOIN chat_threads on (tenant_id, chat_id) → chat_topic.
-    #   3. LEFT JOIN to chat_thread_messages to pick the newest
-    #      createdDateTime as the lastMessageAt label.
-    rows = (await db.execute(
-        text(
-            # Per-chat count must match the message VIEW (the A∪B union in
-            # list_snapshot_messages): a shared 1:1/group chat's count is the
-            # COMPLETE conversation for EVERY member, not just the messages this
-            # member's drain captured first under the shared cursor. Counting
-            # only this snapshot's pointers (the old COUNT(DISTINCT
-            # si.external_id)) made the panel-left show e.g. 2993 for one member
-            # vs 3010 for the other on the SAME chat. Count distinct message ids
-            # from the snapshot pointers (A) UNION the shared durable store (B),
-            # B scoped to the chats this snapshot covers so nothing leaks.
-            "WITH scope AS ( "
-            "  SELECT DISTINCT si.tenant_id, si.parent_external_id AS chat_id "
-            "    FROM snapshot_items si "
-            "   WHERE si.snapshot_id = ANY(:sids) "
-            "     AND si.item_type IN ('TEAMS_CHAT_MESSAGE','TEAMS_MESSAGE','TEAMS_MESSAGE_REPLY') "
-            "     AND si.parent_external_id IS NOT NULL "
-            "), "
-            "msg_ids AS ( "
-            "  SELECT si.tenant_id, si.parent_external_id AS chat_id, si.external_id AS ext "
-            "    FROM snapshot_items si "
-            "   WHERE si.snapshot_id = ANY(:sids) "
-            "     AND si.item_type IN ('TEAMS_CHAT_MESSAGE','TEAMS_MESSAGE','TEAMS_MESSAGE_REPLY') "
-            "     AND si.parent_external_id IS NOT NULL "
-            "  UNION "
-            "  SELECT ct.tenant_id, ct.chat_id, ctm.message_external_id AS ext "
-            "    FROM chat_thread_messages ctm "
-            "    JOIN chat_threads ct ON ct.id = ctm.chat_thread_id AND ct.archived_at IS NULL "
-            "    JOIN scope sc ON sc.tenant_id = ct.tenant_id AND sc.chat_id = ct.chat_id "
-            "   WHERE ctm.archived_at IS NULL "
-            "), "
-            "thread_msgs AS ( "
-            "  SELECT tenant_id, chat_id, COUNT(DISTINCT ext) AS msg_count "
-            "    FROM msg_ids GROUP BY tenant_id, chat_id "
-            ") "
-            "SELECT tm.chat_id, tm.msg_count, ct.chat_topic, ct.chat_type, "
-            "       ct.member_names_json, "
-            "       ( SELECT MAX(ctm.created_date_time) "
-            "           FROM chat_thread_messages ctm "
-            "          WHERE ctm.chat_thread_id = ct.id "
-            "            AND ctm.archived_at IS NULL ) AS last_message_at "
-            "  FROM thread_msgs tm "
-            "  LEFT JOIN chat_threads ct "
-            "         ON ct.tenant_id = tm.tenant_id "
-            "        AND ct.chat_id = tm.chat_id "
-            "        AND ct.archived_at IS NULL "
-            " ORDER BY last_message_at DESC NULLS LAST"
-        ),
-        {"sids": [str(s) for s in sibling_ids]},
-    )).all()
-
-    return [
-        {
-            "chatId": r.chat_id,
-            "displayName": _compose_chat_name(
-                r.chat_id, r.chat_topic, r.chat_type, r.member_names_json,
-            ),
-            "count": int(r.msg_count or 0),
-            "lastMessageAt": (
-                r.last_message_at.isoformat() if r.last_message_at else None
-            ),
-        }
-        for r in rows
-    ]
+    from shared.chat_presentation import list_chat_presentations
+    return await list_chat_presentations(db, UUID(snapshot_id))
 
 
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/azure-db/export")
