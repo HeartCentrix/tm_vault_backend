@@ -385,11 +385,30 @@ async def replicate_snapshot(snapshot: Snapshot, tenant: Tenant, session):
         logger.error("[replicate_snapshot] Failed to query snapshot items for %s: %s", snapshot.id, e)
         return
 
+    if (snapshot.extra_data or {}).get('chat_presentation_format') == 1:
+        try:
+            from shared.chat_presentation_dr import replicate_presentation_metadata
+            label_path = f'chat-presentation/v1/{tenant.id}/{snapshot.id}.json'
+            label_url = f'https://{dr_account_name}.blob.core.windows.net/{dr_container}/{label_path}'
+            async with BlobClient.from_blob_url(label_url, credential=dr_account_key) as client:
+                receipt = await replicate_presentation_metadata(session, snapshot_id=snapshot.id,
+                    tenant_id=tenant.id, client=client)
+            if (tenant.extra_data or {}).get('legal_hold_enabled'):
+                await apply_legal_hold(dr_container, label_path, shard=AzureStorageShard(
+                    account_name=dr_account_name, account_key=dr_account_key))
+            snapshot.extra_data = {**(snapshot.extra_data or {}), 'chat_presentation_dr': {
+                **receipt, 'container': dr_container, 'path': label_path}}
+        except Exception as exc:
+            snapshot.dr_replication_status = 'failed'
+            snapshot.dr_error = f'Chat presentation metadata replication failed: {exc}'
+            logger.error('[replicate_snapshot] Captured chat metadata failed for %s: %s', snapshot.id, exc)
+            return
+
     if not snapshot_items:
         # Metadata-only snapshot, mark as replicated
         snapshot.dr_replication_status = "replicated"
         snapshot.dr_blob_path = f"{dr_container}/{snapshot.id}"
-        snapshot.dr_replicated_at = datetime.now(timezone.utc)
+        snapshot.dr_replicated_at = datetime.now(timezone.utc).replace(tzinfo=None)
         logger.info(
             "[replicate_snapshot] Snapshot %s has no items (metadata-only) — marking as replicated",
             snapshot.id,
@@ -500,7 +519,7 @@ async def replicate_snapshot(snapshot: Snapshot, tenant: Tenant, session):
     if failed == 0:
         snapshot.dr_replication_status = "replicated"
         snapshot.dr_blob_path = f"{dr_container}/{snapshot.id}"
-        snapshot.dr_replicated_at = datetime.now(timezone.utc)
+        snapshot.dr_replicated_at = datetime.now(timezone.utc).replace(tzinfo=None)
         tenant.dr_last_replicated_at = datetime.now(timezone.utc)
         logger.info(
             "[replicate_snapshot] SUCCESS — snapshot %s replicated: %d items, %d bytes, DR container=%s",
