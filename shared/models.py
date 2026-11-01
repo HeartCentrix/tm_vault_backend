@@ -5,7 +5,7 @@ from typing import Optional, Tuple
 from sqlalchemy import (
     Column, String, DateTime, Boolean, Integer, BigInteger,
     Text, ForeignKey, Enum as SAEnum, JSON, ARRAY, func, LargeBinary,
-    Index, UniqueConstraint, text as sql_text,
+    Index, UniqueConstraint, Float, text as sql_text,
 )
 from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import relationship, synonym
@@ -1762,3 +1762,112 @@ class ChatCataloguePin(Base):
         CheckConstraint("(inventory_id IS NULL) <> (object_id IS NULL)", name="ck_chat_pin_target"),
         CheckConstraint("generation >= 0", name="ck_chat_pin_generation"),
     )
+
+
+class CopyWorkflow(Base):
+    """Durable ownership of a leaf's required database-copy continuation."""
+    __tablename__ = 'copy_workflows'
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey('tenants.id'), nullable=False)
+    resource_id = Column(UUID(as_uuid=True), ForeignKey('resources.id'), nullable=False)
+    job_id = Column(UUID(as_uuid=True), ForeignKey('jobs.id', ondelete='RESTRICT'), nullable=False)
+    target_snapshot_id = Column(UUID(as_uuid=True), ForeignKey('snapshots.id', ondelete='RESTRICT'), nullable=False)
+    partition_id = Column(UUID(as_uuid=True), ForeignKey('snapshot_partitions.id', ondelete='RESTRICT'))
+    leaf_key = Column(String(80), nullable=False, unique=True)
+    state = Column(String(16), nullable=False, default='DRAINING')
+    generation = Column(BigInteger, nullable=False, default=0)
+    parent_lease_token = Column(BigInteger, nullable=False, default=0)
+    snapshot_lease_token = Column(BigInteger, nullable=False, default=0)
+    job_lease_token = Column(BigInteger, nullable=False, default=0)
+    continuation = Column(JSON, nullable=False, default=dict)
+    lease_owner_id = Column(UUID(as_uuid=True))
+    lease_expires_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    completed_at = Column(DateTime(timezone=True))
+    __table_args__ = (
+        Index('ix_copy_workflow_snapshot_state', 'target_snapshot_id', 'state'),
+        Index('ix_copy_workflow_partition_state', 'partition_id', 'state'),
+        Index('ix_copy_workflow_job_state', 'job_id', 'state'),
+        CheckConstraint("state IN ('DRAINING','WAITING','RESUMING','COMPLETED','PARTIAL','FAILED','CANCELLED')", name='ck_copy_workflow_state'),
+    )
+
+
+class CopyWorkQueue(Base):
+    """Shared fair service clocks at tenant, policy and resource levels."""
+    __tablename__ = 'copy_work_queues'
+    key = Column(String(64), primary_key=True)
+    scope = Column(String(12), nullable=False)
+    parent_key = Column(String(64))
+    tenant_id = Column(UUID(as_uuid=True), nullable=False)
+    sla_policy_id = Column(UUID(as_uuid=True))
+    resource_id = Column(UUID(as_uuid=True))
+    lane = Column(String(8), nullable=False)
+    weight = Column(Integer, nullable=False, default=1)
+    virtual_finish = Column(Float, nullable=False, default=0)
+    __table_args__ = (
+        Index('ix_copy_queue_parent_finish', 'parent_key', 'virtual_finish', 'key'),
+        CheckConstraint('weight BETWEEN 1 AND 8', name='ck_copy_queue_weight'),
+        CheckConstraint("scope IN ('TENANT','POLICY','RESOURCE') AND lane IN ('micro','giant')", name='ck_copy_queue_scope_lane'),
+    )
+
+
+class CopyWorkTask(Base):
+    __tablename__ = 'copy_work_tasks'
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workflow_id = Column(UUID(as_uuid=True), ForeignKey('copy_workflows.id', ondelete='RESTRICT'), nullable=False)
+    tenant_id = Column(UUID(as_uuid=True), nullable=False)
+    resource_id = Column(UUID(as_uuid=True), nullable=False)
+    sla_policy_id = Column(UUID(as_uuid=True))
+    queue_key = Column(String(64), ForeignKey('copy_work_queues.key'), nullable=False)
+    resource_queue_key = Column(String(64), ForeignKey('copy_work_queues.key'), nullable=False)
+    tenant_queue_key = Column(String(64), ForeignKey('copy_work_queues.key'), nullable=False)
+    idempotency_key = Column(String(64), nullable=False, unique=True)
+    kind = Column(String(32), nullable=False)
+    lane = Column(String(8), nullable=False)
+    params = Column(JSON, nullable=False, default=dict)
+    state = Column(String(16), nullable=False, default='READY')
+    generation = Column(BigInteger, nullable=False, default=0)
+    prepared = Column(Boolean, nullable=False, default=False)
+    checkpoint = Column(BigInteger, nullable=False, default=0)
+    row_count = Column(BigInteger, nullable=False, default=0)
+    bytes_count = Column(BigInteger, nullable=False, default=0)
+    lease_owner_id = Column(UUID(as_uuid=True))
+    lease_expires_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    ready_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    queue_entered_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    cumulative_wait_s = Column(Float, nullable=False, default=0)
+    wait_max_s = Column(Float, nullable=False, default=0)
+    attempts = Column(Integer, nullable=False, default=0)
+    error = Column(JSON)
+    __table_args__ = (
+        Index('ix_copy_task_ready', 'state', 'ready_at', 'resource_queue_key'),
+        Index('ix_copy_task_workflow_state', 'workflow_id', 'state'),
+        Index('ix_copy_task_expired', 'state', 'lease_expires_at'),
+        CheckConstraint("state IN ('READY','RUNNING','COMPLETED','FAILED','CANCELLED')", name='ck_copy_task_state'),
+        CheckConstraint("lane IN ('micro','giant') AND checkpoint >= 0 AND generation >= 0 AND row_count >= 0 AND bytes_count >= 0", name='ck_copy_task_counts'),
+    )
+
+
+class CopyWorkItem(Base):
+    """Frozen selected payloads; source FK is a retention pin, not a cursor."""
+    __tablename__ = 'copy_work_items'
+    task_id = Column(UUID(as_uuid=True), ForeignKey('copy_work_tasks.id', ondelete='CASCADE'), primary_key=True)
+    ordinal = Column(BigInteger, primary_key=True)
+    payload = Column(JSON, nullable=False)
+    source_snapshot_id = Column(UUID(as_uuid=True), ForeignKey('snapshots.id', ondelete='RESTRICT'), index=True)
+    phase = Column(Integer, nullable=False, default=0)
+
+
+class CopyWorkControl(Base):
+    """One short transactional claim mutex and coordinated protocol settings."""
+    __tablename__ = 'copy_work_control'
+    id = Column(String(16), primary_key=True, default='global')
+    enabled = Column(Boolean, nullable=False, default=False)
+    epoch = Column(BigInteger, nullable=False, default=0)
+    micro_capacity = Column(Integer, nullable=False, default=3)
+    giant_capacity = Column(Integer, nullable=False, default=3)
+    total_capacity = Column(Integer, nullable=False, default=6)
+    tenant_capacity = Column(Integer, nullable=False, default=2)
+    virtual_clock = Column(Float, nullable=False, default=0)
+    __table_args__ = (CheckConstraint('micro_capacity > 0 AND giant_capacity > 0 AND total_capacity > 0 AND tenant_capacity > 0', name='ck_copy_control_capacity'),)
