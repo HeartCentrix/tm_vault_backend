@@ -358,3 +358,34 @@ async def test_workflow_explicit_predecessor_conflict_is_rejected(store):
     second = await store.task("FILE_VERSIONS", prior_snap_id=str(older), file_ids=["file-b"])
     with pytest.raises(ValueError, match="source"):
         await prepare(store, second)
+
+
+async def test_manifest_cannot_register_source_after_retention_claim(store):
+    import asyncio
+    await store.add('a')
+    task=await store.task('CHAT_CARRY')
+    tag='copy-pin-race-'+uuid.uuid4().hex
+    entered=asyncio.Event()
+    async with store.factory() as holder:
+        await holder.execute(text("UPDATE snapshots SET status='PENDING_DELETION' WHERE id=:id"),{'id':store.source})
+        async def prepare_while_claimed():
+            async with store.factory() as session:
+                try:
+                    await session.execute(text("SELECT set_config('application_name',:tag,true)"),{'tag':tag})
+                    entered.set()
+                    await executor().prepare_manifest(session,task)
+                    await session.commit()
+                except BaseException:
+                    await session.rollback();raise
+        running=asyncio.create_task(prepare_while_claimed())
+        await entered.wait()
+        for _ in range(100):
+            if running.done(): break
+            async with store.factory() as probe:
+                blocked=await probe.scalar(text("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name=:tag AND wait_event_type='Lock')"),{'tag':tag})
+            if blocked: break
+            await asyncio.sleep(0.01)
+        await holder.commit()
+        with pytest.raises(ValueError,match='source'):
+            await running
+    assert await store.rows()==[]

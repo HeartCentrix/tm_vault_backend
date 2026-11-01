@@ -36,7 +36,7 @@ async def progress_db(monkeypatch):
         # No params, source content, owner identifiers or manifest table exist.
         await conn.execute(text("CREATE TABLE copy_work_tasks (id uuid PRIMARY KEY, workflow_id uuid, "
                                 "capture_attempt bigint DEFAULT 0, sla_policy_id uuid, state text, "
-                                "row_count bigint DEFAULT 0, bytes_count bigint DEFAULT 0, "
+                                "row_count bigint DEFAULT 0, bytes_count bigint DEFAULT 0, execution_s float DEFAULT 0, "
                                 "cumulative_wait_s float DEFAULT 0, queue_entered_at timestamptz, "
                                 "created_at timestamptz DEFAULT NOW(), error json)"))
     factory = async_sessionmaker(engine)
@@ -97,7 +97,7 @@ async def test_admission_wait_and_committed_counts_exclude_sql_runtime_and_old_a
     assert summary["committed_bytes"] == 164
     assert 32 <= summary["admission_wait_s"] < 40
     assert 20 <= summary["oldest_queue_age_s"] < 30
-    assert summary["sql_runtime_s"] is None
+    assert summary["sql_runtime_s"] == 0
 
 
 async def test_typed_wait_and_gap_codes_never_echo_arbitrary_error_content(progress_db):

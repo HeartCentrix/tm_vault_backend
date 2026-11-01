@@ -119,3 +119,27 @@ async def test_source_drain_time_does_not_consume_database_admission_wait_budget
         assert admitted is not None
         task=await db.get(models.CopyWorkTask,admitted.task_id)
         assert task.cumulative_wait_s<10
+
+
+async def test_producer_flag_rollback_keeps_database_protocol_authoritative(store,monkeypatch):
+    module=api();monkeypatch.setattr(module,'_COPY_GUARDS_ACTIVE',False);monkeypatch.setenv('COPY_WORK_ENABLED','false');monkeypatch.setattr(module,'async_session_factory',store.factory)
+    async with store.factory.begin() as db:
+        db.add(models.CopyWorkControl(id='global',enabled=True))
+    await module.initialize_copy_guards(store.factory)
+    target=await store.new_scope()
+    with module.copy_collection(target.snapshot_id) as active:
+        assert active is not None
+        delegated=await module.defer_current_copy('CHAT_CARRY',{})
+        assert delegated is not None
+
+
+async def test_stale_source_capture_cannot_adopt_replacement_before_first_intent(store,monkeypatch):
+    module=api();monkeypatch.setattr(module,'_COPY_GUARDS_ACTIVE',False);monkeypatch.setenv('COPY_WORK_ENABLED','true');monkeypatch.setattr(module,'async_session_factory',store.factory)
+    target=await store.new_scope()
+    with module.copy_collection(target.snapshot_id,expected_snapshot_token=0):
+        async with store.factory.begin() as db:
+            await db.execute(update(models.Snapshot).where(models.Snapshot.id==target.snapshot_id).values(lease_token=1,lease_owner_id=uuid4()))
+        with pytest.raises(module.CopyWorkConflict,match='generation'):
+            await module.defer_current_copy('CHAT_CARRY',{})
+    async with store.factory() as db:
+        assert not list((await db.scalars(select(models.CopyWorkflow).where(models.CopyWorkflow.target_snapshot_id==target.snapshot_id))).all())

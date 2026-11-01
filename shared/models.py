@@ -1834,6 +1834,7 @@ class CopyWorkTask(Base):
     checkpoint = Column(BigInteger, nullable=False, default=0)
     row_count = Column(BigInteger, nullable=False, default=0)
     bytes_count = Column(BigInteger, nullable=False, default=0)
+    execution_s = Column(Float, nullable=False, default=0, server_default='0')
     lease_owner_id = Column(UUID(as_uuid=True))
     lease_expires_at = Column(DateTime(timezone=True))
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())

@@ -109,6 +109,10 @@ async def test_additive_migration_creates_real_queue_tables_and_refuses_active_d
             with Operations.context(MigrationContext.configure(sync)): migration.upgrade()
         await conn.run_sync(upgrade)
     task=await request(store)
+    from sqlalchemy.exc import DBAPIError
+    with pytest.raises(DBAPIError,match='active copy workflow'):
+        async with store.engine.begin() as conn:
+            await conn.execute(text('DELETE FROM snapshots WHERE id=:id'),{'id':task.params['target_snapshot_id']})
     async with store.engine.begin() as conn:
         def downgrade(sync):
             with Operations.context(MigrationContext.configure(sync)): migration.downgrade()

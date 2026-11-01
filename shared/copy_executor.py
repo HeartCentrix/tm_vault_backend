@@ -183,9 +183,22 @@ async def prepare_manifest(session, task) -> None:
     # Pins use RESTRICT FKs: a concurrent delete cannot commit before both
     # manifest payloads and their source references have been made durable.
     statement = ctes + """,
+        source_ids AS MATERIALIZED (
+            SELECT source_snapshot_id AS id FROM selected WHERE source_snapshot_id IS NOT NULL
+            UNION SELECT id FROM source_choice WHERE id IS NOT NULL
+        ), pinned_sources AS MATERIALIZED (
+            SELECT s.id FROM snapshots s JOIN resources r ON r.id=s.resource_id
+             WHERE s.id IN (SELECT id FROM source_ids) AND r.tenant_id=:tid
+               AND s.status::text <> 'PENDING_DELETION'
+               AND (:allow_active OR (s.status::text IN ('COMPLETED','PARTIAL')
+                    AND COALESCE(s.extra_data->>'copy_required_failed','false') <> 'true'))
+             FOR SHARE OF s
+        ),
         validity AS MATERIALIZED (
             SELECT (""" + provenance + """
                 AND (CAST(:prior AS uuid) IS NULL OR EXISTS (SELECT 1 FROM source_choice))
+                AND NOT EXISTS (SELECT 1 FROM source_ids ids
+                    WHERE NOT EXISTS (SELECT 1 FROM pinned_sources pin WHERE pin.id=ids.id))
                 AND NOT EXISTS (SELECT 1 FROM selected
                     WHERE payload->>'tenant_id' IS NOT NULL
                       AND payload->>'tenant_id' <> CAST(CAST(:tid AS uuid) AS text))) AS ok
@@ -195,6 +208,12 @@ async def prepare_manifest(session, task) -> None:
                    payload::json,source_snapshot_id,phase
               FROM selected WHERE (SELECT ok FROM validity)
             RETURNING ordinal
+        ), predecessor_pin AS (
+            INSERT INTO copy_work_items(task_id,ordinal,payload,source_snapshot_id,phase)
+            SELECT :task_id,-1,json_build_object('copy_source_pin',true),p.id,-1
+              FROM source_choice p JOIN pinned_sources pin ON pin.id=p.id
+             WHERE (SELECT ok FROM validity)
+            ON CONFLICT(task_id,ordinal) DO NOTHING
         ), prepared_task AS (
             UPDATE copy_work_tasks SET prepared=true,
                    params=(COALESCE(params::jsonb,'{}'::jsonb) ||
@@ -214,7 +233,8 @@ async def prepare_manifest(session, task) -> None:
         binding='cids' if key=='chat_ids' else key
         expression="(SELECT array_agg(inp.payload->>'value' ORDER BY inp.ordinal) FROM copy_work_inputs inp WHERE inp.task_id=:task_id AND inp.input_key='"+key+"')"
         statement=re.sub(r':'+binding+r'(?![A-Za-z0-9_])',expression,statement)
-    result = (await session.execute(text(statement),dict(binds,has_prior=task.kind not in {'LEGACY_CHAT_ATTACHMENTS','CHAT_RENAME'}))).mappings().one()
+    result = (await session.execute(text(statement),dict(binds,has_prior=task.kind not in {'LEGACY_CHAT_ATTACHMENTS','CHAT_RENAME'},
+        allow_active=task.kind in {'LEGACY_CHAT_ATTACHMENTS','CHAT_RENAME'}))).mappings().one()
     if not result["ok"]:
         if task.kind == "LEGACY_CHAT_ATTACHMENTS":
             raise LegacyChatProvenanceGap("legacy chat attachment provenance is ambiguous")

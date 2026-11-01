@@ -134,6 +134,7 @@ def upgrade():
     op.execute(_INPUT_DDL)
     op.execute('ALTER TABLE copy_workflows ADD COLUMN IF NOT EXISTS capture_attempt bigint NOT NULL DEFAULT 0')
     op.execute('ALTER TABLE copy_work_tasks ADD COLUMN IF NOT EXISTS capture_attempt bigint NOT NULL DEFAULT 0')
+    op.execute('ALTER TABLE copy_work_tasks ADD COLUMN IF NOT EXISTS execution_s double precision NOT NULL DEFAULT 0')
     op.execute('CREATE INDEX IF NOT EXISTS ix_copy_workflow_recovery ON copy_workflows(state,created_at,id)')
     op.execute("""CREATE OR REPLACE FUNCTION tmvault_copy_workflow_delete_guard() RETURNS trigger LANGUAGE plpgsql AS $$
         BEGIN

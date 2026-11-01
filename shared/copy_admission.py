@@ -142,7 +142,7 @@ async def _physical_guards(session, task, workflow, control):
         raise _Deferred('copy_aggregate_busy')
 
 
-async def _settle(factory, claim, *, status, error, queued_seconds=0.0, spend_attempt=True):
+async def _settle(factory, claim, *, status, error, queued_seconds=0.0, spend_attempt=True, execution_s=0.0):
     """Fresh transaction after rollback; never release a replacement's claim."""
     try:
         async with factory.begin() as session:
@@ -158,6 +158,12 @@ async def _settle(factory, claim, *, status, error, queued_seconds=0.0, spend_at
                 status, error = 'FAILED', {'code': 'copy_parent_terminal'}
             now = await session.scalar(select(func.clock_timestamp()))
             if status == 'DEFERRED':
+                previous=(task.error or {}).get('execution_failures',0)
+                failures=previous if type(previous) is int and 0<=previous<=3 else 0
+                if spend_attempt: failures+=1
+                if failures:
+                    error={**error,'execution_failures':failures}
+                    if failures>=3: status='FAILED'
                 task.cumulative_wait_s += max(0.0, queued_seconds)
                 task.queue_entered_at = now
                 task.ready_at = now + timedelta(seconds=1)
@@ -166,6 +172,7 @@ async def _settle(factory, claim, *, status, error, queued_seconds=0.0, spend_at
                 if task.wait_max_s and task.cumulative_wait_s >= task.wait_max_s:
                     status, error = 'FAILED', {'code': 'copy_admission_timeout'}
             task.state = 'READY' if status == 'DEFERRED' else status
+            task.execution_s = float(task.execution_s or 0)+max(0.0,execution_s)
             task.error = error
             task.lease_owner_id = task.lease_expires_at = None
         return status
@@ -205,6 +212,7 @@ async def run_batch(factory, claim: CopyClaim, *, batch_size=512,
                 task.checkpoint = result['cursor']
                 task.row_count += result['rows']
                 task.bytes_count += result['bytes']
+                task.execution_s = float(task.execution_s or 0)+query_seconds
                 task.state = 'COMPLETED' if result['done'] else 'READY'
                 task.lease_owner_id = task.lease_expires_at = None
                 task.error = None
@@ -216,11 +224,11 @@ async def run_batch(factory, claim: CopyClaim, *, batch_size=512,
             return BatchResult('STALE', claim.task_id, query_seconds=query_seconds)
         except (_Cancelled, _ParentEnded) as exc:
             status = await _settle(factory, claim, status='CANCELLED' if isinstance(exc, _Cancelled) else 'FAILED',
-                error={'code': 'copy_parent_cancelled' if isinstance(exc, _Cancelled) else 'copy_parent_terminal'})
+                error={'code': 'copy_parent_cancelled' if isinstance(exc, _Cancelled) else 'copy_parent_terminal'},execution_s=query_seconds)
             return BatchResult(status, claim.task_id, query_seconds=query_seconds)
         except _Deferred as exc:
             status = await _settle(factory, claim, status='DEFERRED', error={'code': exc.code},
-                queued_seconds=monotonic() - admission_started, spend_attempt=False)
+                queued_seconds=monotonic() - admission_started, spend_attempt=False,execution_s=query_seconds)
             return BatchResult(status, claim.task_id, query_seconds=query_seconds)
         except Exception as exc:
             if query_started is not None:
@@ -230,13 +238,13 @@ async def run_batch(factory, claim: CopyClaim, *, batch_size=512,
                 continue
             if state == '55P03':
                 status = await _settle(factory, claim, status='DEFERRED',
-                    error={'code': 'copy_lock_timeout'}, spend_attempt=query_started is not None)
+                    error={'code': 'copy_lock_timeout'}, spend_attempt=query_started is not None,execution_s=query_seconds)
             else:
                 code = {'57014': 'copy_statement_timeout', '40P01': 'copy_deadlock'}.get(state, 'copy_execution_failed')
                 error = {'code': code}
                 if state:
                     error.update(sqlstate=state, attempts=attempt)
-                status = await _settle(factory, claim, status='FAILED', error=error)
+                status = await _settle(factory, claim, status='FAILED', error=error,execution_s=query_seconds)
             return BatchResult(status, claim.task_id, query_seconds=query_seconds)
 
 
@@ -253,6 +261,11 @@ async def enable_copy_protocol(factory, *, micro_capacity, giant_capacity, total
         or total_capacity > micro_capacity + giant_capacity or tenant_capacity > total_capacity):
         raise ValueError('copy capacity exceeds the verified legacy limits or aggregate budget')
     async with factory.begin() as session:
+        schema_ready=await session.scalar(text("""SELECT EXISTS(SELECT 1 FROM pg_trigger
+            WHERE tgrelid='copy_workflows'::regclass AND tgname='copy_workflow_delete_guard'
+              AND NOT tgisinternal AND tgenabled <> 'D')"""))
+        if not schema_ready:
+            raise RuntimeError('copy-work migration delete guard is not installed/enabled')
         await session.execute(insert(CopyWorkControl).values(id='global').on_conflict_do_nothing())
         control = await session.scalar(select(CopyWorkControl).where(CopyWorkControl.id == 'global').with_for_update(nowait=True))
         active = await session.scalar(select(func.count()).select_from(CopyWorkTask)

@@ -5,12 +5,26 @@ import importlib
 from uuid import uuid4
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import func, select, text, update
 
 from test_chat_catalogue_postgres import store
 from shared import copy_executor, copy_work, models
 
 pytestmark = pytest.mark.integration
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def installed_copy_migration(store):
+    from pathlib import Path
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    spec=importlib.util.spec_from_file_location('copy_admission_migration',Path(__file__).resolve().parents[2]/'alembic/versions/0012_copy_work.py')
+    migration=importlib.util.module_from_spec(spec);spec.loader.exec_module(migration)
+    async with store.engine.begin() as connection:
+        def upgrade(sync):
+            with Operations.context(MigrationContext.configure(sync)): migration.upgrade()
+        await connection.run_sync(upgrade)
 
 
 def api():
@@ -86,7 +100,7 @@ async def test_batch_and_checkpoint_commit_together_then_reenter_queue(store):
     async with store.factory() as db:
         task = await db.get(models.CopyWorkTask, task_id)
         assert (task.checkpoint, task.row_count, task.bytes_count) == (2, 2, 14)
-        assert await db.scalar(select(func.count()).select_from(models.CopyWorkItem).where(models.CopyWorkItem.task_id == task_id)) == 2
+        assert await db.scalar(select(func.count()).select_from(models.CopyWorkItem).where(models.CopyWorkItem.task_id == task_id,models.CopyWorkItem.ordinal>0)) == 2
         assert (await db.get(models.CopyWorkflow, task.workflow_id)).state == 'WAITING'
 
 
@@ -311,3 +325,43 @@ async def test_old_claim_cannot_clear_replacement_owner(store):
     async with store.factory() as db:
         task = await db.get(models.CopyWorkTask, task_id)
         assert task.lease_owner_id == replacement and not task.prepared
+
+
+async def test_sql_execution_time_is_durable_and_separate_from_capacity_wait(store,monkeypatch):
+    from shared.copy_observability import copy_work_summary
+    import shared.copy_workflow as workflow_module
+    monkeypatch.setattr(workflow_module,'_COPY_GUARDS_ACTIVE',True)
+    target,task_id,claim=await queued(store)
+    async with store.factory.begin() as db:
+        task=await db.get(models.CopyWorkTask,task_id);task.cumulative_wait_s=37
+    result=await api().run_batch(store.factory,claim)
+    assert result.status=='COMPLETED'
+    async with store.factory() as db:
+        task=await db.get(models.CopyWorkTask,task_id)
+        assert task.execution_s>0
+        summary=await copy_work_summary(db,job_id=(await db.get(models.Snapshot,target.snapshot_id)).job_id)
+        assert summary['admission_wait_s']>=37
+        assert 0<summary['sql_runtime_s']<37
+
+
+async def test_protocol_activation_refuses_models_only_schema_without_delete_guard(store):
+    async with store.engine.begin() as conn:
+        await conn.execute(text('DROP TRIGGER IF EXISTS copy_workflow_delete_guard ON copy_workflows'))
+    with pytest.raises(RuntimeError,match='migration|schema|guard'):
+        await api().enable_copy_protocol(store.factory,micro_capacity=1,giant_capacity=1,total_capacity=1,tenant_capacity=1)
+
+
+async def test_repeated_sql_lock_failures_are_bounded_without_spending_capacity_wait_budget(store,monkeypatch):
+    _,task_id,current=await queued(store)
+    async def locked(session,task):
+        await session.execute(text("DO $$ BEGIN RAISE EXCEPTION 'busy' USING ERRCODE='55P03'; END $$"))
+    monkeypatch.setattr(copy_executor,'prepare_manifest',locked)
+    states=[]
+    for attempt in range(3):
+        result=await api().run_batch(store.factory,current);states.append(result.status)
+        if attempt<2:
+            async with store.factory.begin() as db:
+                task=await db.get(models.CopyWorkTask,task_id);task.ready_at=await db.scalar(select(func.clock_timestamp()))
+            async with store.factory.begin() as db:
+                current=await copy_work.claim(db,owner_id=uuid4())
+    assert states==['DEFERRED','DEFERRED','FAILED']

@@ -21,6 +21,7 @@ _COPY_GUARDS_ACTIVE = False
 _COLLECTION = ContextVar('required_copy_collection', default=None)
 _RESUMING = ContextVar('resuming_copy_workflow', default=None)
 _RESUME_CLAIM = ContextVar('copy_resume_claim', default=None)
+_PROTOCOL_MODE = ContextVar('copy_database_protocol', default=None)
 
 
 @dataclass
@@ -28,6 +29,10 @@ class CopyCollection:
     snapshot_id: UUID
     partition_id: UUID | None = None
     error: BaseException | None = None
+    expected_snapshot_token: int | None = None
+    expected_partition_token: int | None = None
+    expected_job_token: int | None = None
+    sealed_result: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -63,6 +68,10 @@ async def initialize_copy_guards(factory):
         async with factory() as session:
             control = await session.get(CopyWorkControl, 'global')
             pending = await session.scalar(select(exists(select(CopyWorkflow.id).where(CopyWorkflow.state.in_(ACTIVE_WORKFLOWS)))))
+            # Epoch mode is inherited by this worker's handler tasks. A local
+            # flag rollback cannot silently mix legacy writers with the active
+            # database protocol. Disabling the epoch requires drain/restart.
+            _PROTOCOL_MODE.set(bool(pending or (control and control.enabled)))
             _COPY_GUARDS_ACTIVE = _COPY_GUARDS_ACTIVE or copy_work_enabled() or bool(pending or (control and control.enabled))
     except SQLAlchemyError as exc:
         from shared.db_retry import _chain
@@ -74,8 +83,23 @@ async def initialize_copy_guards(factory):
 
 
 @contextmanager
-def copy_collection(snapshot_id, partition_id=None):
-    capture = CopyCollection(_uuid(snapshot_id), _uuid(partition_id)) if copy_work_enabled() else None
+def copy_collection(snapshot_id, partition_id=None, *, expected_snapshot_token=None,
+                    expected_partition_token=None, expected_job_token=None):
+    mode=_PROTOCOL_MODE.get()
+    active=copy_work_enabled() if mode is None else mode
+    if not active:
+        yield None
+        return
+    snapshot_id,partition_id=_uuid(snapshot_id),_uuid(partition_id)
+    existing=_COLLECTION.get()
+    if active and existing and (existing.snapshot_id,existing.partition_id)==(snapshot_id,partition_id):
+        # Nested wrappers own the same source observation/error latch. They
+        # cannot replace the captured generation with a newly read one.
+        yield existing
+        return
+    capture = CopyCollection(snapshot_id,partition_id,
+        expected_snapshot_token=expected_snapshot_token,expected_partition_token=expected_partition_token,
+        expected_job_token=expected_job_token) if active else None
     token = _COLLECTION.set(capture)
     try:
         yield capture
@@ -149,11 +173,26 @@ async def has_pending_copy(session, *, snapshot_id=None, partition_id=None, job_
 async def defer_current_copy(kind, params, lane='giant'):
     global _COPY_GUARDS_ACTIVE
     capture=_COLLECTION.get()
-    if capture is None or not copy_work_enabled(): return None
+    if capture is None: return None
     try:
         target=_uuid(params.get('target_snapshot_id') or capture.snapshot_id)
         if target!=capture.snapshot_id: raise CopyWorkConflict('copy target differs from current leaf')
         async with async_session_factory.begin() as session:
+            pointer=await session.get(Snapshot,target)
+            if pointer is None: raise CopyWorkConflict('copy source capture parent disappeared')
+            job=await session.get(Job,pointer.job_id,with_for_update={'read':True},populate_existing=True)
+            snapshot=await session.get(Snapshot,target,with_for_update={'read':True},populate_existing=True)
+            partition=await session.get(SnapshotPartition,capture.partition_id,
+                with_for_update={'read':True},populate_existing=True) if capture.partition_id else None
+            for expected,actual in ((capture.expected_job_token,job.lease_token if job else None),
+                    (capture.expected_snapshot_token,snapshot.lease_token if snapshot else None),
+                    (capture.expected_partition_token,partition.lease_token if partition else None)):
+                if expected is not None and expected!=actual:
+                    raise CopyWorkConflict('copy source capture generation has moved')
+            if capture.expected_snapshot_token is None: capture.expected_snapshot_token=snapshot.lease_token
+            if capture.expected_job_token is None: capture.expected_job_token=job.lease_token
+            if partition is not None and capture.expected_partition_token is None:
+                capture.expected_partition_token=partition.lease_token
             task=await enqueue(session,CopyRequest(kind=kind,lane=lane,target_snapshot_id=target,
                 partition_id=capture.partition_id,params=params))
             delegated=DeferredCopy(task.id,task.workflow_id)
@@ -207,6 +246,7 @@ async def seal_current_copy(continuation):
     capture=_COLLECTION.get()
     if capture is None: return None
     if capture.error is not None: raise CopyWorkConflict('required copy intent persistence failed') from capture.error
+    if capture.sealed_result is not None: return capture.sealed_result
     encoded=json.dumps(continuation,default=str)
     if len(encoded.encode())>65536: raise ValueError('copy continuation must contain bounded scalars and durable references')
     async with async_session_factory.begin() as session:
@@ -235,7 +275,8 @@ async def seal_current_copy(continuation):
             CopyWorkTask.capture_attempt==workflow.capture_attempt,CopyWorkTask.state=='READY')
             .values(ready_at=now,queue_entered_at=now,cumulative_wait_s=0))
         snapshot.extra_data={**(snapshot.extra_data or {}),'copy_workflow_id':str(workflow.id),'copy_phase':'QUEUED'}
-        return {'copy_waiting':True,'copy_workflow_id':str(workflow.id),'snapshot_id':str(snapshot.id)}
+        capture.sealed_result={'copy_waiting':True,'copy_workflow_id':str(workflow.id),'snapshot_id':str(snapshot.id)}
+        return capture.sealed_result
 
 
 async def begin_resume(factory, workflow_id, owner_id):

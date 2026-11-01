@@ -23,6 +23,7 @@ _COUNTS = """
     COALESCE(SUM(row_count),0) AS committed_rows,
     COALESCE(SUM(bytes_count),0) AS committed_bytes,
     COALESCE(SUM(wait_s),0) AS admission_wait_s,
+    COALESCE(SUM(execution_s),0) AS sql_runtime_s,
     COALESCE(MAX(queue_age_s),0) AS oldest_queue_age_s
 """
 
@@ -50,17 +51,17 @@ async def copy_work_summaries(session, *, job_ids):
                 bool_or(state IN ('PARTIAL','FAILED','CANCELLED')) AS failed
               FROM workflows GROUP BY job_id
         ), tasks AS MATERIALIZED (
-            SELECT w.job_id,t.sla_policy_id,t.state,t.row_count,t.bytes_count,
-                COALESCE(t.cumulative_wait_s,0) + CASE WHEN t.state='READY'
+            SELECT w.job_id,t.sla_policy_id,t.state,t.row_count,t.bytes_count,t.execution_s,
+                COALESCE(t.cumulative_wait_s,0) + CASE WHEN t.state='READY' AND w.state<>'DRAINING'
                     THEN GREATEST(0,EXTRACT(EPOCH FROM
                         clock_timestamp()-COALESCE(t.queue_entered_at,t.created_at))) ELSE 0 END AS wait_s,
-                CASE WHEN t.state='READY' THEN GREATEST(0,EXTRACT(EPOCH FROM
+                CASE WHEN t.state='READY' AND w.state<>'DRAINING' THEN GREATEST(0,EXTRACT(EPOCH FROM
                     clock_timestamp()-COALESCE(t.queue_entered_at,t.created_at))) ELSE 0 END AS queue_age_s,
                 CASE WHEN t.state IN ('FAILED','CANCELLED') THEN
                     CASE WHEN t.error->>'code' IN ({gap_codes}) THEN t.error->>'code'
                          WHEN t.state='CANCELLED' THEN 'copy_cancelled'
                          ELSE 'copy_execution_failed' END END AS gap_code,
-                CASE WHEN t.state='READY' THEN
+                CASE WHEN t.state='READY' AND w.state<>'DRAINING' THEN
                     CASE WHEN t.error->>'code' IN ({wait_codes}) THEN t.error->>'code'
                          ELSE 'copy_admission_wait' END END AS wait_code
               FROM copy_work_tasks t JOIN workflows w ON w.id=t.workflow_id
@@ -79,7 +80,7 @@ async def copy_work_summaries(session, *, job_ids):
               FROM policy_counts
         )
         SELECT w.*,t.pending_tasks,t.queued_tasks,t.running_tasks,t.failed_tasks,
-            t.committed_rows,t.committed_bytes,t.admission_wait_s,t.oldest_queue_age_s,
+            t.committed_rows,t.committed_bytes,t.admission_wait_s,t.sql_runtime_s,t.oldest_queue_age_s,
             t.gap_counts,t.wait_reasons,
             (SELECT COUNT(*) FROM policy_counts p WHERE p.job_id=w.job_id) AS policy_count,
             (SELECT jsonb_agg(to_jsonb(p)-'job_id'-'rank' ORDER BY rank)
@@ -115,8 +116,7 @@ async def copy_work_summaries(session, *, job_ids):
         summaries[str(row['job_id'])] = {
             'state': state, **counts,
             'admission_wait_s': float(row['admission_wait_s'] or 0),
-            # SQL timing is currently transient BatchResult data, not durable state.
-            'sql_runtime_s': None,
+            'sql_runtime_s': float(row['sql_runtime_s'] or 0),
             'oldest_queue_age_s': float(row['oldest_queue_age_s'] or 0),
             'gap_counts': {code: count for code, count in (row['gap_counts'] or {}).items() if count},
             'wait_reasons': {code: count for code, count in (row['wait_reasons'] or {}).items() if count},
