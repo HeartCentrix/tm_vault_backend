@@ -36,6 +36,8 @@ from shared.graph_client import GraphClient
 from shared.multi_app_manager import multi_app_manager
 from shared.message_bus import message_bus
 from shared.storage_rollup import exclude_tier2_storage_dupes_clause
+from shared.copy_observability import copy_work_summaries
+from shared.copy_workflow import copy_work_guards_enabled, initialize_copy_guards
 
 # Sibling-file load: audit-service has a hyphen so a plain
 # `from .activity_backup import` won't resolve. Load via importlib
@@ -760,6 +762,7 @@ async def startup():
     """Initialize message bus and start consumer on startup"""
     from shared import core_metrics
     core_metrics.init()
+    await initialize_copy_guards(async_session_factory)
     await message_bus.connect()
     asyncio.create_task(consume_audit_events())
     asyncio.create_task(_refresh_running_jobs())
@@ -1311,6 +1314,53 @@ async def _list_activities_batch_v2(
         return out
 
 
+async def _attach_activity_copy_work(payload, *, session=None):
+    """One content-free copy aggregate for the final authorized Activity page."""
+    if not copy_work_guards_enabled():
+        return payload
+    rows = []
+    for item in payload.get('items', []):
+        if item.get('operation') != 'BACKUP':
+            continue
+        candidates = item.get('jobIds') or ([] if item.get('batchId') else [item.get('id')])
+        ids = []
+        for value in candidates:
+            try:
+                ids.append(str(uuid.UUID(str(value))))
+            except (ValueError, TypeError):
+                continue
+        if ids:
+            rows.append((item, list(dict.fromkeys(ids))))
+    job_ids = list(dict.fromkeys(job_id for _, ids in rows for job_id in ids))
+    if not job_ids:
+        return payload
+    if session is None:
+        async with async_session_factory() as db:
+            summaries = await copy_work_summaries(db, job_ids=job_ids)
+    else:
+        summaries = await copy_work_summaries(session, job_ids=job_ids)
+    for item, ids in rows:
+        parts = [summaries[job_id] for job_id in ids if job_id in summaries]
+        if not parts:
+            continue
+        states = {part['state'] for part in parts}
+        summary = {'state': next((state for state in (
+            'RUNNING', 'QUEUED', 'WAITING_RESUME', 'FAILED',
+        ) if state in states), 'COMPLETE')}
+        for name in ('pending_tasks', 'queued_tasks', 'running_tasks', 'failed_tasks',
+                     'committed_rows', 'committed_bytes', 'admission_wait_s', 'sql_runtime_s'):
+            summary[name] = sum(part.get(name) or 0 for part in parts)
+        summary['oldest_queue_age_s'] = max(part.get('oldest_queue_age_s') or 0 for part in parts)
+        for name in ('gap_counts', 'wait_reasons'):
+            counts = {}
+            for part in parts:
+                for code, count in (part.get(name) or {}).items():
+                    counts[code] = counts.get(code, 0) + count
+            summary[name] = counts
+        item['copy_work'] = summary
+    return payload
+
+
 @app.get("/api/v1/activity", dependencies=[Depends(require_principal)])
 async def list_activities(
     tenantId: Optional[str] = Query(None),
@@ -1351,7 +1401,7 @@ async def list_activities(
             size=ACTIVITY_SCAN_CAP if settings.BATCH_ROW_REDESIGN_ENABLED else size,
         )
         if not settings.BATCH_ROW_REDESIGN_ENABLED:
-            return legacy
+            return await _attach_activity_copy_work(legacy)
         # Flag on: union backup_batches rows over the legacy slice.
         # v2 rows replace any legacy BACKUP row sharing the same batchId
         # (the click had a backup_batches row inserted — that's authoritative).
@@ -1368,14 +1418,14 @@ async def list_activities(
         merged.sort(key=lambda r: r.get("start_time") or "", reverse=True)
         total = len(merged)
         start_idx = (page - 1) * size
-        return {
+        return await _attach_activity_copy_work({
             "items": merged[start_idx:start_idx + size],
             "total": total,
             "total_capped": bool(legacy.get("total_capped")) or total >= ACTIVITY_SCAN_CAP,
             "page": page,
             "size": size,
             "has_more": (page * size) < total,
-        }
+        })
     # Fall through to the legacy per-Job rollup below.
     async with async_session_factory() as db:
         service_key = _parse_service_type(serviceType)
@@ -1885,13 +1935,13 @@ async def list_activities(
         start_index = (page - 1) * size
         paginated_items = items[start_index:start_index + size]
 
-        return {
+        return await _attach_activity_copy_work({
             "items": paginated_items,
             "total": total,
             "page": page,
             "size": size,
             "has_more": (page * size) < total,
-        }
+        }, session=db)
 
 
 @app.get("/api/v1/activity/export", dependencies=[Depends(require_admin_principal)])
