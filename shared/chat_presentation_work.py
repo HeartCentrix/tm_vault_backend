@@ -95,7 +95,7 @@ async def prepare_presentation_manifest(session, task, params):
             previous.extra_data['chat_presentation_format'].as_integer() == 1)
         prior = prior.distinct(saved.chat_id).order_by(saved.chat_id, previous.created_at.desc(), previous.id.desc()).subquery()
         retain = (prior.c.quality > func.coalesce(winners.c.quality, -1)) & (
-            func.coalesce(winners.c.provenance, '') != 'current_topic_cleared')
+            (func.coalesce(winners.c.provenance, '') != 'current_topic_cleared') | (prior.c.quality < 3))
         path = case((retain, prior.c.folder_path), else_=winners.c.folder_path)
         path = func.coalesce(path, identities.c.stored_path, literal('chats/') + identities.c.chat_id)
         payload = func.json_build_object('chat_id', identities.c.chat_id, 'folder_path', path,

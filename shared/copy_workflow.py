@@ -263,6 +263,12 @@ async def seal_current_copy(continuation):
     if capture is None: return None
     if capture.error is not None: raise CopyWorkConflict('required copy intent persistence failed') from capture.error
     if capture.sealed_result is not None: return capture.sealed_result
+    if capture.partition_id is None and _RESUMING.get() is None:
+        from shared.models import ChatPresentationPlan
+        async with async_session_factory() as session:
+            plan = await session.get(ChatPresentationPlan, capture.snapshot_id)
+        if plan is not None and plan.state not in ('PUBLISHED', 'ABORTED'):
+            await defer_current_copy('CHAT_PRESENTATION', {}, lane='giant')
     encoded=json.dumps(continuation,default=str)
     if len(encoded.encode())>65536: raise ValueError('copy continuation must contain bounded scalars and durable references')
     async with async_session_factory.begin() as session:
@@ -271,6 +277,11 @@ async def seal_current_copy(continuation):
         if workflow is None: return None
         job,snapshot,partition=await _lock_parents(session,workflow)
         workflow=await session.scalar(select(CopyWorkflow).where(CopyWorkflow.id==workflow.id).with_for_update())
+        own = _RESUMING.get()
+        if workflow.state == 'RESUMING' and own is not None and own.workflow_id == workflow.id:
+            if not await verify_copy_resume(session, lock=False):
+                raise CopyWorkConflict('copy publication resume ownership moved')
+            return None
         if workflow.state!='DRAINING' or job.status.value not in ('RUNNING','QUEUED','PENDING','RETRYING') or snapshot.status.value!='IN_PROGRESS':
             raise CopyWorkConflict('copy parent no longer permits suspension')
         leaf=partition or snapshot
@@ -332,6 +343,14 @@ async def begin_resume(factory, workflow_id, owner_id):
         if failed:
             snapshot.extra_data={**(snapshot.extra_data or {}),'copy_required_failed':True,'copy_phase':'FAILED',
                 'degraded_reason':'required database copy did not complete'}
+            failed_presentation = await session.scalar(select(exists(select(CopyWorkTask.id).where(
+                CopyWorkTask.workflow_id == workflow.id, CopyWorkTask.capture_attempt == workflow.capture_attempt,
+                CopyWorkTask.kind == 'CHAT_PRESENTATION', CopyWorkTask.state != 'COMPLETED'))))
+            if failed_presentation:
+                from shared.models import ChatPresentationPlan
+                plan = await session.get(ChatPresentationPlan, snapshot.id)
+                if plan is not None and plan.state != 'PUBLISHED':
+                    plan.state = 'ABORTED'
         else:
             data={**(snapshot.extra_data or {}),'copy_phase':'COMPLETE'}
             data.pop('copy_required_failed',None)

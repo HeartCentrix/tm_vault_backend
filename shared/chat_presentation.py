@@ -3,6 +3,7 @@
 Labels are presentation, never conversation identity. Callers authorize the
 requested snapshots before using these database-only helpers.
 """
+import hashlib
 from uuid import UUID
 
 from sqlalchemy import case, func, select
@@ -15,6 +16,36 @@ MESSAGE_TYPES = ("TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY")
 
 class ChatSelectionError(ValueError):
     """A chat-specific selector cannot prove one captured conversation."""
+
+
+def label_observations(chat_meta, *, owned_chat_ids, current_chats=()):
+    """Resolve only owned labels from evidence already fetched by this user."""
+    current = {row.get('id'): row for row in current_chats}
+    result = []
+    for chat_id in sorted(set(owned_chat_ids) & set(chat_meta)):
+        info, observed = chat_meta[chat_id] or {}, current.get(chat_id, {})
+        topic = observed.get('topic')
+        known_topic = 'topic' in observed and (topic is None or isinstance(topic, str))
+        cached_topic = info.get('topic')
+        name = info.get('displayName') or ''
+        if isinstance(topic, str) and topic.strip():
+            name, quality, source = topic.strip(), 3, 'current_topic'
+        elif not known_topic and isinstance(cached_topic, str) and cached_topic.strip():
+            name, quality, source = cached_topic.strip(), 3, 'cached_topic'
+        else:
+            cleared = known_topic and not (topic or '').strip() and str(observed.get('chatType') or info.get('chatType') or '').lower() != 'oneonone'
+            if cleared and cached_topic and name == cached_topic:
+                name = ''
+            fallback = not name or name.startswith(('Untitled chat #', 'Untitled group #',
+                '1-on-1 Chat (19:', 'Group Chat (19:', 'Chat '))
+            if not name:
+                name = 'Untitled chat #' + hashlib.sha1(chat_id.encode()).hexdigest()[:8]
+            quality = 0 if fallback else 1 if info.get('nameSource') == 'message_author' else 2
+            source = 'current_topic_cleared' if cleared else 'fallback' if fallback else (
+                'author' if quality == 1 else 'participants')
+        result.append({'chat_id': chat_id, 'folder_path': 'chats/' + name,
+            'quality': quality, 'provenance': source})
+    return result
 
 
 def message_chat_id(item=SnapshotItem):
@@ -126,7 +157,9 @@ async def presentation_ready(session, snapshot_id):
     plan = await session.get(ChatPresentationPlan, UUID(str(snapshot_id)))
     if plan is None:
         return True
+    metadata = await session.scalar(select(Snapshot.extra_data).where(Snapshot.id == plan.snapshot_id))
+    if plan.state == 'ABORTED':
+        return bool((metadata or {}).get('copy_required_failed'))
     if plan.state != 'PUBLISHED' or plan.published_count != plan.expected_count:
         return False
-    snapshot = await session.get(Snapshot, plan.snapshot_id)
-    return snapshot is not None and (snapshot.extra_data or {}).get('chat_presentation_format') == 1
+    return (metadata or {}).get('chat_presentation_format') == 1

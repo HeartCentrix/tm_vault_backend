@@ -12086,6 +12086,7 @@ class BackupWorker:
                             chat_meta[_cid_local] = {
                                 **_info,
                                 "displayName": _new_dn,
+                                "nameSource": "message_author",
                                 "memberNames": list(dict.fromkeys(
                                     (_info.get("memberNames") or []) + _names
                                 )),
@@ -12254,6 +12255,15 @@ class BackupWorker:
                     except Exception as _e:
                         print(f"[{self.worker_id}] [USER_CHATS] meta persist failed: {_e}")
 
+                    from shared.chat_presentation import label_observations
+                    from shared.copy_workflow import defer_current_copy
+                    _labels_deferred = None
+                    if snapshot is not None and os.getenv("CHAT_PRESENTATION_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on"):
+                        _owned_chats = set(_shard_chat_ids) if _running_as_chat_shard else set(chat_meta)
+                        _labels_deferred = await defer_current_copy("CHAT_LABELS", {
+                            "labels": label_observations(chat_meta, owned_chat_ids=_owned_chats,
+                                current_chats=chats_raw),
+                        }, lane="micro")
                     # Folder-path normalization. Two passes, designed so a
                     # regression in this run can never clobber a good name
                     # that was already persisted.
@@ -12273,7 +12283,8 @@ class BackupWorker:
                         real_names: List[str] = []
                         migrate_cids: List[str] = []
                         migrate_names: List[str] = []
-                        for cid, info in chat_meta.items():
+                        _rename_meta = chat_meta if _labels_deferred is None else {}
+                        for cid, info in _rename_meta.items():
                             dn = (info or {}).get("displayName")
                             if not dn:
                                 continue
@@ -16568,6 +16579,9 @@ class BackupWorker:
             raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before terminal write")
         if await has_pending_copy(session, snapshot_id=snap.id):
             return "deferred_copy"
+        from shared.chat_presentation import presentation_ready
+        if resource.type == ResourceType.USER_CHATS and not await presentation_ready(session, snap.id):
+            return "deferred_copy"
         _snap_extra = snap.extra_data or {}
         if not may_finalize_snapshot_status(snap.status):
             print(
@@ -17745,6 +17759,12 @@ class BackupWorker:
         async with async_session_factory() as pending_session:
             if await has_pending_copy(pending_session, snapshot_id=snapshot_id):
                 return None
+            from shared.chat_presentation import presentation_ready
+            # A pending plan is enqueued below, after all source shards settle.
+            from shared.models import ChatPresentationPlan
+            _presentation_plan = await pending_session.get(ChatPresentationPlan, snapshot_id)
+            if _presentation_plan is not None and _presentation_plan.state == "PUBLISHING":
+                return None
             if copy_work_guards_enabled():
                 copy_snapshot_head = await pending_session.get(Snapshot, snapshot_id)
         from shared.copy_workflow import pending_copy_sql, verify_copy_resume
@@ -17768,6 +17788,16 @@ class BackupWorker:
                     waiting = await self._seal_copy_handoff(copy_snapshot, {"resume_kind": "partition_union"})
                     if waiting is not None:
                         return None
+                elif (not preempted and _presentation_plan is not None
+                      and _presentation_plan.state == "PENDING"):
+                    # Failed source shards still need a terminal presentation
+                    # receipt; publishing their labels cannot promote content.
+                    waiting = await self._seal_copy_handoff(copy_snapshot, {"resume_kind": "partition_union"})
+                    if waiting is not None:
+                        return None
+        async with async_session_factory() as receipt_session:
+            if not await presentation_ready(receipt_session, snapshot_id):
+                return None
         copy_guard = pending_copy_sql(snapshot_expr="s.id")
         async with async_session_factory() as session:
             if not await verify_copy_resume(session):
@@ -29933,6 +29963,9 @@ class BackupWorker:
         """
         from shared.copy_workflow import has_pending_copy
         if result.get("copy_waiting") or await has_pending_copy(session, snapshot_id=snapshot.id):
+            return False
+        from shared.chat_presentation import presentation_ready
+        if not await presentation_ready(session, snapshot.id):
             return False
         if result.get("chat_inventory_format") == 1:
             # New-format handler already settled under its original work
