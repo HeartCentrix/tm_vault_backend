@@ -198,24 +198,30 @@ async def test_server_transaction_outlives_task_lease_without_reclaim_or_extra_c
         (await db.get(models.CopyWorkTask, task_id)).lease_expires_at = datetime.now(timezone.utc) + timedelta(milliseconds=100)
     started = asyncio.Event()
     original = copy_executor.copy_manifest_batch
-    async def slow(db, task, **kwargs):
-        started.set()
-        await db.execute(text('SELECT pg_sleep(0.35)'))
-        return await original(db, task, **kwargs)
-    monkeypatch.setattr(copy_executor, 'copy_manifest_batch', slow)
-    execution = asyncio.create_task(api().run_batch(store.factory, claim))
-    try:
-        await asyncio.wait_for(started.wait(), timeout=2)
-        async with store.factory.begin() as db:
-            await db.execute(text('SELECT pg_sleep(0.15)'))
-            assert await copy_work.claim(db, owner_id=uuid4()) is None
-            assert not await db.scalar(text('SELECT pg_try_advisory_xact_lock(420018,1000000)'))
-            assert not await db.scalar(text('SELECT pg_try_advisory_xact_lock(420020,0)'))
-        assert (await execution).status == 'COMPLETED'
-    finally:
-        if not execution.done():
-            execution.cancel()
-        await asyncio.gather(execution, return_exceptions=True)
+    gate = task_id.int % (2 ** 31)
+    async with store.engine.connect() as blocker:
+        await blocker.execute(text('SELECT pg_advisory_xact_lock(433010,:gate)'), {'gate':gate})
+        async def slow(db, task, **kwargs):
+            started.set()
+            # Hold an actual server statement until the observer releases it.
+            # A fixed sleep races a busy test process and can finish too early.
+            await db.execute(text('SELECT pg_advisory_xact_lock(433010,:gate)'), {'gate':gate})
+            return await original(db, task, **kwargs)
+        monkeypatch.setattr(copy_executor, 'copy_manifest_batch', slow)
+        execution = asyncio.create_task(api().run_batch(store.factory, claim))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=2)
+            async with store.factory.begin() as db:
+                await db.execute(text('SELECT pg_sleep(0.15)'))
+                assert await copy_work.claim(db, owner_id=uuid4()) is None
+                assert not await db.scalar(text('SELECT pg_try_advisory_xact_lock(420018,1000000)'))
+                assert not await db.scalar(text('SELECT pg_try_advisory_xact_lock(420020,0)'))
+            await blocker.rollback()
+            assert (await execution).status == 'COMPLETED'
+        finally:
+            await blocker.rollback()
+            if not execution.done(): execution.cancel()
+            await asyncio.gather(execution, return_exceptions=True)
 
 
 async def test_activation_rejects_live_legacy_sql_then_persists_epoch(store):
