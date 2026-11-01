@@ -145,3 +145,31 @@ async def test_concurrent_bulk_resource_continuations_finish_shared_job(store, m
         assert (await db.get(models.Job, job_id)).status == models.JobStatus.COMPLETED
         assert not any(w.parent_settle_pending for w in
             (await db.scalars(select(models.CopyWorkflow).where(models.CopyWorkflow.id.in_(workflows)))).all())
+
+
+async def test_expired_callback_after_partition_commit_recovers_parent_without_abandoning_copy(store,monkeypatch,bw):
+    from datetime import datetime,timedelta,timezone
+    scope,workflows=await partition_work(store,monkeypatch,bw)
+    worker=worker_for(bw)
+    finish=copy_workflow.finish_resume
+    monkeypatch.setattr(copy_workflow,'finish_resume',AsyncMock(side_effect=RuntimeError('crash before workflow commit')))
+    with pytest.raises(RuntimeError,match='crash before workflow commit'):
+        await worker.resume_copy_workflow(workflows[0])
+    monkeypatch.setattr(copy_workflow,'finish_resume',finish)
+    async with store.factory.begin() as db:
+        (await db.get(models.CopyWorkControl,'global')).enabled=True
+    runner=CopyWorkRunner(store.factory,worker.resume_copy_workflow)
+    try:
+        assert await runner.recover_once()==0
+        async with store.factory.begin() as db:
+            wf=await db.get(models.CopyWorkflow,workflows[0])
+            assert wf.state=='RESUMING'
+            wf.lease_expires_at=datetime.now(timezone.utc)-timedelta(seconds=1)
+        assert await runner.recover_once()==1
+    finally:await runner.close()
+    async with store.factory() as db:
+        head=await db.get(models.Snapshot,scope.snapshot_id)
+        assert head.status==models.SnapshotStatus.COMPLETED
+        assert (await db.get(models.Job,head.job_id)).status==models.JobStatus.COMPLETED
+        wf=await db.get(models.CopyWorkflow,workflows[0])
+        assert wf.state=='COMPLETED' and not wf.parent_settle_pending

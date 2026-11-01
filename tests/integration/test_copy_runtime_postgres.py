@@ -258,3 +258,36 @@ async def test_future_expected_leaf_fence_fails_closed_and_logs_without_unpinnin
         assert await db.scalar(select(func.count()).select_from(models.CopyWorkItem)
             .where(models.CopyWorkItem.task_id == task_id)) == 1
     await runner.close()
+
+
+@pytest.mark.parametrize('parent_state',['RUNNING','COMPLETED','FAILED'])
+async def test_recovery_does_not_abandon_a_resume_that_committed_its_leaf(store,parent_state):
+    target,task_id,workflow_id,_=await pending(store,task_state='COMPLETED')
+    current=await copy_workflow.begin_resume(store.factory,workflow_id,uuid4())
+    async with store.factory.begin() as db:
+        snapshot=await db.get(models.Snapshot,target.snapshot_id)
+        snapshot.status=models.SnapshotStatus.COMPLETED
+        (await db.get(models.Job,snapshot.job_id)).status=models.JobStatus(parent_state)
+    runner=api().CopyWorkRunner(store.factory,completer(store,[]))
+    await runner._initialize()
+    assert not await runner._abandon(workflow_id)
+    assert workflow_id not in await runner._orphan_candidates()
+    async with store.factory() as db:
+        assert (await db.get(models.CopyWorkflow,workflow_id)).state=='RESUMING'
+        assert (await db.get(models.CopyWorkTask,task_id)).state=='COMPLETED'
+    await runner.close()
+
+
+async def test_terminal_leaf_does_not_hide_explicit_parent_cancellation(store):
+    target,_,workflow_id,_=await pending(store,task_state='COMPLETED')
+    await copy_workflow.begin_resume(store.factory,workflow_id,uuid4())
+    async with store.factory.begin() as db:
+        snapshot=await db.get(models.Snapshot,target.snapshot_id)
+        snapshot.status=models.SnapshotStatus.COMPLETED
+        (await db.get(models.Job,snapshot.job_id)).status=models.JobStatus.CANCELLED
+    runner=api().CopyWorkRunner(store.factory,completer(store,[]))
+    await runner._initialize()
+    assert await runner._abandon(workflow_id)
+    async with store.factory() as db:
+        assert (await db.get(models.CopyWorkflow,workflow_id)).state=='CANCELLED'
+    await runner.close()

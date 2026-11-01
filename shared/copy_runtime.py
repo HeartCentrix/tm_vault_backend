@@ -230,6 +230,9 @@ class CopyWorkRunner:
                         AND NOT EXISTS (SELECT 1 FROM worker_heartbeats wh
                             WHERE wh.worker_id=CASE WHEN cw.partition_id IS NULL THEN s.lease_owner_id ELSE p.lease_owner_id END
                               AND wh.last_seen_at>NOW()-(:heartbeat*INTERVAL '1 second'))))
+                AND NOT (cw.state='RESUMING' AND j.status::text<>'CANCELLED'
+                    AND CASE WHEN cw.partition_id IS NULL THEN s.status::text ELSE p.status END
+                        IN ('COMPLETED','PARTIAL','FAILED'))
                 AND (CAST(:after_created AS timestamptz) IS NULL
                     OR (cw.created_at,cw.id)>(CAST(:after_created AS timestamptz),CAST(:after_id AS uuid)))
                 ORDER BY cw.created_at,cw.id LIMIT :limit
@@ -256,6 +259,14 @@ class CopyWorkRunner:
             workflow = await session.scalar(select(CopyWorkflow).where(CopyWorkflow.id == workflow_id)
                                            .with_for_update().execution_options(populate_existing=True))
             if workflow.state not in copy_work.ACTIVE_WORKFLOWS:
+                return False
+            leaf = partition or snapshot
+            if (workflow.state == 'RESUMING' and leaf is not None and job is not None
+                and getattr(job.status, 'value', job.status) != 'CANCELLED'
+                and getattr(leaf.status, 'value', leaf.status) in {'COMPLETED','PARTIAL','FAILED'}):
+                # The callback commits its leaf before finishing the workflow.
+                # Its live/expired resume lease, not orphan cancellation, owns
+                # that interval. Expired claims replay parent settlement.
                 return False
             now = await session.scalar(select(func.clock_timestamp()))
             cancelled = job is not None and getattr(job.status, 'value', job.status) == 'CANCELLED'
