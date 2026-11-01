@@ -287,6 +287,7 @@ async def test_resume_uses_persisted_continuation_and_never_restarts_graph(
     worker._heartbeat = types.SimpleNamespace(worker_uuid=owner)
     worker.get_graph_client = AsyncMock(side_effect=AssertionError("resume must not request Graph"))
     worker._publish_copy_mail_state = AsyncMock()
+    worker._settle_copy_parent = AsyncMock(return_value=True)
     worker.complete_snapshot = AsyncMock()
     worker._stamp_resource_from_snapshot_row = AsyncMock()
     worker.update_job_status = AsyncMock()
@@ -339,6 +340,7 @@ async def test_existing_worker_starts_and_closes_copy_recovery_runner_when_guard
     worker.worker_id = "test-worker"
     worker._backup_queue_name = "backup.normal"
     worker.initialize = AsyncMock()
+    monkeypatch.setattr(worker_module.message_bus, "connect", AsyncMock())
     worker._supervised_consume = AsyncMock()
     await worker.start()
     assert trace == ["constructed", "started", "closed"]
@@ -393,3 +395,83 @@ async def test_worker_rejects_invalid_copy_limits_through_runtime_validation(
     worker.initialize = AsyncMock()
     with pytest.raises(ValueError, match="copy "):
         await worker.start()
+
+
+async def test_actual_start_runs_sql_recovery_before_unavailable_broker(monkeypatch, worker_module, workflow):
+    import asyncio
+    import shared.heartbeat as heartbeat
+    import shared.lease as lease
+    import shared.reclaim as reclaim
+
+    started, entered = asyncio.Event(), asyncio.Event()
+    runtime = types.ModuleType('shared.copy_runtime')
+    class Runner:
+        def __init__(self, *args, **kwargs): pass
+        async def start(self): started.set()
+        async def close(self): pass
+    class Heartbeat:
+        def __init__(self, **kwargs):
+            self.worker_uuid, self.replica_id = uuid.uuid4(), 'test-replica'
+        async def start(self): pass
+    class Extender:
+        def __init__(self, **kwargs): pass
+        async def start(self): pass
+    async def unavailable():
+        entered.set()
+        await asyncio.Event().wait()
+    runtime.CopyWorkRunner = Runner
+    workflow.initialize_copy_guards = AsyncMock()
+    workflow.copy_work_guards_enabled = lambda: True
+    monkeypatch.setitem(sys.modules, 'shared.copy_runtime', runtime)
+    monkeypatch.setattr(heartbeat, 'HeartbeatThread', Heartbeat)
+    monkeypatch.setattr(lease, 'LeaseExtender', Extender)
+    monkeypatch.setattr(reclaim, 'reclaim_for_replica', AsyncMock(return_value=0))
+    monkeypatch.setattr(worker_module.message_bus, 'connect', unavailable)
+    worker = worker_module.BackupWorker.__new__(worker_module.BackupWorker)
+    worker.worker_id, worker._backup_queue_name = 'test-worker', 'backup.normal'
+    task = asyncio.create_task(worker.start())
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        assert started.is_set(), 'broker outage must not prevent durable SQL recovery startup'
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize('source_result', [
+    {'files_failed': 2, 'enumeration_incomplete': True},
+    {'files_failed': 0, 'enumeration_incomplete': True},
+])
+async def test_partition_resume_preserves_source_loss_after_successful_copy(
+    monkeypatch, worker_module, workflow, source_result,
+):
+    from contextlib import nullcontext
+    sid, rid, tid, jid, wid, pid, owner = (uuid.uuid4() for _ in range(7))
+    snapshot = types.SimpleNamespace(id=sid, extra_data={}, status=worker_module.SnapshotStatus.IN_PROGRESS)
+    resource = types.SimpleNamespace(id=rid, type=worker_module.ResourceType.SHAREPOINT_SITE)
+    partition = types.SimpleNamespace(id=pid, lease_owner_id=owner, lease_token=2, partition_type='SHAREPOINT_DRIVES')
+    persisted = types.SimpleNamespace(target_snapshot_id=sid, partition_id=pid, job_id=jid,
+        resource_id=rid, tenant_id=tid, continuation={'resume_kind':'partition', 'result':source_result})
+    workflow.begin_resume = AsyncMock(return_value=persisted)
+    workflow.finish_resume = AsyncMock(return_value=True)
+    workflow.resuming_copy_workflow = lambda _: nullcontext()
+    class Session:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def get(self, model, key, **kwargs):
+            return {'Snapshot':snapshot,'Resource':resource,'Tenant':types.SimpleNamespace(id=tid),
+                    'Job':types.SimpleNamespace(id=jid),'SnapshotPartition':partition}.get(model.__name__)
+        async def execute(self, *args, **kwargs): return types.SimpleNamespace(one=lambda:(1,7))
+    monkeypatch.setattr(worker_module, 'async_session_factory', Session)
+    worker = worker_module.BackupWorker.__new__(worker_module.BackupWorker)
+    worker.worker_id = 'test-worker'
+    worker._heartbeat = types.SimpleNamespace(worker_uuid=owner)
+    worker._mark_partition_terminal = AsyncMock()
+    worker._emit_partition_audit = AsyncMock()
+    worker._finalize_partitioned_snapshot = AsyncMock()
+    worker._settle_copy_parent = AsyncMock(return_value=True)
+    await worker.resume_copy_workflow(wid)
+    fs = worker._mark_partition_terminal.await_args.kwargs['failure_state']
+    assert fs and fs['enumeration_incomplete'] is True
+    assert fs['files_failed'] >= source_result['files_failed']
+    assert worker._emit_partition_audit.await_args.args[1] == 'PARTIAL'

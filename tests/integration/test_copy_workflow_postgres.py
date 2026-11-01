@@ -50,6 +50,13 @@ async def test_seal_hands_off_leaf_then_resume_waits_for_all_required_tasks(stor
         await db.execute(update(models.Snapshot).where(models.Snapshot.id==scope.snapshot_id).values(status=models.SnapshotStatus.COMPLETED))
     await module.finish_resume(store.factory,workflow.id,owner)
     async with store.factory() as db:
+        assert await module.has_pending_copy(db,snapshot_id=scope.snapshot_id)
+    assert not await module.finish_parent_settlement(store.factory,workflow.id)
+    async with store.factory.begin() as db:
+        snap=await db.get(models.Snapshot,scope.snapshot_id)
+        (await db.get(models.Job,snap.job_id)).status=models.JobStatus.COMPLETED
+    assert await module.finish_parent_settlement(store.factory,workflow.id)
+    async with store.factory() as db:
         assert not await module.has_pending_copy(db,snapshot_id=scope.snapshot_id)
 
 

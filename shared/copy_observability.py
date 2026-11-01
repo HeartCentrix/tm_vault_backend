@@ -16,7 +16,7 @@ _WAIT_CODES = (
     'copy_aggregate_busy', 'copy_protocol_disabled', 'copy_lock_timeout', 'copy_admission_wait',
 )
 _COUNTS = """
-    COUNT(*) FILTER (WHERE state IN ('READY','RUNNING')) AS pending_tasks,
+    COUNT(*) FILTER (WHERE state IN ('READY','RUNNING','CAPTURING')) AS pending_tasks,
     COUNT(*) FILTER (WHERE state='READY') AS queued_tasks,
     COUNT(*) FILTER (WHERE state='RUNNING') AS running_tasks,
     COUNT(*) FILTER (WHERE state IN ('FAILED','CANCELLED')) AS failed_tasks,
@@ -42,16 +42,17 @@ async def copy_work_summaries(session, *, job_ids):
     wait_codes = ','.join(f"'{code}'" for code in _WAIT_CODES)
     rows = (await session.execute(text(f"""
         WITH workflows AS MATERIALIZED (
-            SELECT id,job_id,state,capture_attempt
+            SELECT id,job_id,state,capture_attempt,parent_settle_pending
               FROM copy_workflows WHERE job_id=ANY(CAST(:ids AS uuid[]))
         ), workflow_counts AS (
             SELECT job_id,
-                bool_or(state IN ('WAITING','RESUMING')) AS awaiting_resume,
+                bool_or(state IN ('WAITING','RESUMING') OR parent_settle_pending) AS awaiting_resume,
                 bool_or(state='DRAINING') AS draining,
                 bool_or(state IN ('PARTIAL','FAILED','CANCELLED')) AS failed
               FROM workflows GROUP BY job_id
         ), tasks AS MATERIALIZED (
-            SELECT w.job_id,t.sla_policy_id,t.state,t.row_count,t.bytes_count,t.execution_s,
+            SELECT w.job_id,t.sla_policy_id,CASE WHEN w.state='DRAINING' AND t.state='READY'
+                    THEN 'CAPTURING' ELSE t.state END AS state,t.row_count,t.bytes_count,t.execution_s,
                 COALESCE(t.cumulative_wait_s,0) + CASE WHEN t.state='READY' AND w.state<>'DRAINING'
                     THEN GREATEST(0,EXTRACT(EPOCH FROM
                         clock_timestamp()-COALESCE(t.queue_entered_at,t.created_at))) ELSE 0 END AS wait_s,
@@ -108,7 +109,7 @@ async def copy_work_summaries(session, *, job_ids):
         elif row['awaiting_resume']:
             state = 'WAITING_RESUME'
         elif row['draining']:
-            state = 'QUEUED'
+            state = 'CAPTURING'
         elif row['failed'] or counts['failed_tasks']:
             state = 'FAILED'
         else:

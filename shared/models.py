@@ -1785,11 +1785,13 @@ class CopyWorkflow(Base):
     lease_expires_at = Column(DateTime(timezone=True))
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     completed_at = Column(DateTime(timezone=True))
+    parent_settle_pending = Column(Boolean, nullable=False, default=False, server_default='false')
     __table_args__ = (
         Index('ix_copy_workflow_snapshot_state', 'target_snapshot_id', 'state'),
         Index('ix_copy_workflow_partition_state', 'partition_id', 'state'),
         Index('ix_copy_workflow_job_state', 'job_id', 'state'),
         Index('ix_copy_workflow_recovery', 'state', 'created_at', 'id'),
+        Index('ix_copy_workflow_parent_settle', 'parent_settle_pending', 'created_at', 'id'),
         CheckConstraint("state IN ('DRAINING','WAITING','RESUMING','COMPLETED','PARTIAL','FAILED','CANCELLED')", name='ck_copy_workflow_state'),
     )
 

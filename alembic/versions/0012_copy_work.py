@@ -133,12 +133,14 @@ def upgrade():
         op.execute(statement)
     op.execute(_INPUT_DDL)
     op.execute('ALTER TABLE copy_workflows ADD COLUMN IF NOT EXISTS capture_attempt bigint NOT NULL DEFAULT 0')
+    op.execute('ALTER TABLE copy_workflows ADD COLUMN IF NOT EXISTS parent_settle_pending boolean NOT NULL DEFAULT false')
+    op.execute('CREATE INDEX IF NOT EXISTS ix_copy_workflow_parent_settle ON copy_workflows(parent_settle_pending,created_at,id)')
     op.execute('ALTER TABLE copy_work_tasks ADD COLUMN IF NOT EXISTS capture_attempt bigint NOT NULL DEFAULT 0')
     op.execute('ALTER TABLE copy_work_tasks ADD COLUMN IF NOT EXISTS execution_s double precision NOT NULL DEFAULT 0')
     op.execute('CREATE INDEX IF NOT EXISTS ix_copy_workflow_recovery ON copy_workflows(state,created_at,id)')
     op.execute("""CREATE OR REPLACE FUNCTION tmvault_copy_workflow_delete_guard() RETURNS trigger LANGUAGE plpgsql AS $$
         BEGIN
-          IF OLD.state IN ('DRAINING','WAITING','RESUMING') THEN
+          IF OLD.state IN ('DRAINING','WAITING','RESUMING') OR OLD.parent_settle_pending THEN
             RAISE EXCEPTION 'active copy workflow must settle before parent deletion' USING ERRCODE='55000';
           END IF;
           RETURN OLD;
@@ -148,7 +150,7 @@ def upgrade():
 
 def downgrade():
     connection = op.get_bind()
-    active = connection.execute(text("SELECT EXISTS(SELECT 1 FROM copy_workflows WHERE state IN ('DRAINING','WAITING','RESUMING')) OR EXISTS(SELECT 1 FROM copy_work_control WHERE enabled)" )).scalar()
+    active = connection.execute(text("SELECT EXISTS(SELECT 1 FROM copy_workflows WHERE state IN ('DRAINING','WAITING','RESUMING') OR parent_settle_pending) OR EXISTS(SELECT 1 FROM copy_work_control WHERE enabled)" )).scalar()
     if active:
         raise RuntimeError('active copy work must be drained and disabled before downgrade')
     for table in ('copy_work_inputs','copy_work_items','copy_work_tasks','copy_work_queues','copy_workflows','copy_work_control'):

@@ -49,7 +49,7 @@ async def copy_guard_db(monkeypatch):
             "CREATE TABLE snapshot_items (id uuid PRIMARY KEY, snapshot_id uuid REFERENCES snapshots(id), "
             "tenant_id uuid, blob_path text, content_checksum text, content_size bigint, created_at timestamp)",
             "CREATE TABLE copy_workflows (id uuid PRIMARY KEY, job_id uuid, target_snapshot_id uuid, "
-            "partition_id uuid, state text DEFAULT 'WAITING')",
+            "partition_id uuid, state text DEFAULT 'WAITING', parent_settle_pending boolean DEFAULT false)",
             "CREATE TABLE copy_work_tasks (id uuid PRIMARY KEY, workflow_id uuid, state text DEFAULT 'READY', "
             "params json DEFAULT '{}', lease_expires_at timestamptz, generation bigint DEFAULT 0, error json)",
             "CREATE TABLE copy_work_items (task_id uuid, ordinal bigint, source_snapshot_id uuid, payload json)",

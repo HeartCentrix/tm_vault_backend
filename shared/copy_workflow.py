@@ -22,6 +22,7 @@ _COLLECTION = ContextVar('required_copy_collection', default=None)
 _RESUMING = ContextVar('resuming_copy_workflow', default=None)
 _RESUME_CLAIM = ContextVar('copy_resume_claim', default=None)
 _PROTOCOL_MODE = ContextVar('copy_database_protocol', default=None)
+_PARENT_SETTLEMENT = ContextVar('copy_parent_settlement', default=False)
 
 
 @dataclass
@@ -67,7 +68,7 @@ async def initialize_copy_guards(factory):
     try:
         async with factory() as session:
             control = await session.get(CopyWorkControl, 'global')
-            pending = await session.scalar(select(exists(select(CopyWorkflow.id).where(CopyWorkflow.state.in_(ACTIVE_WORKFLOWS)))))
+            pending = await session.scalar(select(exists(select(CopyWorkflow.id).where(((CopyWorkflow.state.in_(ACTIVE_WORKFLOWS)) | CopyWorkflow.parent_settle_pending)))))
             # Epoch mode is inherited by this worker's handler tasks. A local
             # flag rollback cannot silently mix legacy writers with the active
             # database protocol. Disabling the epoch requires drain/restart.
@@ -119,6 +120,17 @@ def resuming_copy_workflow(workflow_id):
         _RESUMING.reset(token)
 
 
+@contextmanager
+def settling_copy_parent():
+    # Completed copy workflows carry a parent-only retry obligation. They do
+    # not block each other's last-finisher transaction; active copies still do.
+    token = _PARENT_SETTLEMENT.set(True)
+    try:
+        yield
+    finally:
+        _PARENT_SETTLEMENT.reset(token)
+
+
 def _conditions(snapshot_expr=None, partition_expr=None, job_expr=None):
     values=[]
     if snapshot_expr is not None: values.append('cw.target_snapshot_id='+snapshot_expr)
@@ -132,7 +144,9 @@ def pending_copy_sql(snapshot_expr=None, partition_expr=None, job_expr=None):
     if not copy_work_guards_enabled(): return 'TRUE'
     own = _RESUMING.get()
     exclusion = " AND cw.id <> '"+str(own.workflow_id)+"'::uuid" if own else ''
-    predicate = "NOT EXISTS (SELECT 1 FROM copy_workflows cw WHERE cw.state IN ('DRAINING','WAITING','RESUMING') AND "+_conditions(snapshot_expr,partition_expr,job_expr)+exclusion+')'
+    active = "cw.state IN ('DRAINING','WAITING','RESUMING')"
+    if not _PARENT_SETTLEMENT.get(): active = '('+active+' OR cw.parent_settle_pending)'
+    predicate = "NOT EXISTS (SELECT 1 FROM copy_workflows cw WHERE "+active+" AND "+_conditions(snapshot_expr,partition_expr,job_expr)+exclusion+')'
     if own:
         predicate += " AND EXISTS (SELECT 1 FROM copy_workflows rw WHERE rw.id='"+str(own.workflow_id)+"'::uuid AND rw.state='RESUMING' AND rw.lease_owner_id='"+str(own.owner_id)+"'::uuid AND rw.generation="+str(own.generation)+" AND rw.parent_lease_token="+str(own.parent_lease_token)+")"
     return '('+predicate+')'
@@ -142,7 +156,7 @@ def copy_source_pinned_sql(snapshot_expr):
     if not copy_work_guards_enabled(): return 'TRUE'
     value='CAST(('+snapshot_expr+') AS text)'
     return """NOT EXISTS (SELECT 1 FROM copy_workflows cw
-        WHERE cw.state IN ('DRAINING','WAITING','RESUMING') AND (
+        WHERE (cw.state IN ('DRAINING','WAITING','RESUMING') OR cw.parent_settle_pending) AND (
           cw.target_snapshot_id=("""+snapshot_expr+""") OR EXISTS (
             SELECT 1 FROM copy_work_tasks ct LEFT JOIN copy_work_items ci ON ci.task_id=ct.id
              WHERE ct.workflow_id=cw.id AND (ci.source_snapshot_id=("""+snapshot_expr+""")
@@ -154,7 +168,7 @@ def copy_blob_pinned_sql(blob_expr):
     if not copy_work_guards_enabled(): return 'TRUE'
     return """NOT EXISTS (SELECT 1 FROM copy_work_items ci JOIN copy_work_tasks ct ON ct.id=ci.task_id
         JOIN copy_workflows cw ON cw.id=ct.workflow_id
-        WHERE cw.state IN ('DRAINING','WAITING','RESUMING') AND ci.payload->>'blob_path'=("""+blob_expr+"""))
+        WHERE (cw.state IN ('DRAINING','WAITING','RESUMING') OR cw.parent_settle_pending) AND ci.payload->>'blob_path'=("""+blob_expr+"""))
       AND NOT EXISTS (SELECT 1 FROM snapshot_items csi WHERE csi.blob_path=("""+blob_expr+""")
         AND NOT ("""+copy_source_pinned_sql('csi.snapshot_id')+"""))"""
 
@@ -162,7 +176,9 @@ def copy_blob_pinned_sql(blob_expr):
 async def has_pending_copy(session, *, snapshot_id=None, partition_id=None, job_id=None):
     if not copy_work_guards_enabled(): return False
     if _RESUMING.get() is not None and not await verify_copy_resume(session, lock=False): return True
-    filters=[CopyWorkflow.state.in_(ACTIVE_WORKFLOWS)]
+    active=CopyWorkflow.state.in_(ACTIVE_WORKFLOWS)
+    if not _PARENT_SETTLEMENT.get(): active=active | CopyWorkflow.parent_settle_pending
+    filters=[active]
     for column,value in ((CopyWorkflow.target_snapshot_id,snapshot_id),(CopyWorkflow.partition_id,partition_id),(CopyWorkflow.job_id,job_id)):
         if value is not None: filters.append(column==_uuid(value))
     if _RESUMING.get(): filters.append(CopyWorkflow.id!=_RESUMING.get().workflow_id)
@@ -297,8 +313,7 @@ async def begin_resume(factory, workflow_id, owner_id):
         if terminal:
             workflow.state='COMPLETED' if (partition.status=='COMPLETED' if partition else snapshot.status.value=='COMPLETED') else 'PARTIAL'
             workflow.completed_at=now
-            await session.execute(delete(CopyWorkItem).where(CopyWorkItem.task_id.in_(select(CopyWorkTask.id).where(CopyWorkTask.workflow_id==workflow.id))))
-            await session.execute(delete(CopyWorkInput).where(CopyWorkInput.task_id.in_(select(CopyWorkTask.id).where(CopyWorkTask.workflow_id==workflow.id))))
+            workflow.parent_settle_pending=True
             return None
         if job.status.value not in ('RUNNING','QUEUED','PENDING','RETRYING'):
             workflow.state='CANCELLED';workflow.completed_at=now
@@ -338,15 +353,34 @@ async def finish_resume(factory, workflow_id, owner_id, failed=False):
         gaps=await session.scalar(select(exists(select(CopyWorkTask.id).where(CopyWorkTask.workflow_id==workflow.id,CopyWorkTask.capture_attempt==workflow.capture_attempt,CopyWorkTask.state!='COMPLETED'))))
         workflow.state='PARTIAL' if failed or gaps else 'COMPLETED'
         workflow.completed_at=await session.scalar(select(func.clock_timestamp()))
+        workflow.parent_settle_pending=True
         workflow.lease_owner_id=None;workflow.lease_expires_at=None
-        await session.execute(delete(CopyWorkItem).where(CopyWorkItem.task_id.in_(select(CopyWorkTask.id).where(CopyWorkTask.workflow_id==workflow.id))))
-        await session.execute(delete(CopyWorkInput).where(CopyWorkInput.task_id.in_(select(CopyWorkTask.id).where(CopyWorkTask.workflow_id==workflow.id))))
+        return True
+
+
+async def finish_parent_settlement(factory, workflow_id):
+    """Release the retry obligation and pins only after durable parent writes."""
+    async with factory.begin() as session:
+        workflow=await session.get(CopyWorkflow,_uuid(workflow_id))
+        if workflow is None: return True
+        job,snapshot,_=await _lock_parents(session,workflow)
+        workflow=await session.scalar(select(CopyWorkflow).where(CopyWorkflow.id==workflow.id)
+            .with_for_update().execution_options(populate_existing=True))
+        if not workflow.parent_settle_pending: return True
+        if workflow.state in ACTIVE_WORKFLOWS: return False
+        if snapshot is None or job is None: return False
+        if snapshot.status.value not in ('COMPLETED','PARTIAL','FAILED') or job.status.value not in ('COMPLETED','FAILED','CANCELLED'):
+            return False
+        workflow.parent_settle_pending=False
+        task_ids=select(CopyWorkTask.id).where(CopyWorkTask.workflow_id==workflow.id)
+        await session.execute(delete(CopyWorkItem).where(CopyWorkItem.task_id.in_(task_ids)))
+        await session.execute(delete(CopyWorkInput).where(CopyWorkInput.task_id.in_(task_ids)))
         return True
 
 
 async def cancel_copy_work(session, *, snapshot_id=None, job_id=None, workflow_id=None, reason='cancelled', terminal_state='CANCELLED'):
     if not copy_work_guards_enabled(): return 0
-    filters=[CopyWorkflow.state.in_(ACTIVE_WORKFLOWS)]
+    filters=[CopyWorkflow.state.in_(ACTIVE_WORKFLOWS) | CopyWorkflow.parent_settle_pending]
     if snapshot_id is not None: filters.append(CopyWorkflow.target_snapshot_id==_uuid(snapshot_id))
     if job_id is not None: filters.append(CopyWorkflow.job_id==_uuid(job_id))
     if workflow_id is not None: filters.append(CopyWorkflow.id==_uuid(workflow_id))
@@ -361,7 +395,7 @@ async def cancel_copy_work(session, *, snapshot_id=None, job_id=None, workflow_i
             if task.state not in TERMINAL_TASKS:
                 task.state='CANCELLED';task.error={'code':'copy_cancelled','reason':str(reason)[:80]}
                 task.generation+=1;task.lease_owner_id=None;task.lease_expires_at=None
-        workflow.state=terminal_state;workflow.generation+=1;workflow.completed_at=await session.scalar(select(func.clock_timestamp()))
+        workflow.state=terminal_state;workflow.parent_settle_pending=False;workflow.generation+=1;workflow.completed_at=await session.scalar(select(func.clock_timestamp()))
         leaf=partition or snapshot
         if (terminal_state=='FAILED' and snapshot is not None and leaf is not None
             and leaf.lease_token==workflow.parent_lease_token and snapshot.status.value=='IN_PROGRESS'):

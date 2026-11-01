@@ -142,9 +142,12 @@ class CopyWorkRunner:
         async with self.factory() as session:
             await self._short_settings(session)
             now = await session.scalar(select(func.clock_timestamp()))
+            eligible = ((CopyWorkflow.state == 'WAITING') |
+                ((CopyWorkflow.state == 'RESUMING') &
+                 ((CopyWorkflow.lease_expires_at.is_(None)) | (CopyWorkflow.lease_expires_at <= now))) |
+                CopyWorkflow.parent_settle_pending)
             query = select(CopyWorkflow.id, CopyWorkflow.created_at).where(
-                ((CopyWorkflow.state == 'WAITING') | ((CopyWorkflow.state == 'RESUMING') &
-                    ((CopyWorkflow.lease_expires_at.is_(None)) | (CopyWorkflow.lease_expires_at <= now)))),
+                eligible,
                 ~exists(select(CopyWorkTask.id).where(CopyWorkTask.workflow_id == CopyWorkflow.id,
                     CopyWorkTask.capture_attempt == CopyWorkflow.capture_attempt,
                     CopyWorkTask.state.notin_(copy_work.TERMINAL_TASKS))))

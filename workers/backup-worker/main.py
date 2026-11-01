@@ -4383,7 +4383,6 @@ class BackupWorker:
     async def initialize(self):
         from shared.copy_workflow import initialize_copy_guards
         await initialize_copy_guards(async_session_factory)
-        await message_bus.connect()
         if azure_storage_manager.shards:
             print(f"[{self.worker_id}] Azure Storage: {len(azure_storage_manager.shards)} shard(s) ready")
         print(f"[{self.worker_id}] Backup worker initialized (concurrency={settings.BACKUP_CONCURRENCY})")
@@ -4452,7 +4451,16 @@ class BackupWorker:
                 recovery_s=float(os.getenv("COPY_WORK_RECOVERY_SECONDS", "10")),
             )
             await self._copy_work_runner.start()
+        try:
+            await self._consume_backup_queues()
+        finally:
+            if self._copy_work_runner is not None:
+                await self._copy_work_runner.close()
 
+    async def _consume_backup_queues(self):
+        # Broker connect can retry indefinitely. SQL copy recovery is already
+        # running and must survive an outage independently of source intake.
+        await message_bus.connect()
         # NOTE: prefetch is now applied per-queue inside consume_queue() by
         # opening a dedicated channel per queue and calling set_qos on it.
         # The previous global override here (set_qos(prefetch_count=2) on
@@ -4601,11 +4609,7 @@ class BackupWorker:
             ))
 
         print(f"[{self.worker_id}] Started consuming from {len(queues)} queues (supervised)")
-        try:
-            await asyncio.gather(*tasks)
-        finally:
-            if self._copy_work_runner is not None:
-                await self._copy_work_runner.close()
+        await asyncio.gather(*tasks)
 
     async def _supervised_consume(self, queue_name: str, prefetch_count: int):
         """Restart-on-crash wrapper around consume_queue.
@@ -4884,7 +4888,7 @@ class BackupWorker:
         owner_id = owner_id or uuid.uuid5(uuid.NAMESPACE_URL, self.worker_id)
         workflow = await begin_resume(async_session_factory, workflow_id, owner_id)
         if workflow is None:
-            return None
+            return await self._settle_copy_parent(workflow_id)
         continuation = dict(workflow.continuation or {})
         with resuming_copy_workflow(workflow_id):
             async with async_session_factory() as session:
@@ -4920,24 +4924,43 @@ class BackupWorker:
                 captured = continuation.get("result") or {}
                 leaf_items = max(0, total_items - int(continuation["pre_items"])) if "pre_items" in continuation else int(captured.get("item_count") or 0)
                 leaf_bytes = max(0, total_bytes - int(continuation["pre_bytes"])) if "pre_bytes" in continuation else int(captured.get("bytes_added") or 0)
+                failure_state = dict(continuation.get("failure_state") or {})
+                source_loss = int(captured.get("files_failed") or 0)
+                enumeration_incomplete = bool(captured.get("enumeration_incomplete")
+                                              or failure_state.get("enumeration_incomplete"))
+                if source_loss or enumeration_incomplete or failed:
+                    failure_state.update(
+                        files_failed=max(source_loss, int(failure_state.get("files_failed") or 0),
+                                         1 if failed or enumeration_incomplete else 0),
+                        enumeration_incomplete=enumeration_incomplete,
+                    )
+                if failed:
+                    failure_state["copy_required_failed"] = True
+                source_failed = bool(continuation.get("failure_state"))
+                partition_failed = source_failed or (failed and total_items == 0)
+                lossy = failed or source_loss > 0 or enumeration_incomplete or source_failed
                 await self._mark_partition_terminal(
-                    partition.id, status="COMPLETED", files_uploaded=leaf_items, bytes_uploaded=leaf_bytes,
-                    failure_state={"files_failed": 1, "copy_required_failed": True} if failed else None,
+                    partition.id, status="FAILED" if partition_failed else "COMPLETED",
+                    files_uploaded=leaf_items, bytes_uploaded=leaf_bytes,
+                    failure_state=failure_state or None,
                 )
                 await self._emit_partition_audit(
-                    "PARTITION_COMPLETED", "PARTIAL" if failed else "SUCCESS",
+                    "PARTITION_FAILED" if partition_failed else "PARTITION_COMPLETED",
+                    "FAILURE" if partition_failed else "PARTIAL" if lossy else "SUCCESS",
                     tenant_id=str(tenant.id), resource_id=str(resource.id), snapshot_id=snapshot.id,
                     job_id=job.id, partition_id=partition.id,
                     partition_type=continuation.get("partition_type") or partition.partition_type,
                     details={"files_uploaded": leaf_items, "bytes_uploaded": leaf_bytes,
                              "copy_required_failed": failed},
                 )
-                await self._finalize_partitioned_snapshot(snapshot.id, tenant, resource, job.id)
+                failed = lossy
             elif continuation.get("resume_kind") == "partition_union":
                 await self._publish_copy_mail_state(snapshot, failed=failed)
                 if not failed:
                     await self._patch_snapshot_extra_data(snapshot.id, {"mail_carry_forward_pending": False})
-                await self._finalize_partitioned_snapshot(snapshot.id, tenant, resource, job.id)
+                from shared.copy_workflow import settling_copy_parent
+                with settling_copy_parent():
+                    await self._finalize_partitioned_snapshot(snapshot.id, tenant, resource, job.id)
             else:
                 await self._publish_copy_mail_state(snapshot, failed=failed)
                 async with async_session_factory() as session:
@@ -4955,19 +4978,46 @@ class BackupWorker:
                             resource_row.extra_data = pending
                             await session.commit()
                     await self._stamp_resource_from_snapshot_row(session, resource, job.id, snapshot.id, result)
-                async with async_session_factory() as session:
-                    if job.batch_resource_ids:
-                        await self._finalize_bulk_parent_if_complete(session, job.id)
-                    else:
-                        await self.update_job_status(session, job.id,
-                            JobStatus.FAILED if snapshot.status == SnapshotStatus.FAILED else JobStatus.COMPLETED, result)
                 await self.audit_logger.log(
                     action="BACKUP_FAILED" if snapshot.status == SnapshotStatus.FAILED else "BACKUP_COMPLETED",
                     tenant_id=str(tenant.id), actor_type="WORKER", resource_id=str(resource.id),
                     resource_type=resource.type.value, job_id=str(job.id), snapshot_id=str(snapshot.id),
                     outcome="PARTIAL" if failed else "SUCCESS", details={"copy_required_failed": failed},
                 )
-            return await finish_resume(async_session_factory, workflow_id, owner_id, failed=failed)
+            finished = await finish_resume(async_session_factory, workflow_id, owner_id, failed=failed)
+        if finished:
+            await self._settle_copy_parent(workflow_id)
+        return finished
+
+    async def _settle_copy_parent(self, workflow_id):
+        """Retry last-finisher writes after the child workflow barrier commits."""
+        from shared.models import CopyWorkflow
+        from shared.copy_workflow import settling_copy_parent, finish_parent_settlement
+        async with async_session_factory() as session:
+            workflow = await session.get(CopyWorkflow, workflow_id)
+            if workflow is None or not workflow.parent_settle_pending:
+                return False
+            snapshot = await session.get(Snapshot, workflow.target_snapshot_id)
+            job = await session.get(Job, workflow.job_id)
+            resource = await session.get(Resource, workflow.resource_id)
+            tenant = await session.get(Tenant, workflow.tenant_id)
+            if any(parent is None for parent in (snapshot, job, resource, tenant)):
+                return False
+        with settling_copy_parent():
+            if workflow.partition_id or (workflow.continuation or {}).get("resume_kind") == "partition_union":
+                await self._finalize_partitioned_snapshot(snapshot.id, tenant, resource, job.id)
+            async with async_session_factory() as session:
+                current = await session.get(Snapshot, snapshot.id)
+                if current.status not in (SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL, SnapshotStatus.FAILED):
+                    return False
+                if job.batch_resource_ids:
+                    await self._finalize_bulk_parent_if_complete(session, job.id)
+                else:
+                    await self.update_job_status(session, job.id,
+                        JobStatus.FAILED if current.status == SnapshotStatus.FAILED else JobStatus.COMPLETED,
+                        {"item_count": current.item_count, "bytes_total": current.bytes_total,
+                         "copy_required_failed": bool((current.extra_data or {}).get("copy_required_failed"))})
+            return await finish_parent_settlement(async_session_factory, workflow_id)
 
     async def _seal_copy_handoff(self, snapshot, continuation, *, versions_flushed=False):
         """Drain this leaf's writers before atomically giving it to copy work."""
@@ -4978,8 +5028,17 @@ class BackupWorker:
             await asyncio.gather(*tasks)
         if not versions_flushed:
             await self.flush_version_rows(force=True)
+        partition_id = continuation.get("partition_id")
+        source_failure = self._shard_failure_ledger().get(str(partition_id)) if partition_id else None
+        if source_failure:
+            continuation = {**continuation, "failure_state": {
+                key: (value[:1024] if isinstance(value, str) else value)
+                for key, value in source_failure.items()
+                if value is None or isinstance(value, (str, int, float, bool))}}
         waiting = await seal_current_copy(continuation)
         if waiting is not None:
+            if source_failure:
+                self._shard_failure_ledger().pop(str(partition_id), None)
             partition_id = continuation.get("partition_id")
             if partition_id:
                 lease_unregister("snapshot_partitions", uuid.UUID(str(partition_id)))

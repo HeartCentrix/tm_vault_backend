@@ -271,7 +271,7 @@ async def enable_copy_protocol(factory, *, micro_capacity, giant_capacity, total
         active = await session.scalar(select(func.count()).select_from(CopyWorkTask)
             .where(CopyWorkTask.state.in_(['READY', 'RUNNING'])))
         active += await session.scalar(select(func.count()).select_from(CopyWorkflow)
-            .where(CopyWorkflow.state.in_(ACTIVE_WORKFLOWS)))
+            .where(CopyWorkflow.state.in_(ACTIVE_WORKFLOWS) | CopyWorkflow.parent_settle_pending))
         if active:
             raise RuntimeError('active copy work must drain before protocol activation')
         legacy = await session.scalar(text("""SELECT EXISTS(SELECT 1 FROM pg_locks

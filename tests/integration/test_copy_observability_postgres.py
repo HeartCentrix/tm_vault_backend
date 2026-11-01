@@ -32,7 +32,7 @@ async def progress_db(monkeypatch):
     async with engine.begin() as conn:
         await conn.execute(text(f'CREATE SCHEMA "{schema}"'))
         await conn.execute(text("CREATE TABLE copy_workflows (id uuid PRIMARY KEY, job_id uuid, "
-                                "state text, capture_attempt bigint DEFAULT 0)"))
+                                "state text, capture_attempt bigint DEFAULT 0, parent_settle_pending boolean DEFAULT false)"))
         # No params, source content, owner identifiers or manifest table exist.
         await conn.execute(text("CREATE TABLE copy_work_tasks (id uuid PRIMARY KEY, workflow_id uuid, "
                                 "capture_attempt bigint DEFAULT 0, sla_policy_id uuid, state text, "
@@ -77,6 +77,7 @@ async def progress_db(monkeypatch):
 
 
 @pytest.mark.parametrize("task_state,workflow_state,expected", [
+    ("READY", "DRAINING", "CAPTURING"),
     ("READY", "WAITING", "QUEUED"), ("RUNNING", "WAITING", "RUNNING"),
     ("COMPLETED", "WAITING", "WAITING_RESUME"), ("COMPLETED", "RESUMING", "WAITING_RESUME"),
     ("FAILED", "PARTIAL", "FAILED"), ("COMPLETED", "COMPLETED", "COMPLETE"),
@@ -139,3 +140,12 @@ async def test_flag_off_without_observed_work_performs_no_sql(monkeypatch):
             pytest.fail("flag-off job reads must not query copy tables")
 
     assert await observability().copy_work_summary(Session(), job_id=uuid.uuid4()) is None
+
+
+async def test_parent_retry_obligation_remains_visible_after_copy_tasks_finish(progress_db):
+    await progress_db.task("COMPLETED")
+    await progress_db.state("COMPLETED")
+    async with progress_db.factory.begin() as db:
+        await db.execute(text("UPDATE copy_workflows SET parent_settle_pending=true WHERE id=:w"),
+                         {"w":await db.scalar(text("SELECT id FROM copy_workflows LIMIT 1"))})
+    assert (await progress_db.summary())["state"] == "WAITING_RESUME"
