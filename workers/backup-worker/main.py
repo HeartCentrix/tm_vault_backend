@@ -18,6 +18,7 @@ Architecture:
 """
 import asyncio
 import contextvars
+from contextlib import contextmanager
 import functools
 import json
 import re
@@ -1294,6 +1295,23 @@ def _chat_topic_rename_sql(*, legacy_patterns_only: bool) -> str:
     return sql
 
 
+_COPY_CAPTURE_LEAF = contextvars.ContextVar("copy_capture_leaf", default=None)
+
+
+@contextmanager
+def _worker_copy_collection(snapshot_id, partition_id=None, resource_id=None):
+    from shared.copy_workflow import copy_collection
+    with copy_collection(str(snapshot_id), partition_id) as capture:
+        token = _COPY_CAPTURE_LEAF.set({
+            "snapshot_id": str(snapshot_id), "partition_id": str(partition_id) if partition_id else None,
+            "resource_id": str(resource_id) if resource_id else None,
+        } if capture is not None else None)
+        try:
+            yield capture
+        finally:
+            _COPY_CAPTURE_LEAF.reset(token)
+
+
 async def _carry_forward_prior_chat_snapshot_items(
     *,
     tenant_id: str,
@@ -1349,6 +1367,13 @@ async def _carry_forward_prior_chat_snapshot_items(
     """
     if not tenant_id or not resource_id or not target_snapshot_id:
         return 0
+    from shared.copy_workflow import defer_current_copy
+    delegated = await defer_current_copy("CHAT_CARRY", {
+        "tenant_id": str(tenant_id), "resource_id": str(resource_id),
+        "target_snapshot_id": str(target_snapshot_id),
+    })
+    if delegated is not None:
+        return delegated
     async with carry_forward_slot_session(
         str(resource_id), lane="giant", what="chat carry-forward",
     ) as s:
@@ -1484,6 +1509,16 @@ async def _carry_forward_prior_mail_snapshot_items(
     keep_fids = sorted({str(f) for f in (keep_folder_ids or []) if f}) if keep_folder_ids is not None else None
     if keep_fids is not None and not keep_fids:
         return 0  # whitelist given but empty → nothing may be carried
+    from shared.copy_workflow import defer_current_copy
+    delegated = await defer_current_copy("MAIL_CARRY", {
+        "tenant_id": str(tenant_id), "resource_id": str(resource_id),
+        "target_snapshot_id": str(target_snapshot_id),
+        "current_job_id": str(current_job_id) if current_job_id else None,
+        "excluded_paths": excl_paths, "tombstoned_ids": excl_ids,
+        "keep_folder_ids": keep_fids, "exclude_pathless": bool(exclude_pathless),
+    })
+    if delegated is not None:
+        return delegated
     params: Dict[str, Any] = {
         "tsid": str(target_snapshot_id),
         "rid": str(resource_id),
@@ -1799,6 +1834,13 @@ async def _carry_forward_prior_file_versions(
     """
     if not (target_snapshot_id and prior_snap_id and file_ids):
         return 0
+    from shared.copy_workflow import defer_current_copy
+    delegated = await defer_current_copy("FILE_VERSIONS", {
+        "target_snapshot_id": str(target_snapshot_id),
+        "prior_snap_id": str(prior_snap_id), "file_ids": list(file_ids),
+    }, lane="micro")
+    if delegated is not None:
+        return delegated
     async with carry_forward_slot_session(
         str(target_snapshot_id), what="file-version carry-forward",
         # MICRO copy, called per file (thousands/walk): must poll fast or a
@@ -1851,6 +1893,13 @@ async def _copy_chat_attachment_rows_to_snapshot(
     """
     if not tenant_id or not target_snapshot_id or not chat_id:
         return 0
+    from shared.copy_workflow import defer_current_copy
+    delegated = await defer_current_copy("LEGACY_CHAT_ATTACHMENTS", {
+        "tenant_id": str(tenant_id), "target_snapshot_id": str(target_snapshot_id),
+        "chat_id": str(chat_id),
+    }, lane="micro")
+    if delegated is not None:
+        return delegated
     # Herd bound (2026-08-18 convoy round 4): this runs PER CHAT for
     # claim-skipped users — thousands of calls per chats run, each
     # scanning tenant-wide attachment rows. 260 of these convoyed the
@@ -4319,6 +4368,8 @@ class BackupWorker:
         self._shard_enum_failures: Dict[str, Any] = {}
 
     async def initialize(self):
+        from shared.copy_workflow import initialize_copy_guards
+        await initialize_copy_guards(async_session_factory)
         await message_bus.connect()
         if azure_storage_manager.shards:
             print(f"[{self.worker_id}] Azure Storage: {len(azure_storage_manager.shards)} shard(s) ready")
@@ -4374,6 +4425,16 @@ class BackupWorker:
     async def start(self):
         """Start consuming from all backup queues"""
         await self.initialize()
+        from shared.copy_workflow import copy_work_guards_enabled
+        self._copy_work_runner = None
+        if copy_work_guards_enabled():
+            from shared.copy_runtime import CopyWorkRunner
+            self._copy_work_runner = CopyWorkRunner(
+                async_session_factory, self.resume_copy_workflow,
+                concurrency=2, batch_size=512, statement_timeout_ms=60000,
+                lock_timeout_ms=5000, poll_s=1, recovery_s=10,
+            )
+            await self._copy_work_runner.start()
 
         # NOTE: prefetch is now applied per-queue inside consume_queue() by
         # opening a dedicated channel per queue and calling set_qos on it.
@@ -4523,7 +4584,11 @@ class BackupWorker:
             ))
 
         print(f"[{self.worker_id}] Started consuming from {len(queues)} queues (supervised)")
-        await asyncio.gather(*tasks)
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            if self._copy_work_runner is not None:
+                await self._copy_work_runner.close()
 
     async def _supervised_consume(self, queue_name: str, prefetch_count: int):
         """Restart-on-crash wrapper around consume_queue.
@@ -4795,6 +4860,124 @@ class BackupWorker:
         except Exception as audit_err:
             print(f"[{self.worker_id}] [AuditLogger] lifecycle emit failed: {audit_err}")
 
+    async def resume_copy_workflow(self, workflow_id):
+        """Settle persisted capture after required copy tasks, without re-enumeration."""
+        from shared.copy_workflow import begin_resume, finish_resume, resuming_copy_workflow, verify_copy_resume
+        owner_id = getattr(getattr(self, "_heartbeat", None), "worker_uuid", None)
+        owner_id = owner_id or uuid.uuid5(uuid.NAMESPACE_URL, self.worker_id)
+        workflow = await begin_resume(async_session_factory, workflow_id, owner_id)
+        if workflow is None:
+            return None
+        continuation = dict(workflow.continuation or {})
+        with resuming_copy_workflow(workflow_id):
+            async with async_session_factory() as session:
+                if not await verify_copy_resume(session):
+                    raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before continuation")
+                snapshot = await session.get(Snapshot, workflow.target_snapshot_id)
+                resource = await session.get(Resource, workflow.resource_id)
+                tenant = await session.get(Tenant, workflow.tenant_id)
+                job = await session.get(Job, workflow.job_id)
+                if snapshot is None or resource is None or tenant is None or job is None:
+                    raise RuntimeError("copy continuation parent disappeared")
+                row = (await session.execute(select(
+                    func.count(SnapshotItem.id).filter(~SnapshotItem.item_type.in_((
+                        "CHAT_ATTACHMENT", "EMAIL_ATTACHMENT", "CHAT_HOSTED_CONTENT", "ARCHIVE_ATTACHMENT",
+                    ))),
+                    func.coalesce(func.sum(SnapshotItem.content_size), 0),
+                ).where(SnapshotItem.snapshot_id == snapshot.id))).one()
+                total_items, total_bytes = int(row[0] or 0), int(row[1] or 0)
+                partition = await session.get(SnapshotPartition, workflow.partition_id) if workflow.partition_id else None
+            failed = bool((snapshot.extra_data or {}).get("copy_required_failed"))
+            result = {**(continuation.get("result") or {}),
+                      "item_count": total_items, "bytes_total": total_bytes}
+            result.setdefault("bytes_added", total_bytes)
+            if continuation.get("delta_tokens"):
+                snapshot.delta_tokens_json = {**(snapshot.delta_tokens_json or {}), **continuation["delta_tokens"]}
+            if workflow.partition_id:
+                if partition is None:
+                    raise RuntimeError("copy continuation partition disappeared")
+                _bind_partition_lease(partition.id, {
+                    "snapshot_id": str(snapshot.id), "lease_owner_id": partition.lease_owner_id,
+                    "lease_token": partition.lease_token,
+                })
+                captured = continuation.get("result") or {}
+                leaf_items = max(0, total_items - int(continuation["pre_items"])) if "pre_items" in continuation else int(captured.get("item_count") or 0)
+                leaf_bytes = max(0, total_bytes - int(continuation["pre_bytes"])) if "pre_bytes" in continuation else int(captured.get("bytes_added") or 0)
+                await self._mark_partition_terminal(
+                    partition.id, status="COMPLETED", files_uploaded=leaf_items, bytes_uploaded=leaf_bytes,
+                    failure_state={"files_failed": 1, "copy_required_failed": True} if failed else None,
+                )
+                await self._emit_partition_audit(
+                    "PARTITION_COMPLETED", "PARTIAL" if failed else "SUCCESS",
+                    tenant_id=str(tenant.id), resource_id=str(resource.id), snapshot_id=snapshot.id,
+                    job_id=job.id, partition_id=partition.id,
+                    partition_type=continuation.get("partition_type") or partition.partition_type,
+                    details={"files_uploaded": leaf_items, "bytes_uploaded": leaf_bytes,
+                             "copy_required_failed": failed},
+                )
+                await self._finalize_partitioned_snapshot(snapshot.id, tenant, resource, job.id)
+            elif continuation.get("resume_kind") == "partition_union":
+                await self._publish_copy_mail_state(snapshot, failed=failed)
+                if not failed:
+                    await self._patch_snapshot_extra_data(snapshot.id, {"mail_carry_forward_pending": False})
+                await self._finalize_partitioned_snapshot(snapshot.id, tenant, resource, job.id)
+            else:
+                await self._publish_copy_mail_state(snapshot, failed=failed)
+                async with async_session_factory() as session:
+                    landed = await self.complete_snapshot(session, snapshot, result)
+                    if landed is False:
+                        raise ChatCatalogueWorkLeaseMoved("copy resume terminal write was refused")
+                    if snapshot.status == SnapshotStatus.COMPLETED:
+                        if not await verify_copy_resume(session):
+                            raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before cursor promotion")
+                        resource_row = await session.get(Resource, resource.id)
+                        pending, promoted = promote_pending_cursors_for_type(
+                            resource_row.extra_data, resource.type, snapshot_id=snapshot.id,
+                        )
+                        if promoted:
+                            resource_row.extra_data = pending
+                            await session.commit()
+                    await self._stamp_resource_from_snapshot_row(session, resource, job.id, snapshot.id, result)
+                async with async_session_factory() as session:
+                    if job.batch_resource_ids:
+                        await self._finalize_bulk_parent_if_complete(session, job.id)
+                    else:
+                        await self.update_job_status(session, job.id,
+                            JobStatus.FAILED if snapshot.status == SnapshotStatus.FAILED else JobStatus.COMPLETED, result)
+                await self.audit_logger.log(
+                    action="BACKUP_FAILED" if snapshot.status == SnapshotStatus.FAILED else "BACKUP_COMPLETED",
+                    tenant_id=str(tenant.id), actor_type="WORKER", resource_id=str(resource.id),
+                    resource_type=resource.type.value, job_id=str(job.id), snapshot_id=str(snapshot.id),
+                    outcome="PARTIAL" if failed else "SUCCESS", details={"copy_required_failed": failed},
+                )
+            return await finish_resume(async_session_factory, workflow_id, owner_id, failed=failed)
+
+    async def _seal_copy_handoff(self, snapshot, continuation, *, versions_flushed=False):
+        """Drain this leaf's writers before atomically giving it to copy work."""
+        from shared.copy_workflow import seal_current_copy
+        tasks = [task for task in getattr(self, "_detached_hc_finalizers", ())
+                 if getattr(task, "_copy_snapshot_id", None) == str(snapshot.id)]
+        if tasks:
+            await asyncio.gather(*tasks)
+        if not versions_flushed:
+            await self.flush_version_rows(force=True)
+        waiting = await seal_current_copy(continuation)
+        if waiting is not None:
+            partition_id = continuation.get("partition_id")
+            if partition_id:
+                lease_unregister("snapshot_partitions", uuid.UUID(str(partition_id)))
+            else:
+                lease_unregister("snapshots", snapshot.id)
+        elif _COPY_CAPTURE_LEAF.get() is not None and not _COPY_CAPTURE_LEAF.get()["partition_id"]:
+            token = _COPY_CAPTURE_LEAF.set(None)
+            try:
+                await self._publish_copy_mail_state(
+                    snapshot, failed=bool((snapshot.extra_data or {}).get("copy_required_failed")),
+                )
+            finally:
+                _COPY_CAPTURE_LEAF.reset(token)
+        return waiting
+
     async def _load_mail_folder_deltas(
         self, resource_id: uuid.UUID,
     ) -> Dict[str, str]:
@@ -4829,6 +5012,45 @@ class BackupWorker:
             )
             return {}
 
+    async def _stage_copy_mail_state(self, leaf, state):
+        async with async_session_factory() as session:
+            from shared.copy_workflow import verify_copy_resume
+            if not await verify_copy_resume(session):
+                raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before cursor write")
+            await session.execute(text("""
+                UPDATE snapshots SET extra_data = jsonb_set(
+                    COALESCE(extra_data::jsonb, '{}'::jsonb), '{copy_mail_cursor_states}',
+                    COALESCE(extra_data::jsonb->'copy_mail_cursor_states', '{}'::jsonb)
+                    || jsonb_build_object(CAST(:leaf AS text), CAST(:state AS jsonb)), true)::json
+                WHERE id = CAST(:sid AS uuid) AND status = 'IN_PROGRESS'
+            """), {"sid": leaf["snapshot_id"], "leaf": leaf["partition_id"] or "snapshot",
+                    "state": json.dumps(state)})
+            await session.commit()
+
+    async def _publish_copy_mail_state(self, snapshot, *, failed=False):
+        async with async_session_factory() as session:
+            fresh = await session.get(Snapshot, snapshot.id)
+            states = dict((fresh.extra_data or {}).get("copy_mail_cursor_states") or {}) if fresh else {}
+        for state in states.values():
+            if failed:
+                # Preserve failure evidence and rewind every staged advance.
+                await self._persist_mail_delta_state(
+                    uuid.UUID(state["resource_id"]), new_tokens={}, ok_token_keys=set(),
+                    drained_fids=set(), fingerprints_now={},
+                    evicted_token_keys=set(state.get("ok_token_keys") or []),
+                    quiet_held_back=True, evict_reason="required copy failed",
+                )
+            else:
+                await self._persist_mail_delta_state(
+                    uuid.UUID(state["resource_id"]),
+                    new_tokens=state["new_tokens"], ok_token_keys=set(state["ok_token_keys"]),
+                    drained_fids=set(state["drained_fids"]), fingerprints_now=state["fingerprints_now"],
+                    evicted_token_keys=state["evicted_token_keys"],
+                    write_legacy_mirror=state["write_legacy_mirror"],
+                )
+        if states and not failed:
+            await self._patch_snapshot_extra_data(snapshot.id, {"copy_mail_cursor_states": {}})
+
     async def _upsert_mail_folder_delta(
         self, resource_id: uuid.UUID, folder_id: str, delta_token: str,
     ) -> None:
@@ -4840,8 +5062,26 @@ class BackupWorker:
         being the only thing they touch, PG's row lock makes the two
         writes commute.
         """
+        leaf = _COPY_CAPTURE_LEAF.get()
+        if leaf is not None and leaf["resource_id"] == str(resource_id):
+            async with async_session_factory() as session:
+                from shared.copy_workflow import verify_copy_resume
+                if not await verify_copy_resume(session):
+                    raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before cursor write")
+                await session.execute(text("""
+                    UPDATE snapshots SET extra_data = jsonb_set(
+                        COALESCE(extra_data::jsonb, '{}'::jsonb), '{copy_mail_checkpoint_tokens}',
+                        COALESCE(extra_data::jsonb->'copy_mail_checkpoint_tokens', '{}'::jsonb)
+                        || jsonb_build_object(CAST(:fid AS text), CAST(:tok AS text)), true)::json
+                    WHERE id = CAST(:sid AS uuid) AND status = 'IN_PROGRESS'
+                """), {"sid": leaf["snapshot_id"], "fid": str(folder_id), "tok": delta_token})
+                await session.commit()
+            return
         try:
             async with async_session_factory() as session:
+                from shared.copy_workflow import verify_copy_resume
+                if not await verify_copy_resume(session):
+                    raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before cursor write")
                 await session.execute(
                     text(
                         """
@@ -4885,6 +5125,9 @@ class BackupWorker:
 
         async def _do() -> None:
             async with async_session_factory() as session:
+                from shared.copy_workflow import verify_copy_resume
+                if not await verify_copy_resume(session):
+                    raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before cursor write")
                 await session.execute(
                     text(
                         """
@@ -4963,6 +5206,9 @@ class BackupWorker:
 
         async def _do() -> None:
             async with async_session_factory() as session:
+                from shared.copy_workflow import verify_copy_resume
+                if not await verify_copy_resume(session):
+                    raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before cursor write")
                 await session.execute(
                     text(
                         """
@@ -4999,6 +5245,9 @@ class BackupWorker:
 
         async def _do() -> None:
             async with async_session_factory() as session:
+                from shared.copy_workflow import verify_copy_resume
+                if not await verify_copy_resume(session):
+                    raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before cursor write")
                 await session.execute(
                     text(
                         "DELETE FROM mail_folder_delta "
@@ -5043,6 +5292,9 @@ class BackupWorker:
         """
         try:
             async with async_session_factory() as session:
+                from shared.copy_workflow import verify_copy_resume
+                if not await verify_copy_resume(session):
+                    raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before cursor write")
                 await session.execute(
                     text(
                         """
@@ -5115,6 +5367,19 @@ class BackupWorker:
         and tests/workers/test_mail_expired_delta_rewalk.py.
         """
         gated, held_back = gate_mail_delta_tokens(new_tokens, ok_token_keys)
+        leaf = _COPY_CAPTURE_LEAF.get()
+        if leaf is not None and leaf["resource_id"] == str(resource_id) and not quiet_held_back and (gated or drained_fids):
+            await self._stage_copy_mail_state(leaf, {
+                "resource_id": str(resource_id), "new_tokens": gated,
+                "ok_token_keys": sorted(str(key) for key in ok_token_keys),
+                "drained_fids": sorted(str(key) for key in drained_fids),
+                "fingerprints_now": dict(fingerprints_now or {}),
+                "evicted_token_keys": sorted(str(key) for key in (evicted_token_keys or ())),
+                "write_legacy_mirror": bool(write_legacy_mirror),
+            })
+            if evict_result is not None:
+                evict_result.update(ok=True, keys=[])
+            return gated
         for _fid in ([] if quiet_held_back else held_back):
             print(
                 f"[{self.worker_id}] [USER_MAIL] "
@@ -5193,6 +5458,9 @@ class BackupWorker:
         if write_legacy_mirror:
             try:
                 async with async_session_factory() as _s:
+                    from shared.copy_workflow import verify_copy_resume
+                    if not await verify_copy_resume(_s):
+                        raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before cursor mirror write")
                     r = await _s.get(Resource, resource_id)
                     if r is None and _evicted:
                         _mirror_ok = False  # nothing popped: dual-read would resurrect
@@ -5741,7 +6009,10 @@ class BackupWorker:
             # expectation), then immediately mark it COMPLETED with
             # skipped_concurrent so operators can see why no items were
             # ingested for this (job, resource) pair.
-            snapshot = await self.create_snapshot(resource, message, job_id)
+            try:
+                snapshot = await self.create_snapshot(resource, message, job_id)
+            except ChatCatalogueWorkLeaseMoved:
+                return
             try:
                 async with async_session_factory() as _skip_s:
                     _live = await _skip_s.get(Snapshot, snapshot.id)
@@ -5798,7 +6069,10 @@ class BackupWorker:
         print(f"[{self.worker_id}] Processing backup for {resource_id} (type={resource_type}, tenant={tenant.id})")
 
         # create_snapshot opens + closes its own short-lived session.
-        snapshot = await self.create_snapshot(resource, message, job_id)
+        try:
+            snapshot = await self.create_snapshot(resource, message, job_id)
+        except ChatCatalogueWorkLeaseMoved:
+            return
         # Live-progress tick — snapshot row now exists, handler about to run.
         await _update_job_pct(job_id, 15)
 
@@ -5833,7 +6107,17 @@ class BackupWorker:
 
         try:
             print(f"[{self.worker_id}] Calling handler for {resource_type}: {resource.display_name}")
-            result = await handler(graph_client, resource, snapshot, tenant, message)
+            with _worker_copy_collection(snapshot.id, message.get("partitionId"), resource.id):
+                result = await handler(graph_client, resource, snapshot, tenant, message)
+                if not (result or {}).get("copy_waiting"):
+                    waiting = await self._seal_copy_handoff(snapshot, {
+                        "resume_kind": "single", "result": {
+                            key: value for key, value in (result or {}).items()
+                            if value is None or isinstance(value, (str, int, float, bool))
+                        },
+                    })
+                    if waiting is not None:
+                        result = waiting
             # Handler finished — finalize phase ahead (DB writes + audit).
             await _update_job_pct(job_id, 95)
         except ChatCatalogueWorkLeaseMoved:
@@ -5962,6 +6246,9 @@ class BackupWorker:
             if _is_cancel:
                 return
             raise
+
+        if (result or {}).get("copy_waiting"):
+            return result
 
         # ── Step 3b: success finalization — short sessions per write ──────
         # Partition gate: if the handler (or any nested sub-call —
@@ -7766,7 +8053,7 @@ class BackupWorker:
                                 excluded_paths=_cf_excluded,
                                 tombstoned_ids=mail_tombstoned_ids,
                             )
-                            if _cf_rows:
+                            if isinstance(_cf_rows, int) and _cf_rows:
                                 print(
                                     f"[{self.worker_id}] [USER_MAIL] "
                                     f"{resource.display_name or resource.id}: "
@@ -10210,7 +10497,7 @@ class BackupWorker:
                                             target_snapshot_id=str(snapshot.id),
                                             chat_id=cid,
                                         )
-                                        if _att_copied:
+                                        if isinstance(_att_copied, int) and _att_copied:
                                             _persisted_total += _att_copied
                                     except Exception as _ae:
                                         # The chat stays ok (its messages are
@@ -10488,7 +10775,7 @@ class BackupWorker:
                                                 target_snapshot_id=str(snapshot.id),
                                                 chat_id=cid,
                                             )
-                                            if _att_copied:
+                                            if isinstance(_att_copied, int) and _att_copied:
                                                 _persisted_total += _att_copied
                                         except Exception as _ae:
                                             _chat_att_copy["failed"] += 1
@@ -11615,6 +11902,7 @@ class BackupWorker:
                         if not hasattr(self, "_detached_hc_finalizers"):
                             self._detached_hc_finalizers = []
                         _det_t = asyncio.create_task(_hc_drain_finalizer())
+                        _det_t._copy_snapshot_id = str(snapshot.id)
                         self._detached_hc_finalizers.append(_det_t)
                         # Best-effort GC of completed finalizers so the
                         # list doesn't grow unbounded across thousands
@@ -11920,7 +12208,15 @@ class BackupWorker:
                         # snapshot => skip; never fall back to the
                         # resource-wide form.
                         _sid = str(snapshot.id) if snapshot is not None else None
+                        from shared.copy_workflow import defer_current_copy
+                        _rename_deferred = None
                         if real_cids and _sid:
+                            _rename_deferred = await defer_current_copy("CHAT_RENAME", {
+                                "resource_id": str(resource.id), "target_snapshot_id": _sid,
+                                "chat_ids": real_cids, "names": real_names,
+                                "legacy_patterns_only": False,
+                            })
+                        if real_cids and _sid and _rename_deferred is None:
                             async with carry_forward_slot_session(
                                 str(resource.id), lane="giant", what="chatTopic normalize",
                             ) as _s2:
@@ -11935,7 +12231,14 @@ class BackupWorker:
                                         f"[{self.worker_id}] [USER_CHATS] "
                                         f"normalized folder_path on {rc} stale row(s)"
                                     )
+                        _migrate_deferred = None
                         if migrate_cids and _sid:
+                            _migrate_deferred = await defer_current_copy("CHAT_RENAME", {
+                                "resource_id": str(resource.id), "target_snapshot_id": _sid,
+                                "chat_ids": migrate_cids, "names": migrate_names,
+                                "legacy_patterns_only": True,
+                            })
+                        if migrate_cids and _sid and _migrate_deferred is None:
                             async with carry_forward_slot_session(
                                 str(resource.id), lane="giant", what="chatTopic legacy migrate",
                             ) as _s3:
@@ -12075,23 +12378,18 @@ class BackupWorker:
             async with semaphore:
                 await _raise_if_job_cancelled(job_id)
                 snapshot = await self.create_snapshot(resource, message, job_id)
+                if resource.type == ResourceType.USER_CHATS:
+                    catalogue_result = await self._maybe_backup_chat_catalogue(
+                        resource, snapshot, tenant, graph_client, message, job_id)
+                    if catalogue_result is not None:
+                        return catalogue_result
+            with _worker_copy_collection(snapshot.id, message.get("partitionId"), resource.id):
+                return await _capture_one(resource, snapshot)
+
+        async def _capture_one(resource: Resource, snapshot: Snapshot) -> Dict:
+            async with semaphore:
                 _snap_by_resource[str(resource.id)] = str(snapshot.id)
-                # Audit: BACKUP_STARTED is emitted ONCE at the outermost
-                # entry point (_process_single_backup for individual /
-                # fanout-mass paths, _finalize_partitioned_snapshot for
-                # the terminal). Emitting again here used to surface as
-                # 4–6 duplicate events per backup (outer + this closure +
-                # one per partition shard re-entry via synth_msg).
-                # Pass snapshot into the fetcher so handlers (USER_CHATS
-                # today, USER_MAIL next) can stream-persist their items
-                # inline and return a lightweight attachment-candidate
-                # list. Cuts peak memory O(all-items) → O(one-chunk).
                 try:
-                    if resource.type == ResourceType.USER_CHATS:
-                        catalogue_result = await self._maybe_backup_chat_catalogue(
-                            resource, snapshot, tenant, graph_client, message, job_id)
-                        if catalogue_result is not None:
-                            return catalogue_result
                     items_data = await _fetch_for(resource, snapshot)
                 except EnumerationFailed as enum_exc:
                     # Enumeration died (Graph 401/5xx mid-walk, or a
@@ -12612,7 +12910,7 @@ class BackupWorker:
                             _run_chat_carry_forward,
                             label=f"chat_carry_forward:{str(resource.id)[:8]}",
                         )
-                        if _cf:
+                        if isinstance(_cf, int) and _cf:
                             print(
                                 f"[{self.worker_id}] [USER_CHATS] "
                                 f"{resource.display_name or resource.id}: "
@@ -12686,6 +12984,27 @@ class BackupWorker:
                         "partitioned": True,
                     }
 
+                # Drain any pending FILE_VERSION rows from the worker's bulk
+                # buffer BEFORE the snapshot flips to COMPLETED — otherwise
+                # the "Done" state could be visible while a few hundred rows
+                # are still in-buffer waiting on the next size/time trigger.
+                try:
+                    flushed = await self.flush_version_rows(force=True)
+                    if flushed:
+                        print(f"[{self.worker_id}]   [VERSIONS] pre-COMPLETED flush: {flushed} rows")
+                except Exception as fe:
+                    print(f"[{self.worker_id}]   [VERSIONS] pre-COMPLETED flush warning: "
+                          f"{type(fe).__name__}: {fe}")
+
+                waiting = await self._seal_copy_handoff(snapshot, {
+                    "resume_kind": "partition" if message.get("partitionId") else "user_content",
+                    "partition_id": message.get("partitionId"),
+                    "result": {"item_count": len(items_data), "bytes_added": bytes_total},
+                    **(message.get("_copy_resume") or {}),
+                }, versions_flushed=True)
+                if waiting is not None:
+                    return waiting
+
                 # Count from the DB rather than `len(items_data)` because the
                 # USER_MAIL streaming-persist path filters items_data down to
                 # attachment-candidates (so the generic persist step doesn't
@@ -12735,18 +13054,6 @@ class BackupWorker:
                 # by the full size of interleaved chat attachments — observed
                 # 2 GB missing on Amit Mishra's snapshot.
                 bytes_total = max(bytes_total + att_bytes, persisted_bytes)
-
-                # Drain any pending FILE_VERSION rows from the worker's bulk
-                # buffer BEFORE the snapshot flips to COMPLETED — otherwise
-                # the "Done" state could be visible while a few hundred rows
-                # are still in-buffer waiting on the next size/time trigger.
-                try:
-                    flushed = await self.flush_version_rows(force=True)
-                    if flushed:
-                        print(f"[{self.worker_id}]   [VERSIONS] pre-COMPLETED flush: {flushed} rows")
-                except Exception as fe:
-                    print(f"[{self.worker_id}]   [VERSIONS] pre-COMPLETED flush warning: "
-                          f"{type(fe).__name__}: {fe}")
 
                 async with async_session_factory() as session:
                     # Delta-from-prior so reuse-heavy paths (chat skip-by-
@@ -12829,6 +13136,11 @@ class BackupWorker:
         # produced 2–6× duplicate audit rows per attempt.
         if len(results) == 1 and isinstance(results[0], dict) and results[0].get("chat_inventory_format") == 1:
             return results[0]
+        waiting = [r for r in results if isinstance(r, dict) and r.get("copy_waiting")]
+        if waiting:
+            return waiting[0] if len(waiting) == 1 else {
+                **waiting[0], "copy_workflow_ids": [r["copy_workflow_id"] for r in waiting],
+            }
         item_count = sum(r.get("item_count", 0) for r in results if isinstance(r, dict))
         bytes_added = sum(r.get("bytes_added", 0) for r in results if isinstance(r, dict))
         return {"item_count": item_count, "bytes_added": bytes_added}
@@ -15627,10 +15939,12 @@ class BackupWorker:
         owner_uuid: Optional[str] = None
         if getattr(self, "_heartbeat", None) is not None:
             owner_uuid = str(self._heartbeat.worker_uuid)
+        from shared.copy_workflow import pending_copy_sql
+        copy_guard = pending_copy_sql(partition_expr="snapshot_partitions.id")
         async with async_session_factory() as session:
             row = (await session.execute(
                 text(
-                    """
+                    f"""
                     UPDATE snapshot_partitions
                        SET status        = 'IN_PROGRESS',
                            worker_id     = :wid,
@@ -15653,6 +15967,7 @@ class BackupWorker:
                            END,
                            lease_token   = lease_token + 1
                      WHERE id = :pid
+                       AND {copy_guard}
                        AND (
                             status = 'QUEUED'
                             OR (
@@ -15800,6 +16115,8 @@ class BackupWorker:
         The UPDATE is idempotent by construction (the ``status NOT IN
         ('COMPLETED','FAILED')`` guard), so replay is free.
         """
+        from shared.copy_workflow import pending_copy_sql, verify_copy_resume
+        _copy_guard = pending_copy_sql(partition_expr="snapshot_partitions.id")
         from shared.db_retry import run_with_db_retry as _db_retry
 
         # Lease fence (2026-10-14): the owner + token _claim_partition
@@ -15812,6 +16129,8 @@ class BackupWorker:
         async def _write_terminal():
             nonlocal _stolen
             async with async_session_factory() as session:
+                if not await verify_copy_resume(session):
+                    raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before partition settlement")
                 _res = await session.execute(
                     text(
                         f"""
@@ -15823,6 +16142,7 @@ class BackupWorker:
                                failure_state  = COALESCE(CAST(:fs AS JSONB), failure_state::jsonb)
                          WHERE id = :pid
                            AND status NOT IN ('COMPLETED', 'FAILED')
+                           AND {_copy_guard}
                            {_fence_sql}
                         """
                     ),
@@ -15963,6 +16283,9 @@ class BackupWorker:
         """
         try:
             async with async_session_factory() as _s:
+                from shared.copy_workflow import verify_copy_resume
+                if not await verify_copy_resume(_s):
+                    raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before cursor write")
                 await _s.execute(
                     text(
                         """
@@ -15986,6 +16309,9 @@ class BackupWorker:
             )
         try:
             async with async_session_factory() as _s2:
+                from shared.copy_workflow import verify_copy_resume
+                if not await verify_copy_resume(_s2):
+                    raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before cursor write")
                 _snap = await _s2.get(Snapshot, snapshot_id)
                 if _snap is not None:
                     _snap.extra_data = {**(_snap.extra_data or {}), **patch}
@@ -16153,6 +16479,11 @@ class BackupWorker:
 
         Wiring pinned by tests/workers/test_inline_finalize_wiring.py.
         """
+        from shared.copy_workflow import has_pending_copy, verify_copy_resume
+        if not await verify_copy_resume(session):
+            raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before terminal write")
+        if await has_pending_copy(session, snapshot_id=snap.id):
+            return "deferred_copy"
         _snap_extra = snap.extra_data or {}
         if not may_finalize_snapshot_status(snap.status):
             print(
@@ -16170,6 +16501,9 @@ class BackupWorker:
         _proposed, _degraded_reason = (
             terminal_status_for_extra_data(_snap_extra)
         )
+        if _snap_extra.get("copy_required_failed"):
+            _proposed = SnapshotStatus.PARTIAL if (snap.item_count or 0) else SnapshotStatus.FAILED
+            _degraded_reason = "required database copy failed"
         snap.status = await _coerce_snapshot_terminal_on_cancel(
             snap, _proposed,
         )
@@ -17184,6 +17518,10 @@ class BackupWorker:
                 excluded_paths=sorted(union_paths),
                 tombstoned_ids=union_tombs,
             )
+            from shared.copy_workflow import DeferredCopy
+            if isinstance(copied, DeferredCopy):
+                delegated = copied
+                return delegated
             # The pending clear is load-bearing: while it stands the snapshot
             # is never a prior, yet every shard's cursors already advanced —
             # so a clear that does not land is a failed carry (rewind below).
@@ -17318,10 +17656,36 @@ class BackupWorker:
                 flush=True,
             )
             return None
+        from shared.copy_workflow import has_pending_copy
+        async with async_session_factory() as pending_session:
+            if await has_pending_copy(pending_session, snapshot_id=snapshot_id):
+                return None
+        from shared.copy_workflow import pending_copy_sql, verify_copy_resume
+        with _worker_copy_collection(snapshot_id) as capture:
+            if capture is not None:
+                async with async_session_factory() as check_session:
+                    counts = (await check_session.execute(text(
+                        "SELECT COUNT(*), COUNT(*) FILTER (WHERE status NOT IN ('COMPLETED','FAILED')), "
+                        "COUNT(*) FILTER (WHERE status = 'COMPLETED') "
+                        "FROM snapshot_partitions WHERE snapshot_id = CAST(:sid AS uuid)"
+                    ), {"sid": str(snapshot_id)})).first()
+                    copy_snapshot = await check_session.get(Snapshot, snapshot_id)
+                if not counts or not counts[0] or counts[1] or copy_snapshot is None:
+                    return None
+                preempted = copy_snapshot.status != SnapshotStatus.IN_PROGRESS
+                if (not preempted and int(counts[2] or 0) > 0
+                    and not (copy_snapshot.extra_data or {}).get("mail_union_carry_claimed")):
+                    await self._carry_forward_partitioned_user_mail(snapshot_id)
+                    waiting = await self._seal_copy_handoff(copy_snapshot, {"resume_kind": "partition_union"})
+                    if waiting is not None:
+                        return None
+        copy_guard = pending_copy_sql(snapshot_expr="s.id")
         async with async_session_factory() as session:
+            if not await verify_copy_resume(session):
+                raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before snapshot settlement")
             row = (await session.execute(
                 text(
-                    """
+                    f"""
                     WITH expected AS (
                         SELECT COUNT(*) AS n
                           FROM snapshot_partitions
@@ -17357,14 +17721,17 @@ class BackupWorker:
                         status = (CASE
                             WHEN c.terminal < e.n THEN s.status
                             WHEN c.completed = 0
-                             AND s.extra_data->>'chat_inventory_format' = '1'
+                             AND (s.extra_data->>'chat_inventory_format' = '1' OR s.extra_data->>'copy_required_failed' = 'true')
                              AND EXISTS (SELECT 1 FROM snapshot_items si WHERE si.snapshot_id = s.id)
-                                                 THEN 'PARTIAL'::snapshotstatus
+                              THEN 'PARTIAL'::snapshotstatus
                             WHEN c.completed = 0 THEN 'FAILED'::snapshotstatus
                             WHEN c.failed > 0 OR c.lossy > 0
+                              OR s.extra_data->>'copy_required_failed' = 'true'
                               OR (s.extra_data->>'chat_inventory_format' = '1'
                                   AND NULLIF(s.extra_data->>'degraded_reason', '') IS NOT NULL)
-                                                 THEN 'PARTIAL'::snapshotstatus
+                              THEN CASE WHEN s.extra_data->>'copy_required_failed' = 'true'
+                                  AND NOT EXISTS (SELECT 1 FROM snapshot_items si WHERE si.snapshot_id = s.id)
+                                THEN 'FAILED'::snapshotstatus ELSE 'PARTIAL'::snapshotstatus END
                             ELSE 'COMPLETED'::snapshotstatus
                         END),
                         completed_at = (CASE
@@ -17375,6 +17742,7 @@ class BackupWorker:
                     WHERE s.id = :sid
                       AND e.n > 0
                       AND s.status = 'IN_PROGRESS'
+                      AND {copy_guard}
                   RETURNING s.status::text AS new_status,
                             c.terminal, e.n, s.job_id,
                             s.resource_id
@@ -17526,6 +17894,8 @@ class BackupWorker:
         # `_backup_user_content_parallel`'s finalize block. Idempotent —
         # safe on both winning-flip and preempted-by-REAPER paths.
         async with async_session_factory() as session:
+            if not await verify_copy_resume(session):
+                raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before counter reconciliation")
             CHILD_ITEM_TYPES = (
                 "CHAT_ATTACHMENT",
                 "EMAIL_ATTACHMENT",
@@ -17642,7 +18012,9 @@ class BackupWorker:
                 _d_lossy = int(getattr(derived_row, "lossy", 0) or 0)
                 _d_pending = int(getattr(derived_row, "pending", 0) or 0)
                 if _d_n > 0 and _d_pending == 0:
-                    if _d_failed == _d_n and catalogue_format and persisted_count:
+                    if (snap.extra_data or {}).get("copy_required_failed"):
+                        _derived_status = SnapshotStatus.PARTIAL if persisted_count else SnapshotStatus.FAILED
+                    elif _d_failed == _d_n and catalogue_format and persisted_count:
                         _derived_status = SnapshotStatus.PARTIAL
                     elif _d_failed == _d_n:
                         _derived_status = SnapshotStatus.FAILED
@@ -17804,6 +18176,8 @@ class BackupWorker:
             if new_status == "COMPLETED" and resource is not None and not catalogue_format:
                 try:
                     async with async_session_factory() as _ps:
+                        if not await verify_copy_resume(_ps):
+                            raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before partition cursor promotion")
                         _res_row = await _ps.get(Resource, resource.id)
                         if _res_row is not None:
                             _new_ed, _promoted = promote_pending_cursors_for_type(
@@ -18184,13 +18558,22 @@ class BackupWorker:
         # the absolute concurrency ceiling. Acquiring tenant first means
         # a tenant blocked on its own cap doesn't hold a worker slot.
         tenant_sem = await self._acquire_tenant_slot(str(tenant_id))
+        copy_handoff = False
         try:
             async with tenant_sem:
                 async with self._onedrive_backup_semaphore:
-                    uploaded, uploaded_bytes = await self._useronedrive_backup_files(
-                        graph_client, resource, snapshot, tenant,
-                        drive_id, file_items,
-                    )
+                    with _worker_copy_collection(snapshot_id, partition_id, resource_id):
+                        uploaded, uploaded_bytes = await self._useronedrive_backup_files(
+                            graph_client, resource, snapshot, tenant, drive_id, file_items,
+                        )
+                        waiting = await self._seal_copy_handoff(snapshot, {
+                            "resume_kind": "partition", "partition_id": str(partition_id),
+                            "partition_type": partition_type,
+                            "result": {"item_count": int(uploaded or 0), "bytes_added": int(uploaded_bytes or 0)},
+                        })
+                        if waiting is not None:
+                            copy_handoff = True
+                            return waiting
             await self._mark_partition_terminal(
                 partition_id, status="COMPLETED",
                 files_uploaded=int(uploaded or 0),
@@ -18228,22 +18611,23 @@ class BackupWorker:
             )
             raise
         finally:
-            # Always attempt finalize — last-finisher pattern,
-            # idempotent. Even if this partition's drain raised
-            # mid-way, other shards may still be in flight; the
-            # finalize won't flip until all are terminal.
-            try:
-                await self._finalize_partitioned_snapshot(
-                    snapshot_id,
-                    tenant=tenant,
-                    resource=resource,
-                    job_id=job_id,
-                )
-            except Exception as fin_exc:
-                print(
-                    f"[{self.worker_id}] [PARTITION FINALIZE] "
-                    f"unhandled: {type(fin_exc).__name__}: {fin_exc}"
-                )
+            if not copy_handoff:
+                # Always attempt finalize — last-finisher pattern,
+                # idempotent. Even if this partition's drain raised
+                # mid-way, other shards may still be in flight; the
+                # finalize won't flip until all are terminal.
+                try:
+                    await self._finalize_partitioned_snapshot(
+                        snapshot_id,
+                        tenant=tenant,
+                        resource=resource,
+                        job_id=job_id,
+                    )
+                except Exception as fin_exc:
+                    print(
+                        f"[{self.worker_id}] [PARTITION FINALIZE] "
+                        f"unhandled: {type(fin_exc).__name__}: {fin_exc}"
+                    )
 
     async def _process_chats_partition_message(
         self, message: Dict[str, Any],
@@ -18512,11 +18896,17 @@ class BackupWorker:
         # `_shard_bookkeeping_counters`. The `else:` clause is load-bearing
         # — an exception raised from there must NOT be caught by the
         # drain's `except`, or the bug walks straight back in.
+        copy_handoff = False
+        synth_msg["_copy_resume"] = {"pre_items": pre_items, "pre_bytes": pre_bytes,
+                                     "partition_type": partition_type}
         try:
             async with tenant_sem:
-                await self._backup_user_content_parallel(
+                copy_result = await self._backup_user_content_parallel(
                     [resource], graph_client, tenant, synth_msg, job_id,
                 )
+            if (copy_result or {}).get("copy_waiting"):
+                copy_handoff = True
+                return copy_result
         except ChatCatalogueWorkLeaseMoved:
             _note_partition_lease_stolen(self.worker_id, partition_id)
             return
@@ -18557,18 +18947,19 @@ class BackupWorker:
                 bookkeeping_state=_bk_state,
             )
         finally:
-            try:
-                await self._finalize_partitioned_snapshot(
-                    snapshot_id,
-                    tenant=tenant,
-                    resource=resource,
-                    job_id=job_id,
-                )
-            except Exception as fin_exc:
-                print(
-                    f"[{self.worker_id}] [PARTITION FINALIZE] "
-                    f"unhandled: {type(fin_exc).__name__}: {fin_exc}"
-                )
+            if not copy_handoff:
+                try:
+                    await self._finalize_partitioned_snapshot(
+                        snapshot_id,
+                        tenant=tenant,
+                        resource=resource,
+                        job_id=job_id,
+                    )
+                except Exception as fin_exc:
+                    print(
+                        f"[{self.worker_id}] [PARTITION FINALIZE] "
+                        f"unhandled: {type(fin_exc).__name__}: {fin_exc}"
+                    )
 
     async def _process_mail_partition_message(
         self, message: Dict[str, Any],
@@ -18853,18 +19244,24 @@ class BackupWorker:
         # this shard terminally FAILED (2026-08-11 CHATS/4 of snapshot
         # 6807df97 lost exactly that way; the mail handler carried the
         # identical pre/post shape).
+        copy_handoff = False
+        synth_msg["_copy_resume"] = {"pre_items": pre_items, "pre_bytes": pre_bytes,
+                                     "partition_type": partition_type}
         try:
             async with tenant_sem:
                 if is_tier1:
-                    await self._backup_mailboxes_parallel(
+                    copy_result = await self._backup_mailboxes_parallel(
                         [resource], graph_client, tenant,
                         synth_msg, job_id,
                     )
                 else:
-                    await self._backup_user_content_parallel(
+                    copy_result = await self._backup_user_content_parallel(
                         [resource], graph_client, tenant,
                         synth_msg, job_id,
                     )
+            if (copy_result or {}).get("copy_waiting"):
+                copy_handoff = True
+                return copy_result
         except JobCancelledMidFlight as _cx:
             # Operator cancel: settle THIS shard FAILED(job_cancelled) and ack
             # — no requeue, no traceback. The finally-finalizer flags the
@@ -18924,16 +19321,17 @@ class BackupWorker:
                 bookkeeping_state=_bk_state,
             )
         finally:
-            try:
-                await self._finalize_partitioned_snapshot(
-                    snapshot_id, tenant=tenant, resource=resource,
-                    job_id=job_id,
-                )
-            except Exception as fin_exc:
-                print(
-                    f"[{self.worker_id}] [PARTITION FINALIZE] "
-                    f"unhandled: {type(fin_exc).__name__}: {fin_exc}"
-                )
+            if not copy_handoff:
+                try:
+                    await self._finalize_partitioned_snapshot(
+                        snapshot_id, tenant=tenant, resource=resource,
+                        job_id=job_id,
+                    )
+                except Exception as fin_exc:
+                    print(
+                        f"[{self.worker_id}] [PARTITION FINALIZE] "
+                        f"unhandled: {type(fin_exc).__name__}: {fin_exc}"
+                    )
 
     async def _process_sharepoint_partition_message(
         self, message: Dict[str, Any],
@@ -19147,6 +19545,7 @@ class BackupWorker:
 
         tenant_sem = await self._acquire_tenant_slot(str(tenant_id))
 
+        copy_handoff = False
         try:
             async with tenant_sem:
                 # backup_sharepoint returns this shard's contribution
@@ -19156,10 +19555,19 @@ class BackupWorker:
                 # So we take the shard's contribution straight from
                 # the return dict rather than diffing snapshot counters
                 # (which stay at 0 mid-flight for SharePoint).
-                sp_result = await self.backup_sharepoint(
-                    graph_client, resource_for_sp, snapshot, tenant,
-                    synth_msg,
-                )
+                with _worker_copy_collection(snapshot_id, partition_id, resource_id):
+                    sp_result = await self.backup_sharepoint(
+                        graph_client, resource_for_sp, snapshot, tenant, synth_msg,
+                    )
+                    waiting = await self._seal_copy_handoff(snapshot, {
+                        "resume_kind": "partition", "partition_id": str(partition_id),
+                        "partition_type": partition_type,
+                        "result": {key: value for key, value in (sp_result or {}).items()
+                                   if value is None or isinstance(value, (str, int, float, bool))},
+                    })
+                    if waiting is not None:
+                        copy_handoff = True
+                        return waiting
             shard_items = int((sp_result or {}).get("item_count") or 0)
             shard_bytes = int((sp_result or {}).get("bytes_added") or 0)
             # A shard that lost files — or worse, never enumerated some of
@@ -19227,16 +19635,17 @@ class BackupWorker:
             )
             raise
         finally:
-            try:
-                await self._finalize_partitioned_snapshot(
-                    snapshot_id, tenant=tenant, resource=resource,
-                    job_id=job_id,
-                )
-            except Exception as fin_exc:
-                print(
-                    f"[{self.worker_id}] [PARTITION FINALIZE] "
-                    f"unhandled: {type(fin_exc).__name__}: {fin_exc}"
-                )
+            if not copy_handoff:
+                try:
+                    await self._finalize_partitioned_snapshot(
+                        snapshot_id, tenant=tenant, resource=resource,
+                        job_id=job_id,
+                    )
+                except Exception as fin_exc:
+                    print(
+                        f"[{self.worker_id}] [PARTITION FINALIZE] "
+                        f"unhandled: {type(fin_exc).__name__}: {fin_exc}"
+                    )
 
     async def _process_groups_partition_message(
         self, message: Dict[str, Any],
@@ -21126,11 +21535,24 @@ class BackupWorker:
         semaphore = asyncio.Semaphore(settings.BACKUP_CONCURRENCY)
 
         async def backup_one_resource(resource: Resource):
+            snapshot = await self.create_snapshot(resource, message, job_id)
+            with _worker_copy_collection(snapshot.id, message.get("partitionId"), resource.id):
+                result = await _capture_copy_leaf(resource, snapshot)
+                if (result or {}).get("copy_waiting"):
+                    return result
+                waiting = await self._seal_copy_handoff(snapshot, {
+                    "resume_kind": "partition" if message.get("partitionId") else "single",
+                    "partition_id": message.get("partitionId"),
+                    "result": {key: value for key, value in (result or {}).items()
+                               if value is None or isinstance(value, (str, int, float, bool))},
+                    **(message.get("_copy_resume") or {}),
+                })
+                return waiting if waiting is not None else result
+
+        async def _capture_copy_leaf(resource: Resource, snapshot: Snapshot):
             async with semaphore:
                 await _raise_if_job_cancelled(job_id)
-                snapshot = None
                 try:
-                    snapshot = await self.create_snapshot(resource, message, job_id)
                     # BACKUP_STARTED emitted once at the outer entry
                     # (_process_single_backup); see comment in
                     # _backup_user_content_parallel for the rationale.
@@ -21257,6 +21679,9 @@ class BackupWorker:
                     return {"item_count": 0, "bytes_added": 0}
 
         results = await asyncio.gather(*[backup_one_resource(r) for r in resources], return_exceptions=True)
+        waiting = [result for result in results if isinstance(result, dict) and result.get("copy_waiting")]
+        if waiting:
+            return waiting[0]
         return {
             "item_count": sum(r.get("item_count", 0) for r in results if isinstance(r, dict)),
             "bytes_added": sum(r.get("bytes_added", 0) for r in results if isinstance(r, dict)),
@@ -21471,7 +21896,10 @@ class BackupWorker:
                             prior_snap_id=snapshot._prior_snap_id,
                             file_ids=[file_id],
                         )
-                        if copied:
+                        from shared.copy_workflow import DeferredCopy
+                        if isinstance(copied, DeferredCopy):
+                            carry_forward_did_run = True
+                        elif copied:
                             print(f"[{self.worker_id}]   [VERSIONS-CARRY] {file_name}: {copied} prior row(s) cloned (eTag unchanged)")
                             carry_forward_did_run = True
                     except Exception as cfe:
@@ -22610,12 +23038,25 @@ class BackupWorker:
         mbx_timeout_s = int(os.getenv("MAILBOX_TIMEOUT_S", "43200"))
 
         async def backup_one_mailbox(resource: Resource):
+            snapshot = await self.create_snapshot(resource, message, job_id)
+            with _worker_copy_collection(snapshot.id, message.get("partitionId"), resource.id):
+                result = await _capture_copy_leaf(resource, snapshot)
+                if (result or {}).get("copy_waiting"):
+                    return result
+                waiting = await self._seal_copy_handoff(snapshot, {
+                    "resume_kind": "partition" if message.get("partitionId") else "single",
+                    "partition_id": message.get("partitionId"),
+                    "result": {key: value for key, value in (result or {}).items()
+                               if value is None or isinstance(value, (str, int, float, bool))},
+                    **(message.get("_copy_resume") or {}),
+                })
+                return waiting if waiting is not None else result
+
+        async def _capture_copy_leaf(resource: Resource, snapshot: Snapshot):
             async with semaphore:
                 await _raise_if_job_cancelled(job_id)
-                snapshot = None
                 user_label = resource.display_name or resource.external_id
                 try:
-                    snapshot = await self.create_snapshot(resource, message, job_id)
                     # This path never carries prior rows: its snapshots are
                     # delta-only once cursors exist and must never be chosen as
                     # a carry-forward prior (prior_snapshot_sql excludes the
@@ -23243,6 +23684,9 @@ class BackupWorker:
         results = await asyncio.gather(
             *[backup_one_mailbox(r) for r in resources], return_exceptions=True,
         )
+        waiting = [result for result in results if isinstance(result, dict) and result.get("copy_waiting")]
+        if waiting:
+            return waiting[0]
         return {
             "item_count": sum(r.get("item_count", 0) for r in results if isinstance(r, dict)),
             "bytes_added": sum(r.get("bytes_added", 0) for r in results if isinstance(r, dict)),
@@ -23303,11 +23747,27 @@ class BackupWorker:
         semaphore = asyncio.Semaphore(settings.BACKUP_CONCURRENCY)
 
         async def backup_one(resource: Resource):
+            snapshot = await self.create_snapshot(resource, message, job_id)
+            from shared.copy_workflow import copy_collection
+            with copy_collection(snapshot.id, message.get("partitionId")) as capture:
+                result = await _capture_copy_leaf(resource, snapshot)
+                if (result or {}).get("copy_waiting"):
+                    return result
+                waiting = None
+                if capture is not None:
+                    waiting = await self._seal_copy_handoff(snapshot, {
+                        "resume_kind": "partition" if message.get("partitionId") else "single",
+                        "partition_id": message.get("partitionId"),
+                        "result": {key: value for key, value in (result or {}).items()
+                                   if value is None or isinstance(value, (str, int, float, bool))},
+                        **(message.get("_copy_resume") or {}),
+                    })
+                return waiting if waiting is not None else result
+
+        async def _capture_copy_leaf(resource: Resource, snapshot: Snapshot):
             async with semaphore:
                 await _raise_if_job_cancelled(job_id)
-                snapshot = None
                 try:
-                    snapshot = await self.create_snapshot(resource, message, job_id)
                     # BACKUP_STARTED emitted once at the outer entry
                     # (_process_single_backup); inner emission removed
                     # to prevent duplicate audit rows per attempt.
@@ -23324,6 +23784,9 @@ class BackupWorker:
                         result = await self.backup_power_bi_workspace(graph_client, resource, snapshot, tenant, message)
                     else:
                         result = await self._backup_metadata_only(graph_client, resource, snapshot, tenant, message)
+
+                    if (result or {}).get("copy_waiting"):
+                        return result
 
                     # Finalize the per-resource snapshot so the Recovery UI
                     # picks it up. Without this the snapshot stayed
@@ -23357,6 +23820,9 @@ class BackupWorker:
                     return {"item_count": 0, "bytes_added": 0}
 
         results = await asyncio.gather(*[backup_one(r) for r in resources], return_exceptions=True)
+        waiting = [result for result in results if isinstance(result, dict) and result.get("copy_waiting")]
+        if waiting:
+            return waiting[0]
         return {
             "item_count": sum(r.get("item_count", 0) for r in results if isinstance(r, dict)),
             "bytes_added": sum(r.get("bytes_added", 0) for r in results if isinstance(r, dict)),
@@ -25540,6 +26006,8 @@ class BackupWorker:
         result = await self._backup_user_content_parallel(
             [resource], graph_client, tenant, message, job_id,
         )
+        if result.get("copy_waiting"):
+            return result
         # Make the outer "ghost" snapshot reflect the parallel handler's
         # totals so the UI doesn't show two rows (one with 0 items, one
         # with the real count) for the same trigger.
@@ -26873,11 +27341,13 @@ class BackupWorker:
         generic handler catch in ``_process_single_backup`` turns into a
         FAILED snapshot — never a COMPLETED-empty one after a real error."""
         from archive_backup import run_archive_backup
-        return await run_archive_backup(
-            graph_client, resource, snapshot, tenant,
-            worker_id=self.worker_id,
-            force_full=bool((message or {}).get("forceFullBackup") or (message or {}).get("type") == "FULL"),
-        )
+        from shared.copy_workflow import copy_collection
+        with copy_collection(snapshot.id, (message or {}).get("partitionId")):
+            return await run_archive_backup(
+                graph_client, resource, snapshot, tenant,
+                worker_id=self.worker_id,
+                force_full=bool((message or {}).get("forceFullBackup") or (message or {}).get("type") == "FULL"),
+            )
 
     async def backup_mailbox(self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
                              tenant: Tenant, message: Dict) -> Dict:
@@ -27229,6 +27699,17 @@ class BackupWorker:
             # snapshot is a complete enumeration; type it FULL so retention's
             # anchor logic protects it. Any failure leaves INCREMENTAL.
             await self._mark_snapshot_full(snapshot)
+
+        from shared.copy_workflow import DeferredCopy
+        if isinstance(carried, DeferredCopy):
+            await self._persist_mail_delta_state(
+                resource.id, new_tokens=new_tokens, ok_token_keys=ok_keys,
+                drained_fids=set(), fingerprints_now={},
+                evicted_token_keys=(evicted | (set(saved_before) if force_full else set())),
+                write_legacy_mirror=False,
+            )
+            return {"item_count": fresh_count, "new_item_count": fresh_count,
+                    "bytes_added": fresh_bytes, "new_delta_token": None}
 
         total_items, total_bytes = fresh_count + carried, fresh_bytes
         try:
@@ -29204,6 +29685,9 @@ class BackupWorker:
         to PARTIAL. Pass the handler's own resource_id and the reap
         only touches that handler's own loose ends; siblings keep
         running."""
+        from shared.copy_workflow import pending_copy_sql
+        snapshot_guard = pending_copy_sql(snapshot_expr="s.id")
+        write_guard = pending_copy_sql(snapshot_expr="snapshots.id")
         try:
             async with async_session_factory() as session:
                 # Bug #169 defense-in-depth: a partitioned snapshot whose
@@ -29214,12 +29698,13 @@ class BackupWorker:
                 # gate at the call site.
                 if resource_id_filter is not None:
                     rows = (await session.execute(
-                        text("""
+                        text(f"""
                             SELECT s.id
                             FROM snapshots s
                             WHERE s.job_id = :jid
                               AND s.resource_id = :rid
                               AND s.status = 'IN_PROGRESS'
+                              AND {snapshot_guard}
                               AND NOT EXISTS (
                                   SELECT 1 FROM snapshot_partitions sp
                                    WHERE sp.snapshot_id = s.id
@@ -29232,10 +29717,11 @@ class BackupWorker:
                     )).all()
                 else:
                     rows = (await session.execute(
-                        text("""
+                        text(f"""
                             SELECT s.id
                             FROM snapshots s
                             WHERE s.job_id = :jid AND s.status = 'IN_PROGRESS'
+                              AND {snapshot_guard}
                               AND NOT EXISTS (
                                   SELECT 1 FROM snapshot_partitions sp
                                    WHERE sp.snapshot_id = s.id
@@ -29254,7 +29740,7 @@ class BackupWorker:
                     # numbers match storage, not whatever the in-memory
                     # counter on a dead task last wrote.
                     actual = (await session.execute(
-                        text("""
+                        text(f"""
                             SELECT count(*) AS n,
                                    COALESCE(sum(content_size), 0) AS b
                             FROM snapshot_items WHERE snapshot_id = :sid
@@ -29264,7 +29750,7 @@ class BackupWorker:
                     n_items = int(actual[0] or 0) if actual else 0
                     b_bytes = int(actual[1] or 0) if actual else 0
                     await session.execute(
-                        text("""
+                        text(f"""
                             UPDATE snapshots
                             SET status = 'PARTIAL'::snapshotstatus,
                                 completed_at = NOW(),
@@ -29274,7 +29760,7 @@ class BackupWorker:
                                 bytes_added = COALESCE(bytes_added, :b),
                                 duration_secs = COALESCE(duration_secs,
                                     EXTRACT(EPOCH FROM (NOW() - started_at))::int),
-                                extra_data = COALESCE(extra_data::jsonb, '{}'::jsonb)
+                                extra_data = COALESCE(extra_data::jsonb, '{{}}'::jsonb)
                                              || jsonb_build_object(
                                                 'reaped', true,
                                                 'reap_reason', CAST(:r AS text))
@@ -29286,6 +29772,7 @@ class BackupWorker:
                               -- Flipping either to PARTIAL corrupts the
                               -- claim / demotes a terminal state.
                               AND status = 'IN_PROGRESS'::snapshotstatus
+                              AND {write_guard}
                         """),
                         {"sid": sid, "n": n_items, "b": b_bytes, "r": reason},
                     )
@@ -29321,6 +29808,9 @@ class BackupWorker:
         a contradictory state, and any consumer reading status
         during that window gets a wrong answer.
         """
+        from shared.copy_workflow import has_pending_copy
+        if result.get("copy_waiting") or await has_pending_copy(session, snapshot_id=snapshot.id):
+            return False
         if result.get("chat_inventory_format") == 1:
             # New-format handler already settled under its original work
             # lease. Never let this detached outer object promote PARTIAL
@@ -29389,6 +29879,8 @@ class BackupWorker:
             SnapshotStatus.PARTIAL if (files_failed > 0 or _deg_reason)
             else SnapshotStatus.COMPLETED
         )
+        if (snapshot.extra_data or {}).get("copy_required_failed"):
+            proposed = SnapshotStatus.PARTIAL if snapshot.item_count else SnapshotStatus.FAILED
         snapshot.status = await _coerce_snapshot_terminal_on_cancel(
             snapshot, proposed,
         )
@@ -29457,10 +29949,12 @@ class BackupWorker:
         # still-running coordinator to FAILED gets corrected when the
         # surviving run finishes (load-bearing recovery flow, observed
         # on OneDrive force-fulls).
-        await self._write_snapshot_terminal(
+        landed = await self._write_snapshot_terminal(
             session, snapshot,
             allowed_from=(SnapshotStatus.IN_PROGRESS, SnapshotStatus.FAILED),
         )
+        if landed is False:
+            return False
 
         # Emit observability + operational cost telemetry. Safe no-op when
         # prometheus_client missing. Wrapped in try/except so a metrics
@@ -30502,6 +30996,9 @@ class BackupWorker:
             )
             prior = existing.scalar_one_or_none()
             if prior is not None:
+                from shared.copy_workflow import has_pending_copy
+                if await has_pending_copy(session, snapshot_id=prior.id):
+                    raise ChatCatalogueWorkLeaseMoved("snapshot is suspended for required database copy")
                 # Post-restart resume: the redelivered message lands on a
                 # worker whose LeaseExtender bumps rows by OWNER id — a
                 # resumed snapshot still stamped with the DEAD worker's
@@ -30747,10 +31244,15 @@ class BackupWorker:
         )
         _incoming_extra = dict(snapshot.extra_data or {})
 
+        from shared.copy_workflow import has_pending_copy, verify_copy_resume
         from shared.db_retry import run_with_db_retry as _db_retry
 
         async def _attempt() -> bool:
             async with async_session_factory() as s:
+                if not await verify_copy_resume(s):
+                    return False
+                if await has_pending_copy(s, snapshot_id=_sid):
+                    return False
                 row = (await s.execute(
                     select(
                         Snapshot.status,
@@ -30943,6 +31445,11 @@ class BackupWorker:
                 )
 
     async def update_job_status(self, session: AsyncSession, job_id: uuid.UUID, status: JobStatus, result: Dict):
+        from shared.copy_workflow import has_pending_copy, verify_copy_resume
+        if not await verify_copy_resume(session):
+            raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before terminal write")
+        if status in (JobStatus.COMPLETED, JobStatus.FAILED) and await has_pending_copy(session, job_id=job_id):
+            return False
         job = await session.get(Job, job_id)
         if job:
             _cur = str(getattr(job.status, "name", None) or job.status).upper()
@@ -31052,6 +31559,9 @@ class BackupWorker:
         refresh is naturally idempotent (same SUM under PG row
         lock), so late-arriving finalizers can converge the row to
         the correct totals even after status terminal."""
+        from shared.copy_workflow import has_pending_copy, pending_copy_sql, verify_copy_resume
+        if await has_pending_copy(session, job_id=job_id):
+            return None
         try:
             # 2026-08-25 durability: the flip used to run once on the
             # caller's session and a killed connection silently dropped
@@ -31199,8 +31709,13 @@ class BackupWorker:
                               m.n_missing AS n_missing
                 """)
 
+            _flip_sql = text(str(_flip_sql).replace(
+                "WHERE j.id = :jid", "WHERE j.id = :jid AND " + pending_copy_sql(job_expr="j.id"),
+            ))
             async def _flip():
                 async with async_session_factory() as s:
+                    if not await verify_copy_resume(s):
+                        raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before job rollup")
                     r = (await s.execute(_flip_sql, {"jid": job_id})).first()
                     await s.commit()
                     return r

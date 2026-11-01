@@ -1074,6 +1074,13 @@ async def _default_carry_forward(
     pgbouncer server connection — see shared.database.carry_forward_slot_session)."""
     if not (target_snapshot_id and prior_snapshot_id and external_ids):
         return 0
+    from shared.copy_workflow import defer_current_copy
+    delegated = await defer_current_copy("ARCHIVE_CARRY", {
+        "target_snapshot_id": str(target_snapshot_id),
+        "prior_snapshot_id": str(prior_snapshot_id), "external_ids": list(external_ids),
+    })
+    if delegated is not None:
+        return delegated
     from sqlalchemy import text
     from shared.database import carry_forward_slot_session
 
@@ -1545,6 +1552,29 @@ async def run_archive_backup(
                 carried = await carry_forward(
                     str(snapshot.id), prior_snap_id, unchanged_ids,
                 )
+
+        from shared.copy_workflow import DeferredCopy, seal_current_copy
+        if isinstance(carried, DeferredCopy):
+            # Export fanout is fully joined; persist only counters and durable refs.
+            waiting = await seal_current_copy({
+                "resume_kind": "archive",
+                "result": {
+                    "item_count": succeeded, "bytes_added": bytes_added,
+                    "new_item_count": succeeded, "new_delta_token": None,
+                    "files_total": total_to_export, "files_succeeded": succeeded,
+                    "files_failed": failed_items + len(folder_failures),
+                },
+                "delta_tokens": {
+                    "items_enumerated": len(items), "locations_walked": len(walker.walked_bases),
+                    "items_baseline": _baseline_n, "coverage_pct": _cov_pct,
+                    "files_total": total_to_export, "files_succeeded": succeeded,
+                    "files_failed": failed_items + len(folder_failures),
+                    "folders_failed": len(folder_failures),
+                },
+            })
+            if waiting is None:
+                raise RuntimeError("delegated archive copy has no durable continuation")
+            return waiting
 
     except EnumerationFailed:
         raise
