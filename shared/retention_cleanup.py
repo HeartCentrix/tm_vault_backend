@@ -74,6 +74,8 @@ from typing import Dict, List, Optional, Set, Tuple
 import logging
 import uuid
 
+from shared.copy_workflow import copy_source_pinned_sql
+
 from sqlalchemy import select, delete, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -808,10 +810,11 @@ async def _delete_snapshots(
     """
     if not snap_ids:
         return 0
-    rows = (await session.execute(text("""
+    rows = (await session.execute(text(f"""
         SELECT id
           FROM snapshots
          WHERE id = ANY(CAST(:ids AS UUID[]))
+           AND {copy_source_pinned_sql('snapshots.id')}
            AND status::text = ANY(CAST(:terminal AS TEXT[]))
            AND (lease_expires_at IS NULL OR lease_expires_at <= NOW())
            AND COALESCE(hc_drain_status, 'NOT_APPLICABLE') <> 'PENDING'
@@ -1182,6 +1185,14 @@ async def enforce_retention_for_tenant(session: AsyncSession, tenant_id: uuid.UU
             keep = keep | _baseline_keep_ids(snaps)
 
         to_delete = {s.id for s in snaps} - keep
+        copy_guard = copy_source_pinned_sql("snapshots.id")
+        if to_delete and copy_guard != "TRUE":
+            pinned = (await session.execute(text(f"""
+                SELECT id FROM snapshots
+                 WHERE id = ANY(CAST(:ids AS UUID[])) AND NOT ({copy_guard})
+            """), {"ids": [str(sid) for sid in to_delete]})).fetchall()
+            keep.update(row[0] for row in pinned)
+            to_delete -= keep
         # A snapshot a worker may still be writing to is never deletable,
         # whatever the retention window says.
         in_flight = {s.id for s in snaps if _is_protected_in_flight(s)}

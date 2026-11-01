@@ -22,6 +22,8 @@ from typing import List, Optional
 
 from sqlalchemy import text
 
+from shared.copy_workflow import pending_copy_sql
+
 
 RECONCILER_BATCH = int(os.getenv("RECONCILER_BATCH", "200"))
 RECONCILER_MAX_REQUEUE = int(os.getenv("RECONCILER_MAX_REQUEUE", "3"))
@@ -293,7 +295,7 @@ async def sweep_orphans(session) -> SweepStats:
     requeue_rows = (
         await session.execute(
             text(
-                """
+                f"""
                 -- enqueued_at is reset to NOW() on each requeue (see the
                 -- UPDATE below) so the staleness window starts over per
                 -- requeue cycle. Without that reset the criterion stayed
@@ -313,6 +315,7 @@ async def sweep_orphans(session) -> SweepStats:
                              ON wh.worker_id = sp.lease_owner_id
                             AND wh.last_seen_at > NOW() - (:stale_s * INTERVAL '1 second')
                      WHERE sp.status IN ('QUEUED','IN_PROGRESS')
+                       AND {pending_copy_sql(partition_expr='sp.id')}
                        AND wh.worker_id IS NULL
                        AND (
                             sp.lease_expires_at IS NULL
@@ -388,6 +391,7 @@ async def sweep_orphans(session) -> SweepStats:
                              ON wh.worker_id = sp.lease_owner_id
                             AND wh.last_seen_at > NOW() - (:stale_s * INTERVAL '1 second')
                      WHERE {_NEVER_CLAIMED.format(p="sp.")}
+                       AND {pending_copy_sql(partition_expr='sp.id')}
                        AND wh.worker_id IS NULL
                        AND sp.lease_expires_at IS NULL
                        AND sp.enqueued_at <
@@ -431,13 +435,14 @@ async def sweep_orphans(session) -> SweepStats:
     poison_rows = (
         await session.execute(
             text(
-                """
+                f"""
                 UPDATE snapshot_partitions
                    SET status = 'FAILED',
                        lease_owner_id = NULL,
                        lease_expires_at = NULL,
                        lease_token = lease_token + 1
                  WHERE status IN ('QUEUED','IN_PROGRESS')
+                   AND {pending_copy_sql(partition_expr='snapshot_partitions.id')}
                    AND requeue_count >= :max_rq
                    AND (lease_expires_at IS NULL OR lease_expires_at < NOW())
                    -- Only a shard some worker actually claimed can be a
@@ -494,6 +499,7 @@ async def sweep_orphans(session) -> SweepStats:
                                'unclaimed_expired_at', NOW()
                            )
                  WHERE {_NEVER_CLAIMED.format(p="sp.")}
+                   AND {pending_copy_sql(partition_expr='sp.id')}
                    AND sp.lease_expires_at IS NULL
                    AND sp.enqueued_at <
                        NOW() - (:unclaimed_stale * INTERVAL '1 minute')
@@ -541,7 +547,7 @@ async def sweep_orphans(session) -> SweepStats:
     snap_rows = (
         await session.execute(
             text(
-                """
+                f"""
                 -- snapshot_partitions.status is plain VARCHAR (not an
                 -- enum) — the publisher writes 'QUEUED', workers flip
                 -- to 'IN_PROGRESS', then 'COMPLETED'/'FAILED'. No
@@ -615,7 +621,7 @@ async def sweep_orphans(session) -> SweepStats:
                            ELSE 'FAILED'::snapshotstatus
                        END,
                        completed_at     = NOW(),
-                       -- Say WHY. This settle used to land a bare {} , so a
+                       -- Say WHY. This settle used to land a bare {{}} , so a
                        -- FAILED snapshot was indistinguishable from a
                        -- handler crash or a Graph failure without grepping
                        -- every worker replica (2026-08-05: Corp_Esplanade's
@@ -647,7 +653,7 @@ async def sweep_orphans(session) -> SweepStats:
                                         || 'outcomes (no shard left in flight)'
                                END,
                                'reconciler_settled', true
-                           ) || COALESCE(s.extra_data::jsonb, '{}'::jsonb),
+                           ) || COALESCE(s.extra_data::jsonb, '{{}}'::jsonb),
                        -- Was NULL on the live row, which is what proved
                        -- fail_snapshot / the inline finalize never ran. Fill
                        -- it so that signal stays meaningful.
@@ -692,6 +698,7 @@ async def sweep_orphans(session) -> SweepStats:
                        lease_expires_at = NULL,
                        lease_token      = s.lease_token + 1
                  WHERE s.status = 'IN_PROGRESS'::snapshotstatus
+                   AND {pending_copy_sql(snapshot_expr='s.id')}
                    AND NOT EXISTS (
                        SELECT 1 FROM snapshot_partitions sp
                         WHERE sp.snapshot_id = s.id
@@ -773,7 +780,7 @@ async def sweep_orphans(session) -> SweepStats:
     job_rows = (
         await session.execute(
             text(
-                """
+                f"""
                 -- jobstatus enum values: QUEUED, PENDING, RUNNING,
                 -- COMPLETED, FAILED, CANCELLED, CANCELLING, RETRYING.
                 -- *No* PARTIAL — that lives on snapshotstatus only.
@@ -820,6 +827,7 @@ async def sweep_orphans(session) -> SweepStats:
                        lease_expires_at = NULL,
                        lease_token      = j.lease_token + 1
                  WHERE j.status = 'RUNNING'::jobstatus
+                   AND {pending_copy_sql(job_expr='j.id')}
                    AND NOT EXISTS (
                        SELECT 1 FROM snapshots s
                         WHERE s.job_id = j.id
@@ -863,7 +871,7 @@ async def sweep_orphans(session) -> SweepStats:
     snap_integrity_rows = (
         await session.execute(
             text(
-                """
+                f"""
                 WITH part_agg AS (
                     SELECT sp.snapshot_id,
                            COUNT(*)                                      AS n,
@@ -958,6 +966,7 @@ async def sweep_orphans(session) -> SweepStats:
                            )
                   FROM part_agg pa
                  WHERE s.id = pa.snapshot_id
+                   AND {pending_copy_sql(snapshot_expr='s.id')}
                    AND pa.n > 0
                    AND NOT pa.any_pending
                    AND s.status IN ('COMPLETED'::snapshotstatus,

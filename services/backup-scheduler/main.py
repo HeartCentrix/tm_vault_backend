@@ -25,6 +25,9 @@ import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from shared.database import async_session_factory
+from shared.copy_workflow import (
+    copy_source_pinned_sql, initialize_copy_guards, pending_copy_sql,
+)
 from shared.models import (
     Resource, SlaPolicy, Tenant, Job, Organization, Snapshot,
     ResourceType, ResourceStatus, JobType, JobStatus, SnapshotType, TenantStatus, TenantType
@@ -471,6 +474,7 @@ async def startup():
     from shared import core_metrics
     core_metrics.init()
     await db_init_db()
+    await initialize_copy_guards(async_session_factory)
     await startup_router()
     # At-rest encryption hook so scheduler blob reads decrypt (no-op unless
     # BACKUP_ENCRYPTION_* env is configured).
@@ -562,7 +566,7 @@ async def startup():
     async def _sweep_stale_snapshots():
         try:
             async with async_session_factory() as session:
-                result = await session.execute(text("""
+                result = await session.execute(text(f"""
                     WITH counts AS (
                         SELECT s.id,
                                s.started_at,
@@ -576,6 +580,7 @@ async def startup():
                                 WHERE si.snapshot_id = s.id) AS last_item_at
                         FROM snapshots s
                         WHERE s.status = 'IN_PROGRESS'
+                          AND {pending_copy_sql(snapshot_expr='s.id')}
                           -- Liveness check: a snapshot is alive if its
                           -- most-recent snapshot_items row was inserted
                           -- recently. OneDrive / SharePoint / Power BI
@@ -657,7 +662,7 @@ async def startup():
                         completed_at = NOW(),
                         duration_secs = EXTRACT(EPOCH FROM
                             (NOW() - c.started_at))::int,
-                        extra_data = COALESCE(s.extra_data::jsonb, '{}'::jsonb)
+                        extra_data = COALESCE(s.extra_data::jsonb, '{{}}'::jsonb)
                                      || jsonb_build_object(
                                         'stale_sweep', true,
                                         'reason',
@@ -740,7 +745,7 @@ async def startup():
             # invocations harmless.
             try:
                 async with async_session_factory() as session:
-                    flip_rows = (await session.execute(text("""
+                    flip_rows = (await session.execute(text(f"""
                         WITH bulk_jobs AS (
                             SELECT id,
                                    COALESCE(array_length(batch_resource_ids, 1), 0) AS n
@@ -788,7 +793,7 @@ async def startup():
                             progress_pct = 100,
                             items_processed = c.items,
                             bytes_processed = c.bytes,
-                            result = COALESCE(j.result::jsonb, '{}'::jsonb)
+                            result = COALESCE(j.result::jsonb, '{{}}'::jsonb)
                                      || jsonb_build_object(
                                         'finalized_by', 'stale_sweep',
                                         'snapshots_total', bj.n,
@@ -800,6 +805,7 @@ async def startup():
                                      )
                         FROM counts c, bulk_jobs bj
                         WHERE j.id = bj.id
+                          AND {pending_copy_sql(job_expr='j.id')}
                           AND j.id = c.job_id
                           AND c.terminal >= bj.n
                           AND j.status NOT IN (
@@ -933,18 +939,19 @@ async def startup():
                 async with async_session_factory() as session:
                     failed_rows = (await session.execute(
                         text(
-                            """
+                            f"""
                             UPDATE snapshot_partitions
                                SET status        = 'FAILED',
                                    completed_at  = NOW(),
                                    failure_state = COALESCE(
-                                       failure_state, '{}'::json
+                                       failure_state, '{{}}'::json
                                    )::jsonb || jsonb_build_object(
                                        'reason', 'max_retries_exceeded',
                                        'retry_count', retry_count,
                                        'stale_sweep_at', NOW()
                                    )
                              WHERE status = 'IN_PROGRESS'
+                               AND {pending_copy_sql(partition_expr='snapshot_partitions.id')}
                                AND started_at IS NOT NULL
                                AND started_at < NOW()
                                                 - (:stale * INTERVAL '1 minute')
@@ -977,19 +984,20 @@ async def startup():
                 async with async_session_factory() as session:
                     stuck_rows = (await session.execute(
                         text(
-                            """
+                            f"""
                             UPDATE snapshot_partitions
                                SET status        = 'QUEUED',
                                    worker_id     = NULL,
                                    started_at    = NULL,
                                    retry_count   = retry_count + 1,
                                    failure_state = COALESCE(
-                                       failure_state, '{}'::json
+                                       failure_state, '{{}}'::json
                                    )::jsonb || jsonb_build_object(
                                        'stale_sweep', true,
                                        'reset_at', NOW()
                                    )
                              WHERE status = 'IN_PROGRESS'
+                               AND {pending_copy_sql(partition_expr='snapshot_partitions.id')}
                                AND started_at IS NOT NULL
                                AND started_at < NOW()
                                                 - (:stale * INTERVAL '1 minute')
@@ -1051,16 +1059,17 @@ async def startup():
                         async with async_session_factory() as session:
                             await session.execute(
                                 text(
-                                    """
+                                    f"""
                                     UPDATE snapshot_partitions
                                        SET status       = 'FAILED',
                                            completed_at = NOW(),
                                            failure_state = COALESCE(
-                                               failure_state, '{}'::json
+                                               failure_state, '{{}}'::json
                                            )::jsonb || jsonb_build_object(
                                                'reason', 'job_cancelled_during_sweep'
                                            )
                                      WHERE id::text = ANY(:ids)
+                                       AND {pending_copy_sql(partition_expr='snapshot_partitions.id')}
                                     """
                                 ),
                                 {"ids": cancelled_part_ids},
@@ -1236,7 +1245,7 @@ async def startup():
                 # ``(extra_data::jsonb ->> 'cancelled_at') IS NOT NULL``
                 # instead which works regardless of the underlying type
                 # (the cast is a no-op when the column is already jsonb).
-                candidates = (await session.execute(text("""
+                candidates = (await session.execute(text(f"""
                     SELECT s.id AS sid, s.resource_id, s.started_at,
                            s.extra_data,
                            r.type::text   AS resource_type,
@@ -1275,6 +1284,7 @@ async def startup():
                        -- within one lease TTL (~10 min), including
                        -- operator cancels — a deferred teardown beats a
                        -- corrupted live run.
+                       AND {copy_source_pinned_sql('s.id')}
                        AND (s.lease_expires_at IS NULL OR s.lease_expires_at < NOW())
                        -- Defense against partitioned-shard double-cleanup.
                        AND NOT EXISTS (
@@ -1329,6 +1339,7 @@ async def startup():
                                 "       lease_token = s.lease_token + 1 "
                                 "  FROM jobs j "
                                 " WHERE s.id = :sid "
+                                f"   AND {copy_source_pinned_sql('s.id')} "
                                 "   AND s.job_id = j.id "
                                 "   AND (s.lease_expires_at IS NULL OR s.lease_expires_at < NOW()) "
                                 "   AND ( (s.extra_data::jsonb ->> 'cancelled_at') IS NOT NULL "
@@ -1435,6 +1446,7 @@ async def startup():
                                 " WHERE si.snapshot_id = :sid "
                                 "   AND s.id = si.snapshot_id "
                                 "   AND s.status = 'PENDING_DELETION' "
+                                f"   AND {copy_source_pinned_sql('s.id')} "
                                 "   AND (s.lease_expires_at IS NULL OR s.lease_expires_at < NOW())"
                             ),
                             {"sid": sid},
@@ -1444,6 +1456,7 @@ async def startup():
                                 "DELETE FROM snapshots s "
                                 " WHERE s.id = :sid "
                                 "   AND s.status = 'PENDING_DELETION' "
+                                f"   AND {copy_source_pinned_sql('s.id')} "
                                 "   AND (s.lease_expires_at IS NULL OR s.lease_expires_at < NOW())"
                             ),
                             {"sid": sid},
@@ -1734,7 +1747,7 @@ async def startup():
                             f"failed: {fex}"
                         )
 
-                stalled = (await session.execute(text("""
+                stalled = (await session.execute(text(f"""
                     SELECT b.id,
                            EXISTS(
                                SELECT 1 FROM snapshots s
@@ -1744,6 +1757,11 @@ async def startup():
                            ) AS has_any_snapshot
                       FROM backup_batches b
                      WHERE b.status = 'IN_PROGRESS'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM jobs copy_job
+                            WHERE COALESCE(copy_job.spec::jsonb->>'batch_id','') = b.id::text
+                              AND NOT ({pending_copy_sql(job_expr='copy_job.id')})
+                       )
                        AND b.created_at < NOW() - make_interval(hours => :hh)
                      LIMIT 500
                 """), {"hh": _s.BATCH_STALL_TIMEOUT_HOURS})).all()
@@ -1786,7 +1804,7 @@ async def startup():
     async def _reap_stuck_running_jobs():
         try:
             async with async_session_factory() as session:
-                result = await session.execute(text("""
+                result = await session.execute(text(f"""
                     WITH terminal_per_job AS (
                         SELECT j.id AS job_id,
                                cardinality(j.batch_resource_ids) AS n_resources,
@@ -1811,7 +1829,7 @@ async def startup():
                         progress_pct = 100,
                         completed_at = NOW(),
                         updated_at = NOW(),
-                        result = COALESCE(j.result::jsonb, '{}'::jsonb)
+                        result = COALESCE(j.result::jsonb, '{{}}'::jsonb)
                                  || jsonb_build_object(
                                     'reaped_by', 'stuck_running_reaper',
                                     'total', t.n_resources,
@@ -1822,6 +1840,7 @@ async def startup():
                                  )
                     FROM terminal_per_job t
                     WHERE j.id = t.job_id
+                      AND {pending_copy_sql(job_expr='j.id')}
                       AND t.n_terminal >= t.n_resources
                     RETURNING j.id
                 """))
@@ -1856,7 +1875,7 @@ async def startup():
     async def _reap_missing_snapshot_jobs():
         try:
             async with async_session_factory() as session:
-                result = await session.execute(text("""
+                result = await session.execute(text(f"""
                     WITH t AS (
                         SELECT j.id AS job_id,
                                cardinality(j.batch_resource_ids) AS n_resources,
@@ -1908,7 +1927,7 @@ async def startup():
                             'message lost/dead-lettered before any worker '
                             'ran, or rows deleted after dispatch; '
                             'finalized by missing_snapshot_reaper'),
-                        result = COALESCE(j.result::jsonb, '{}'::jsonb)
+                        result = COALESCE(j.result::jsonb, '{{}}'::jsonb)
                                  || jsonb_build_object(
                                     'reaped_by', 'missing_snapshot_reaper',
                                     'total', t.n_resources,
@@ -1942,6 +1961,7 @@ async def startup():
                                  )
                     FROM t
                     WHERE j.id = t.job_id
+                      AND {pending_copy_sql(job_expr='j.id')}
                       AND t.n_nonterminal = 0
                       AND t.n_existing < t.n_resources
                       AND NOT EXISTS (
@@ -1981,7 +2001,7 @@ async def startup():
     async def _reap_settled_single_resource_jobs():
         try:
             async with async_session_factory() as session:
-                result = await session.execute(text("""
+                result = await session.execute(text(f"""
                     WITH agg AS (
                         SELECT s.job_id,
                                COUNT(*) FILTER (WHERE s.status IN ('COMPLETED','PARTIAL')) AS n_ok,
@@ -2019,7 +2039,7 @@ async def startup():
                                         'snapshot recorded no failure_reason'),
                                      500))
                             END,
-                        result = COALESCE(j.result::jsonb, '{}'::jsonb)
+                        result = COALESCE(j.result::jsonb, '{{}}'::jsonb)
                                  || jsonb_build_object(
                                     'reaped_by', 'single_resource_job_reaper',
                                     'item_count', a.items_total,
@@ -2027,6 +2047,7 @@ async def startup():
                                  )
                     FROM agg a
                     WHERE j.id = a.job_id
+                      AND {pending_copy_sql(job_expr='j.id')}
                       AND j.type = 'BACKUP'
                       AND j.status IN ('QUEUED','RUNNING')
                       AND j.resource_id IS NOT NULL

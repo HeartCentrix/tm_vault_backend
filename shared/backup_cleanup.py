@@ -134,6 +134,8 @@ from typing import (
 )
 from uuid import UUID
 
+from shared.copy_workflow import copy_blob_pinned_sql, copy_source_pinned_sql
+
 from sqlalchemy import delete as sa_delete, select, text, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -826,6 +828,20 @@ async def select_deletable_blob_paths(
             retained[path] = RETAIN_REUSE_DESCENDANT
             continue
         survivors.add(path)
+
+    # Frozen manifests may outlive their source snapshot_items rows.
+    copy_guard = copy_blob_pinned_sql("candidate.blob_path")
+    if survivors and copy_guard != "TRUE":
+        paths = sorted(survivors)
+        for start in range(0, len(paths), _PROBE_CHUNK):
+            pinned = (await session.execute(text(f"""
+                SELECT candidate.blob_path
+                  FROM unnest(CAST(:paths AS text[])) AS candidate(blob_path)
+                 WHERE NOT ({copy_guard})
+            """), {"paths": paths[start:start + _PROBE_CHUNK]})).all()
+            for row in pinned:
+                survivors.discard(row.blob_path)
+                retained[row.blob_path] = "pending_copy"
 
     # --- Gate 3a: indexed (tenant_id, content_checksum) sharer probe --
     keyed: Dict[UUID, Set[str]] = {}
@@ -1548,6 +1564,7 @@ async def cleanup_cancelled_snapshots(
         stmt = (
             select(Snapshot.id)
             .where(Snapshot.job_id == job_id)
+            .where(text(copy_source_pinned_sql("snapshots.id")))
             .where(Snapshot.status.in_([
                 SnapshotStatus.IN_PROGRESS,
                 SnapshotStatus.COMPLETED,
@@ -1631,6 +1648,27 @@ async def cleanup_cancelled_snapshots(
             "reuse_protected_cancelled_at, rows + counters intact)",
             job_id, held,
         )
+
+    # Serialize source admission with teardown before deleting any bytes.
+    copy_guard = copy_source_pinned_sql("snapshots.id")
+    if copy_guard != "TRUE":
+        eligible = [sid for sid in snapshot_ids if sid not in protected_roots]
+        if eligible:
+            async with session_factory() as session:
+                claimed = (await session.execute(text(f"""
+                    UPDATE snapshots
+                       SET status = 'PENDING_DELETION',
+                           lease_owner_id = NULL, lease_expires_at = NULL,
+                           lease_token = lease_token + 1
+                     WHERE id = ANY(CAST(:ids AS uuid[]))
+                       AND (lease_expires_at IS NULL OR lease_expires_at < NOW())
+                       AND {copy_guard}
+                    RETURNING id
+                """), {"ids": [str(sid) for sid in eligible]})).all()
+                await session.commit()
+            snapshot_ids = list(protected_roots) + [row[0] for row in claimed]
+        if not snapshot_ids:
+            return stats
 
     # --- 2. Stream-delete blobs in batches -----------------------------
     # Keyset pagination on item id so a worker crash mid-cleanup can

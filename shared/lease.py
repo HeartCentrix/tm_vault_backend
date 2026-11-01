@@ -25,6 +25,8 @@ from typing import Optional
 
 from sqlalchemy import text
 
+from shared.copy_workflow import pending_copy_sql
+
 
 # 5k-user prod scale: CHATS partitions with 403 backoffs and heavy
 # OneDrive shards routinely run 5+ minutes per partition. Renew at
@@ -169,6 +171,9 @@ async def claim(
     of the race never sees a usable token.
     """
     _check_table(table)
+    copy_scope = {"jobs": "job_expr", "snapshots": "snapshot_expr",
+                  "snapshot_partitions": "partition_expr"}[table]
+    copy_guard = pending_copy_sql(**{copy_scope: f"{table}.id"})
     sql = text(
         f"""
         UPDATE {table}
@@ -177,6 +182,7 @@ async def claim(
                lease_token      = lease_token + 1
          WHERE id = cast(:wid AS uuid)
            AND status::text = :in_prog
+           AND {copy_guard}
            AND (lease_expires_at IS NULL OR lease_expires_at < NOW())
          RETURNING lease_token
         """

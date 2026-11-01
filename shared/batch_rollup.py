@@ -26,6 +26,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
+from shared.copy_workflow import pending_copy_sql
+
 from sqlalchemy import text
 
 # Operations that may be inlined into the SQL by ``build_batch_rollup_query``.
@@ -598,6 +600,7 @@ def build_batch_rollup_query(
             COUNT(s.id)                                             AS snap_total,
             COUNT(*) FILTER (
                 WHERE s.status::text = 'COMPLETED'
+                  AND {pending_copy_sql(snapshot_expr='s.id')}
                   AND COALESCE(
                         json_extract_path_text(s.extra_data, 'skipped_concurrent'),
                         'false'
@@ -611,7 +614,8 @@ def build_batch_rollup_query(
             )                                                       AS snap_skipped,
             COUNT(*) FILTER (WHERE s.status::text = 'PARTIAL')      AS snap_partial,
             COUNT(*) FILTER (WHERE s.status::text = 'FAILED')       AS snap_failed,
-            COUNT(*) FILTER (WHERE s.status::text IN ('QUEUED','IN_PROGRESS'))
+            COUNT(*) FILTER (WHERE s.status::text IN ('QUEUED','IN_PROGRESS')
+                                  OR NOT ({pending_copy_sql(snapshot_expr='s.id')}))
                                                                     AS snap_pending,
             MAX(s.completed_at)                                     AS snaps_max_completed_at,
             COALESCE(SUM(s.bytes_added), 0)                         AS bytes_added,
@@ -1289,11 +1293,16 @@ async def _finalize_batch_if_complete(batch_id, session) -> Optional[str]:
     enums compared with ``::text``; writes wrapped in
     ``SELECT FOR UPDATE`` for race protection.
     """
-    locked = (await session.execute(text("""
+    locked = (await session.execute(text(f"""
         SELECT id, created_at, scope_user_ids
           FROM backup_batches
          WHERE id = cast(:bid AS uuid)
            AND status = 'IN_PROGRESS'
+           AND NOT EXISTS (
+               SELECT 1 FROM jobs copy_job
+                WHERE COALESCE(copy_job.spec::jsonb->>'batch_id','') = backup_batches.id::text
+                  AND NOT ({pending_copy_sql(job_expr='copy_job.id')})
+           )
          FOR UPDATE
     """), {"bid": str(batch_id)})).first()
     if not locked:
@@ -1397,13 +1406,14 @@ async def _finalize_batch_if_complete(batch_id, session) -> Optional[str]:
         return None
 
     # Gates 2 + 3: every leaf must have a terminal snapshot newer than batch.created_at.
-    pending = (await session.execute(text("""
+    pending = (await session.execute(text(f"""
         WITH leaves AS (
             SELECT cast(unnest(cast(:lids AS uuid[])) AS uuid) AS rid
         ),
         latest AS (
             SELECT DISTINCT ON (s.resource_id)
-                   s.resource_id, s.status::text AS status
+                   s.resource_id, s.status::text AS status,
+                   {pending_copy_sql(snapshot_expr='s.id')} AS copy_ready
               FROM snapshots s
               JOIN leaves l ON s.resource_id = l.rid
              WHERE s.created_at > cast(:created AS timestamp)
@@ -1414,6 +1424,7 @@ async def _finalize_batch_if_complete(batch_id, session) -> Optional[str]:
           LEFT JOIN latest la ON la.resource_id = l.rid
          WHERE la.resource_id IS NULL
             OR la.status NOT IN ('COMPLETED','PARTIAL','FAILED')
+            OR NOT la.copy_ready
     """), {"lids": leaf_ids, "created": batch_created_at})).all()
     if pending:
         return None
