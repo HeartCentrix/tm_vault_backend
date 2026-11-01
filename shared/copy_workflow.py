@@ -282,6 +282,8 @@ async def seal_current_copy(continuation):
         workflow.snapshot_lease_token=snapshot.lease_token
         workflow.job_lease_token=job.lease_token
         workflow.continuation=json.loads(encoded)
+        from shared.copy_work import align_ready_workflow
+        await align_ready_workflow(session,workflow.id)
         workflow.state='WAITING';workflow.generation+=1
         workflow.lease_owner_id=None;workflow.lease_expires_at=None
         now=await session.scalar(select(func.clock_timestamp()))

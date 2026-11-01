@@ -90,7 +90,9 @@ async def test_crash_after_leaf_completion_recovers_parent_without_broker(store,
     async with store.factory.begin() as db:
         wf = await db.get(models.CopyWorkflow, workflows[0])
         assert wf.parent_settle_pending and wf.state == 'COMPLETED'
-        db.add(models.CopyWorkControl(id='global', enabled=True))
+        control=await db.get(models.CopyWorkControl,'global')
+        if control is None: db.add(models.CopyWorkControl(id='global', enabled=True))
+        else: control.enabled=True
     worker._settle_copy_parent = original
     runner = CopyWorkRunner(store.factory, worker.resume_copy_workflow)
     try:

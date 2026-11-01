@@ -165,6 +165,41 @@ async def enqueue(session, request: CopyRequest) -> CopyWorkTask:
     return task
 
 
+async def align_ready_workflow(session, workflow_id) -> None:
+    """An inactive queue enters behind the backlogged siblings' next fair turn."""
+    workflow = await session.get(CopyWorkflow, _uuid(workflow_id))
+    if workflow is None or workflow.state != 'DRAINING':
+        return
+    # Share claim's short scheduling mutex. Claim never locks a workflow and
+    # skips locked task rows, so seal's held DRAINING workflow cannot block it.
+    await session.execute(insert(CopyWorkControl).values(id='global').on_conflict_do_nothing())
+    await session.scalar(select(CopyWorkControl.id).where(CopyWorkControl.id == 'global').with_for_update())
+    backlog = select(CopyWorkTask.id).join(CopyWorkflow, CopyWorkflow.id == CopyWorkTask.workflow_id).where(
+        CopyWorkflow.state == 'WAITING', CopyWorkflow.id != workflow.id,
+        CopyWorkTask.capture_attempt == CopyWorkflow.capture_attempt,
+        CopyWorkTask.state.in_(('READY', 'RUNNING')))
+    for scope, column in (('TENANT', CopyWorkTask.tenant_queue_key),
+                          ('POLICY', CopyWorkTask.queue_key), ('RESOURCE', CopyWorkTask.resource_queue_key)):
+        siblings = aliased(CopyWorkQueue)
+        minimum = select(func.min(siblings.virtual_finish)).where(
+            siblings.scope == scope, siblings.lane == CopyWorkQueue.lane,
+            siblings.parent_key.is_not_distinct_from(CopyWorkQueue.parent_key),
+            siblings.key != CopyWorkQueue.key,
+            exists(backlog.where(column == siblings.key)).correlate(siblings),
+        ).correlate(CopyWorkQueue).scalar_subquery()
+        keys = select(column).where(CopyWorkTask.workflow_id == workflow.id,
+            CopyWorkTask.capture_attempt == workflow.capture_attempt, CopyWorkTask.state.in_(('READY', 'RUNNING')))
+        rows = await session.execute(select(CopyWorkQueue,
+            exists(backlog.where(column == CopyWorkQueue.key)).correlate(CopyWorkQueue), minimum,
+        ).where(CopyWorkQueue.scope == scope, CopyWorkQueue.key.in_(keys)))
+        for queue, already_active, sibling_min in rows:
+            if not already_active and sibling_min is not None:
+                # A full positive quantum also prevents smaller-key new queues
+                # from repeatedly winning equal-clock or epsilon-only ties.
+                queue.virtual_finish = max(queue.virtual_finish, sibling_min + 1 / queue.weight)
+    await session.flush()
+
+
 async def claim(session, *, owner_id, lease_seconds=90) -> CopyClaim | None:
     # Serializes only short scheduling decisions, never execution or waiting.
     await session.execute(insert(CopyWorkControl).values(id='global').on_conflict_do_nothing())
