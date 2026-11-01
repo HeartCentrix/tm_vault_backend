@@ -1,4 +1,14 @@
 """Naming uses already captured user-scoped evidence, never activity timestamps."""
+def test_legacy_producers_require_rollout_enable_but_readers_do_not(monkeypatch):
+    from shared.chat_presentation import chat_presentation_enabled
+    monkeypatch.delenv('CHAT_PRESENTATION_ENABLED', raising=False)
+    assert not chat_presentation_enabled()
+    monkeypatch.setenv('CHAT_PRESENTATION_ENABLED', 'true')
+    assert chat_presentation_enabled()
+    monkeypatch.setenv('CHAT_PRESENTATION_ENABLED', 'false')
+    assert not chat_presentation_enabled()
+
+
 def test_current_topic_wins_over_cached_name_and_only_owned_chats_emit_labels():
     from shared.chat_presentation import label_observations
     labels = label_observations({'a': {'displayName': 'Old', 'topic': 'Old'},

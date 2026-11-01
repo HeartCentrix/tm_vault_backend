@@ -11,10 +11,8 @@ _DDL = (
     """CREATE TABLE IF NOT EXISTS chat_presentation_plans (
 	snapshot_id UUID NOT NULL, 
 	state VARCHAR(16) NOT NULL, 
-	source_signature VARCHAR(64), 
 	task_id UUID, 
 	expected_count BIGINT NOT NULL, 
-	last_chat_id TEXT, 
 	published_count BIGINT NOT NULL, 
 	PRIMARY KEY (snapshot_id), 
 	CONSTRAINT ck_chat_presentation_plan_state CHECK (state IN ('PENDING','PUBLISHING','PUBLISHED','ABORTED')), 

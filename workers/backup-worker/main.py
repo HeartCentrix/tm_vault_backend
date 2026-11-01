@@ -12255,10 +12255,10 @@ class BackupWorker:
                     except Exception as _e:
                         print(f"[{self.worker_id}] [USER_CHATS] meta persist failed: {_e}")
 
-                    from shared.chat_presentation import label_observations
+                    from shared.chat_presentation import label_observations, chat_presentation_enabled
                     from shared.copy_workflow import defer_current_copy
                     _labels_deferred = None
-                    if snapshot is not None and os.getenv("CHAT_PRESENTATION_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on"):
+                    if snapshot is not None and chat_presentation_enabled():
                         _owned_chats = set(_shard_chat_ids) if _running_as_chat_shard else set(chat_meta)
                         _labels_deferred = await defer_current_copy("CHAT_LABELS", {
                             "labels": label_observations(chat_meta, owned_chat_ids=_owned_chats,

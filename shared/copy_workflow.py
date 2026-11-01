@@ -347,10 +347,12 @@ async def begin_resume(factory, workflow_id, owner_id):
                 CopyWorkTask.workflow_id == workflow.id, CopyWorkTask.capture_attempt == workflow.capture_attempt,
                 CopyWorkTask.kind == 'CHAT_PRESENTATION', CopyWorkTask.state != 'COMPLETED'))))
             if failed_presentation:
-                from shared.models import ChatPresentationPlan
+                from shared.models import ChatPresentationPlan, ChatPresentationDraft
                 plan = await session.get(ChatPresentationPlan, snapshot.id)
                 if plan is not None and plan.state != 'PUBLISHED':
                     plan.state = 'ABORTED'
+                    await session.execute(delete(ChatPresentationDraft).where(
+                        ChatPresentationDraft.snapshot_id == snapshot.id))
         else:
             data={**(snapshot.extra_data or {}),'copy_phase':'COMPLETE'}
             data.pop('copy_required_failed',None)

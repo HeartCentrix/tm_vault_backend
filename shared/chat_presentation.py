@@ -4,6 +4,7 @@ Labels are presentation, never conversation identity. Callers authorize the
 requested snapshots before using these database-only helpers.
 """
 import hashlib
+import os
 from uuid import UUID
 
 from sqlalchemy import case, func, select, or_
@@ -17,6 +18,10 @@ MESSAGE_TYPES = ("TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY")
 
 class ChatSelectionError(ValueError):
     """A chat-specific selector cannot prove one captured conversation."""
+
+
+def chat_presentation_enabled():
+    return os.getenv('CHAT_PRESENTATION_ENABLED', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
 
 
 def label_observations(chat_meta, *, owned_chat_ids, current_chats=()):

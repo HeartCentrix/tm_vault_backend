@@ -1752,10 +1752,8 @@ class ChatPresentationPlan(Base):
     __tablename__ = "chat_presentation_plans"
     snapshot_id = Column(UUID(as_uuid=True), ForeignKey("snapshots.id", ondelete="CASCADE"), primary_key=True)
     state = Column(String(16), nullable=False, default="PENDING")
-    source_signature = Column(String(64))
     task_id = Column(UUID(as_uuid=True))
     expected_count = Column(BigInteger, nullable=False, default=0)
-    last_chat_id = Column(Text)
     published_count = Column(BigInteger, nullable=False, default=0)
     __table_args__ = (CheckConstraint("state IN ('PENDING','PUBLISHING','PUBLISHED','ABORTED')", name="ck_chat_presentation_plan_state"),)
 

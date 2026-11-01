@@ -131,6 +131,12 @@ async def enqueue(session, request: CopyRequest) -> CopyWorkTask:
             raise CopyWorkConflict('chat label is outside the source partition')
         await session.execute(insert(ChatPresentationPlan).values(snapshot_id=snapshot.id,
             state='PENDING', published_count=0).on_conflict_do_nothing())
+        plan = await session.get(ChatPresentationPlan, snapshot.id)
+        if plan.state == 'PUBLISHED':
+            raise CopyWorkConflict('captured chat presentation is already sealed')
+        if request.kind == 'CHAT_LABELS' and plan.state == 'ABORTED':
+            plan.state, plan.task_id = 'PENDING', None
+            plan.expected_count, plan.published_count = 0, 0
     from shared.database import CARRY_FORWARD_WAIT_MAX_S
     params = {**request.params, 'target_snapshot_id': str(snapshot.id)}
     # Derived source evidence is not part of the producer's idempotency key.

@@ -1,6 +1,4 @@
 """Small captured-label manifests in the existing fenced copy-work protocol."""
-import hashlib
-
 from sqlalchemy import case, delete, exists, func, literal, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import aliased
@@ -98,16 +96,21 @@ async def prepare_presentation_manifest(session, task, params):
             (func.coalesce(winners.c.provenance, '') != 'current_topic_cleared') | (prior.c.quality < 3))
         path = case((retain, prior.c.folder_path), else_=winners.c.folder_path)
         path = func.coalesce(path, identities.c.stored_path, literal('chats/') + identities.c.chat_id)
+        other, producer = aliased(ChatPresentationDraft), aliased(CopyWorkflow)
+        conflict = exists(select(other.chat_id).join(producer, producer.id == other.workflow_id).where(
+            other.snapshot_id == workflow.target_snapshot_id, other.chat_id == identities.c.chat_id,
+            producer.target_snapshot_id == workflow.target_snapshot_id, producer.state != 'CANCELLED',
+            other.capture_attempt == producer.capture_attempt, other.quality == winners.c.quality,
+            other.folder_path != winners.c.folder_path)).correlate(identities, winners)
         payload = func.json_build_object('chat_id', identities.c.chat_id, 'folder_path', path,
             'quality', func.coalesce(case((retain, prior.c.quality), else_=winners.c.quality), 0),
             'provenance', case((retain, 'retained_history'), else_=func.coalesce(winners.c.provenance, 'legacy_stored')),
-            'conflicted', func.coalesce(winners.c.conflicted, False))
+            'conflicted', func.coalesce(winners.c.conflicted, False) | conflict)
         selected = select(literal(task.id), func.row_number().over(order_by=identities.c.chat_id),
             payload, literal(0)).select_from(identities.outerjoin(winners,
                 winners.c.chat_id == identities.c.chat_id).outerjoin(prior, prior.c.chat_id == identities.c.chat_id))
         await session.execute(insert(CopyWorkItem).from_select(['task_id', 'ordinal', 'payload', 'phase'], selected))
         plan.state, plan.task_id = 'PUBLISHING', task.id
-        plan.source_signature = hashlib.sha256(f'{workflow.id}:{workflow.capture_attempt}'.encode()).hexdigest()
         plan.expected_count = await session.scalar(select(func.count()).select_from(CopyWorkItem).where(CopyWorkItem.task_id == task.id))
         plan.published_count = 0
     task.prepared = True
@@ -153,6 +156,8 @@ async def apply_label_batch(session, task, *, limit):
             snapshot = await session.get(Snapshot, workflow.target_snapshot_id)
             snapshot.extra_data = {**(snapshot.extra_data or {}), 'chat_presentation_format': 1}
             plan.state = 'PUBLISHED'
+            await session.execute(delete(ChatPresentationDraft).where(
+                ChatPresentationDraft.snapshot_id == workflow.target_snapshot_id))
     return {'done': bool(done), 'cursor': cursor, 'rows': len(rows), 'bytes': 0}
 
 
