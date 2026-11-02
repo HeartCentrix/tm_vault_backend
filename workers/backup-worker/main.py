@@ -22818,7 +22818,7 @@ class BackupWorker:
         chunk_size = min(chunk_size, max(65536, budget.resident_bytes // (max_parallel_parts + 8)))
         reservation = chunk_size * (max_parallel_parts + 6) + segment_concurrency * 65536
         fallback = False
-        async with budget.bytes(reservation):
+        async with budget.bytes(reservation, includes_storage=True):
             async with _httpx.AsyncClient(timeout=_httpx.Timeout(connect=15, read=300, write=60, pool=15),
                     follow_redirects=True, http2=False) as raw:
                 client = download_client(raw, graph_client)
@@ -23043,7 +23043,7 @@ class BackupWorker:
 
         budget = execution_budget()
         chunk_size = min(chunk_size, max(65536, budget.resident_bytes // (max_parallel_parts + 8)))
-        async with budget.bytes(chunk_size * (max_parallel_parts + 6)):
+        async with budget.bytes(chunk_size * (max_parallel_parts + 6), includes_storage=True):
             source = _byte_iter()
             try:
                 return await shard.upload_blob_stream(container, blob_path, source, expected_size,

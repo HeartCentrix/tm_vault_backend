@@ -60,8 +60,11 @@ class ExecutionBudget:
 
     @asynccontextmanager
     async def bytes(self, amount, *, includes_storage=False):
+        allowance = amount if includes_storage is True else includes_storage
+        if allowance is not False and (type(allowance) is not int or not 0 <= allowance <= amount):
+            raise ValueError('invalid prepaid storage allowance')
         await self.acquire_bytes(amount)
-        token = _PREPAID_STORAGE.set((self, asyncio.current_task(), amount)) if includes_storage else None
+        token = _PREPAID_STORAGE.set((self, asyncio.current_task(), allowance)) if allowance is not False else None
         try:
             yield
         finally:
@@ -167,6 +170,8 @@ async def unit_scope(unit_key, kind, *, checkpoint=None, deadline_at=None):
         unit = await work.record_unit_checkpoint(session, execution.claim, unit_key=unit_key, kind=kind,
             checkpoint=checkpoint, deadline_at=deadline_at)
     state = UnitExecution(unit.unit_key, unit.kind, unit.deadline_at, unit.created_at, unit.reconciliations)
+    if datetime.now(timezone.utc) >= state.deadline_at:
+        raise ProviderBudgetExhausted('provider unit original deadline exhausted')
     token = _UNIT.set(state)
     try:
         yield state
@@ -310,10 +315,18 @@ class ProviderWorkRunner:
                 error = deferred.error if isinstance(deferred, ProviderTurnDeferred) else deferred
                 execution.defer(error)
                 await _join_provider_tasks(execution)
+                error = execution.deferred
                 async with self.factory.begin() as session:
                     await work.suspend_current_work(session, claim, next_eligible_at=error.next_eligible_at,
                         reason=getattr(error, 'stage', 'provider_wait'))
                 return {'provider_waiting': True, 'provider_work_id': str(claim.work_id)}
+            except ProviderBudgetExhausted:
+                await _join_provider_tasks(execution)
+                with work.work_scope(claim):
+                    async with self.factory.begin() as session:
+                        await work.fail_exhausted_work(session, claim)
+                await self.settle_callback(claim.work_id)
+                return {'provider_exhausted': True, 'provider_work_id': str(claim.work_id)}
             except asyncio.CancelledError:
                 await _join_provider_tasks(execution)
                 # Only an owned nonterminal leaf can be released; user cancellation
@@ -326,6 +339,7 @@ class ProviderWorkRunner:
                     return {'provider_lease_lost': True}
                 raise
             finally:
+                await _join_provider_tasks(execution)
                 renewer.cancel()
                 await asyncio.gather(renewer, return_exceptions=True)
                 _EXECUTION.reset(token)

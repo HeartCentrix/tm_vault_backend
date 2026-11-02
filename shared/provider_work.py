@@ -156,8 +156,16 @@ async def ensure_work(session, *, snapshot_id, snapshot_token, job_token, partit
             (policy_key, 'POLICY', tenant_key, weight), (resource_key, 'RESOURCE', policy_key, 1)):
         floor = await session.scalar(select(func.coalesce(func.max(ProviderWorkQueue.virtual_finish), 0))
             .where(ProviderWorkQueue.parent_key.is_not_distinct_from(parent)))
-        await session.execute(insert(ProviderWorkQueue).values(key=key, scope=scope, parent_key=parent,
-            tenant_id=resource.tenant_id, weight=share, virtual_finish=float(floor)).on_conflict_do_nothing())
+        column = {'TENANT': ProviderWork.tenant_queue_key, 'POLICY': ProviderWork.policy_queue_key,
+            'RESOURCE': ProviderWork.resource_queue_key}[scope]
+        idle = ~exists(select(ProviderWork.id).where(column == key,
+            (ProviderWork.state.in_(('DRAINING', 'RESUMING')) | ((ProviderWork.state == 'WAITING')
+                & (ProviderWork.next_eligible_at <= func.clock_timestamp())
+                & (func.coalesce(ProviderWork.continuation['queue_was_cooling'].as_string(), 'false') != 'true')))))
+        statement = insert(ProviderWorkQueue).values(key=key, scope=scope, parent_key=parent,
+            tenant_id=resource.tenant_id, weight=share, virtual_finish=float(floor))
+        await session.execute(statement.on_conflict_do_update(index_elements=['key'],
+            set_={'virtual_finish': func.greatest(ProviderWorkQueue.virtual_finish, float(floor))}, where=idle))
     await session.execute(insert(ProviderWorkControl).values(id='global', enabled=True).on_conflict_do_nothing())
     row = ProviderWork(id=uuid4(), leaf_key=leaf_key, tenant_id=resource.tenant_id,
         resource_id=resource.id, job_id=job.id, snapshot_id=snapshot.id,
@@ -190,7 +198,7 @@ async def _owned(session, claim, *, allow_terminal=False):
     return row, job, snapshot, partition
 
 
-async def claim_due_work(session, *, owner_id, lease_seconds=120):
+async def claim_due_work(session, *, owner_id, lease_seconds=120, _clamp_rounds=0):
     if lease_seconds <= 0:
         raise ValueError('provider lease must be positive')
     await session.execute(insert(ProviderWorkControl).values(id='global', enabled=enabled()).on_conflict_do_nothing())
@@ -223,9 +231,15 @@ async def claim_due_work(session, *, owner_id, lease_seconds=120):
         if row is None:
             continue
         if not _active(job, snapshot, partition):
-            terminal = (partition.status if partition else snapshot.status.value) in ('COMPLETED', 'PARTIAL', 'FAILED')
-            row.state = 'COMPLETED' if terminal and job.status.value != 'CANCELLED' else 'CANCELLED'
-            row.parent_settle_pending = row.state == 'COMPLETED'
+            leaf_status = partition.status if partition else snapshot.status.value
+            terminal = leaf_status in ('COMPLETED', 'PARTIAL', 'FAILED')
+            unresolved = await session.scalar(select(exists(select(ProviderWorkUnit.id).where(
+                ProviderWorkUnit.work_id == row.id, ProviderWorkUnit.state != 'COMPLETED'))))
+            row.state = (('PARTIAL' if leaf_status == 'COMPLETED' and unresolved else leaf_status)
+                if terminal and job.status.value != 'CANCELLED' else 'CANCELLED')
+            row.parent_settle_pending = terminal and row.state != 'CANCELLED'
+            await session.execute(update(ProviderWorkUnit).where(ProviderWorkUnit.work_id == row.id,
+                ProviderWorkUnit.state.in_(('PENDING', 'RUNNING'))).values(state='FAILED'))
             row.generation += 1
             continue
         if row.state not in ACTIVE or (row.lease_expires_at and row.lease_expires_at > now and row.state != 'WAITING'):
@@ -237,6 +251,27 @@ async def claim_due_work(session, *, owner_id, lease_seconds=120):
             row.generation += 1
             row.lease_owner_id = row.lease_expires_at = None
             continue
+        if (row.continuation or {}).get('queue_was_cooling'):
+            for key, column in ((row.tenant_queue_key, ProviderWork.tenant_queue_key),
+                    (row.policy_queue_key, ProviderWork.policy_queue_key),
+                    (row.resource_queue_key, ProviderWork.resource_queue_key)):
+                ready_peer = await session.scalar(select(exists(select(ProviderWork.id).where(
+                    ProviderWork.id != row.id, column == key,
+                    ProviderWork.state.in_(('DRAINING', 'RESUMING')) | ((ProviderWork.state == 'WAITING')
+                        & (ProviderWork.next_eligible_at <= now)
+                        & (func.coalesce(ProviderWork.continuation['queue_was_cooling'].as_string(), 'false') != 'true'))))))
+                if not ready_peer:
+                    queue = await session.get(ProviderWorkQueue, key)
+                    floor = await session.scalar(select(func.max(ProviderWorkQueue.virtual_finish))
+                        .where(ProviderWorkQueue.parent_key.is_not_distinct_from(queue.parent_key)))
+                    queue.virtual_finish = max(queue.virtual_finish, floor or 0)
+            row.continuation = {**row.continuation, 'queue_was_cooling': False}
+            await session.flush()
+            # Re-sort after changing service clocks; do not use the stale order.
+            if _clamp_rounds >= 63:
+                return None
+            return await claim_due_work(session, owner_id=owner_id, lease_seconds=lease_seconds,
+                _clamp_rounds=_clamp_rounds + 1)
         # A copy continuation owns its distinct drain until its receipts settle.
         from shared.models import CopyWorkflow
         copy = await session.scalar(select(CopyWorkflow).where(CopyWorkflow.target_snapshot_id == snapshot.id,
@@ -344,6 +379,8 @@ async def suspend_current_work(session, claim, *, next_eligible_at, reason, cont
     row.generation += 1
     if continuation is not None:
         row.continuation = _bounded(continuation)
+    if next_eligible_at > now + timedelta(milliseconds=10):
+        row.continuation = {**(row.continuation or {}), 'queue_was_cooling': True}
     leaf.lease_token += 1
     row.parent_lease_token = leaf.lease_token
     row.snapshot_lease_token = snapshot.lease_token
@@ -356,28 +393,70 @@ async def suspend_current_work(session, claim, *, next_eligible_at, reason, cont
 async def finish_work(session, claim, *, state='COMPLETED'):
     from shared.provider_runtime import check_provider_turn
     check_provider_turn()
-    row, _, _, _ = await _owned(session, claim, allow_terminal=True)
+    row, _, snapshot, partition = await _owned(session, claim, allow_terminal=True)
     if state not in ('COMPLETED', 'PARTIAL', 'FAILED'):
         raise ValueError('invalid provider completion')
     pending = await session.scalar(select(exists(select(ProviderWorkUnit.id).where(
         ProviderWorkUnit.work_id == row.id, ProviderWorkUnit.state.in_(('PENDING', 'RUNNING'))))))
     if pending:
         raise ProviderWorkConflict('provider work still has pending units')
+    failed = await session.scalar(select(exists(select(ProviderWorkUnit.id).where(
+        ProviderWorkUnit.work_id == row.id, ProviderWorkUnit.state.in_(('FAILED', 'CANCELLED'))))))
+    leaf_status = partition.status if partition else snapshot.status.value
+    if state == 'COMPLETED':
+        if leaf_status == 'FAILED':
+            state = 'FAILED'
+        elif failed or leaf_status == 'PARTIAL':
+            state = 'PARTIAL'
     row.state, row.parent_settle_pending = state, True
     row.completed_at = await session.scalar(select(func.clock_timestamp()))
     row.lease_owner_id, row.lease_expires_at = None, None
     await session.flush()
 
 
+async def fail_exhausted_work(session, claim):
+    """Settle a spent original budget once, retaining already durable content."""
+    from shared.models import CopyWorkflow, SnapshotItem, SnapshotStatus
+    row, _, snapshot, partition = await _owned(session, claim, allow_terminal=True)
+    await session.execute(update(ProviderWorkUnit).where(ProviderWorkUnit.work_id == row.id,
+        ProviderWorkUnit.state.in_(('PENDING', 'RUNNING'))).values(state='FAILED'))
+    # A never-sealed copy drain cannot outlive its failed source capture.
+    from shared.copy_workflow import cancel_copy_work
+    copies = (await session.scalars(select(CopyWorkflow.id).where(
+        CopyWorkflow.target_snapshot_id == snapshot.id,
+        CopyWorkflow.partition_id.is_not_distinct_from(row.partition_id),
+        CopyWorkflow.state.in_(ACTIVE)))).all()
+    for copy_id in copies:
+        await cancel_copy_work(session, workflow_id=copy_id, reason='provider_budget_exhausted', terminal_state='FAILED')
+    snapshot.extra_data = {**(snapshot.extra_data or {}), 'degraded_reason':
+        (snapshot.extra_data or {}).get('degraded_reason') or 'provider retry budget exhausted',
+        'provider_phase': 'INCOMPLETE'}
+    now = await session.scalar(select(func.clock_timestamp()))
+    if partition:
+        partition.status = 'FAILED'
+        partition.failure_state = {**(partition.failure_state or {}), 'reason': 'provider_budget_exhausted'}
+        partition.completed_at = now.replace(tzinfo=None)
+    elif snapshot.status.value == 'IN_PROGRESS':
+        count, size = (await session.execute(select(func.count(), func.coalesce(func.sum(SnapshotItem.content_size), 0))
+            .where(SnapshotItem.snapshot_id == snapshot.id))).one()
+        snapshot.item_count, snapshot.bytes_total = count, size
+        snapshot.status = SnapshotStatus.PARTIAL if count else SnapshotStatus.FAILED
+        snapshot.completed_at = now.replace(tzinfo=None)
+    await session.flush()
+    await finish_work(session, claim, state='FAILED')
+    row.last_reason = 'provider_budget_exhausted'
+
+
 async def finish_parent_settlement(session, work_id):
     hint = await session.get(ProviderWork, _uuid(work_id))
     if hint is None:
         return False
-    _, snapshot, _ = await _parents(session, hint.snapshot_id, hint.partition_id)
+    job, snapshot, _ = await _parents(session, hint.snapshot_id, hint.partition_id)
     row = await session.scalar(select(ProviderWork).where(ProviderWork.id == hint.id).with_for_update())
     if row.state not in TERMINAL:
         raise ProviderWorkConflict('provider work has not finished')
-    if snapshot.status.value not in ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELLED'):
+    if (snapshot.status.value not in ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELLED')
+            or job.status.value not in ('COMPLETED', 'FAILED', 'CANCELLED')):
         return False
     row.parent_settle_pending = False
     return True

@@ -70,3 +70,17 @@ async def test_standalone_storage_operations_share_budget_and_cancel_waiter(monk
         with pytest.raises(asyncio.CancelledError):
             await task
     assert budget.used_bytes == 0
+
+async def test_prepaid_storage_cannot_spend_retained_metadata_allowance(monkeypatch):
+    from shared import provider_runtime as runtime
+    budget = ExecutionBudget(resident_bytes=100)
+    monkeypatch.setattr(runtime, '_budget', budget)
+    async with budget.bytes(100, includes_storage=40):
+        async with runtime.storage_buffer_budget(40):
+            assert budget.used_bytes == 100
+        with pytest.raises(ValueError, match='prepaid'):
+            async with runtime.storage_buffer_budget(41): pass
+    for invalid in (-1, 101, '40'):
+        with pytest.raises(ValueError):
+            async with budget.bytes(100, includes_storage=invalid): pass
+    assert budget.used_bytes == 0

@@ -64,6 +64,7 @@ async def test_expired_claim_recovers_without_broker_and_old_owner_cannot_finish
         assert not await work.finish_parent_settlement(db, replacement.work_id)
         snapshot = await db.get(models.Snapshot, replacement.snapshot_id)
         snapshot.status = models.SnapshotStatus.COMPLETED
+        (await db.get(models.Job, replacement.job_id)).status = models.JobStatus.COMPLETED
         await db.flush()
         assert await work.finish_parent_settlement(db, replacement.work_id)
         assert not await work.has_pending_provider(db, snapshot_id=replacement.snapshot_id)
@@ -403,6 +404,9 @@ async def test_renew_can_finish_owned_receipt_after_snapshot_becomes_terminal(st
     async with store.factory.begin() as db:
         await work.renew_work(db, owner)
         await work.finish_work(db, owner)
+        assert not await work.finish_parent_settlement(db, owner.work_id)
+        (await db.get(models.Job, owner.job_id)).status = models.JobStatus.COMPLETED
+        await db.flush()
         assert await work.finish_parent_settlement(db, owner.work_id)
 
 async def test_lost_lease_interrupts_turn_without_removing_worker_capacity(store):
