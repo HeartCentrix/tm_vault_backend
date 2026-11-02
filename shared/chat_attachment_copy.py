@@ -110,7 +110,7 @@ LEGACY_CHAT_ATTACHMENT_COPY_SQL = LEGACY_CHAT_ATTACHMENT_SELECTION_CTES + """
            p.indexed_at, p.backend_id, NOW()
       FROM payloads p
      WHERE NOT (SELECT provenance_gap FROM guard)
-     ORDER BY p.external_id, p.item_type
+     ORDER BY p.external_id COLLATE "C", p.item_type COLLATE "C"
     ON CONFLICT (snapshot_id, external_id, item_type) DO NOTHING
     RETURNING id
 )

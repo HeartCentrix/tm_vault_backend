@@ -291,7 +291,7 @@ async def prepare_manifest(session, task) -> None:
                       AND payload->>'tenant_id' <> CAST(CAST(:tid AS uuid) AS text))) AS ok
         ), stored AS (
             INSERT INTO copy_work_items(task_id,ordinal,payload,source_snapshot_id,phase)
-            SELECT :task_id,row_number() OVER (ORDER BY phase,payload->>'external_id',payload->>'item_type',payload->>'id'),
+            SELECT :task_id,row_number() OVER (ORDER BY phase,(payload->>'external_id') COLLATE "C",(payload->>'item_type') COLLATE "C",(payload->>'id') COLLATE "C"),
                    payload::json,source_snapshot_id,phase
               FROM selected WHERE (SELECT ok FROM validity)
             RETURNING ordinal
@@ -371,7 +371,8 @@ async def copy_manifest_batch(session, task, *, limit: int) -> dict:
                    p.indexed_at,p.backend_id,p.chat_version_id,NOW()
               FROM batch b CROSS JOIN LATERAL jsonb_populate_record(NULL::snapshot_items,b.payload::jsonb) p
              WHERE (SELECT ok FROM batch_validity)
-             ORDER BY b.ordinal ON CONFLICT(snapshot_id,external_id,item_type) DO NOTHING
+             ORDER BY p.external_id COLLATE "C", p.item_type COLLATE "C", b.ordinal
+             ON CONFLICT(snapshot_id,external_id,item_type) DO NOTHING
             RETURNING item_type,content_size
         """
     row = (await session.execute(text(prefix + mutation + """

@@ -244,7 +244,7 @@ class PoisonMessageError(Exception):
     payload pins a consumer indefinitely (2026-05-16 incident)."""
 
 
-async def _bulk_upsert_snapshot_items(
+async def _insert_snapshot_items(
     session, rows: List[Dict[str, Any]],
 ) -> int:
     """Insert snapshot_items rows in chunked multi-row INSERTs with
@@ -265,6 +265,9 @@ async def _bulk_upsert_snapshot_items(
     """
     if not rows:
         return 0
+    from shared.snapshot_item_writes import CHAT_ITEM_TYPES, ordered_snapshot_item_rows
+    if all(row["item_type"] in CHAT_ITEM_TYPES for row in rows):
+        rows = ordered_snapshot_item_rows(rows)
     from sqlalchemy.dialects.postgresql import insert as _pg_insert
     from sqlalchemy.exc import IntegrityError as _IntegrityError
     total = 0
@@ -286,8 +289,16 @@ async def _bulk_upsert_snapshot_items(
     _n_cols = max(1, len(SnapshotItem.__table__.columns))
     _max_rows_by_params = max(1, _PG_MAX_BIND_PARAMS // _n_cols)
     _chunk_rows = max(1, min(_BULK_INSERT_CHUNK, _max_rows_by_params))
-    for i in range(0, len(rows), _chunk_rows):
-        chunk = rows[i:i + _chunk_rows]
+    i = 0
+    while i < len(rows):
+        # Keep different assigned/default column shapes separate without
+        # disturbing the transaction-wide conflict-key order.
+        stop = i + 1
+        shape = rows[i].keys()
+        while stop < min(i + _chunk_rows, len(rows)) and rows[stop].keys() == shape:
+            stop += 1
+        chunk = rows[i:stop]
+        i = stop
         # ON CONFLICT target must match an existing unique index column
         # set exactly. The snapshot_items unique index is
         # uq_snapshot_items_snap_ext_type on
@@ -305,13 +316,24 @@ async def _bulk_upsert_snapshot_items(
             # cleanly. Match on the FK constraint name, not the message
             # text, to stay robust across asyncpg / driver wording.
             if "snapshot_items_snapshot_id_fkey" in str(e):
-                await session.rollback()
                 snap_id = chunk[0].get("snapshot_id") if chunk else None
                 raise SnapshotVanishedError(
                     f"snapshot {snap_id} no longer exists; aborting handler"
                 ) from e
             raise
         total += len(chunk)
+    return total
+
+
+async def _bulk_upsert_snapshot_items(session, rows: List[Dict[str, Any]]) -> int:
+    """Compatibility adapter: preserve the caller-owned session/commit contract."""
+    if not rows:
+        return 0
+    try:
+        total = await _insert_snapshot_items(session, rows)
+    except SnapshotVanishedError:
+        await session.rollback()
+        raise
     await session.commit()
     return total
 
@@ -1459,6 +1481,7 @@ async def _carry_forward_prior_chat_snapshot_items(
                     # the copy runs; NOT EXISTS cannot see a row that lands after
                     # the SELECT, so without this clause one such row aborts the
                     # whole copy (UniqueViolationError, see docstring).
+                    'ORDER BY src.external_id COLLATE "C", src.item_type COLLATE "C" '
                     "ON CONFLICT (snapshot_id, external_id, item_type) DO NOTHING"
                 ),
                 {
