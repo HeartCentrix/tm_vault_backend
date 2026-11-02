@@ -45,7 +45,7 @@ def _bucket_date(dt: datetime, tz: ZoneInfo) -> _date:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(tz).date()
-from sqlalchemy import select, func, text, and_, or_
+from sqlalchemy import select, func, text, and_, or_, event
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -124,6 +124,7 @@ async def lifespan(app: FastAPI):
         with suppress(asyncio.CancelledError):
             await prewarm_task
     await close_db()
+    await _refresh_engine.dispose()
     if _ro_engine is not None:
         await _ro_engine.dispose()
 
@@ -226,6 +227,7 @@ M365_RESOURCE_TYPES = {
     ResourceType.USER_CONTACTS,
     ResourceType.USER_CALENDAR,
     ResourceType.USER_CHATS,
+    ResourceType.USER_ARCHIVE,
     ResourceType.TEAMS_CHAT_EXPORT,
 }
 
@@ -751,540 +753,198 @@ async def get_protection_status(
     }
 
 
-# Newest-version content-size rollup for one resource, fully SQL-side.
-# Same statement family as snapshot-service's _rollup_latest_items (the
-# 2026-07-14 content-snapshots OOM fix): GROUP BY hash-aggregates the
-# per-item newest version inside Postgres and returns one scalar —
-# never materialize snapshot_items rows in Python (one user's chats
-# child holds 11M pointer rows).
-_PROTECTED_ROLLUP_SQL = """
-    SELECT COALESCE(SUM(size), 0) AS bytes
-    FROM (
-      SELECT (array_agg(si.content_size ORDER BY si.created_at DESC))[1] AS size
-      FROM snapshot_items si
-      WHERE si.snapshot_id = ANY(:snaps)
-        AND COALESCE(si.is_deleted, false) = false
-      GROUP BY COALESCE(si.external_id, si.id::text)
-    ) latest
-"""
+# Protected size is a durable read model; HTTP requests never rebuild item history.
+from shared.protected_size import read_summary as _read_size_summary
+from shared.protected_size import refresh_once as _refresh_size_once
+from shared.database import _engine_kwargs
+from shared.auth_enforcement import verified_user
 
-# (resource_id, latest snapshot id) -> protected bytes. L1 in front of
-# the durable resource_protected_bytes table (below); per-process,
-# rebuilt on restart. Entries self-invalidate when a newer snapshot
-# completes. Wholesale clear is a runaway guard only.
-_protected_bytes_cache: dict = {}
-_PROTECTED_CACHE_MAX = 10000
-
-_PROTECTED_UPSERT_SQL = """
-    INSERT INTO resource_protected_bytes
-        (resource_id, latest_snapshot_id, bytes, computed_at)
-    VALUES (:rid, :snap, :bytes, NOW())
-    ON CONFLICT (resource_id) DO UPDATE
-        SET latest_snapshot_id = EXCLUDED.latest_snapshot_id,
-            bytes = EXCLUDED.bytes,
-            computed_at = EXCLUDED.computed_at
-"""
-
-
-# Request-path guards (2026-10-14). Over 4 h on prod 15 of 30
-# /backup/size calls came back 504: the gateway's 60 s read timeout
-# (api-gateway GATEWAY_TIMEOUT) fired while this endpoint was still
-# walking resources, the gateway retried the GET once, and every
-# browser call left TWO abandoned 60-120 s rollup chains running on the
-# primary (the planner picks a Parallel Seq Scan over snapshot_items
-# for mid-size resources). Three bounds now apply to a request:
-#   * a wall-clock budget under the gateway timeout — past it the
-#     endpoint answers with what it has and `partial: true`;
-#   * at most _PROTECTED_ROLLUP_CONCURRENCY heavy rollups in flight per
-#     process, request path and prewarm loop together;
-#   * each heavy statement runs under SET LOCAL statement_timeout for
-#     the budget that is left, so the primary stops it the moment the
-#     budget is spent instead of finishing a query nobody waits for.
-_PROTECTED_REQUEST_BUDGET_S = float(os.getenv("PROTECTED_REQUEST_BUDGET_S", "50"))
-_PROTECTED_ROLLUP_CONCURRENCY = 2
-_heavy_rollup_sem = asyncio.Semaphore(_PROTECTED_ROLLUP_CONCURRENCY)
-_STATEMENT_CANCELLED_SQLSTATE = "57014"  # query_canceled: statement_timeout hit
-
-# ---------------------------------------------------------------------------
-# Read replica for the heavy rollups (2026-10-15 RCA). The newest-version
-# hash aggregate over a resource's snapshot_items is a Parallel Seq Scan for
-# every mid/large resource; recomputed three times a day per resource it was
-# the single largest sequential reader of the primary (37.8 TB through
-# parallel workers in 32 h) and the read IO behind every multi-minute
-# carry-forward slot hold in the workers. DB_RO_HOST (CNPG's replica
-# service, e.g. postgres-ha-ro.databases.svc.cluster.local) moves that
-# SELECT off the primary; the resource_protected_bytes upsert still goes to
-# the primary. Opt-in: unset => everything stays on the primary as before.
-_RO_HOST = os.getenv("DB_RO_HOST", "").strip()
-_RO_PORT = int(os.getenv("DB_RO_PORT", "5432"))
+_SIZE_REQUEST_BUDGET_S = float(os.getenv('PROTECTED_REQUEST_BUDGET_S', '5'))
+_PREWARM_INTERVAL_S = int(os.getenv('PROTECTED_PREWARM_INTERVAL_S', '300'))
+_REFRESH_IDLE_S = float(os.getenv('PROTECTED_REFRESH_IDLE_S', '2'))
+_PREWARM_ENABLED = os.getenv('PROTECTED_PREWARM_ENABLED', 'true').lower() in ('true', '1', 'yes')
+_prewarm_task: Optional[asyncio.Task] = None
+_RO_HOST = os.getenv('DB_RO_HOST', '').strip()
+_RO_PORT = int(os.getenv('DB_RO_PORT', '5432'))
 _ro_engine = None
 _ro_session_factory = None
+
+
+def _size_engine(url):
+    kwargs = _engine_kwargs()
+    kwargs.update(pool_size=1, max_overflow=0, pool_timeout=5)
+    size_engine = create_async_engine(url, **kwargs)
+    schema = '"' + settings.DB_SCHEMA.replace('"', '""') + '",public'
+
+    @event.listens_for(size_engine.sync_engine, 'begin')
+    def set_transaction_schema(connection):
+        # Transaction pooling can ignore startup search_path; set it on the actual backend.
+        connection.exec_driver_sql('SET LOCAL search_path TO ' + schema)
+
+    return size_engine
+
+
+_refresh_engine = _size_engine(settings.DATABASE_URL)
+_refresh_session_factory = async_sessionmaker(_refresh_engine, class_=AsyncSession, expire_on_commit=False)
 if _RO_HOST:
-    _ro_engine = create_async_engine(
-        make_url(settings.DATABASE_URL)
-        .set(host=_RO_HOST, port=_RO_PORT)
-        .render_as_string(hide_password=False),
-        pool_size=int(os.getenv("DB_RO_POOL_SIZE", "2")),
-        max_overflow=2,
-        pool_pre_ping=True,
-        pool_recycle=1800,
+    _ro_engine = _size_engine(make_url(settings.DATABASE_URL).set(host=_RO_HOST, port=_RO_PORT))
+    _ro_session_factory = async_sessionmaker(_ro_engine, class_=AsyncSession, expire_on_commit=False)
+
+
+async def _protected_prewarm_pass() -> dict:
+    return await _refresh_size_once(
+        _refresh_session_factory, source_factory=_ro_session_factory,
+        page_size=1000, statement_timeout_ms=5000,
     )
-    _ro_session_factory = async_sessionmaker(
-        _ro_engine, class_=AsyncSession, expire_on_commit=False,
-    )
-
-# The replica may lag. Only trust it for a rollup when it already shows the
-# snapshot that keys the rollup row as eligible: WAL is replayed in order,
-# so the snapshot's items are visible whenever its terminal status is.
-_REPLICA_SEES_SNAPSHOT_SQL = (
-    "SELECT 1 FROM snapshots WHERE id = :sid "
-    "AND status IN ('COMPLETED', 'PARTIAL', 'PENDING_DELETION')"
-)
-
-
-async def _run_rollup(session: AsyncSession, sib_ids, remaining: Optional[float]):
-    """The heavy statement on one session, bounded by the request budget
-    when there is one."""
-    if remaining is None:
-        return (await session.execute(
-            text(_PROTECTED_ROLLUP_SQL), {"snaps": sib_ids},
-        )).first()
-    # SAVEPOINT: a statement_timeout abort poisons the whole transaction
-    # ("current transaction is aborted"); rolling back to the savepoint
-    # keeps the session usable for the next resource. Same pattern as
-    # shared/backup_cleanup.py::_probe_unkeyed_paths_bounded. SET cannot
-    # take bind parameters; the value is an int.
-    async with session.begin_nested():
-        await session.execute(text(
-            f"SET LOCAL statement_timeout = {max(1000, int(remaining * 1000))}"
-        ))
-        rollup = (await session.execute(
-            text(_PROTECTED_ROLLUP_SQL), {"snaps": sib_ids},
-        )).first()
-    # GUC changes survive RELEASE SAVEPOINT: do not leave the upsert +
-    # commit running under the rollup's timeout.
-    await session.execute(text("SET LOCAL statement_timeout = DEFAULT"))
-    return rollup
-
-
-async def _rollup_on_best_session(db: AsyncSession, sib_ids, latest_id, remaining):
-    """Run the rollup on the replica when one is configured and it has
-    replayed ``latest_id``; otherwise on the primary session ``db``."""
-    factory = _ro_session_factory
-    if factory is not None:
-        async with factory() as ro:
-            seen = (await ro.execute(
-                text(_REPLICA_SEES_SNAPSHOT_SQL), {"sid": str(latest_id)},
-            )).first()
-            if seen is not None:
-                return await _run_rollup(ro, sib_ids, remaining)
-        log.info("[backup-size] replica has not replayed snapshot %s yet — "
-                 "rollup on primary", latest_id)
-    return await _run_rollup(db, sib_ids, remaining)
-
-
-async def _protected_bytes_for_resource(
-    db: AsyncSession,
-    resource_id,
-    *,
-    deadline: Optional[float] = None,
-    recompute: bool = True,
-) -> Optional[int]:
-    """Protected bytes for one resource, or None when the answer needs
-    a heavy rollup this call may not run (``recompute=False``) or that
-    did not fit before ``deadline`` (event-loop clock, seconds).
-
-    The cache decision is the resource's newest eligible snapshot id:
-    L1 dict, then the durable resource_protected_bytes row, then the
-    newest-version rollup over every eligible snapshot plus an upsert.
-    A resource is recomputed only when that latest id changed.
-    """
-    latest = (await db.execute(
-        _eligible_snapshots_stmt(resource_id).limit(1)
-    )).first()
-    if latest is None:
-        return 0
-    latest_id = latest[0]
-    key = (str(resource_id), str(latest_id))
-    hit = _protected_bytes_cache.get(key)
-    if hit is not None:
-        return hit
-    # L2: durable rollup row — shared across uvicorn workers and pods,
-    # survives restarts. The per-process dict above is only an L1 that
-    # saves this round trip on a warm worker. Both are keyed on the
-    # latest snapshot id, so a newer snapshot is an automatic miss.
-    row = (await db.execute(
-        text(
-            "SELECT bytes FROM resource_protected_bytes "
-            "WHERE resource_id = :rid AND latest_snapshot_id = :snap"
-        ),
-        {"rid": str(resource_id), "snap": str(latest_id)},
-    )).first()
-    if row is not None:
-        out = int(row[0] or 0)
-    else:
-        if not recompute:
-            return None
-        out = await _recompute_protected_bytes(db, resource_id, latest_id, deadline)
-        if out is None:
-            return None
-    if len(_protected_bytes_cache) >= _PROTECTED_CACHE_MAX:
-        _protected_bytes_cache.clear()
-    _protected_bytes_cache[key] = out
-    return out
-
-
-def _eligible_snapshots_stmt(resource_id):
-    # resource_id equality + ORDER BY created_at DESC is exactly
-    # ix_snapshots_resource_created (resource_id, created_at DESC): the
-    # newest eligible snapshot is one index probe + LIMIT 1, and the
-    # full sibling list (rollup input) walks the same index.
-    return (
-        select(Snapshot.id)
-        .where(
-            Snapshot.resource_id == resource_id,
-            Snapshot.status.in_([
-                SnapshotStatus.COMPLETED,
-                SnapshotStatus.PARTIAL,
-                SnapshotStatus.PENDING_DELETION,
-            ]),
-        )
-        .order_by(Snapshot.created_at.desc())
-    )
-
-
-def _is_statement_cancelled(exc: BaseException) -> bool:
-    orig = getattr(exc, "orig", None)
-    for err in (orig, getattr(orig, "__cause__", None)):
-        if getattr(err, "sqlstate", None) == _STATEMENT_CANCELLED_SQLSTATE:
-            return True
-    return False
-
-
-async def _recompute_protected_bytes(
-    db: AsyncSession, resource_id, latest_id, deadline: Optional[float],
-) -> Optional[int]:
-    """The heavy path: hash-aggregate every eligible snapshot's items,
-    then upsert the durable row. None means skipped because the budget
-    ran out — waiting for a rollup slot, or the statement itself was
-    cancelled by statement_timeout — and the row stays stale for the
-    prewarm loop to fill.
-    """
-    loop = asyncio.get_running_loop()
-
-    def _remaining() -> Optional[float]:
-        return None if deadline is None else deadline - loop.time()
-
-    remaining = _remaining()
-    if remaining is not None and remaining <= 0:
-        return None
-    try:
-        if remaining is None:
-            await _heavy_rollup_sem.acquire()
-        else:
-            await asyncio.wait_for(_heavy_rollup_sem.acquire(), timeout=remaining)
-    except asyncio.TimeoutError:
-        log.warning("[backup-size] no rollup slot within budget for resource %s — skipped",
-                    resource_id)
-        return None
-    try:
-        sib_ids = [r[0] for r in (await db.execute(
-            _eligible_snapshots_stmt(resource_id)
-        )).all()]
-        if not sib_ids:
-            return 0
-        remaining = _remaining()
-        if remaining is not None and remaining <= 0:
-            return None
-        try:
-            # Heavy SELECT on the replica when configured and caught up,
-            # else on the primary; the upsert below is always primary.
-            rollup = await _rollup_on_best_session(db, sib_ids, latest_id, remaining)
-        except DBAPIError as exc:
-            if deadline is None or not _is_statement_cancelled(exc):
-                raise
-            log.warning("[backup-size] rollup for resource %s cancelled at the request "
-                        "budget — skipped, prewarm will fill it", resource_id)
-            return None
-        out = int(rollup[0] or 0) if rollup else 0
-        await db.execute(text(_PROTECTED_UPSERT_SQL), {
-            "rid": str(resource_id),
-            "snap": str(latest_id),
-            "bytes": out,
-        })
-        await db.commit()
-        return out
-    finally:
-        _heavy_rollup_sem.release()
-
-
-_PREWARM_INTERVAL_S = int(os.getenv("PROTECTED_PREWARM_INTERVAL_S", "120"))
-
-# Resources whose newest eligible snapshot no longer matches their
-# rollup row (or that have no row yet). Statuses mirror
-# _protected_bytes_for_resource exactly.
-_STALE_ROLLUPS_SQL = """
-    WITH latest AS (
-        SELECT s.resource_id,
-               (array_agg(s.id ORDER BY s.created_at DESC))[1] AS latest_snapshot_id
-        FROM snapshots s
-        WHERE s.status IN ('COMPLETED', 'PARTIAL', 'PENDING_DELETION')
-        GROUP BY s.resource_id
-    )
-    SELECT l.resource_id
-    FROM latest l
-    LEFT JOIN resource_protected_bytes p ON p.resource_id = l.resource_id
-    WHERE p.resource_id IS NULL
-       OR p.latest_snapshot_id <> l.latest_snapshot_id
-"""
-
-_PRUNE_ROLLUPS_SQL = """
-    DELETE FROM resource_protected_bytes p
-    WHERE NOT EXISTS (
-        SELECT 1 FROM snapshots s
-        WHERE s.resource_id = p.resource_id
-          AND s.status IN ('COMPLETED', 'PARTIAL', 'PENDING_DELETION')
-    )
-"""
-
-
-_PREWARM_LOCK_KEY = 420019  # pg advisory key: one prewarm pass fleet-wide at a time
-
-
-async def _protected_prewarm_pass() -> tuple[str, int]:
-    """One prewarm pass under a transaction-scoped advisory lock on the
-    primary, so only ONE uvicorn worker / pod recomputes stale rollups at
-    a time. 2026-10-15: both uvicorn workers ran the loop and the
-    jitter did not de-sync them — 878 upserts for 566 new eligible
-    snapshots, every duplicate a full Parallel Seq Scan on the primary.
-    Transaction-scoped (not session-scoped) because the pooler runs in
-    transaction mode. Returns (status, refreshed_count)."""
-    async with async_session_factory() as lock_db:
-        async with lock_db.begin():
-            got = (await lock_db.execute(
-                text("SELECT pg_try_advisory_xact_lock(:k)"),
-                {"k": _PREWARM_LOCK_KEY},
-            )).scalar()
-            if not got:
-                return ("skipped", 0)
-            async with async_session_factory() as db:
-                stale = [r[0] for r in (await db.execute(text(_STALE_ROLLUPS_SQL))).all()]
-                pruned = (await db.execute(text(_PRUNE_ROLLUPS_SQL))).rowcount
-                await db.commit()
-            if stale or pruned:
-                log.info("[prewarm] %d stale rollups, %d pruned", len(stale), pruned or 0)
-            pass_started = asyncio.get_running_loop().time()
-            for rid in stale:
-                async with async_session_factory() as rdb:
-                    await _protected_bytes_for_resource(rdb, rid)
-            if stale:
-                log.info("[prewarm] refreshed %d rollups in %.1fs", len(stale),
-                         asyncio.get_running_loop().time() - pass_started)
-            return ("refreshed", len(stale))
 
 
 async def _protected_prewarm_loop():
-    """Keep resource_protected_bytes fresh so no user request ever pays
-    the multi-second snapshot_items rollup. 2026-07-29: the first
-    Overview load after each Gold batch recomputed everything on the
-    request path — 16.1s for a real user. Recompute is serial on
-    purpose (one rollup at a time keeps DB pressure flat); with the
-    read-through in _protected_bytes_for_resource a concurrent user
-    request at worst duplicates one resource's rollup, never waits on
-    the whole pass. Each pass runs under an advisory lock
-    (_protected_prewarm_pass) so a second uvicorn worker or pod skips
-    it instead of repeating it, and the heavy SELECT goes to the read
-    replica when DB_RO_HOST is set.
-    """
-    await asyncio.sleep(random.uniform(5, 35))
+    await asyncio.sleep(random.uniform(.1, 1))
+    failures = 0
     while True:
         try:
-            await _protected_prewarm_pass()
+            result = await _protected_prewarm_pass()
+            failures = 0
+            idle = result.get('status') in ('idle', 'busy', 'deferred', 'replica_lag',
+                                          'replica_deferred', 'backoff', 'retry', 'lost_lease')
+            await asyncio.sleep(_REFRESH_IDLE_S if idle else .05)
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception("[prewarm] protected-bytes pass failed")
-        await asyncio.sleep(_PREWARM_INTERVAL_S)
-
-
-_PREWARM_ENABLED = os.getenv("PROTECTED_PREWARM_ENABLED", "true").lower() in ("true", "1", "yes")
-_prewarm_task: Optional[asyncio.Task] = None
+            failures += 1
+            log.exception('[protected-size] background refresh failed; published totals remain available')
+            await asyncio.sleep(min(30, 2 ** min(failures, 5)))
 
 
 def _start_protected_prewarm() -> Optional[asyncio.Task]:
-    """Start the prewarm loop at most once per process (lifespan
-    re-entry, tests); PROTECTED_PREWARM_ENABLED=false is the kill
-    switch for the background load on the primary."""
     global _prewarm_task
     if not _PREWARM_ENABLED:
-        log.info("[prewarm] disabled via PROTECTED_PREWARM_ENABLED")
         return None
-    if _prewarm_task is not None and not _prewarm_task.done():
-        return _prewarm_task
-    _prewarm_task = asyncio.create_task(_protected_prewarm_loop())
+    if _prewarm_task is None or _prewarm_task.done():
+        _prewarm_task = asyncio.create_task(_protected_prewarm_loop())
     return _prewarm_task
 
 
-@app.get("/api/v1/dashboard/backup/size")
+async def _size_scope(db: AsyncSession, principal: dict, requested_tenant) -> Optional[tuple[UUID, ...]]:
+    roles = {str(role).upper() for role in principal.get('roles', [])}
+    requested = None
+    if requested_tenant is not None:
+        try:
+            requested = UUID(str(requested_tenant))
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=422, detail='Invalid tenantId')
+    if principal.get('_principal') == 'internal' or 'SUPER_ADMIN' in roles:
+        return (requested,) if requested else None
+    entitled = set()
+    for tenant in principal.get('tenant_ids', []):
+        try:
+            entitled.add(UUID(str(tenant)))
+        except (ValueError, TypeError):
+            continue
+    if 'ORG_ADMIN' in roles:
+        try:
+            organization = UUID(str(principal.get('org_id')))
+        except (ValueError, TypeError):
+            entitled = set()
+        else:
+            entitled = set((await db.execute(select(Tenant.id).where(Tenant.org_id == organization))).scalars().all())
+    if requested:
+        if requested not in entitled:
+            raise HTTPException(status_code=403, detail='Not entitled to the requested tenant')
+        return (requested,)
+    return tuple(sorted(entitled, key=lambda value: value.int))
+
+
+_SIZE_HISTORY_SQL = '''
+    SELECT timezone(:tz, s.completed_at AT TIME ZONE 'UTC')::date AS day,
+           COALESCE(SUM(s.bytes_added), 0)::bigint AS bytes
+    FROM snapshots s JOIN resources r ON r.id = s.resource_id
+    WHERE s.status::text IN ('COMPLETED', 'PARTIAL', 'PENDING_DELETION')
+      AND s.completed_at >= :window_start AND s.completed_at < :window_end
+      AND (:all_tenants OR r.tenant_id = ANY(CAST(:tenant_ids AS uuid[])))
+      AND (:all_types OR r.type::text = ANY(CAST(:resource_types AS text[])))
+    GROUP BY timezone(:tz, s.completed_at AT TIME ZONE 'UTC')::date
+'''
+
+
+def _size_response(summary: dict, daily_data: list, *, history_complete: bool) -> dict:
+    total = summary['totalBytes']
+    day = daily_data[-1]['bytes'] if daily_data else 0
+    week = sum(row['bytes'] for row in daily_data[-7:])
+    growth = int(round(sum(row['bytes'] for row in daily_data) / 30.0))
+    baseline_complete = (
+        total is not None and not summary.get('partial') and not summary.get('stale')
+        and not summary.get('initializingScope') and summary.get('freshness') == 'fresh'
+    )
+    can_project = baseline_complete and history_complete
+    def change(value):
+        return format_bytes(abs(value)) + (' ↑' if value > 0 else ' ↓')
+    return {
+        **summary,
+        'total': format_bytes(total) if total is not None else 'Calculating',
+        'allTimeTotal': format_bytes(total) if total is not None else None,
+        'oneDayChange': change(day) if history_complete else None,
+        'sevenDayChange': change(week) if history_complete else None,
+        'oneMonthChange': change(week) if history_complete else None,  # Existing seven-day client alias.
+        'dailyData': daily_data,
+        'dailyGrowthBytes': growth if history_complete else None,
+        'historyStatus': 'complete' if history_complete else 'unavailable',
+        'historyPartial': not history_complete,
+        'growthMetric': 'captured-change-volume',
+        'projectionKind': 'linear-capture-volume-estimate',
+        'projectedBytes1y': total + growth * 365 if can_project else None,
+        'projectedBytes3y': total + growth * 1095 if can_project else None,
+    }
+
+
+@app.get('/api/v1/dashboard/backup/size')
 async def get_backup_size(
     request: Request,
-    tenantId: Optional[str] = Query(None),
+    tenantId: Optional[UUID] = Query(None),
     serviceType: Optional[str] = Query(None),
-    tz: Optional[str] = Query(
-        None,
-        description=(
-            "IANA timezone to bucket daily growth in. "
-            "Defaults to UTC."
-        ),
-    ),
+    tz: Optional[str] = Query(None, description='IANA timezone for daily captured-volume buckets.'),
     db: AsyncSession = Depends(get_db),
 ):
-    service_key = parse_service_type(serviceType)
-    service_resource_types = resource_types_for_service(service_key)
-    client_tz = _resolve_tz(tz)
-
-    filters = []
-    if tenantId:
-        filters.append(Resource.tenant_id == UUID(tenantId))
-    if service_resource_types:
-        filters.append(Resource.type.in_(service_resource_types))
-
-    # Headline = PROTECTED-DATA size: newest-version content_size per
-    # live item, per resource, summed. The previous source
-    # (SUM(Resource.storage_bytes)) is a bytes-WRITTEN metric — the
-    # worker stores "sum of bytes_added across retained snapshots",
-    # which undercounts twice: content-hash dedup means re-baselines
-    # upload almost nothing, and retention pruning drops the original
-    # baseline's bytes while its blobs stay referenced. Observed
-    # 2026-07-14: Overview said 50 GB while one user's OneDrive alone
-    # held 124 GB. Mirrors the snapshot-service /storage-summary fix.
-    # Parent rows carry only identity items post-Tier-2-refactor, so
-    # summing per-resource rollups does not double-count children —
-    # no tier2-dupes clause needed here.
-    proto_res_rows = (await db.execute(
-        select(Snapshot.resource_id)
-        .join(Resource, Resource.id == Snapshot.resource_id)
-        .where(
-            Snapshot.status.in_([
-                SnapshotStatus.COMPLETED,
-                SnapshotStatus.PARTIAL,
-                SnapshotStatus.PENDING_DELETION,
-            ]),
-            *filters,
-        )
-        .group_by(Snapshot.resource_id)
-    )).all()
-    # Two passes: first everything the caches already answer (cheap,
-    # so a budget-cut answer still carries every warm resource), then
-    # the cold ones under the request budget. Between resources the
-    # client is checked — the gateway drops the connection at its read
-    # timeout, and nothing should keep the primary busy for a response
-    # no one will read.
-    loop_time = asyncio.get_running_loop().time
-    started = loop_time()
-    deadline = started + _PROTECTED_REQUEST_BUDGET_S
-    disconnected = False
-
-    async def _out_of_time() -> bool:
-        nonlocal disconnected
-        if await request.is_disconnected():
-            disconnected = True
-            return True
-        return loop_time() >= deadline
-
-    total = 0
-    partial = False
-    cold: list = []
-    for (res_id,) in proto_res_rows:
-        if await _out_of_time():
-            partial = True
-            break
-        val = await _protected_bytes_for_resource(db, res_id, recompute=False)
-        if val is None:
-            cold.append(res_id)
-        else:
-            total += val
-    rolled = 0
-    for res_id in cold:
-        if partial or await _out_of_time():
-            partial = True
-            break
-        val = await _protected_bytes_for_resource(db, res_id, deadline=deadline)
-        if val is None:
-            partial = True
-            break
-        total += val
-        rolled += 1
-    if partial:
-        log.warning(
-            "[backup-size] partial total after %.1fs: %d of %d cold resources "
-            "rolled up (disconnected=%s, budget=%.0fs)",
-            loop_time() - started, rolled, len(cold), disconnected,
-            _PROTECTED_REQUEST_BUDGET_S,
-        )
-
-    # Per-day chart = bytes ADDED per day (write growth), bucketed by
-    # snapshot completed_at in the client tz. The previous version
-    # bucketed each resource's ENTIRE cumulative size into its
-    # last_backup_at day — with daily incrementals every resource's
-    # last backup is today, so the whole chart collapsed onto one bar
-    # and every other day read zero (2026-07-14: "only shows data for
-    # 7/14 but we had backup data yesterday").
-    today = _bucket_date(datetime.utcnow(), client_tz)
-    window_start = today - timedelta(days=29)
-    window_start_ts = datetime.combine(window_start, datetime.min.time())
-
-    hist_rows = (await db.execute(
-        select(Snapshot.completed_at, Snapshot.bytes_added)
-        .join(Resource, Resource.id == Snapshot.resource_id)
-        .where(
-            exclude_tier2_storage_dupes_clause(),
-            Snapshot.status.in_([
-                SnapshotStatus.COMPLETED,
-                SnapshotStatus.PARTIAL,
-                SnapshotStatus.PENDING_DELETION,
-            ]),
-            Snapshot.completed_at.isnot(None),
-            Snapshot.completed_at >= window_start_ts,
-            *filters,
-        )
-    )).all()
-    per_day_map: dict = {}
-    for ts, added in hist_rows:
-        if ts is None:
-            continue
-        day_key = _bucket_date(ts, client_tz)
-        per_day_map[day_key] = per_day_map.get(day_key, 0) + int(added or 0)
-
+    summary = None
+    history_complete = False
     daily_data = []
-    for i in range(30):
-        date = window_start + timedelta(days=i)
-        daily_data.append({
-            "date": date.isoformat(),
-            "bytes": per_day_map.get(date, 0),
-        })
-
-    seven_day_change = sum(d["bytes"] for d in daily_data[-7:])
-    one_day_change = daily_data[-1]["bytes"]
-
-    # Storage-page tiles: raw byte fields (client formats) + linear
-    # projections rooted at the protected total, using the mean daily
-    # write growth across the whole 30-day window. Mean, not median —
-    # re-baseline spikes are real growth the object store has to hold
-    # (blobs are never deleted on Wasabi, retention_cleanup.py:55).
-    daily_growth = int(round(sum(d["bytes"] for d in daily_data) / 30.0))
-
-    return {
-        "total": format_bytes(total),
-        "oneDayChange": format_bytes(abs(one_day_change)) + (" ↑" if one_day_change > 0 else " ↓"),
-        "oneMonthChange": format_bytes(abs(seven_day_change)) + (" ↑" if seven_day_change > 0 else " ↓"),
-        "allTimeTotal": format_bytes(total),
-        "dailyData": daily_data,
-        "totalBytes": total,
-        # True when the walk stopped early (client gone or budget spent):
-        # total/projections then cover only the resources reached.
-        "partial": partial,
-        "dailyGrowthBytes": daily_growth,
-        "projectedBytes1y": total + daily_growth * 365,
-        "projectedBytes3y": total + daily_growth * 1095,
-    }
+    try:
+        async with asyncio.timeout(_SIZE_REQUEST_BUDGET_S):
+            if await request.is_disconnected():
+                raise HTTPException(status_code=499, detail='Client disconnected')
+            principal = verified_user(request)
+            service_key = parse_service_type(serviceType)
+            resource_types = resource_types_for_service(service_key)
+            type_names = tuple(sorted(t.value for t in resource_types)) if resource_types else None
+            schema = '"' + settings.DB_SCHEMA.replace('"', '""') + '",public'
+            await db.execute(text(
+                "SELECT set_config('statement_timeout', :timeout, true), "
+                "set_config('search_path', :schema, true)"
+            ), {'timeout': str(max(1, int(_SIZE_REQUEST_BUDGET_S * 1000))), 'schema': schema})
+            tenant_ids = await _size_scope(db, principal, tenantId)
+            summary = await _read_size_summary(db, tenant_ids=tenant_ids, service_types=type_names)
+            if await request.is_disconnected():
+                raise HTTPException(status_code=499, detail='Client disconnected')
+            client_tz = _resolve_tz(tz)
+            today = datetime.now(timezone.utc).astimezone(client_tz).date()
+            start = today - timedelta(days=29)
+            start_utc = datetime.combine(start, datetime.min.time(), client_tz).astimezone(timezone.utc).replace(tzinfo=None)
+            end_utc = datetime.combine(today + timedelta(days=1), datetime.min.time(), client_tz).astimezone(timezone.utc).replace(tzinfo=None)
+            hist_rows = (await db.execute(text(_SIZE_HISTORY_SQL), {
+                'tz': str(client_tz), 'window_start': start_utc, 'window_end': end_utc,
+                'all_tenants': tenant_ids is None, 'tenant_ids': list(tenant_ids or ()),
+                'all_types': type_names is None, 'resource_types': list(type_names or ()),
+            })).all()
+            buckets = {str(day): int(value or 0) for day, value in hist_rows}
+            daily_data = [{'date': (start + timedelta(days=i)).isoformat(),
+                           'bytes': buckets.get((start + timedelta(days=i)).isoformat(), 0)} for i in range(30)]
+            history_complete = True
+            # Finish the read transaction inside the handler budget; get_db has no SQL to commit.
+            await db.rollback()
+    except (TimeoutError, DBAPIError):
+        log.warning('[protected-size] bounded dashboard read unavailable', exc_info=True)
+        with suppress(Exception):
+            await asyncio.wait_for(db.rollback(), timeout=.5)
+        if summary is None:
+            raise HTTPException(status_code=503, detail='Backup size is temporarily unavailable')
+    return _size_response(summary, daily_data, history_complete=history_complete)
