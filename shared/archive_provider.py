@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
+import tempfile
 from urllib.parse import urlsplit
 
 import httpx
@@ -22,14 +24,9 @@ def export_base(url, expected):
     return canonical_base(url[:-len('/exportItems')] + '/folders', expected=expected)
 
 
-async def export_items(graph, url, ids, *, timeout, byte_limit=16 * 1024 * 1024):
-    """Only exportItems is a repeatable POST. No mutation uses this adapter.
-
-    The byte ceiling is checked while streaming, before JSON parse or base64
-    decode. Callers split oversized multi-item batches; a singleton remains an
-    explicit unresolved receipt until a spooled export adapter is available.
-    """
-    if not ids or len(ids) > 20 or byte_limit < 1024:
+async def _request_export(graph, url, ids, *, timeout, read_body):
+    """Only exportItems is a repeatable POST; no restore mutation uses this path."""
+    if not ids or len(ids) > 20:
         raise ValueError('invalid archive export envelope')
     original_base = export_base(url, None)
     budget = ProviderReadBudget()
@@ -61,21 +58,42 @@ async def export_items(graph, url, ids, *, timeout, byte_limit=16 * 1024 * 1024)
                         elif response.status_code != 200:
                             raise ProviderReadError('unexpected_export_status', status=response.status_code)
                         else:
-                            body = bytearray()
-                            async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
-                                if len(body) + len(chunk) > byte_limit:
-                                    raise ArchiveExportOversize()
-                                body.extend(chunk)
-                            try:
-                                data = json.loads(body)
-                            except (ValueError, UnicodeError):
-                                retry = ProviderReadError('malformed_export', attempts=budget.attempts)
-                            else:
-                                if not isinstance(data, dict) or not isinstance(data.get('value'), list):
-                                    raise ProviderReadError('malformed_export_collection')
-                                return data
+                            return await read_body(response)
         except httpx.TransportError:
             retry = ProviderReadError('archive_export_transport', attempts=budget.attempts)
         if retry is not None:
             # Close the response, client context and physical admission before delay.
             await asyncio.sleep(budget.retry_delay(retry))
+
+
+async def export_items(graph, url, ids, *, timeout, byte_limit=16 * 1024 * 1024):
+    """Bounded in-memory compatibility reader for small diagnostic responses."""
+    if byte_limit < 1024:
+        raise ValueError('invalid archive export envelope')
+    async def read(response):
+        body = bytearray()
+        async for chunk in response.aiter_bytes(chunk_size=65536):
+            if len(body) + len(chunk) > byte_limit:
+                raise ArchiveExportOversize()
+            body.extend(chunk)
+        try:
+            data = json.loads(body)
+        except (ValueError, UnicodeError):
+            raise ProviderReadError('malformed_export') from None
+        if not isinstance(data, dict) or not isinstance(data.get('value'), list):
+            raise ProviderReadError('malformed_export_collection')
+        return data
+    return await _request_export(graph, url, ids, timeout=timeout, read_body=read)
+
+
+@asynccontextmanager
+async def export_items_spooled(graph, url, ids, *, timeout, metadata_limit=4 * 1024 * 1024):
+    """Keep opaque bytes on disk through upload/receipt, then remove all spools."""
+    from shared.archive_spool import ExportSpoolDecoder
+    with tempfile.TemporaryDirectory(prefix='tmvault-archive-') as directory:
+        async def read(response):
+            with ExportSpoolDecoder(directory, metadata_limit=metadata_limit) as parser:
+                async for chunk in response.aiter_bytes(chunk_size=65536):
+                    parser.feed(chunk)
+                return parser.finish()
+        yield await _request_export(graph, url, ids, timeout=timeout, read_body=read)

@@ -80,6 +80,11 @@ async def run(store, monkeypatch, source, *, pause=0):
         stats['peak'] = max(stats['peak'], stats['export_active'])
         return {'value': [{'itemId': iid, 'changeKey': 'a', 'data': base64.b64encode(b'abc').decode()} for iid in ids]}
     monkeypatch.setattr('shared.archive_provider.export_items', export)
+    from contextlib import asynccontextmanager
+    @asynccontextmanager
+    async def export_spooled(*args, **kwargs):
+        yield await export(*args, **kwargs)
+    monkeypatch.setattr('shared.archive_provider.export_items_spooled', export_spooled)
     async def persist(pairs):
         await asyncio.sleep(pause)
         ledger = ArchiveCapture(store.factory, fence)

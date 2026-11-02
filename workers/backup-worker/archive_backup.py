@@ -1750,7 +1750,8 @@ def _make_durable_persist(resource, snapshot, tenant, ledger, settings):
         import base64
         import binascii
         import hashlib
-        from shared.azure_storage import azure_storage_manager, upload_blob_with_dedup
+        from shared.azure_storage import azure_storage_manager, upload_blob_with_dedup, upload_blob_with_dedup_from_file
+        from shared.archive_spool import SpooledArchiveData
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
         container = azure_storage_manager.get_container_name(str(tenant.id), ARCHIVE_WORKLOAD)
         receipts = []
@@ -1760,23 +1761,31 @@ def _make_durable_persist(resource, snapshot, tenant, ledger, settings):
             if entry.get('changeKey') != item.get('changeKey'):
                 await ledger.fail_items([iid], 'source_changed')
                 continue
-            try:
-                data = base64.b64decode(entry.get('data'), validate=True)
-            except (ValueError, TypeError, binascii.Error):
-                await ledger.fail_items([iid], 'invalid_export_data')
-                continue
-            if not data:
+            encoded = entry.get('data')
+            if isinstance(encoded, SpooledArchiveData):
+                data_size, checksum = encoded.size, encoded.sha256
+            else:
+                try:
+                    data = base64.b64decode(encoded, validate=True)
+                except (ValueError, TypeError, binascii.Error):
+                    await ledger.fail_items([iid], 'invalid_export_data')
+                    continue
+                data_size, checksum = len(data), hashlib.sha256(data).hexdigest()
+            if not data_size:
                 await ledger.fail_items([iid], 'empty_export_data')
                 continue
             path = azure_storage_manager.build_blob_path(str(tenant.id), str(resource.id), str(snapshot.id), iid)
-            checksum = hashlib.sha256(data).hexdigest()
-            result = await upload_blob_with_dedup(tenant.id, checksum, container, path, data, shard, max_retries=3)
+            if isinstance(encoded, SpooledArchiveData):
+                result = await upload_blob_with_dedup_from_file(tenant.id, checksum, container,
+                    path, encoded.path, shard, file_size=data_size, max_retries=3)
+            else:
+                result = await upload_blob_with_dedup(tenant.id, checksum, container, path, data, shard, max_retries=3)
             if not isinstance(result, dict) or not result.get('success'):
                 await ledger.fail_items([iid], 'upload_failed')
                 continue
             row = build_archive_item_row(snapshot_id=snapshot.id, tenant_id=tenant.id,
                 folder={'id': item['_folder_id']}, item=item,
-                blob_path=result.get('blob_path') or path, content_hash=checksum, blob_len=len(data),
+                blob_path=result.get('blob_path') or path, content_hash=checksum, blob_len=data_size,
                 mailbox_id=item['_mailbox_id'], graph_version=settings.ARCHIVE_GRAPH_VERSION,
                 folder_path=item['_folder_path'])
             row['metadata'] = row.pop('extra_data')
@@ -1790,7 +1799,7 @@ def _make_durable_persist(resource, snapshot, tenant, ledger, settings):
 async def _run_durable_archive(graph_client, resource, snapshot, tenant, *, worker_id, force_full,
                                settings, fence, copy_capture, factory=None, persist_batch=None):
     from shared.archive_capture import ArchiveCapture, ArchiveConflict, archive_final_gate, canonical_base
-    from shared.archive_provider import export_items, export_base, ArchiveExportOversize
+    from shared.archive_provider import export_items, export_items_spooled, export_base, ArchiveExportOversize
     from shared.provider_read import ProviderReadError
     from shared.copy_workflow import seal_current_copy
     if factory is None:
@@ -1873,19 +1882,14 @@ async def _run_durable_archive(graph_client, resource, snapshot, tenant, *, work
             ids = [row['external_id'] for row in chunk]
             url = url or chunk[0]['location'][:-len('/folders')] + '/exportItems'
             try:
-                response = await export_items(graph_client, url, ids, timeout=settings.ARCHIVE_IMPORT_TIMEOUT_S,
-                    byte_limit=byte_limit)
-            except ArchiveExportOversize:
-                if len(chunk) == 1:
-                    await ledger.fail_items(ids, 'export_response_byte_limit')
-                else:
-                    middle = len(chunk) // 2
-                    await process(chunk[:middle], url, hops)
-                    await process(chunk[middle:], url, hops)
-                return
+                async with export_items_spooled(graph_client, url, ids,
+                        timeout=settings.ARCHIVE_IMPORT_TIMEOUT_S) as response:
+                    await persist_response(chunk, response, url, hops)
             except (ProviderReadError, ValueError, httpx.HTTPError) as exc:
                 await ledger.fail_items(ids, getattr(exc, 'stage', 'export_failed'))
-                return
+
+        async def persist_response(chunk, response, url, hops):
+            ids = [row['external_id'] for row in chunk]
             mark_progress()
             entries = {}
             for entry in response['value']:

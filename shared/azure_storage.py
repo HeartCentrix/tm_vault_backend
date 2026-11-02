@@ -2078,7 +2078,20 @@ async def upload_blob_with_dedup(
     hiccup the dedup check silently falls through to a real upload
     — never blocks the backup.
     """
-    if content_hash and len(content) >= min_size_bytes:
+    existing = await _readable_dedup_result(tenant_id, content_hash, container_name,
+        len(content), shard, min_size_bytes)
+    if existing:
+        return existing
+
+    return await upload_blob_with_retry(
+        container_name, blob_path, content, shard,
+        max_retries=max_retries, metadata=metadata,
+    )
+
+
+async def _readable_dedup_result(tenant_id, content_hash, container_name, content_size,
+                               shard, min_size_bytes):
+    if content_hash and content_size >= min_size_bytes:
         try:
             from shared.blob_dedup import find_existing_blob
             from shared.database import async_session_factory
@@ -2123,7 +2136,7 @@ async def upload_blob_with_dedup(
                         "success": True,
                         "blob_path": existing,
                         "blob_url": existing,
-                        "size_bytes": len(content),
+                        "size_bytes": content_size,
                         "method": "dedup_hit",
                     }
                 # Existing blob is not readable from container_name —
@@ -2134,7 +2147,18 @@ async def upload_blob_with_dedup(
             # Dedup is advisory — a DB hiccup must not block the backup.
             pass
 
-    return await upload_blob_with_retry(
-        container_name, blob_path, content, shard,
-        max_retries=max_retries, metadata=metadata,
-    )
+    return None
+
+
+async def upload_blob_with_dedup_from_file(tenant_id, content_hash, container_name,
+        blob_path, file_path, shard, *, file_size, max_retries=3, metadata=None, min_size_bytes=1024):
+    """Same tenant/container dedup contract with a bounded file upload."""
+    import os
+    if os.path.getsize(file_path) != file_size:
+        raise ValueError("archive spool length changed before upload")
+    existing = await _readable_dedup_result(tenant_id, content_hash, container_name,
+        file_size, shard, min_size_bytes)
+    if existing:
+        return existing
+    return await upload_blob_with_retry_from_file(container_name, blob_path, file_path,
+        shard, file_size=file_size, max_retries=max_retries, metadata=metadata)

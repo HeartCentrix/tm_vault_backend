@@ -111,3 +111,38 @@ async def test_external_redirect_is_rejected_before_credentialed_request():
     with pytest.raises(ValueError, match='route'):
         await export_items(Graph(), URL, ['one'], timeout=10)
     assert len(calls) == 1
+
+
+async def test_large_singleton_spools_through_receipt_lifetime_and_cleans_up():
+    import base64
+    import hashlib
+    from pathlib import Path
+    from shared.archive_provider import export_items_spooled
+    from shared.archive_spool import SpooledArchiveData
+    block = b'abc' * 16384
+    encoded = base64.b64encode(block)
+    class LargeBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'{"value":[{"itemId":"large","changeKey":"v1","data":"'
+            for _ in range(512):
+                yield encoded
+            yield b'"}]}'
+    class Graph:
+        async def _get_token(self): return 'synthetic'
+        @asynccontextmanager
+        async def _admit_data_request(self, *args, **kwargs): yield
+        @asynccontextmanager
+        async def _http_session(self):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, stream=LargeBody()))) as client:
+                yield client
+    async with export_items_spooled(Graph(), URL, ['large'], timeout=10) as response:
+        data = response['value'][0]['data']
+        assert isinstance(data, SpooledArchiveData)
+        assert data.size == len(block) * 512 > 16 * 1024 * 1024
+        path = Path(data.path)
+        assert path.exists()
+        expected = hashlib.sha256()
+        for _ in range(512):
+            expected.update(block)
+        assert data.sha256 == expected.hexdigest()
+    assert not path.exists()
