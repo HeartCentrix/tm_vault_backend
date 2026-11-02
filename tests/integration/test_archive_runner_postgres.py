@@ -44,6 +44,8 @@ class Source:
         self.count, self.gaps = count, gaps
         self.active = self.peak = self.calls = 0
     async def _get(self, url, params=None, on_activity=None, *, on_page=None):
+        if on_page is None:
+            return {'id': url.rsplit('/', 1)[-1], 'childFolderCount': 1 if self.gaps else 0}
         self.active += 1
         self.peak = max(self.peak, self.active)
         self.calls += 1

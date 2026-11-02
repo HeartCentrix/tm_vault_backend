@@ -1866,8 +1866,9 @@ async def _run_durable_archive(graph_client, resource, snapshot, tenant, *, work
                     # Existing gaps retain this failed repair attempt; a probe does not certify coverage.
                     pass
             await walker.run()
-        await ledger.repair()
+        await ledger.repair(read_folder=graph_client._get)
         await walker.run()
+        await ledger.verify_repair_counts(graph_client._get)
         summary = await ledger.summary()
         floor = getattr(settings, 'ARCHIVE_MIN_COVERAGE_PCT', 90)
         coverage = 100 * summary['items_enumerated'] / baseline if baseline else None

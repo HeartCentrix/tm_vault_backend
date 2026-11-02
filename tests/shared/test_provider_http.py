@@ -256,6 +256,18 @@ async def test_batch_response_obeys_byte_envelope_before_json_parse():
                     {'id': 'one', 'method': 'GET', 'url': '/users/a/messages'}]})
 
 
+def test_nested_readers_cannot_relax_the_callers_byte_ceiling():
+    from shared.provider_http import response_byte_limit, _response_limit
+    with response_byte_limit(2048):
+        with response_byte_limit(None):
+            assert _response_limit.get() == 2048
+        with response_byte_limit(4096):
+            assert _response_limit.get() == 2048
+        with response_byte_limit(1024):
+            assert _response_limit.get() == 1024
+        assert _response_limit.get() == 2048
+
+
 async def test_preauthenticated_archive_import_is_metered_without_auth_or_replay(monkeypatch):
     from shared.archive_export import post_json_no_auth
     from shared.graph_rate_limiter import graph_rate_limiter

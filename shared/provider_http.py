@@ -26,7 +26,9 @@ _response_limit = ContextVar('provider_response_byte_limit', default=None)
 def response_byte_limit(limit):
     if limit is not None and (type(limit) is not int or limit < 1024):
         raise ValueError('invalid provider response byte budget')
-    marker = _response_limit.set(limit)
+    inherited = _response_limit.get()
+    effective = inherited if limit is None else min(inherited, limit) if inherited is not None else limit
+    marker = _response_limit.set(effective)
     try:
         yield
     finally:

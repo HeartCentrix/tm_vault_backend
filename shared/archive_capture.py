@@ -252,12 +252,21 @@ class ArchiveCapture:
                               'gap_kind': text("CASE WHEN EXCLUDED.gap_kind IS NOT NULL OR archive_item_work.change_key IS DISTINCT FROM EXCLUDED.change_key OR archive_item_work.location <> EXCLUDED.location THEN 'source_changed' ELSE archive_item_work.gap_kind END")}).returning(text('(xmax = 0) AS inserted')))
                     inserted_count += sum(bool(r[0]) for r in changes)
             else:
+                memberships = {}
                 for child in page['value']:
                     if not isinstance(child, dict) or not isinstance(child.get('id'), str) or not child['id']:
                         raise ArchivePageError('archive folder identity missing')
                     route = folder_base(child, base)
                     if not await self._location(db, route):
                         continue
+                    target_key = digest(route, child['id'], 'items')
+                    member_key = digest('membership', row.scope_key, row.scope_generation, target_key)
+                    memberships[member_key] = dict(snapshot_id=self.fence.snapshot_id,
+                        capture_generation=self.generation, scope_key=member_key, phase='membership',
+                        base_url=route, folder_id=child['id'], parent_scope_key=row.scope_key,
+                        parent_generation=row.scope_generation, state='complete', terminal_page=True,
+                        evidence={'target_key': target_key, 'children_key':
+                            digest(route, child['id'], 'children') if child.get('childFolderCount') != 0 else None})
                     path = row.display_path + '/' + str(child.get('displayName') or child['id'])
                     declared = child.get('childFolderCount')
                     for phase in ('items', 'children'):
@@ -279,9 +288,15 @@ class ArchiveCapture:
                             old.terminal_page = False
                             old.next_url = f'{route}/{child["id"]}/{"items" if phase == "items" else "childFolders"}'
                             old.parent_generation = row.scope_generation
+                            old.parent_scope_key = row.scope_key
                             old.declared_count = declared if phase == 'children' else child.get('totalItemCount')
                         elif old.base_url != route or old.folder_id != child['id']:
                             raise ArchiveConflict('archive scope hash collision')
+                values = list(memberships.values())
+                for start in range(0, len(values), 200):
+                    inserted = await db.execute(insert(Folder).values(values[start:start + 200])
+                        .on_conflict_do_nothing().returning(Folder.scope_key))
+                    inserted_count += len(inserted.all())
             db.add(Folder(snapshot_id=self.fence.snapshot_id, capture_generation=self.generation,
                 scope_key=receipt_key, phase='receipt', base_url=base, folder_id=row.folder_id,
                 parent_scope_key=row.scope_key, parent_generation=row.scope_generation, state='complete',
@@ -290,13 +305,7 @@ class ArchiveCapture:
             row.next_url = nxt
             row.terminal_page = not nxt
             await db.flush()
-            if row.phase == 'items':
-                row.observed_count += inserted_count
-            else:
-                row.observed_count = await db.scalar(select(func.count()).select_from(Folder).where(
-                    Folder.snapshot_id == self.fence.snapshot_id, Folder.capture_generation == self.generation,
-                    Folder.parent_scope_key == row.scope_key, Folder.parent_generation == row.scope_generation,
-                    Folder.phase == 'items', Folder.state != 'excluded'))
+            row.observed_count += inserted_count
             if not nxt:
                 row.state = 'complete'
                 if row.declared_count is not None and row.observed_count < row.declared_count:
@@ -338,7 +347,94 @@ class ArchiveCapture:
             row.state, row.gap_kind = 'pending', None
             return True
 
-    async def repair(self):
+    async def _refresh_count(self, scope, read_folder, *, after=False):
+        """Read metadata outside the owner transaction, with durable finite evidence."""
+        async with self.factory.begin() as db:
+            await self.lock(db)
+            row = await self._scope(db, scope)
+            proof = dict((row.evidence or {}).get('count_reconciliation') or {})
+            key = 'after_reads' if after else 'before_reads'
+            done = 'after_done' if after else 'before_done'
+            if proof.get(done):
+                return
+            if proof.get(key, 0) >= 2:
+                row.state, row.gap_kind = 'unresolved', 'count_reconciliation_exhausted'
+                proof[done], proof['stable'] = True, False
+                row.evidence = {**row.evidence, 'count_reconciliation': proof}
+                return
+            proof[key] = proof.get(key, 0) + 1
+            proof.setdefault('original_count', row.declared_count)
+            row.evidence = {**(row.evidence or {}), 'count_reconciliation': proof}
+            request = row.base_url + '/' + row.folder_id
+        try:
+            from shared.provider_http import response_byte_limit
+            with response_byte_limit(65536):
+                metadata = await read_folder(request)
+            name = 'childFolderCount' if scope['phase'] == 'children' else 'totalItemCount'
+            count = metadata.get(name) if isinstance(metadata, dict) else None
+            if not isinstance(metadata, dict) or metadata.get('id') != scope['folder_id'] or type(count) is not int or count < 0:
+                raise ArchivePageError('archive folder count proof is invalid')
+            # A redirected folder response may identify its auxiliary mailbox
+            # only through @odata.context. An explicit parent hint takes priority.
+            route = (folder_base(metadata, scope['base_url']) if metadata.get('parentMailboxUrl')
+                     else page_base(metadata, scope['base_url']))
+        except Exception as error:
+            from shared.provider_read import ProviderReadError
+            if not isinstance(error, (ArchivePageError, ProviderReadError)) and type(error).__name__ not in (
+                    'HTTPStatusError', 'ReadTimeout', 'ConnectError', 'GraphRetryExhaustedError'):
+                raise
+            async with self.factory.begin() as db:
+                await self.lock(db)
+                row = await self._scope(db, scope)
+                proof = dict(row.evidence['count_reconciliation'])
+                proof['metadata_unavailable'] = True
+                proof[done] = True
+                row.evidence = {**row.evidence, 'count_reconciliation': proof}
+                row.state, row.gap_kind = 'unresolved', 'count_metadata_unavailable'
+            return
+        async with self.factory.begin() as db:
+            await self.lock(db)
+            row = await self._scope(db, scope)
+            proof = dict(row.evidence['count_reconciliation'])
+            proof[done] = True
+            if after:
+                proof['final_count'], proof['final_route'] = count, route
+                proof['stable'] = (not proof.get('metadata_unavailable') and count == proof.get('refreshed_count')
+                    and route == proof.get('refreshed_route') == row.evidence.get('response_base')
+                    and row.observed_count == count and row.terminal_page)
+                if not proof['stable']:
+                    row.state, row.gap_kind = 'unresolved', 'count_changed_during_repair'
+            else:
+                proof['refreshed_count'], proof['refreshed_route'] = count, route
+                row.declared_count = count
+            row.evidence = {**row.evidence, 'count_reconciliation': proof}
+
+    async def verify_repair_counts(self, read_folder):
+        while True:
+            async with self.factory() as db:
+                rows = list((await db.scalars(select(Folder).where(Folder.snapshot_id == self.fence.snapshot_id,
+                    Folder.capture_generation == self.generation, Folder.phase.in_(('items', 'children')),
+                    Folder.restart_count > 0, Folder.state != 'excluded',
+                    Folder.evidence['count_reconciliation']['before_reads'].as_integer() > 0,
+                    Folder.evidence['count_reconciliation']['after_done'].as_boolean().is_not(True))
+                    .order_by(Folder.scope_key).limit(100))).all())
+                scopes = [{c.name: getattr(row, c.key) for c in Folder.__table__.columns} for row in rows
+                    if (row.evidence or {}).get('count_reconciliation')]
+            if not scopes:
+                return
+            for scope in scopes:
+                proof = scope['evidence']['count_reconciliation']
+                if proof.get('metadata_unavailable') or not proof.get('refreshed_route'):
+                    async with self.factory.begin() as db:
+                        await self.lock(db)
+                        row = await self._scope(db, scope)
+                        row.state, row.gap_kind = 'unresolved', 'count_metadata_unavailable'
+                        row.evidence = {**row.evidence, 'count_reconciliation': {
+                            **row.evidence['count_reconciliation'], 'after_done': True, 'stable': False}}
+                else:
+                    await self._refresh_count(scope, read_folder, after=True)
+
+    async def repair(self, read_folder=None):
         """One finite repair turn, respecting persisted provider cooldowns."""
         async with self.factory.begin() as db:
             await self.lock(db)
@@ -348,11 +444,17 @@ class ArchiveCapture:
                 Folder.gap_kind != 'location_cap',
                 (Folder.not_before.is_(None) | (Folder.not_before <= func.now()))).limit(100))).all())
             restart = []
+            refresh = []
             for scope in rows:
                 if scope.next_url:
                     scope.state = 'pending'
                 elif scope.restart_count < 1:
-                    restart.append({'scope_key': scope.scope_key, 'scope_generation': scope.scope_generation})
+                    descriptor = {c.name: getattr(scope, c.key) for c in Folder.__table__.columns}
+                    restart.append(descriptor)
+                    if read_folder and scope.phase != 'root' and scope.gap_kind == 'count_shortfall':
+                        refresh.append(descriptor)
+        for scope in refresh:
+            await self._refresh_count(scope, read_folder)
         for scope in restart:
             await self.restart(scope)
         return len(rows)
@@ -473,13 +575,18 @@ class ArchiveCapture:
                 return await self.summary(session)
         folder = (await db.execute(text('''SELECT count(*) FILTER (WHERE phase='root' AND logical_attempts>0) AS locations_walked,
             count(*) FILTER (WHERE phase='root') AS locations_planned,
-            count(*) FILTER (WHERE state='complete' AND terminal_page) AS scopes_complete,
+            count(*) FILTER (WHERE state='complete' AND terminal_page AND
+                (evidence->'count_reconciliation' IS NULL OR evidence->'count_reconciliation'->>'stable'='true')) AS scopes_complete,
             count(*) FILTER (WHERE state IN ('pending','reading')) AS scopes_pending,
-            count(*) FILTER (WHERE state='unresolved') AS scopes_unresolved,
+            count(*) FILTER (WHERE state='unresolved' OR (state='complete' AND
+                evidence->'count_reconciliation' IS NOT NULL AND
+                COALESCE(evidence->'count_reconciliation'->>'stable','false')<>'true')) AS scopes_unresolved,
             count(*) FILTER (WHERE not_before>NOW()) AS scopes_deferred,
-            count(*) FILTER (WHERE state<>'complete' OR NOT terminal_page) AS folders_failed,
+            count(*) FILTER (WHERE state<>'complete' OR NOT terminal_page OR
+                (evidence->'count_reconciliation' IS NOT NULL AND
+                    COALESCE(evidence->'count_reconciliation'->>'stable','false')<>'true')) AS folders_failed,
             count(*) AS scopes_planned FROM archive_folder_work WHERE snapshot_id=:sid AND capture_generation=:gen
-            AND phase<>'receipt' AND state<>'excluded' '''), self.params())).mappings().one()
+            AND phase NOT IN ('receipt','membership') AND state<>'excluded' '''), self.params())).mappings().one()
         counts = (await db.execute(text('''WITH current AS (
             SELECT i.external_id, bool_and(i.state='stored' AND s.id IS NOT NULL
               AND s.content_hash=i.receipt->>'hash' AND s.blob_path=i.receipt->>'blob_path'
@@ -493,10 +600,27 @@ class ArchiveCapture:
             WHERE i.snapshot_id=:sid AND i.capture_generation=:gen AND f.state<>'excluded' GROUP BY i.external_id)
             SELECT count(*) AS items_enumerated,count(*) FILTER (WHERE stored) AS files_succeeded,
               count(*) FILTER (WHERE NOT COALESCE(stored,false)) AS items_failed FROM current'''), self.params())).mappings().one()
-        samples = (await db.execute(text('''SELECT phase, gap_kind AS kind, folder_id, display_path AS path, observed_count, declared_count
-            FROM archive_folder_work WHERE snapshot_id=:sid AND capture_generation=:gen AND phase<>'receipt'
-            AND state NOT IN ('complete','excluded') ORDER BY scope_key LIMIT 20'''), self.params())).mappings()
+        samples = (await db.execute(text('''SELECT phase, COALESCE(gap_kind,'count_reconciliation_pending') AS kind, folder_id, display_path AS path, observed_count, declared_count
+            FROM archive_folder_work WHERE snapshot_id=:sid AND capture_generation=:gen AND phase NOT IN ('receipt','membership')
+            AND (state NOT IN ('complete','excluded') OR (state='complete' AND evidence->'count_reconciliation' IS NOT NULL
+                AND COALESCE(evidence->'count_reconciliation'->>'stable','false')<>'true')) ORDER BY scope_key LIMIT 20'''), self.params())).mappings()
         result = {**dict(folder), **dict(counts), 'folder_failures': [dict(r) for r in samples]}
+        # Shared child work can have observations from multiple parent lists.
+        # A restarted parent must not silently erase another list's required child.
+        missing_members = await db.scalar(text('''SELECT count(DISTINCT required.key)
+            FROM archive_folder_work m JOIN archive_folder_work p
+              ON p.snapshot_id=m.snapshot_id AND p.capture_generation=m.capture_generation
+              AND p.scope_key=m.parent_scope_key AND p.scope_generation=m.parent_generation
+            CROSS JOIN LATERAL (VALUES (m.evidence->>'target_key'),(m.evidence->>'children_key')) required(key)
+            LEFT JOIN archive_folder_work target ON target.snapshot_id=m.snapshot_id
+              AND target.capture_generation=m.capture_generation AND target.scope_key=required.key
+            WHERE m.snapshot_id=:sid AND m.capture_generation=:gen AND m.phase='membership'
+              AND m.state<>'excluded' AND p.state<>'excluded' AND required.key IS NOT NULL
+              AND (target.scope_key IS NULL OR target.state='excluded')'''), self.params())
+        if missing_members:
+            result['folders_failed'] += missing_members
+            result['folder_failures'].append({'phase': 'membership', 'kind': 'required_folder_not_covered',
+                'count': missing_members})
         totals = (await db.execute(text('SELECT COALESCE(sum(content_size),0) FROM snapshot_items WHERE snapshot_id=:sid'),
             {'sid': self.fence.snapshot_id})).scalar()
         exported = (await db.execute(text('''SELECT count(*),COALESCE(sum(size),0) FROM (
