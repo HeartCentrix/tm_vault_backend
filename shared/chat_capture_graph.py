@@ -25,12 +25,22 @@ from shared.graph_ratelimit import AsyncTokenBucket, parse_retry_after
 _RESOURCE_BUCKETS: WeakValueDictionary[tuple[str, str, str], AsyncTokenBucket] = WeakValueDictionary()
 
 
+from shared.provider_read import ProviderReadError
+
 class ChatGraphError(RuntimeError):
     """Capture cannot establish complete source coverage; URLs are redacted."""
 
     def __init__(self, message: str, *, status_code: int | None = None):
         super().__init__(message)
         self.status_code = status_code
+
+    @classmethod
+    def from_response(cls, response, *, stage):
+        safe = ProviderReadError.from_response(response, stage)
+        result = cls(f"Graph capture {stage} failed with HTTP {safe.status_code}", status_code=safe.status_code)
+        result.code, result.inner_code, result.request_id = safe.code, safe.inner_code, safe.request_id
+        result.retry_after = safe.retry_after
+        return result
 
 
 class _PinnedGraphClient(GraphClient):
@@ -202,7 +212,7 @@ class StrictChatGraphSource:
                 await self._pause(response, attempt)
                 continue
             if response.status_code != 200:
-                raise ChatGraphError(f"Graph capture failed with HTTP {response.status_code}", status_code=response.status_code)
+                raise ChatGraphError.from_response(response, stage="metadata")
             try:
                 data = response.json()
             except ValueError:
@@ -318,7 +328,16 @@ class StrictChatGraphSource:
                     else:
                         retry_response = None
                         if response.status_code != 200:
-                            raise ChatGraphError(f"capture content failed with HTTP {response.status_code}", status_code=response.status_code)
+                            # Error bodies may contain signed URLs; retain only safe fields.
+                            error_bytes = bytearray()
+                            async for chunk in response.aiter_bytes(4096):
+                                error_bytes.extend(chunk)
+                                if len(error_bytes) > 16384:
+                                    error_bytes.clear()
+                                    break
+                            safe_response = httpx.Response(response.status_code,
+                                headers=response.headers, content=bytes(error_bytes))
+                            raise ChatGraphError.from_response(safe_response, stage="content")
                         if response.headers.get("Content-Encoding", "identity").lower() != "identity":
                             raise ChatGraphError("unexpected capture content encoding")
                         length = _content_length(response)

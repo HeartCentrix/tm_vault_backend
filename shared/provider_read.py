@@ -19,11 +19,12 @@ class ProviderReadError(RuntimeError):
     """Never include provider messages, resource URLs or credentials in logs."""
 
     def __init__(self, stage, *, status=None, code=None, request_id=None,
-                 retry_after=None, attempts=1, response=None):
+                 retry_after=None, attempts=1, response=None, inner_code=None):
         self.stage = stage
         self.status_code = status
         self.code = _identifier(code)
         self.request_id = _identifier(request_id)
+        self.inner_code = _identifier(inner_code)
         self.retry_after = retry_after
         self.attempts = attempts
         self.response = response
@@ -37,7 +38,10 @@ class ProviderReadError(RuntimeError):
                 error = {}
         except (ValueError, httpx.ResponseNotRead):
             error = {}
-        return cls(stage, status=response.status_code, code=error.get("code"),
+        inner = error.get("innerError") or error.get("innererror") or {}
+        if not isinstance(inner, dict):
+            inner = {}
+        return cls(stage, status=response.status_code, code=error.get("code"), inner_code=inner.get("code"),
                    request_id=response.headers.get("request-id") or response.headers.get("SPRequestGuid"),
                    retry_after=parse_retry_after(response.headers.get("Retry-After")),
                    attempts=attempts, response=response)

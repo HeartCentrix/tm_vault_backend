@@ -131,3 +131,28 @@ def test_observation_unknown_version_fails_closed():
     module = importlib.import_module("shared.chat_capture")
     with pytest.raises(ValueError, match="version"):
         module.ChatObservationLedger(scope(), observation_hash_version=3)
+
+
+def test_failure_diagnostics_retain_safe_provider_fields():
+    from types import SimpleNamespace
+    module = importlib.import_module("shared.chat_capture")
+    with module.ChatObservationLedger(scope()) as ledger:
+        ledger.failure(0, "messages", SimpleNamespace(status_code=403, code="Forbidden",
+            inner_code="InsufficientPrivileges", request_id="request-id-123"))
+        detail = ledger.failure_details()[0]
+        assert detail["provider_code"] == "Forbidden"
+        assert detail["provider_inner_code"] == "InsufficientPrivileges"
+        assert detail["provider_request_id"] == "request-id-123"
+
+
+def test_mismatch_diagnostics_distinguish_missing_and_changed_keys_without_payload():
+    module = importlib.import_module("shared.chat_capture")
+    with module.ChatObservationLedger(scope()) as ledger:
+        ledger.record(0, item("removed", body="secret"))
+        ledger.record(0, item("changed", body="secret"))
+        ledger.record(1, item("changed", body="other secret"))
+        ledger.record(1, item("added"))
+        detail = ledger.difference_details()
+        assert detail["only_first"] == detail["only_second"] == detail["changed"] == 1
+        assert len(detail["sample_keys"]) == 3
+        assert "secret" not in str(detail)

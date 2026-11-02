@@ -509,3 +509,19 @@ async def test_public_configuration_hash_matches_open_source(source_factory):
     async with make(lambda request: httpx.Response(200, json={"value": []})) as source:
         assert source.permission_scope_hash == module.permission_scope_hash_for(
             tenant_id="tenant", application_id="app", principal_id="user")
+
+
+async def test_provider_denial_keeps_safe_code_and_request_id_without_error_message(source_factory):
+    make, *_ = source_factory
+    request_id = '11111111-2222-3333-4444-555555555555'
+    def handler(request):
+        return httpx.Response(403, headers={'request-id': request_id}, json={'error': {
+            'code': 'Forbidden', 'message': 'https://private.invalid/?token=secret',
+            'innerError': {'code': 'InsufficientPrivileges', 'request-id': request_id}}})
+    async with make(handler) as source:
+        with pytest.raises(Exception) as error:
+            _ = [page async for page in source.iter_message_pages('chat')]
+    assert getattr(error.value, 'code', None) == 'Forbidden'
+    assert getattr(error.value, 'inner_code', None) == 'InsufficientPrivileges'
+    assert getattr(error.value, 'request_id', None) == request_id
+    assert 'secret' not in str(error.value)

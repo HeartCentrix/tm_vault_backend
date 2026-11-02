@@ -25,6 +25,7 @@ from shared.chat_capture_graph import StrictChatGraphSource, effective_capture_s
 from shared.chat_capture_storage import upload_capture_content, verify_catalogue_content
 from shared.chat_content_stream import spool_chat_content
 from shared.db_retry import run_catalogue_transaction
+from shared.provider_read import _identifier
 from shared.models import ChatCaptureAttempt, ChatInventory, ChatInventoryItem, ChatItemVersion, SnapshotChatInventory, SnapshotItem
 
 
@@ -44,7 +45,7 @@ class ChatObservationLedger:
         self.db = sqlite3.connect(self.path)
         self.db.execute("CREATE TABLE observed (pass INTEGER, key TEXT, semantic TEXT, binary INTEGER, PRIMARY KEY(pass,key))")
         self.db.execute("CREATE TABLE expected (pass INTEGER, key TEXT, required INTEGER, PRIMARY KEY(pass,key))")
-        self.db.execute("CREATE TABLE failures (pass INTEGER, phase TEXT, error_type TEXT, status INTEGER, graph_id TEXT, parent_graph_id TEXT)")
+        self.db.execute("CREATE TABLE failures (pass INTEGER, phase TEXT, error_type TEXT, status INTEGER, graph_id TEXT, parent_graph_id TEXT, provider_code TEXT, provider_inner_code TEXT, provider_request_id TEXT)")
 
     def __enter__(self):
         return self
@@ -96,12 +97,29 @@ class ChatObservationLedger:
         status = getattr(error, "status_code", None)
         if type(status) is not int:
             status = None
-        self.db.execute("INSERT INTO failures VALUES (?,?,?,?,?,?)",
-            (observation, phase, type(error).__name__, status, graph_id, parent_id))
+        self.db.execute("INSERT INTO failures VALUES (?,?,?,?,?,?,?,?,?)",
+            (observation, phase, type(error).__name__, status, graph_id, parent_id,
+             _identifier(getattr(error, "code", None)), _identifier(getattr(error, "inner_code", None)),
+             _identifier(getattr(error, "request_id", None))))
 
     def failure_details(self):
-        names = ("observation", "phase", "error_type", "status_code", "graph_id", "parent_graph_id")
+        names = ("observation", "phase", "error_type", "status_code", "graph_id", "parent_graph_id",
+                 "provider_code", "provider_inner_code", "provider_request_id")
         return [dict(zip(names, row)) for row in self.db.execute("SELECT * FROM failures LIMIT 50")]
+
+    def difference_details(self):
+        queries = {
+            "only_first": "SELECT a.key FROM observed a LEFT JOIN observed b ON b.pass=1 AND b.key=a.key WHERE a.pass=0 AND b.key IS NULL",
+            "only_second": "SELECT b.key FROM observed b LEFT JOIN observed a ON a.pass=0 AND a.key=b.key WHERE b.pass=1 AND a.key IS NULL",
+            "changed": "SELECT a.key FROM observed a JOIN observed b ON b.pass=1 AND b.key=a.key WHERE a.pass=0 AND a.semantic<>b.semantic",
+        }
+        result = {"observation_hash_version": self.observation_hash_version, "sample_keys": []}
+        for kind, query in queries.items():
+            result[kind] = self.db.execute("SELECT COUNT(*) FROM (" + query + ")").fetchone()[0]
+            remaining = 20 - len(result["sample_keys"])
+            result["sample_keys"].extend({"kind": kind, "logical_key": row[0]} for row in
+                self.db.execute(query + " LIMIT ?", (remaining,)))
+        return result
 
 
 @dataclass
@@ -418,6 +436,12 @@ async def capture_chat_inventory(*, scope, graph_client, storage, session_factor
                                     ledger.fingerprint(0) != ledger.fingerprint(1))
                     except ChatSourceMovement:
                         movement, first.conflicts = True, 1
+                    if movement:
+                        mismatch = ledger.difference_details()
+                        async def save_mismatch(session):
+                            attempt, _ = await catalogue._attempt(session, keeper.lease)
+                            attempt.evidence_history = [*(attempt.evidence_history or []), {"observation_mismatch": mismatch}]
+                        await run_catalogue_transaction(session_factory, save_mismatch)
                     if movement and retry < 2:
                         await _restart(session_factory, keeper, scope)
                         continue
