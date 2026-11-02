@@ -569,3 +569,42 @@ async def test_scheduled_archive_flag_controls_missing_child_on_real_sql(conn, m
     row, shaped = (await run_rollup(conn))[str(f.batch_id)]
     assert row.missing_t2 == 0
     assert shaped["status"] == "Done"
+
+
+async def test_large_activity_window_does_not_rescan_all_batches_per_row(conn):
+    """Bound planner work without depending on index names or wall-clock speed."""
+    import json
+    count = 5000
+    await conn.execute("""
+        INSERT INTO resources(id,tenant_id,type,status,display_name,created_at)
+        SELECT md5('resource'||i)::uuid,md5('tenant')::uuid,'SHAREPOINT_SITE','ACTIVE',
+               'synthetic-'||i,now()-interval '1 year' FROM generate_series(1,6)i;
+        INSERT INTO jobs(id,type,tenant_id,status,batch_resource_ids,spec,created_at,completed_at)
+        SELECT md5('job'||i)::uuid,'BACKUP',md5('tenant')::uuid,'COMPLETED',
+               (SELECT array_agg(id) FROM resources),json_build_object('batch_id',md5('batch'||i)::uuid),
+               now()-(i||' hours')::interval,now()-(i||' hours')::interval+interval '10 minutes'
+        FROM generate_series(1,5000)i;
+        INSERT INTO snapshots(id,job_id,resource_id,status,completed_at,bytes_added,item_count)
+        SELECT md5(j.id::text||r.id::text)::uuid,j.id,r.id,'COMPLETED',j.completed_at,1000,10
+        FROM jobs j CROSS JOIN resources r;
+        INSERT INTO snapshot_partitions(id,job_id,snapshot_id,status,completed_at)
+        SELECT md5('part'||s.id::text)::uuid,s.job_id,s.id,'COMPLETED',s.completed_at FROM snapshots s;
+        CREATE INDEX ON snapshots(job_id);
+        CREATE INDEX ON snapshot_partitions(job_id);
+        CREATE INDEX ON resources(parent_resource_id);
+        CREATE INDEX ON batch_pending_users(batch_id,state);
+        ANALYZE;
+    """)
+    stmt = build_batch_rollup_query(tenant_id=None, start_date=None, end_date=None,
+                                   operation='BACKUP', size=count, offset=0)
+    sql = str(stmt.compile(dialect=pg_dialect.dialect(), compile_kwargs={'literal_binds': True}))
+    records = await conn.fetch(sql)
+    assert len(records) == count
+    assert all(row['items_added'] == 60 and row['bytes_added'] == 6000 for row in records)
+    plan = json.loads(await conn.fetchval('EXPLAIN (ANALYZE,FORMAT JSON) ' + sql))[0]['Plan']
+    nodes, inspected = [plan], 0
+    while nodes:
+        node = nodes.pop()
+        inspected += node.get('Rows Removed by Join Filter', 0) * node.get('Actual Loops', 1)
+        nodes.extend(node.get('Plans', []))
+    assert inspected < count * 30, f'batch candidate rows repeatedly visited: {inspected}'

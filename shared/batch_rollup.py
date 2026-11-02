@@ -961,6 +961,8 @@ def build_batch_rollup_query(
             END AS pending
         FROM batches b
     )
+    , rollup_rows AS MATERIALIZED (
+    -- Keep the final page limit from selecting quadratic nested-loop rescans.
     SELECT
         b.batch_id,
         b.tenant_id,
@@ -1017,7 +1019,9 @@ def build_batch_rollup_query(
     LEFT JOIN total_expected te ON te.batch_id = b.batch_id
     LEFT JOIN discovery_pending_cte dp ON dp.batch_id = b.batch_id
     LEFT JOIN tier_split tsp ON tsp.batch_id = b.batch_id
-    ORDER BY b.started_at DESC NULLS LAST
+    )
+    SELECT * FROM rollup_rows
+    ORDER BY started_at DESC NULLS LAST
     LIMIT :size OFFSET :off
     """
     binds: Dict[str, Any] = dict(
