@@ -74,12 +74,15 @@ def copy_work_enabled():
 
 
 def copy_work_guards_enabled():
-    return copy_work_enabled() or _COPY_GUARDS_ACTIVE or _RESUMING.get() is not None
+    from shared.provider_work import guards_enabled
+    return copy_work_enabled() or _COPY_GUARDS_ACTIVE or _RESUMING.get() is not None or guards_enabled()
 
 
 async def initialize_copy_guards(factory):
     """Latch persisted work even when a deployment turns producers back off."""
     global _COPY_GUARDS_ACTIVE
+    from shared.provider_work import initialize_guards
+    await initialize_guards(factory)
     try:
         async with factory() as session:
             control = await session.get(CopyWorkControl, 'global')
@@ -164,13 +167,14 @@ def pending_copy_sql(snapshot_expr=None, partition_expr=None, job_expr=None):
     predicate = "NOT EXISTS (SELECT 1 FROM copy_workflows cw WHERE "+active+" AND "+_conditions(snapshot_expr,partition_expr,job_expr)+exclusion+')'
     if own:
         predicate += " AND EXISTS (SELECT 1 FROM copy_workflows rw WHERE rw.id='"+str(own.workflow_id)+"'::uuid AND rw.state='RESUMING' AND rw.lease_owner_id='"+str(own.owner_id)+"'::uuid AND rw.generation="+str(own.generation)+" AND rw.parent_lease_token="+str(own.parent_lease_token)+")"
-    return '('+predicate+')'
+    from shared.provider_work import pending_provider_sql
+    return '('+predicate+' AND '+pending_provider_sql(snapshot_expr,partition_expr,job_expr)+')'
 
 
 def copy_source_pinned_sql(snapshot_expr):
     if not copy_work_guards_enabled(): return 'TRUE'
     value='CAST(('+snapshot_expr+') AS text)'
-    return """NOT EXISTS (SELECT 1 FROM copy_workflows cw
+    predicate = """NOT EXISTS (SELECT 1 FROM copy_workflows cw
         WHERE (cw.state IN ('DRAINING','WAITING','RESUMING') OR cw.parent_settle_pending) AND (
           cw.target_snapshot_id=("""+snapshot_expr+""") OR EXISTS (
             SELECT 1 FROM copy_work_tasks ct LEFT JOIN copy_work_items ci ON ci.task_id=ct.id
@@ -178,6 +182,8 @@ def copy_source_pinned_sql(snapshot_expr):
                 OR ct.params->>'prior_snap_id'="""+value+"""
                 OR ct.params->>'prior_snapshot_id'="""+value+"""))))"""
 
+    from shared.provider_work import pending_provider_sql
+    return '(' + predicate + ' AND ' + pending_provider_sql(snapshot_expr=snapshot_expr) + ')'
 
 def copy_blob_pinned_sql(blob_expr):
     if not copy_work_guards_enabled(): return 'TRUE'
@@ -190,6 +196,8 @@ def copy_blob_pinned_sql(blob_expr):
 
 async def has_pending_copy(session, *, snapshot_id=None, partition_id=None, job_id=None):
     if not copy_work_guards_enabled(): return False
+    from shared.provider_work import guards_enabled, has_pending_provider
+    if guards_enabled() and await has_pending_provider(session, snapshot_id=snapshot_id, partition_id=partition_id, job_id=job_id): return True
     if _RESUMING.get() is not None and not await verify_copy_resume(session, lock=False): return True
     active=CopyWorkflow.state.in_(ACTIVE_WORKFLOWS)
     if not _PARENT_SETTLEMENT.get(): active=active | CopyWorkflow.parent_settle_pending
@@ -385,6 +393,15 @@ async def seal_current_copy(continuation):
         if receipt is None:
             receipt=capture.seal_receipt=_SealReceipt(workflow.id,workflow.generation,
                 workflow.capture_attempt,_parent_identity(job,snapshot,partition),continuation)
+        from shared.provider_work import current_claim, record_unit_checkpoint, finish_work
+        provider_claim = current_claim()
+        if provider_claim is not None:
+            await record_unit_checkpoint(session, provider_claim, unit_key='planning', kind='planning', state='COMPLETED')
+            await finish_work(session, provider_claim)
+            from shared.models import ProviderWork
+            provider_row = await session.get(ProviderWork, provider_claim.work_id)
+            provider_row.parent_settle_pending = False
+            provider_row.last_reason = 'copy_handoff'
         leaf.lease_token+=1
         leaf.lease_owner_id=None;leaf.lease_expires_at=None
         workflow.parent_lease_token=leaf.lease_token
@@ -510,7 +527,11 @@ async def finish_parent_settlement(factory, workflow_id):
 
 
 async def cancel_copy_work(session, *, snapshot_id=None, job_id=None, workflow_id=None, reason='cancelled', terminal_state='CANCELLED'):
-    if not copy_work_guards_enabled(): return 0
+    from shared.provider_work import guards_enabled, cancel_provider_work
+    provider_count = 0
+    if guards_enabled() and (snapshot_id is not None or job_id is not None):
+        provider_count = await cancel_provider_work(session, snapshot_id=snapshot_id, job_id=job_id, reason=reason)
+    if not copy_work_guards_enabled(): return provider_count
     filters=[CopyWorkflow.state.in_(ACTIVE_WORKFLOWS) | CopyWorkflow.parent_settle_pending]
     if snapshot_id is not None: filters.append(CopyWorkflow.target_snapshot_id==_uuid(snapshot_id))
     if job_id is not None: filters.append(CopyWorkflow.job_id==_uuid(job_id))
@@ -538,4 +559,4 @@ async def cancel_copy_work(session, *, snapshot_id=None, job_id=None, workflow_i
                 'task_count':len(tasks)}}
         await session.execute(delete(CopyWorkItem).where(CopyWorkItem.task_id.in_([task.id for task in tasks])))
         await session.execute(delete(CopyWorkInput).where(CopyWorkInput.task_id.in_([task.id for task in tasks])))
-    return len(workflows)
+    return len(workflows) + provider_count

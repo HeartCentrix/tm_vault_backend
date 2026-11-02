@@ -614,6 +614,29 @@ async def publish_inventory(session, *, lease: CaptureLease) -> CaptureResult:
     return _result(attempt, association, chosen, uploaded)
 
 
+async def suspend_capture(session, *, lease, claim, unit_key, next_eligible_at):
+    """Supersede only this unpublished attempt and retain its pending receipt."""
+    from shared import provider_work
+    from shared.models import ProviderWorkUnit
+    await provider_work._owned(session, claim)
+    attempt, scope = await _attempt(session, lease)
+    if (attempt.snapshot_id != claim.snapshot_id or attempt.partition_id != claim.partition_id
+            or await session.get(SnapshotChatInventory, (attempt.snapshot_id, attempt.chat_id))):
+        raise ChatCatalogueConflict("published or unrelated capture cannot suspend")
+    matching = exists(select(ChatInventoryItem.logical_key).where(
+        ChatInventoryItem.inventory_id == attempt.staged_inventory_id,
+        ChatInventoryItem.logical_key == SnapshotItem.external_id,
+        ChatInventoryItem.version_id == SnapshotItem.chat_version_id))
+    await session.execute(delete(SnapshotItem).where(SnapshotItem.snapshot_id == attempt.snapshot_id, matching))
+    unit = await provider_work.record_unit_checkpoint(session, claim, unit_key=unit_key, kind='chat')
+    unit.next_eligible_at = next_eligible_at
+    unit.error = {'code': 'provider_deferred', 'capture_attempt_id': str(attempt.id)}
+    attempt.state, attempt.failure_reason = 'SUPERSEDED', 'provider_deferred'
+    attempt.evidence_history = [*(attempt.evidence_history or []),
+        {'provider_deferred': True, 'next_eligible_at': next_eligible_at.isoformat()}]
+    await session.flush()
+
+
 async def abort_capture(session, *, lease: CaptureLease, reason: str) -> None:
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError("abort reason is required")

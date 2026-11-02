@@ -218,6 +218,8 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
         exclude_message=None, scope_filter_hash=None, check_cancelled=None, concurrency=1,
         snapshot_lease_token=None, partition_lease_token=None, job_lease_token=None):
     """Return None only for an eligible disabled legacy path; never downgrade."""
+    from shared.provider_runtime import (unit_scope, checkpoint_unit, check_provider_turn,
+        ProviderTurnDeferred, current_execution)
     from shared.chat_capture import capture_chat_inventory
     from shared.chat_capture_graph import pinned_chat_source, effective_capture_scope_hash
     if type(concurrency) is not int or concurrency < 1:
@@ -225,6 +227,7 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
     if exclude_message is not None and not scope_filter_hash:
         raise ValueError("chat exclusions require a stable configured scope hash")
     async def cancel_check():
+        check_provider_turn()
         if check_cancelled is not None:
             await check_cancelled()
     await cancel_check()
@@ -286,10 +289,17 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                 async with session_factory() as session:
                     previous = await _published_chat(session, scope)
                 if previous is not None:
+                    async with unit_scope('chat:' + hashlib.sha256(cid.encode()).hexdigest(), 'chat'):
+                        await checkpoint_unit(receipt_id=str(previous.inventory_id),
+                            state='COMPLETED' if previous.outcome == 'complete' else 'FAILED')
                     return previous
-                return await capture_chat_inventory(scope=scope, graph_client=source, storage=storage,
-                    session_factory=session_factory, folder_path=_folder(chats[cid]),
-                    exclude_message=exclude_message, scope_filter_hash=scope_filter_hash)
+                async with unit_scope('chat:' + hashlib.sha256(cid.encode()).hexdigest(), 'chat'):
+                    result = await capture_chat_inventory(scope=scope, graph_client=source, storage=storage,
+                        session_factory=session_factory, folder_path=_folder(chats[cid]),
+                        exclude_message=exclude_message, scope_filter_hash=scope_filter_hash)
+                    await checkpoint_unit(receipt_id=str(result.inventory_id),
+                        state='COMPLETED' if result.outcome == 'complete' else 'FAILED')
+                    return result
             remaining = iter(keys)
             async def worker():
                 nonlocal completed
@@ -327,7 +337,12 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                         errors.append(result.failure_reason or "chat capture has incomplete coverage")
             workers = [asyncio.create_task(worker()) for _ in range(min(concurrency, len(keys)))]
             try:
-                await asyncio.gather(*workers)
+                outcomes = await asyncio.gather(*workers, return_exceptions=True)
+                # The first deferred request stops new admissions. Siblings close
+                # and suspend their own unpublished capture before parent fencing.
+                for outcome in outcomes:
+                    if isinstance(outcome, BaseException):
+                        raise outcome
             finally:
                 for task in workers:
                     task.cancel()

@@ -406,13 +406,15 @@ async def capture_chat_inventory(*, scope, graph_client, storage, session_factor
     """Capture one target's observed chat coverage, with two bounded reconciliations."""
     from shared.config import settings
     observation_version = settings.CHAT_OBSERVATION_HASH_VERSION
-    started = datetime.now(timezone.utc)
+    from shared.provider_runtime import current_unit, current_execution, ProviderTurnDeferred, checkpoint_unit
+    unit = current_unit()
+    started = unit.created_at if unit else datetime.now(timezone.utc)
     if exclude_message is not None and not scope_filter_hash:
         raise ValueError("source exclusions require a stable configured filter hash")
     async with _source(graph_client, scope.principal_id) as source:
         if effective_capture_scope_hash(source.permission_scope_hash, scope_filter_hash) != scope.permission_scope_hash:
             raise ValueError("capture scope differs from pinned source configuration")
-        for retry in range(3):
+        for retry in range(unit.reconciliations if unit else 0, 3):
             async def begin(session):
                 lease = await catalogue.begin_capture(session, scope=scope, folder_path=folder_path,
                     observation_hash_version=observation_version)
@@ -444,6 +446,7 @@ async def capture_chat_inventory(*, scope, graph_client, storage, session_factor
                         await run_catalogue_transaction(session_factory, save_mismatch)
                     if movement and retry < 2:
                         await _restart(session_factory, keeper, scope)
+                        await checkpoint_unit(state="PENDING", reconciliations=1)
                         continue
                     evidence = CaptureEvidence(first.complete, second.complete,
                         ledger.fingerprint(0), ledger.fingerprint(1), first.conflicts + int(movement),
@@ -459,7 +462,23 @@ async def capture_chat_inventory(*, scope, graph_client, storage, session_factor
                             attempt.evidence_history = [*(attempt.evidence_history or []), {"capture_errors": failure_details}]
                         return await catalogue.publish_inventory(session, lease=keeper.lease)
                     return await run_catalogue_transaction(session_factory, finish)
+            except ProviderTurnDeferred as deferred:
+                execution = current_execution()
+                async def suspend(session):
+                    await catalogue.suspend_capture(session, lease=keeper.lease, claim=execution.claim,
+                        unit_key=unit.key, next_eligible_at=deferred.next_eligible_at)
+                await run_catalogue_transaction(session_factory, suspend)
+                raise
             except asyncio.CancelledError:
+                execution = current_execution()
+                if execution is not None and unit is not None:
+                    async def suspend_cancelled(session):
+                        due = execution.deferred.next_eligible_at if execution.deferred else datetime.now(timezone.utc)
+                        await catalogue.suspend_capture(session, lease=keeper.lease, claim=execution.claim,
+                            unit_key=unit.key, next_eligible_at=due)
+                    with suppress(Exception):
+                        await asyncio.shield(run_catalogue_transaction(session_factory, suspend_cancelled))
+                    raise
                 async def abort(session):
                     await catalogue.abort_capture(session, lease=keeper.lease, reason="capture cancelled before verification")
                 with suppress(Exception):

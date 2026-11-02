@@ -215,11 +215,13 @@ class CopyWorkRunner:
     async def _orphan_candidates(self):
         async with self.factory() as session:
             await self._short_settings(session)
-            query = text("""
+            from shared.provider_work import pending_provider_sql
+            provider_guard = pending_provider_sql(snapshot_expr='cw.target_snapshot_id', partition_expr=None)
+            query = text(f"""
                 SELECT cw.id,cw.created_at FROM copy_workflows cw
                 JOIN jobs j ON j.id=cw.job_id JOIN snapshots s ON s.id=cw.target_snapshot_id
                 LEFT JOIN snapshot_partitions p ON p.id=cw.partition_id
-                WHERE cw.state IN ('DRAINING','WAITING','RESUMING') AND (
+                WHERE {provider_guard} AND cw.state IN ('DRAINING','WAITING','RESUMING') AND (
                     j.status::text NOT IN ('RUNNING','QUEUED','PENDING','RETRYING')
                     OR s.status::text <> 'IN_PROGRESS'
                     OR (p.id IS NOT NULL AND p.status IN ('COMPLETED','FAILED'))

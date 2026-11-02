@@ -1980,3 +1980,96 @@ class ArchiveItemWork(Base):
         Index('ix_archive_item_identity', 'snapshot_id', 'capture_generation', 'external_id'),
         Index('ix_archive_item_pending', 'snapshot_id', 'capture_generation', 'state', 'external_id'),
     )
+
+
+class ProviderWorkQueue(Base):
+    """Positive service clocks, separate from database-copy lanes."""
+    __tablename__ = 'provider_work_queues'
+    key = Column(String(64), primary_key=True)
+    scope = Column(String(12), nullable=False)
+    parent_key = Column(String(64))
+    tenant_id = Column(UUID(as_uuid=True), nullable=False)
+    weight = Column(Integer, nullable=False, default=1)
+    virtual_finish = Column(Float, nullable=False, default=0)
+    __table_args__ = (
+        Index('ix_provider_queue_finish', 'parent_key', 'virtual_finish', 'key'),
+        CheckConstraint('weight > 0', name='ck_provider_queue_weight'),
+    )
+
+
+class ProviderWorkControl(Base):
+    __tablename__ = 'provider_work_control'
+    id = Column(String(16), primary_key=True, default='global')
+    enabled = Column(Boolean, nullable=False, default=False)
+    epoch = Column(BigInteger, nullable=False, default=1)
+    total_capacity = Column(Integer, nullable=False, default=8)
+    tenant_capacity = Column(Integer, nullable=False, default=4)
+    control_reserve = Column(Integer, nullable=False, default=2)
+    virtual_clock = Column(Float, nullable=False, default=0)
+    __table_args__ = (CheckConstraint('total_capacity > 0 AND tenant_capacity > 0 AND control_reserve > 0', name='ck_provider_capacity'),)
+
+
+class ProviderWork(Base):
+    __tablename__ = 'provider_work'
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    leaf_key = Column(String(80), unique=True, nullable=False)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey('tenants.id', ondelete='CASCADE'), nullable=False)
+    resource_id = Column(UUID(as_uuid=True), ForeignKey('resources.id', ondelete='CASCADE'), nullable=False)
+    job_id = Column(UUID(as_uuid=True), ForeignKey('jobs.id', ondelete='CASCADE'), nullable=False)
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey('snapshots.id', ondelete='CASCADE'), nullable=False)
+    partition_id = Column(UUID(as_uuid=True), ForeignKey('snapshot_partitions.id', ondelete='CASCADE'))
+    sla_policy_id = Column(UUID(as_uuid=True))
+    weight = Column(Integer, nullable=False)
+    tenant_queue_key = Column(String(64), ForeignKey('provider_work_queues.key'), nullable=False)
+    policy_queue_key = Column(String(64), ForeignKey('provider_work_queues.key'), nullable=False)
+    resource_queue_key = Column(String(64), ForeignKey('provider_work_queues.key'), nullable=False)
+    state = Column(String(16), nullable=False, default='WAITING')
+    protocol_version = Column(Integer, nullable=False, default=1)
+    generation = Column(BigInteger, nullable=False, default=0)
+    parent_lease_token = Column(BigInteger, nullable=False)
+    snapshot_lease_token = Column(BigInteger, nullable=False)
+    job_lease_token = Column(BigInteger, nullable=False)
+    lease_owner_id = Column(UUID(as_uuid=True))
+    lease_expires_at = Column(DateTime(timezone=True))
+    next_eligible_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    queue_entered_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    completed_at = Column(DateTime(timezone=True))
+    continuation = Column(JSON, nullable=False, default=dict)
+    parent_settle_pending = Column(Boolean, nullable=False, default=False)
+    suspension_generation = Column(BigInteger)
+    last_reason = Column(String(80))
+    __table_args__ = (
+        Index('ix_provider_work_due', 'state', 'next_eligible_at', 'resource_queue_key', 'id'),
+        Index('ix_provider_work_expired', 'state', 'lease_expires_at'),
+        Index('ix_provider_work_snapshot', 'snapshot_id', 'state'),
+        Index('ix_provider_work_partition', 'partition_id', 'state'),
+        Index('ix_provider_work_job', 'job_id', 'state'),
+        Index('ix_provider_parent_settle', 'parent_settle_pending', 'created_at', 'id'),
+        CheckConstraint("state IN ('DRAINING','WAITING','RESUMING','COMPLETED','PARTIAL','FAILED','CANCELLED')", name='ck_provider_state'),
+        CheckConstraint('weight > 0 AND generation >= 0 AND protocol_version = 1', name='ck_provider_protocol'),
+    )
+
+
+class ProviderWorkUnit(Base):
+    __tablename__ = 'provider_work_units'
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    work_id = Column(UUID(as_uuid=True), ForeignKey('provider_work.id', ondelete='CASCADE'), nullable=False)
+    unit_key = Column(String(128), nullable=False)
+    kind = Column(String(32), nullable=False)
+    source_version = Column(String(128))
+    state = Column(String(16), nullable=False, default='PENDING')
+    checkpoint = Column(JSON, nullable=False, default=dict)
+    receipt_id = Column(String(128))
+    attempts = Column(BigInteger, nullable=False, default=0)
+    waited_s = Column(Float, nullable=False, default=0)
+    reconciliations = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    deadline_at = Column(DateTime(timezone=True), nullable=False)
+    next_eligible_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    error = Column(JSON)
+    __table_args__ = (
+        UniqueConstraint('work_id', 'unit_key', name='uq_provider_unit_key'),
+        Index('ix_provider_unit_due', 'work_id', 'state', 'next_eligible_at', 'id'),
+        CheckConstraint("state IN ('PENDING','RUNNING','COMPLETED','FAILED','CANCELLED') AND attempts >= 0 AND waited_s >= 0 AND reconciliations >= 0", name='ck_provider_unit_state'),
+    )
