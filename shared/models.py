@@ -1923,3 +1923,60 @@ class CopyWorkInput(Base):
     input_key = Column(String(32), primary_key=True)
     ordinal = Column(BigInteger, primary_key=True)
     payload = Column(JSON, nullable=False)
+
+
+class ArchiveFolderWork(Base):
+    """Durable qualified folder scopes and page receipts for one capture."""
+    __tablename__ = 'archive_folder_work'
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey('snapshots.id', ondelete='CASCADE'), primary_key=True)
+    capture_generation = Column(UUID(as_uuid=True), primary_key=True)
+    scope_key = Column(String(64), primary_key=True)
+    phase = Column(String(16), nullable=False)
+    base_url = Column(Text, nullable=False)
+    folder_id = Column(Text, nullable=False, default='')
+    parent_scope_key = Column(String(64))
+    parent_generation = Column(Integer)
+    display_path = Column(Text, nullable=False, default='')
+    state = Column(String(16), nullable=False, default='pending')
+    scope_generation = Column(Integer, nullable=False, default=1)
+    next_url = Column(Text)
+    page_ordinal = Column(Integer, nullable=False, default=0)
+    observed_count = Column(BigInteger, nullable=False, default=0)
+    declared_count = Column(BigInteger)
+    terminal_page = Column(Boolean, nullable=False, default=False)
+    logical_attempts = Column(Integer, nullable=False, default=0)
+    restart_count = Column(Integer, nullable=False, default=0)
+    error_count = Column(Integer, nullable=False, default=0)
+    gap_kind = Column(String(64))
+    evidence = Column(JSON, nullable=False, default=dict)
+    not_before = Column(DateTime(timezone=True))
+    __table_args__ = (
+        Index('ix_archive_folder_due', 'snapshot_id', 'capture_generation', 'state', 'not_before', 'scope_key'),
+        Index('ix_archive_folder_parent', 'snapshot_id', 'capture_generation', 'parent_scope_key'),
+    )
+
+
+class ArchiveItemWork(Base):
+    """Small observations and exact content receipts; never exported bodies."""
+    __tablename__ = 'archive_item_work'
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey('snapshots.id', ondelete='CASCADE'), primary_key=True)
+    capture_generation = Column(UUID(as_uuid=True), primary_key=True)
+    scope_key = Column(String(64), primary_key=True)
+    scope_generation = Column(Integer, primary_key=True)
+    external_id = Column(Text, primary_key=True)
+    location = Column(Text, nullable=False)
+    folder_id = Column(Text, nullable=False)
+    change_key = Column(Text)
+    item_type = Column(Text)
+    size = Column(BigInteger)
+    display_path = Column(Text, nullable=False, default='')
+    page_ordinal = Column(Integer, nullable=False)
+    state = Column(String(16), nullable=False, default='discovered')
+    gap_kind = Column(String(64))
+    copy_task_id = Column(UUID(as_uuid=True), ForeignKey('copy_work_tasks.id', ondelete='SET NULL'))
+    receipt_item_id = Column(UUID(as_uuid=True), ForeignKey('snapshot_items.id', ondelete='SET NULL'))
+    receipt = Column(JSON, nullable=False, default=dict)
+    __table_args__ = (
+        Index('ix_archive_item_identity', 'snapshot_id', 'capture_generation', 'external_id'),
+        Index('ix_archive_item_pending', 'snapshot_id', 'capture_generation', 'state', 'external_id'),
+    )
