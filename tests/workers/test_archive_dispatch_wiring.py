@@ -48,7 +48,7 @@ def _worker_methods():
 async def test_bulk_and_single_archive_routes_share_pipeline_and_snapshot(monkeypatch, message, force_full):
     worker = _worker_methods()
     worker.worker_id = "archive-test"
-    graph, tenant, snapshot = object(), object(), SimpleNamespace(id="snapshot")
+    graph, tenant, snapshot = object(), SimpleNamespace(id="tenant"), SimpleNamespace(id="snapshot", job_id="job", lease_token=7, lease_owner_id=None)
     resource = SimpleNamespace(id="resource", type=SimpleNamespace(value="USER_ARCHIVE"))
     result = {"item_count": 12, "bytes_added": 42}
     run = AsyncMock(return_value=result)
@@ -62,8 +62,10 @@ async def test_bulk_and_single_archive_routes_share_pipeline_and_snapshot(monkey
     assert worker._HANDLER_TABLE["USER_ARCHIVE"] == "backup_archive"
     assert await worker._backup_resource_group([resource], tenant, message, "job") == result
     worker.create_snapshot.assert_awaited_once_with(resource, message, "job")
+    from shared.archive_capture import ArchiveFence
     run.assert_awaited_once_with(
         graph, resource, snapshot, tenant, worker_id="archive-test", force_full=force_full,
+        archive_fence=ArchiveFence("snapshot", "job", "resource", "tenant", 7, None), copy_capture=None,
     )
     worker.complete_snapshot.assert_awaited_once()
     worker.fail_snapshot.assert_not_awaited()

@@ -4941,7 +4941,22 @@ class BackupWorker:
             result = {**(continuation.get("result") or {}),
                       "item_count": total_items, "bytes_total": total_bytes}
             result.setdefault("bytes_added", total_bytes)
-            if continuation.get("delta_tokens"):
+            if continuation.get("resume_kind") == "archive":
+                from shared.archive_capture import archive_final_gate
+                async with async_session_factory.begin() as archive_session:
+                    if not await verify_copy_resume(archive_session):
+                        raise ChatCatalogueWorkLeaseMoved("archive copy resume ownership moved")
+                    current_archive = await archive_session.get(Snapshot, snapshot.id)
+                    archive_summary = await archive_final_gate(archive_session, current_archive,
+                        generation=continuation.get("archive_capture_generation"))
+                    if archive_summary is not None:
+                        result.update(files_failed=archive_summary["files_failed"],
+                            archive_snapshot_token=current_archive.lease_token,
+                            archive_job_token=job.lease_token)
+                        snapshot.delta_tokens_json = dict(current_archive.delta_tokens_json or {})
+                        failed = failed or archive_summary["files_failed"] > 0
+            if continuation.get("delta_tokens") and not (continuation.get("resume_kind") == "archive"
+                    and (snapshot.extra_data or {}).get("archive_capture")):
                 snapshot.delta_tokens_json = {**(snapshot.delta_tokens_json or {}), **continuation["delta_tokens"]}
             if workflow.partition_id:
                 if partition is None:
@@ -27537,6 +27552,7 @@ class BackupWorker:
         generic handler catch in ``_process_single_backup`` turns into a
         FAILED snapshot — never a COMPLETED-empty one after a real error."""
         from archive_backup import run_archive_backup
+        from shared.archive_capture import ArchiveFence
         from shared.copy_workflow import copy_collection
         _copy_partition_id = (message or {}).get("partitionId")
         _copy_claim = _partition_lease_record(_copy_partition_id) if _copy_partition_id else None
@@ -27551,6 +27567,15 @@ class BackupWorker:
             return await run_archive_backup(
                 graph_client, resource, snapshot, tenant,
                 worker_id=self.worker_id,
+                archive_fence=ArchiveFence(
+                    snapshot.id, snapshot.job_id, resource.id, tenant.id,
+                    snapshot.lease_token, (message or {}).get("_job_lease_token"),
+                    snapshot_owner=snapshot.lease_owner_id,
+                    partition_id=uuid.UUID(str(_copy_partition_id)) if _copy_partition_id else None,
+                    partition_token=_copy_claim["lease"].token if _copy_claim else None,
+                    partition_owner=uuid.UUID(str(_copy_claim["lease"].owner_id)) if _copy_claim else None,
+                ),
+                copy_capture=capture,
                 force_full=bool((message or {}).get("forceFullBackup") or (message or {}).get("type") == "FULL"),
             )
 
@@ -30041,6 +30066,23 @@ class BackupWorker:
             if live.status != SnapshotStatus.IN_PROGRESS:
                 lease_unregister("snapshots", live.id)
             return
+        # The persisted marker wins over detached handler state or rollout flags.
+        archive_metadata = await session.scalar(select(Snapshot.extra_data).where(Snapshot.id == snapshot.id))
+        if (archive_metadata or {}).get("archive_capture"):
+            archive_live = await session.get(Snapshot, snapshot.id)
+            from shared.archive_capture import ArchiveConflict, archive_final_gate
+            archive_job = await session.get(Job, archive_live.job_id, with_for_update=True, populate_existing=True)
+            archive_live = await session.get(Snapshot, snapshot.id, with_for_update=True, populate_existing=True)
+            if (archive_live.status != SnapshotStatus.IN_PROGRESS
+                    or archive_live.lease_token != result.get("archive_snapshot_token")
+                    or archive_job is None or archive_job.lease_token != result.get("archive_job_token")
+                    or archive_job.status in (JobStatus.CANCELLED, JobStatus.CANCELLING)):
+                raise ArchiveConflict("archive finalization parent generation changed")
+            archive_summary = await archive_final_gate(session, archive_live,
+                generation=result.get("archive_capture_generation"))
+            result.update(item_count=archive_summary["files_succeeded"], files_failed=archive_summary["files_failed"])
+            snapshot.extra_data = dict(archive_live.extra_data or {})
+            snapshot.delta_tokens_json = dict(archive_live.delta_tokens_json or {})
         extra = snapshot.extra_data or {}
         if extra.get("partitioned") is True:
             # Last-finisher owns this snapshot's terminal state.

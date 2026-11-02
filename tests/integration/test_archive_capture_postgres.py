@@ -192,3 +192,90 @@ async def test_cyclic_page_cursor_rolls_back_descriptors(store):
         await ledger.page(root, {'value': [{'id': 'f'}], '@odata.nextLink': BASE}, BASE)
     assert (await ledger.summary())['scopes_planned'] == 1
     assert not await ledger.manifest_batch()
+
+
+async def test_migration_creates_additive_tables_and_refuses_unsafe_downgrade(store):
+    import importlib.util
+    from pathlib import Path
+    from sqlalchemy import text
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    path = Path(__file__).resolve().parents[2] / 'alembic/versions/0016_archive_capture.py'
+    spec = importlib.util.spec_from_file_location('archive_migration_test', path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    def apply(conn):
+        with Operations.context(MigrationContext.configure(conn)):
+            migration.upgrade()
+            migration.upgrade()
+            with pytest.raises(RuntimeError, match='forward migration'):
+                migration.downgrade()
+    async with store.engine.begin() as conn:
+        await conn.run_sync(models.ArchiveItemWork.__table__.drop)
+        await conn.run_sync(models.ArchiveFolderWork.__table__.drop)
+        await conn.run_sync(apply)
+        assert await conn.scalar(text("SELECT to_regclass('archive_item_work') IS NOT NULL"))
+
+
+async def test_page_context_and_explicit_hint_keep_opaque_case_and_exact_scope(store):
+    from shared.archive_capture import canonical_base, ArchivePageError
+    ledger = await capture(store)
+    root = await ledger.claim_scope()
+    aux = BASE.replace('MBX:Primary', 'MBX:CaseSensitive')
+    context = 'https://graph.microsoft.com/beta/$metadata#admin/Exchange/Mailboxes/MBX:CaseSensitive/folders'
+    await ledger.page(root, {'value': [{'id': 'F', 'childFolderCount': 0, 'parentMailboxUrl': aux[:-8]}], '@odata.context': context}, BASE)
+    async with store.factory() as db:
+        item_scope = await db.scalar(select(models.ArchiveFolderWork).where(models.ArchiveFolderWork.phase == 'items'))
+        assert item_scope.base_url == aux
+        assert item_scope.folder_id == 'F'
+    assert canonical_base(aux) != canonical_base(aux.replace('CaseSensitive', 'casesensitive'))
+    for unsafe in ('https://evil.invalid/beta/admin/exchange/mailboxes/X/folders',
+                   'https://graph.microsoft.com/beta/users/X/folders'):
+        with pytest.raises(ArchivePageError):
+            canonical_base(unsafe)
+
+
+async def test_invalid_shape_rolls_back_page_and_location_cap_is_explicit(store):
+    from shared.archive_capture import ArchivePageError
+    ledger = await capture(store)
+    scope = await ledger.claim_scope()
+    with pytest.raises(ArchivePageError):
+        await ledger.page(scope, {'value': [{'id': 'good'}, {}]}, BASE)
+    assert (await ledger.summary())['scopes_planned'] == 1
+    for i in range(10):
+        await ledger.add_location(BASE.replace('Primary', f'Aux{i}'))
+    async with store.factory() as db:
+        over = list((await db.scalars(select(models.ArchiveFolderWork).where(models.ArchiveFolderWork.gap_kind == 'location_cap'))).all())
+        assert len(over) == 3
+
+
+@pytest.mark.slow
+async def test_lazy_large_archive_census_has_bounded_descriptor_pages(store):
+    import os
+    import resource
+    import time
+    count = int(os.environ.get('ARCHIVE_SCALE_ROWS', '0'))
+    if not count:
+        pytest.skip('explicit ARCHIVE_SCALE_ROWS controls the large disposable census')
+    ledger = await capture(store)
+    root = await ledger.claim_scope()
+    await ledger.page(root, {'value': [{'id': 'f', 'childFolderCount': 0}]}, BASE)
+    scope = await ledger.claim_scope()
+    started = time.monotonic()
+    pages = 0
+    for start in range(0, count, 1000):
+        request = scope['next_url'] if start == 0 else scope['next_url'] + f'?page={start}'
+        page = {'value': [{'id': f'i-{i:09}', 'changeKey': 'stable', 'size': 3}
+            for i in range(start, min(start + 1000, count))]}
+        if start + 1000 < count:
+            page['@odata.nextLink'] = scope['next_url'] + f'?page={start + 1000}'
+        await ledger.page(scope, page, request)
+        pages += 1
+        del page
+    summary = await ledger.summary()
+    assert summary['items_enumerated'] == count and summary['folders_failed'] == 0
+    assert summary['files_failed'] == count  # Enumeration is not content capture.
+    assert len(await ledger.manifest_batch(limit=20)) == min(20, count)
+    print({'archive_scale_rows': count, 'pages': pages, 'max_page_descriptors': 1000,
+        'rss_peak_bytes': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        'elapsed_seconds': round(time.monotonic() - started, 2)})

@@ -360,13 +360,20 @@ class ArchiveCapture:
                 self.params(after=after, limit=min(limit, 256), state=state))).mappings()]
 
     async def baseline(self, days=30):
-        async with self.factory() as db:
+        async with self.factory.begin() as db:
+            snap = await self.lock(db)
+            context = dict(snap.extra_data['archive_capture'])
+            if 'baseline_count' in context:
+                return (UUID(context['prior_snapshot_id']) if context.get('prior_snapshot_id') else None, context['baseline_count'])
             result = (await db.execute(text('''SELECT s.id, s.item_count FROM snapshots s
                 WHERE s.resource_id=:rid AND s.id<>:sid AND s.status IN ('COMPLETED','PARTIAL')
                 AND EXISTS (SELECT 1 FROM snapshot_items i WHERE i.snapshot_id=s.id AND i.item_type='ARCHIVE_ITEM')
                 ORDER BY (s.created_at > NOW()-make_interval(days=>:days)) DESC,s.item_count DESC NULLS LAST,s.created_at DESC LIMIT 1'''),
                 {'rid': self.fence.resource_id, 'sid': self.fence.snapshot_id, 'days': days})).first()
-            return (result[0], int(result[1] or 0)) if result else (None, 0)
+            chosen = (result[0], int(result[1] or 0)) if result else (None, 0)
+            context.update(prior_snapshot_id=str(chosen[0]) if chosen[0] else None, baseline_count=chosen[1])
+            snap.extra_data = {**snap.extra_data, 'archive_capture': context}
+            return chosen
 
     async def classify(self, prior_id, *, force_full=False, copy_collection=None):
         after = ''
@@ -407,6 +414,8 @@ class ArchiveCapture:
         async with self.factory.begin() as db:
             await self.lock(db)
             for row in rows:
+                if (row['snapshot_id'], row['tenant_id']) != (self.fence.snapshot_id, self.fence.tenant_id):
+                    raise ArchiveConflict('archive receipt target identity differs')
                 iid, ck = row['external_id'], row['metadata'].get('changeKey')
                 observations = list((await db.scalars(select(Item).join(Folder,
                     (Folder.snapshot_id == Item.snapshot_id) & (Folder.capture_generation == Item.capture_generation)
@@ -449,7 +458,12 @@ class ArchiveCapture:
         if db is None:
             async with self.factory() as session:
                 return await self.summary(session)
-        folder = (await db.execute(text('''SELECT count(*) FILTER (WHERE phase='root') AS locations_walked,
+        folder = (await db.execute(text('''SELECT count(*) FILTER (WHERE phase='root' AND logical_attempts>0) AS locations_walked,
+            count(*) FILTER (WHERE phase='root') AS locations_planned,
+            count(*) FILTER (WHERE state='complete' AND terminal_page) AS scopes_complete,
+            count(*) FILTER (WHERE state IN ('pending','reading')) AS scopes_pending,
+            count(*) FILTER (WHERE state='unresolved') AS scopes_unresolved,
+            count(*) FILTER (WHERE not_before>NOW()) AS scopes_deferred,
             count(*) FILTER (WHERE state<>'complete' OR NOT terminal_page) AS folders_failed,
             count(*) AS scopes_planned FROM archive_folder_work WHERE snapshot_id=:sid AND capture_generation=:gen
             AND phase<>'receipt' AND state<>'excluded' '''), self.params())).mappings().one()
@@ -457,6 +471,8 @@ class ArchiveCapture:
             SELECT i.external_id, bool_and(i.state='stored' AND s.id IS NOT NULL
               AND s.content_hash=i.receipt->>'hash' AND s.blob_path=i.receipt->>'blob_path'
               AND s.content_size=(i.receipt->>'size')::bigint AND s.backend_id::text=i.receipt->>'backend_id'
+              AND s.encryption_key_id IS NOT DISTINCT FROM i.receipt->>'encryption_key_id'
+              AND s.backup_version IS NOT DISTINCT FROM (i.receipt->>'backup_version')::integer
               AND COALESCE(s.metadata->>'changeKey',s.metadata->>'change_key') IS NOT DISTINCT FROM i.change_key) AS stored
             FROM archive_item_work i JOIN archive_folder_work f ON f.snapshot_id=i.snapshot_id AND f.capture_generation=i.capture_generation
               AND f.scope_key=i.scope_key AND f.scope_generation=i.scope_generation

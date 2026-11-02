@@ -1139,6 +1139,9 @@ async def run_archive_backup(
     carry_forward: Optional[Callable] = None,
     load_prior_paths: Optional[Callable] = None,
     load_baseline: Optional[Callable] = None,
+    archive_fence=None,
+    copy_capture=None,
+    capture_factory=None,
 ) -> Dict[str, Any]:
     """Back up one USER_ARCHIVE resource. Returns the standard handler result
     dict (``item_count`` / ``bytes_added`` / ``new_delta_token``) consumed by
@@ -1148,6 +1151,10 @@ async def run_archive_backup(
     ``complete_snapshot`` finalizes PARTIAL rather than COMPLETED."""
     if settings is None:
         from shared.config import settings as settings  # noqa: PLW0127
+    if load_prev is None:
+        return await _run_durable_archive(graph_client, resource, snapshot, tenant,
+            worker_id=worker_id, force_full=force_full, settings=settings, fence=archive_fence,
+            copy_capture=copy_capture, factory=capture_factory, persist_batch=persist_batch)
     _default_db_collabs = load_prev is None
     if load_prev is None:
         async def load_prev(rid: str, csid: str):  # noqa: PLW0127
@@ -1609,6 +1616,7 @@ async def run_archive_backup(
         raise
     finally:
         _guard.cancel()
+        await asyncio.gather(_guard, return_exceptions=True)
 
     item_count = succeeded + carried
 
@@ -1669,3 +1677,302 @@ async def run_archive_backup(
         "files_failed": failed_items,
         "archive_carried_forward": carried,
     }
+
+
+class _DurableArchiveWalker:
+    """A fixed local pool consumes the durable folder frontier."""
+    def __init__(self, graph, ledger, settings, on_progress):
+        self.g, self.ledger, self.settings, self.on_progress = graph, ledger, settings, on_progress
+
+    async def run(self):
+        from shared.archive_capture import ArchiveConflict, ArchivePageError
+        from shared.provider_read import ProviderReadError
+        lock, changed = asyncio.Lock(), asyncio.Event()
+        active = 0
+
+        async def worker():
+            nonlocal active
+            while True:
+                async with lock:
+                    scope = await self.ledger.claim_scope()
+                    if scope is None:
+                        if active == 0:
+                            changed.set()
+                            return
+                        changed.clear()
+                    else:
+                        active += 1
+                if scope is None:
+                    await changed.wait()
+                    continue
+                try:
+                    async def sink(page, request_url):
+                        await self.ledger.page(scope, page, request_url)
+                        self.on_progress()
+                        changed.set()
+                    params = None
+                    if scope['page_ordinal'] == 0:
+                        params = {'$top': str(getattr(self.settings, 'ARCHIVE_ITEM_PAGE_SIZE', 1000)
+                            if scope['phase'] == 'items' else getattr(self.settings, 'ARCHIVE_FOLDER_PAGE_SIZE', 200))}
+                        if scope['phase'] == 'items':
+                            params['$select'] = 'id,changeKey,size,type'
+                    await self.g._get(scope['next_url'], params, on_activity=self.on_progress, on_page=sink)
+                except ArchiveConflict:
+                    raise
+                except (httpx.HTTPError, ArchivePageError, ProviderReadError, asyncio.TimeoutError) as exc:
+                    status = getattr(exc, 'status_code', getattr(getattr(exc, 'response', None), 'status_code', None))
+                    if status == 410:
+                        await self.ledger.restart(scope)
+                    else:
+                        await self.ledger.fail_scope(scope, exc)
+                except Exception as exc:
+                    if type(exc).__name__ != 'GraphRetryExhaustedError':
+                        raise
+                    await self.ledger.fail_scope(scope, exc)
+                finally:
+                    async with lock:
+                        active -= 1
+                        changed.set()
+
+        tasks = [asyncio.create_task(worker()) for _ in range(max(1, self.settings.ARCHIVE_FOLDER_CONCURRENCY))]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _make_durable_persist(resource, snapshot, tenant, ledger, settings):
+    """Upload one bounded chunk and return exact per-item durable receipts."""
+    async def persist(pairs):
+        import base64
+        import binascii
+        import hashlib
+        from shared.azure_storage import azure_storage_manager, upload_blob_with_dedup
+        shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
+        container = azure_storage_manager.get_container_name(str(tenant.id), ARCHIVE_WORKLOAD)
+        receipts = []
+        # Sequential within a worker keeps one decoded blob live at a time.
+        for item, entry in pairs:
+            iid = item['id']
+            if entry.get('changeKey') != item.get('changeKey'):
+                await ledger.fail_items([iid], 'source_changed')
+                continue
+            try:
+                data = base64.b64decode(entry.get('data'), validate=True)
+            except (ValueError, TypeError, binascii.Error):
+                await ledger.fail_items([iid], 'invalid_export_data')
+                continue
+            if not data:
+                await ledger.fail_items([iid], 'empty_export_data')
+                continue
+            path = azure_storage_manager.build_blob_path(str(tenant.id), str(resource.id), str(snapshot.id), iid)
+            checksum = hashlib.sha256(data).hexdigest()
+            result = await upload_blob_with_dedup(tenant.id, checksum, container, path, data, shard, max_retries=3)
+            if not isinstance(result, dict) or not result.get('success'):
+                await ledger.fail_items([iid], 'upload_failed')
+                continue
+            row = build_archive_item_row(snapshot_id=snapshot.id, tenant_id=tenant.id,
+                folder={'id': item['_folder_id']}, item=item,
+                blob_path=result.get('blob_path') or path, content_hash=checksum, blob_len=len(data),
+                mailbox_id=item['_mailbox_id'], graph_version=settings.ARCHIVE_GRAPH_VERSION,
+                folder_path=item['_folder_path'])
+            row['metadata'] = row.pop('extra_data')
+            row['backend_id'] = getattr(snapshot, 'backend_id', None) or getattr(shard, 'backend_id', None)
+            row['metadata'].update({'changeKey': entry['changeKey'], 'graph_type': item.get('type'), 'source': 'archive'})
+            receipts.extend(await ledger.commit_rows([row]))
+        return receipts
+    return persist
+
+
+async def _run_durable_archive(graph_client, resource, snapshot, tenant, *, worker_id, force_full,
+                               settings, fence, copy_capture, factory=None, persist_batch=None):
+    from shared.archive_capture import ArchiveCapture, ArchiveConflict, archive_final_gate, canonical_base
+    from shared.archive_provider import export_items, export_base, ArchiveExportOversize
+    from shared.provider_read import ProviderReadError
+    from shared.copy_workflow import seal_current_copy
+    if factory is None:
+        from shared.database import async_session_factory
+        factory = async_session_factory
+    if fence is None:
+        raise ArchiveConflict('archive caller did not supply its captured parent fence')
+    mbx = ((resource.extra_data or {}).get('archiveMailboxId')
+        or (resource.extra_data or {}).get('archive_mailbox_id') or resource.external_id)
+    base = canonical_base(f'https://graph.microsoft.com/{settings.ARCHIVE_GRAPH_VERSION}/admin/exchange/mailboxes/{mbx}/folders')
+    ledger = ArchiveCapture(factory, fence, max_locations=getattr(settings, 'ARCHIVE_MAX_LOCATIONS', 8))
+    visibility = str(getattr(graph_client, 'client_id', ''))
+    await ledger.begin(base, visibility)
+    # Carry the marker into the detached caller object; later finalization must see it.
+    async with factory() as db:
+        from shared.models import Snapshot
+        persisted = await db.get(Snapshot, snapshot.id)
+        snapshot.extra_data = dict(persisted.extra_data or {})
+    prior_id, baseline = await ledger.baseline(getattr(settings, 'ARCHIVE_BASELINE_LOOKBACK_DAYS', 30))
+    progress = {'at': time.monotonic()}
+    def mark_progress():
+        progress['at'] = time.monotonic()
+    walker = _DurableArchiveWalker(graph_client, ledger, settings, mark_progress)
+    victim = asyncio.current_task()
+    guard_error = []
+
+    async def guard():
+        while True:
+            await asyncio.sleep(float(getattr(settings, 'ARCHIVE_LIVENESS_PROBE_S', 120)))
+            try:
+                async with factory.begin() as db:
+                    await ledger.lock(db)
+                threshold = float(getattr(settings, 'ARCHIVE_STALL_ABORT_S', 5400))
+                if threshold and time.monotonic() - progress['at'] > threshold:
+                    raise EnumerationFailed('archive work exceeded its progress deadline')
+            except BaseException as exc:
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                guard_error.append(exc)
+                victim.cancel()
+                return
+
+    monitor = asyncio.create_task(guard())
+    try:
+        await walker.run()
+        probe_calls = max(0, min(3, int(getattr(settings, 'ARCHIVE_LOCATION_PROBE_CALLS', 3))))
+        if prior_id and probe_calls:
+            sample = await ledger.missing_samples(prior_id, probe_calls * 20)
+            for ids in _chunks(sample, 20):
+                try:
+                    response = await export_items(graph_client, base[:-len('/folders')] + '/exportItems', ids,
+                        timeout=settings.ARCHIVE_IMPORT_TIMEOUT_S)
+                    for entry in response['value']:
+                        target = _export_redirect_url(entry.get('Error') or entry.get('error'))
+                        if target:
+                            await ledger.add_location(export_base(target, base))
+                except (ProviderReadError, ValueError):
+                    # Existing gaps retain this failed repair attempt; a probe does not certify coverage.
+                    pass
+            await walker.run()
+        await ledger.repair()
+        await walker.run()
+        summary = await ledger.summary()
+        floor = getattr(settings, 'ARCHIVE_MIN_COVERAGE_PCT', 90)
+        coverage = 100 * summary['items_enumerated'] / baseline if baseline else None
+        if baseline and floor > 0 and coverage < floor:
+            error = EnumerationFailed('archive census is below its retained absolute coverage baseline')
+            error.retryable = False
+            raise error
+        if summary['folders_failed'] > getattr(settings, 'ARCHIVE_MAX_FOLDER_FAILURES', 100):
+            raise EnumerationFailed('archive coverage gaps exceeded the configured failure cap')
+        if summary['folders_failed'] and not summary['items_enumerated']:
+            raise EnumerationFailed('archive census has no recoverable items and unresolved folders')
+        await ledger.classify(prior_id, force_full=force_full, copy_collection=copy_capture)
+        if persist_batch is None:
+            persist_batch = _make_durable_persist(resource, snapshot, tenant, ledger, settings)
+        byte_limit = max(1024, int(getattr(settings, 'ARCHIVE_EXPORT_RESPONSE_BYTES', 16 * 1024 * 1024)))
+
+        async def process(chunk, url=None, hops=0):
+            ids = [row['external_id'] for row in chunk]
+            url = url or chunk[0]['location'][:-len('/folders')] + '/exportItems'
+            try:
+                response = await export_items(graph_client, url, ids, timeout=settings.ARCHIVE_IMPORT_TIMEOUT_S,
+                    byte_limit=byte_limit)
+            except ArchiveExportOversize:
+                if len(chunk) == 1:
+                    await ledger.fail_items(ids, 'export_response_byte_limit')
+                else:
+                    middle = len(chunk) // 2
+                    await process(chunk[:middle], url, hops)
+                    await process(chunk[middle:], url, hops)
+                return
+            except (ProviderReadError, ValueError, httpx.HTTPError) as exc:
+                await ledger.fail_items(ids, getattr(exc, 'stage', 'export_failed'))
+                return
+            mark_progress()
+            entries = {}
+            for entry in response['value']:
+                if not isinstance(entry, dict) or entry.get('itemId') not in ids or entry.get('itemId') in entries:
+                    await ledger.fail_items(ids, 'invalid_export_identity')
+                    return
+                entries[entry['itemId']] = entry
+            pairs, redirects = [], {}
+            for row in chunk:
+                entry = entries.get(row['external_id'])
+                if entry is None:
+                    await ledger.fail_items([row['external_id']], 'missing_export_receipt')
+                    continue
+                err = entry.get('Error') or entry.get('error')
+                if err:
+                    target = _export_redirect_url(err)
+                    if target and hops < MAX_EXPORT_HOPS:
+                        try:
+                            export_base(target, base)
+                        except ValueError:
+                            target = None
+                    else:
+                        target = None
+                    if target:
+                        redirects.setdefault(target, []).append(row)
+                    else:
+                        await ledger.fail_items([row['external_id']], 'export_item_error')
+                    continue
+                item = {'id': row['external_id'], 'changeKey': row['change_key'], 'type': row['item_type'],
+                    '_folder_id': row['folder_id'], '_folder_path': row['display_path'],
+                    '_mailbox_id': row['location'].split('/mailboxes/', 1)[1].split('/folders')[0]}
+                pairs.append((item, entry))
+            if pairs:
+                receipts = await persist_batch(pairs)
+                if not isinstance(receipts, list):
+                    raise ArchiveConflict('archive persistence must return per-item receipts')
+                received = {r['external_id'] for r in receipts}
+                missing = [item['id'] for item, _ in pairs if item['id'] not in received]
+                if missing:
+                    await ledger.fail_items(missing, 'missing_storage_receipt')
+            # Drop bodies before following redirects within this same worker.
+            del response, entries, pairs
+            for target, rows in redirects.items():
+                await process(rows, target, hops + 1)
+            mark_progress()
+
+        async def export_worker():
+            while chunk := await ledger.export_batch(byte_budget=byte_limit):
+                # A worker's slot covers HTTP, decode, upload and committed receipt.
+                # Split by route; raw item IDs are never sent to another known location.
+                routes = {}
+                for item in chunk:
+                    routes.setdefault(item['location'], []).append(item)
+                for values in routes.values():
+                    await process(values)
+
+        tasks = [asyncio.create_task(export_worker()) for _ in range(max(1, settings.ARCHIVE_EXPORT_CONCURRENCY))]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        async with factory.begin() as db:
+            current = await ledger.lock(db)
+            summary = await archive_final_gate(db, current, generation=ledger.generation)
+            summary.update(items_baseline=baseline, coverage_pct=coverage)
+            current.delta_tokens_json = {**(current.delta_tokens_json or {}), **summary}
+            snapshot.delta_tokens_json = dict(current.delta_tokens_json)
+        result = {'item_count': summary['files_succeeded'], 'bytes_added': summary['bytes_added'],
+            'bytes_total': summary['bytes_total'], 'new_item_count': summary['new_item_count'], 'new_delta_token': None,
+            'files_total': summary['items_enumerated'], 'files_succeeded': summary['files_succeeded'],
+            'files_failed': summary['files_failed'], 'archive_capture_version': 1,
+            'archive_capture_generation': str(ledger.generation),
+            'archive_snapshot_token': fence.snapshot_token, 'archive_job_token': fence.job_token}
+        if await ledger.has_copies():
+            waiting = await seal_current_copy({'resume_kind': 'archive', 'archive_capture_version': 1,
+                'archive_capture_generation': str(ledger.generation), 'result': result, 'delta_tokens': summary})
+            if waiting is None:
+                raise ArchiveConflict('archive required copy has no durable continuation')
+            return waiting
+        return result
+    except asyncio.CancelledError:
+        if guard_error:
+            raise guard_error[0] from None
+        raise
+    finally:
+        monitor.cancel()
+        await asyncio.gather(monitor, return_exceptions=True)
