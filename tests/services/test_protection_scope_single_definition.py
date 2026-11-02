@@ -115,11 +115,7 @@ def test_scope_hides_exactly_the_ui_hidden_types():
 # ── the endpoint actually uses it ─────────────────────────────────────────
 
 def _protection_status_src() -> str:
-    start = _DS_SRC.find("async def get_protection_status")
-    assert start != -1, "get_protection_status was renamed — retarget this test"
-    end = _DS_SRC.find("\n# Newest-version content-size rollup", start)
-    assert end != -1
-    return _DS_SRC[start:end]
+    return inspect.getsource(_ds.get_protection_status)
 
 
 def test_protection_status_applies_no_hardcoded_status_filter():

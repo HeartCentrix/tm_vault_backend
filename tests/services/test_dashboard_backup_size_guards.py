@@ -158,3 +158,23 @@ async def test_disconnected_client_does_not_start_summary_or_history(dashboard, 
         await invoke(dashboard, monkeypatch, db=db, request=Request(disconnected=True))
     assert error.value.status_code == 499
     assert db.calls == []
+
+
+async def test_disconnect_cancels_history_while_it_is_waiting(dashboard, monkeypatch):
+    req = Request()
+    class SlowHistory(DB):
+        cancelled = False
+        async def execute(self, sql, params=None):
+            if 'GROUP BY' in str(sql) and 'completed_at' in str(sql):
+                req.disconnected = True
+                try:
+                    await asyncio.sleep(.2)
+                except asyncio.CancelledError:
+                    self.cancelled = True
+                    raise
+            return await super().execute(sql, params)
+    db = SlowHistory()
+    with pytest.raises(HTTPException) as error:
+        await invoke(dashboard, monkeypatch, db=db, request=req)
+    assert error.value.status_code == 499
+    assert db.cancelled is True

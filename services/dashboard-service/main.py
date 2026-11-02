@@ -908,43 +908,66 @@ async def get_backup_size(
     summary = None
     history_complete = False
     daily_data = []
+    tasks = []
+
+    async def read():
+        nonlocal summary, history_complete, daily_data
+        principal = verified_user(request)
+        service_key = parse_service_type(serviceType)
+        resource_types = resource_types_for_service(service_key)
+        type_names = tuple(sorted(t.value for t in resource_types)) if resource_types else None
+        schema = '"' + settings.DB_SCHEMA.replace('"', '""') + '",public'
+        await db.execute(text(
+            "SELECT set_config('statement_timeout', :timeout, true), "
+            "set_config('search_path', :schema, true)"
+        ), {'timeout': str(max(1, int(_SIZE_REQUEST_BUDGET_S * 1000))), 'schema': schema})
+        tenant_ids = await _size_scope(db, principal, tenantId)
+        summary = await _read_size_summary(db, tenant_ids=tenant_ids, service_types=type_names)
+        if await request.is_disconnected():
+            raise HTTPException(status_code=499, detail='Client disconnected')
+        client_tz = _resolve_tz(tz)
+        today = datetime.now(timezone.utc).astimezone(client_tz).date()
+        start = today - timedelta(days=29)
+        start_utc = datetime.combine(start, datetime.min.time(), client_tz).astimezone(timezone.utc).replace(tzinfo=None)
+        end_utc = datetime.combine(today + timedelta(days=1), datetime.min.time(), client_tz).astimezone(timezone.utc).replace(tzinfo=None)
+        hist_rows = (await db.execute(text(_SIZE_HISTORY_SQL), {
+            'tz': str(client_tz), 'window_start': start_utc, 'window_end': end_utc,
+            'all_tenants': tenant_ids is None, 'tenant_ids': list(tenant_ids or ()),
+            'all_types': type_names is None, 'resource_types': list(type_names or ()),
+        })).all()
+        buckets = {str(day): int(value or 0) for day, value in hist_rows}
+        daily_data = [{'date': (start + timedelta(days=i)).isoformat(),
+                       'bytes': buckets.get((start + timedelta(days=i)).isoformat(), 0)} for i in range(30)]
+        history_complete = True
+        # Finish the read transaction inside the handler budget; get_db has no SQL to commit.
+        await db.rollback()
+
+    async def disconnected():
+        while not await request.is_disconnected():
+            await asyncio.sleep(.025)
+
     try:
         async with asyncio.timeout(_SIZE_REQUEST_BUDGET_S):
             if await request.is_disconnected():
                 raise HTTPException(status_code=499, detail='Client disconnected')
-            principal = verified_user(request)
-            service_key = parse_service_type(serviceType)
-            resource_types = resource_types_for_service(service_key)
-            type_names = tuple(sorted(t.value for t in resource_types)) if resource_types else None
-            schema = '"' + settings.DB_SCHEMA.replace('"', '""') + '",public'
-            await db.execute(text(
-                "SELECT set_config('statement_timeout', :timeout, true), "
-                "set_config('search_path', :schema, true)"
-            ), {'timeout': str(max(1, int(_SIZE_REQUEST_BUDGET_S * 1000))), 'schema': schema})
-            tenant_ids = await _size_scope(db, principal, tenantId)
-            summary = await _read_size_summary(db, tenant_ids=tenant_ids, service_types=type_names)
-            if await request.is_disconnected():
+            work = asyncio.create_task(read())
+            monitor = asyncio.create_task(disconnected())
+            tasks = [work, monitor]
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            if monitor in done:
+                await monitor
                 raise HTTPException(status_code=499, detail='Client disconnected')
-            client_tz = _resolve_tz(tz)
-            today = datetime.now(timezone.utc).astimezone(client_tz).date()
-            start = today - timedelta(days=29)
-            start_utc = datetime.combine(start, datetime.min.time(), client_tz).astimezone(timezone.utc).replace(tzinfo=None)
-            end_utc = datetime.combine(today + timedelta(days=1), datetime.min.time(), client_tz).astimezone(timezone.utc).replace(tzinfo=None)
-            hist_rows = (await db.execute(text(_SIZE_HISTORY_SQL), {
-                'tz': str(client_tz), 'window_start': start_utc, 'window_end': end_utc,
-                'all_tenants': tenant_ids is None, 'tenant_ids': list(tenant_ids or ()),
-                'all_types': type_names is None, 'resource_types': list(type_names or ()),
-            })).all()
-            buckets = {str(day): int(value or 0) for day, value in hist_rows}
-            daily_data = [{'date': (start + timedelta(days=i)).isoformat(),
-                           'bytes': buckets.get((start + timedelta(days=i)).isoformat(), 0)} for i in range(30)]
-            history_complete = True
-            # Finish the read transaction inside the handler budget; get_db has no SQL to commit.
-            await db.rollback()
+            await work
     except (TimeoutError, DBAPIError):
         log.warning('[protected-size] bounded dashboard read unavailable', exc_info=True)
         with suppress(Exception):
             await asyncio.wait_for(db.rollback(), timeout=.5)
         if summary is None:
             raise HTTPException(status_code=503, detail='Backup size is temporarily unavailable')
+    finally:
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            with suppress(TimeoutError):
+                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=.5)
     return _size_response(summary, daily_data, history_complete=history_complete)
