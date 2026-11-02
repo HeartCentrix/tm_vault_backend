@@ -22,7 +22,7 @@ async def dashboard_store(monkeypatch):
     if not url:
         pytest.skip('requires explicitly disposable PostgreSQL')
     schema = 'dashboard_size_test_' + uuid4().hex
-    engine = create_async_engine(url, connect_args={'statement_cache_size': 0})
+    engine = create_async_engine(url, pool_size=1, max_overflow=0, connect_args={'statement_cache_size': 0})
     queries = []
 
     @event.listens_for(engine.sync_engine, 'begin')
@@ -140,3 +140,17 @@ async def test_real_pending_change_keeps_last_size_and_avoids_uncertain_projecti
     assert data['projectedBytes1y'] is None
     await s.drain()
     assert (await s.call({'roles': [], 'tenant_ids': [str(tenant)]}))['totalBytes'] == 2
+
+
+async def test_timed_out_history_does_not_poison_reused_single_connection(dashboard_store, monkeypatch):
+    s = dashboard_store
+    tenant = uuid4()
+    await s.resource(tenant, 'USER_MAIL', 17)
+    await s.drain()
+    monkeypatch.setattr(s.main, '_SIZE_REQUEST_BUDGET_S', .03)
+    monkeypatch.setattr(s.main, '_SIZE_HISTORY_SQL', 'SELECT current_date, 0 FROM pg_sleep(.2)')
+    for _ in range(3):
+        result = await s.call({'roles': [], 'tenant_ids': [str(tenant)]})
+        assert result['totalBytes'] == 17
+        assert result['historyPartial'] is True
+        assert (await s.sql('SELECT 1')).scalar() == 1

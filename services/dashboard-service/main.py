@@ -910,6 +910,18 @@ async def get_backup_size(
     daily_data = []
     tasks = []
 
+    async def stop_reads():
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            try:
+                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=.5)
+            except TimeoutError:
+                # An unresponsive canceled connection must never return to the pool.
+                with suppress(Exception):
+                    await asyncio.wait_for(db.invalidate(), timeout=.5)
+            tasks.clear()
+
     async def read():
         nonlocal summary, history_complete, daily_data
         principal = verified_user(request)
@@ -959,15 +971,13 @@ async def get_backup_size(
                 raise HTTPException(status_code=499, detail='Client disconnected')
             await work
     except (TimeoutError, DBAPIError):
+        # AsyncSession cannot roll back while its child is still using the connection.
+        await stop_reads()
         log.warning('[protected-size] bounded dashboard read unavailable', exc_info=True)
         with suppress(Exception):
             await asyncio.wait_for(db.rollback(), timeout=.5)
         if summary is None:
             raise HTTPException(status_code=503, detail='Backup size is temporarily unavailable')
     finally:
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            with suppress(TimeoutError):
-                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=.5)
+        await stop_reads()
     return _size_response(summary, daily_data, history_complete=history_complete)
