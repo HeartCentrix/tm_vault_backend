@@ -554,3 +554,25 @@ async def test_hosted_order_noise_does_not_restart_v2_capture(store, adapters, m
     _, result = await run_capture(store, adapters)
     assert result.outcome == outcome
     assert adapters.source.passes == expected_passes
+
+async def test_completed_download_context_closes_before_immutable_upload(store, adapters, monkeypatch):
+    active = 0
+    original_file, original_hosted = adapters.source.open_file, adapters.source.open_hosted
+    def tracked(original):
+        @asynccontextmanager
+        async def opened(*args,**kwargs):
+            nonlocal active
+            async with original(*args,**kwargs) as result:
+                active += 1
+                try: yield result
+                finally: active -= 1
+        return opened
+    monkeypatch.setattr(adapters.source,'open_file',tracked(original_file))
+    monkeypatch.setattr(adapters.source,'open_hosted',tracked(original_hosted))
+    original_upload = adapters.storage.upload_from_file
+    async def upload(*args,**kwargs):
+        assert active == 0, 'provider HTTP lease retained through storage upload'
+        return await original_upload(*args,**kwargs)
+    monkeypatch.setattr(adapters.storage,'upload_from_file',upload)
+    _, result = await run_capture(store,adapters)
+    assert result.outcome == 'complete' and len(adapters.storage.uploads)==2

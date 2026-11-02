@@ -84,7 +84,10 @@ async def test_thread_consumer_uploads_encrypted_zip_with_exact_download_route_o
             saved["metadata"] = kwargs["Metadata"]
             return {"UploadId": "thread-target"}
         async def upload_part(self, **kwargs):
-            parts[kwargs["PartNumber"]] = kwargs["Body"]
+            body = kwargs["Body"]
+            content = b"".join(iter(lambda: body.read(65536), b""))
+            assert len(content) == kwargs["ContentLength"]
+            parts[kwargs["PartNumber"]] = content
             return {"ETag": str(kwargs["PartNumber"])}
         async def complete_multipart_upload(self, **kwargs):
             saved["bytes"] = b"".join(parts[index] for index in sorted(parts))

@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 import hashlib
 import os
+import shutil
 import tempfile
 
 
@@ -18,6 +19,21 @@ class SpooledChatContent:
     path: str
     size: int
     sha256: str
+
+
+async def _disk_io(operation, *args):
+    task = asyncio.create_task(asyncio.to_thread(operation, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # Cancelling to_thread cannot stop its write. Join before closing the
+        # file or releasing its payload reservation, including repeated cancel.
+        while not task.done():
+            with suppress(asyncio.CancelledError, Exception):
+                await asyncio.shield(task)
+        with suppress(asyncio.CancelledError, Exception):
+            task.result()
+        raise
 
 
 @asynccontextmanager
@@ -35,20 +51,25 @@ async def spool_chat_content(chunks, *, expected_size=None, max_bytes=None, dire
     size = 0
     digest = hashlib.sha256()
     try:
-        async for chunk in chunks:
-            if not isinstance(chunk, bytes):
-                raise ChatContentCaptureError("content stream yielded non-byte data")
-            size += len(chunk)
-            if max_bytes is not None and size > max_bytes:
-                raise ChatContentCaptureError("content exceeded the configured byte limit")
-            if expected_size is not None and size > expected_size:
-                raise ChatContentCaptureError("content size exceeded the expected size")
-            if chunk:
-                digest.update(chunk)
-                await asyncio.to_thread(handle.write, chunk)
-        if expected_size is not None and size != expected_size:
-            raise ChatContentCaptureError("content size did not match the expected size")
-        await asyncio.to_thread(handle.flush)
+        from shared.provider_runtime import execution_budget
+        # StrictChatGraphSource emits64KiB chunks; reserve producer/write room.
+        async with execution_budget().bytes(2*1024*1024):
+            async for chunk in chunks:
+                if not isinstance(chunk, bytes):
+                    raise ChatContentCaptureError("content stream yielded non-byte data")
+                size += len(chunk)
+                if max_bytes is not None and size > max_bytes:
+                    raise ChatContentCaptureError("content exceeded the configured byte limit")
+                if expected_size is not None and size > expected_size:
+                    raise ChatContentCaptureError("content size exceeded the expected size")
+                if chunk:
+                    if shutil.disk_usage(os.path.dirname(handle.name)).free < len(chunk)+256*1024*1024:
+                        raise ChatContentCaptureError('insufficient temporary space for chat capture')
+                    digest.update(chunk)
+                    await _disk_io(handle.write, chunk)
+            if expected_size is not None and size != expected_size:
+                raise ChatContentCaptureError("content size did not match the expected size")
+            await _disk_io(handle.flush)
         yield SpooledChatContent(handle.name, size, digest.hexdigest())
     finally:
         try:

@@ -525,3 +525,11 @@ async def test_provider_denial_keeps_safe_code_and_request_id_without_error_mess
     assert getattr(error.value, 'inner_code', None) == 'InsufficientPrivileges'
     assert getattr(error.value, 'request_id', None) == request_id
     assert 'secret' not in str(error.value)
+
+
+async def test_binary_source_chunks_fit_shared_spool_buffer(source_factory):
+    make, *_ = source_factory
+    async with make(lambda request: httpx.Response(200,content=b'x'*(1024*1024))) as source:
+        async with source.open_hosted('chat','message','hosted') as (stream, size, _):
+            sizes = [len(chunk) async for chunk in stream]
+    assert sum(sizes)==1024*1024 and max(sizes)<=65536

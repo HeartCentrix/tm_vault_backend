@@ -120,3 +120,62 @@ async def test_genuinely_empty_file_is_valid(tmp_path):
                                         directory=tmp_path) as saved:
         assert saved.size == 0
         assert saved.sha256 == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+async def test_spool_reserves_download_buffers_and_releases_before_upload(tmp_path, monkeypatch):
+    from shared import provider_runtime
+    budget = provider_runtime.ExecutionBudget(resident_bytes=4*1024*1024)
+    monkeypatch.setattr(provider_runtime,'_budget',budget)
+    async def source():
+        assert budget.used_bytes > 0
+        yield b'complete'
+    async with api().spool_chat_content(source(),directory=tmp_path):
+        assert budget.used_bytes == 0
+    assert list(tmp_path.iterdir()) == []
+
+async def test_cancel_waits_for_started_disk_write_before_closing_file(tmp_path, monkeypatch):
+    import threading
+    import tempfile
+    entered, release = threading.Event(), threading.Event()
+    original = tempfile.NamedTemporaryFile
+    open_files = []
+    class SlowFile:
+        def __init__(self,file): self.file=file
+        @property
+        def name(self): return self.file.name
+        def write(self,data):
+            entered.set()
+            assert release.wait(5)
+            return self.file.write(data)
+        def flush(self): return self.file.flush()
+        def close(self):
+            assert release.is_set(), 'closed file while background write still active'
+            self.file.close()
+    def make(*args,**kwargs):
+        file = SlowFile(original(*args,**kwargs))
+        open_files.append(file)
+        return file
+    monkeypatch.setattr(tempfile,'NamedTemporaryFile',make)
+    async def consume():
+        async with api().spool_chat_content(chunks(b'abc'),directory=tmp_path):
+            pytest.fail('cancelled write completed')
+    task = asyncio.create_task(consume())
+    try:
+        assert await asyncio.to_thread(entered.wait,2)
+        task.cancel()
+        await asyncio.sleep(.02)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError): await task
+        assert all(file.file.closed for file in open_files)
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        release.set()
+        await asyncio.gather(task,return_exceptions=True)
+        for file in open_files: file.file.close()
+
+async def test_spool_refuses_exhausted_disk_before_writing(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr('shutil.disk_usage',lambda path: SimpleNamespace(free=0))
+    with pytest.raises(api().ChatContentCaptureError,match='temporary space'):
+        async with api().spool_chat_content(chunks(b'abc'),directory=tmp_path): pass
+    assert list(tmp_path.iterdir()) == []

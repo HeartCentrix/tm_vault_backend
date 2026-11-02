@@ -348,7 +348,7 @@ class StrictChatGraphSource:
                         async def chunks():
                             total = 0
                             try:
-                                async for chunk in response.aiter_bytes():
+                                async for chunk in response.aiter_bytes(chunk_size=65536):
                                     total += len(chunk)
                                     if expected is not None and total > expected:
                                         raise ChatGraphError("capture content length exceeded")

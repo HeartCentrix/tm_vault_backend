@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager, suppress
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
@@ -271,32 +271,34 @@ async def _binary(*, scope, keeper, factory, storage, source_client, item_type,
     if retained is not None:
         return retained
     opened = source_client.open_file(raw) if file else source_client.open_hosted(scope.chat_id, parent_id, graph_id)
-    async with opened as (chunks, expected_size, content_type):
-        if isinstance(content_type, str) and content_type:
-            payload.setdefault("captured_content_type", content_type)
-        async with spool_chat_content(keeper.guard(chunks), expected_size=expected_size) as spooled:
-            if file:
-                refreshed = await source_client.refresh_file(source["source_drive_id"], source["source_item_id"])
-                if _file_source(refreshed) != source:
-                    raise ChatSourceMovement("required file changed during download")
-            retained = await _retained(scope=scope, keeper=keeper, factory=factory, storage=storage,
-                item_type=item_type, graph_id=graph_id, parent_id=parent_id, payload=payload,
-                source=source, checksum=spooled.sha256, stage=stage)
-            if retained is not None:
-                return retained
-            if stage:
-                content = await upload_capture_content(scope=scope, lease=keeper.lease,
-                    spooled=spooled, storage=storage, session_factory=factory, **source)
-            else:
-                # Reconciliation hashes semantic bytes; this location is never
-                # persisted, uploaded or used for reads.
-                content = ChatContentDescriptor(UUID(int=0), scope.backend_id, "observation", "observation",
-                    spooled.sha256, spooled.size, None, 1, None, **source)
-            item = CapturedChatItem(item_type, graph_id, parent_id, payload, content)
-            if stage:
-                await _stage(factory, keeper, [item])
-            return item
-
+    async with AsyncExitStack() as spools:
+        async with opened as (chunks, expected_size, content_type):
+            if isinstance(content_type, str) and content_type:
+                payload.setdefault("captured_content_type", content_type)
+            spooled = await spools.enter_async_context(
+                spool_chat_content(keeper.guard(chunks), expected_size=expected_size))
+        # Verified EOF closes the provider response before refresh/upload work.
+        if file:
+            refreshed = await source_client.refresh_file(source["source_drive_id"], source["source_item_id"])
+            if _file_source(refreshed) != source:
+                raise ChatSourceMovement("required file changed during download")
+        retained = await _retained(scope=scope, keeper=keeper, factory=factory, storage=storage,
+            item_type=item_type, graph_id=graph_id, parent_id=parent_id, payload=payload,
+            source=source, checksum=spooled.sha256, stage=stage)
+        if retained is not None:
+            return retained
+        if stage:
+            content = await upload_capture_content(scope=scope, lease=keeper.lease,
+                spooled=spooled, storage=storage, session_factory=factory, **source)
+        else:
+            # Reconciliation hashes semantic bytes; this location is never
+            # persisted, uploaded or used for reads.
+            content = ChatContentDescriptor(UUID(int=0), scope.backend_id, "observation", "observation",
+                spooled.sha256, spooled.size, None, 1, None, **source)
+        item = CapturedChatItem(item_type, graph_id, parent_id, payload, content)
+        if stage:
+            await _stage(factory, keeper, [item])
+        return item
 
 async def _observe(*, scope, keeper, factory, storage, source, ledger, observation,
                    exclude_message=None, folder_path=None):
