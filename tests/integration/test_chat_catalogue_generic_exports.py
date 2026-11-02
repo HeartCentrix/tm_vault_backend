@@ -311,6 +311,9 @@ async def test_generic_export_target_uses_tenant_encryption_or_fails_closed_befo
         async def complete_multipart_upload(self, **kwargs):
             saved["bytes"] = b"".join(parts[index] for index in sorted(parts))
         async def head_object(self, **kwargs):
+            if "bytes" not in saved:
+                from botocore.exceptions import ClientError
+                raise ClientError({"Error": {"Code": "404"}}, "HeadObject")
             return {"ContentLength": len(saved["bytes"]), "ETag": '"etag"', "LastModified": datetime.utcnow()}
         async def get_object(self, **kwargs):
             assert (kwargs["Bucket"], kwargs["Key"]) == saved["route"]

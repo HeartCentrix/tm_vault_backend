@@ -27,14 +27,15 @@ async def test_seekable_file_body_is_bounded_replayable_and_exact(tmp_path):
     from shared.storage.file_upload import FileBody
     path = tmp_path / 'body'
     path.write_bytes(b'a' * MIB + b'b' * MIB)
-    with path.open('rb') as source, FileBody(source, MIB // 2, MIB) as body:
-        assert body.seek(0, os.SEEK_END) == MIB
-        assert body.seek(0) == 0
-        total, digest, peak = await drain(body)
-        assert total == MIB and digest == hashlib.sha256(b'a' * (MIB//2) + b'b' * (MIB//2)).hexdigest()
-        assert peak <= MIB
-        body.seek(0)
-        assert len(body.read()) <= MIB
+    with path.open('rb') as source:
+        async with FileBody(source, MIB // 2, MIB) as body:
+            assert body.seek(0, os.SEEK_END) == MIB
+            assert body.seek(0) == 0
+            total, digest, peak = await drain(body)
+            assert total == MIB and digest == hashlib.sha256(b'a' * (MIB//2) + b'b' * (MIB//2)).hexdigest()
+            assert peak <= MIB
+            body.seek(0)
+            assert len(body.read()) <= MIB
 
 async def test_owned_file_parts_join_cancel_before_releasing_files(tmp_path):
     from shared.storage.file_upload import send_file_parts

@@ -92,6 +92,9 @@ async def test_thread_consumer_uploads_encrypted_zip_with_exact_download_route_o
         async def complete_multipart_upload(self, **kwargs):
             saved["bytes"] = b"".join(parts[index] for index in sorted(parts))
         async def head_object(self, **kwargs):
+            if "bytes" not in saved:
+                from botocore.exceptions import ClientError
+                raise ClientError({"Error": {"Code": "404"}}, "HeadObject")
             return {"ContentLength": len(saved["bytes"]), "ETag": '"etag"', "LastModified": datetime.utcnow()}
         async def get_object(self, **kwargs):
             assert (kwargs["Bucket"], kwargs["Key"]) == saved["route"]

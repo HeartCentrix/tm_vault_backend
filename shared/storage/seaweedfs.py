@@ -57,6 +57,57 @@ logger = logging.getLogger(__name__)
 _MODE_TMVAULT_TO_S3 = {"Locked": "COMPLIANCE", "Unlocked": "GOVERNANCE"}
 
 
+async def _s3_require_absent(client, bucket, key):
+    # Older S3-compatible servers may ignore conditional writes. Refuse a
+    # known existing key; the final condition also protects races on capable servers.
+    try:
+        await client.head_object(Bucket=bucket, Key=key)
+    except ClientError as error:
+        if error.response.get('Error', {}).get('Code') in ('404', 'NoSuchKey', 'NotFound'):
+            return
+        raise
+    raise ImmutableBlobError('create-only upload target already exists')
+
+
+async def _s3_file_request(client, operation, **kwargs):
+    from shared.storage.file_upload import FileBody
+    body, meta = kwargs.get('Body'), getattr(client, 'meta', None)
+    if not isinstance(body, FileBody) or meta is None:
+        return await getattr(client, operation)(**kwargs)
+    name = {'put_object': 'PutObject', 'upload_part': 'UploadPart'}[operation]
+    event = 'before-sign.s3.' + name
+    async def prepare(request, **_):
+        if request.body is body:
+            await body.prepare_to_sign()
+    meta.events.register_first(event, prepare)
+    try:
+        return await getattr(client, operation)(**kwargs)
+    finally:
+        meta.events.unregister(event, prepare)
+
+
+async def _s3_create_only(client, operation, *, overwrite, **kwargs):
+    """Sign atomic create-only conditions, including older botocore models."""
+    from functools import partial
+    method = partial(_s3_file_request, client, operation)
+    if overwrite:
+        return await method(**kwargs)
+    name = {'put_object': 'PutObject', 'complete_multipart_upload': 'CompleteMultipartUpload'}[operation]
+    meta = getattr(client, 'meta', None)
+    if meta is None or 'IfNoneMatch' in meta.service_model.operation_model(name).input_shape.members:
+        return await method(IfNoneMatch='*', **kwargs)
+    event = 'before-call.s3.' + name
+    def conditional(params, **_):
+        params['headers']['If-None-Match'] = '*'
+    # A client belongs to this upload. Register only its final write, before
+    # SigV4 signing, then remove the hook even when the service rejects it.
+    meta.events.register_first(event, conditional)
+    try:
+        return await method(**kwargs)
+    finally:
+        meta.events.unregister(event, conditional)
+
+
 class SeaweedStore:
     kind = "seaweedfs"
 
@@ -405,39 +456,43 @@ class SeaweedStore:
                                metadata=None, overwrite=True, *, tenant_id=None) -> BlobInfo:
         if _crypto_runtime.is_write_enabled() and (tenant_id or self._tenant_id):
             return await self._upload_encrypted_file(container, path, file_path, size,
-                metadata=metadata, tenant_id=tenant_id or self._tenant_id)
+                metadata=metadata, tenant_id=tenant_id or self._tenant_id, overwrite=overwrite)
 
         from shared.provider_runtime import storage_buffer_budget
-        from shared.storage.file_upload import FileBody, file_upload_capacity, file_identity, part_size_for, send_file_parts
+        from shared.storage.file_upload import FileBody, file_upload_capacity, file_identity, part_size_for, send_file_parts, finish_io
         bucket, key = self._bucket(container), self._key(container, path)
         concurrency, reservation = file_upload_capacity(self._upload_concurrency)
         part_size = part_size_for(size, max_parts=10000, minimum=8*1024*1024, maximum=5*1024**3)
         try:
             async with storage_buffer_budget(reservation), self._client_ctx() as s3:
+                if not overwrite:
+                    await _s3_require_absent(s3, bucket, key)
                 if size < part_size:
                     identity = file_identity(file_path)
                     if identity[2] != size:
                         raise OSError('upload source size differs from its declared size')
-                    with open(file_path, 'rb') as source, FileBody(source, 0, size) as body:
-                        await s3.put_object(Bucket=bucket, Key=key, Body=body, ContentLength=size,
-                            Metadata=_clean_metadata(metadata or {}))
-                        if body.tell() != size or file_identity(file_path) != identity:
-                            raise OSError('upload source changed or was not consumed exactly')
+                    with open(file_path, 'rb') as source:
+                        async with FileBody(source, 0, size) as body:
+                            await _s3_create_only(s3, 'put_object', overwrite=overwrite,
+                                Bucket=bucket, Key=key, Body=body, ContentLength=size,
+                                Metadata=_clean_metadata(metadata or {}))
+                            if body.tell() != size or file_identity(file_path) != identity:
+                                raise OSError('upload source changed or was not consumed exactly')
                 else:
                     mp = await s3.create_multipart_upload(Bucket=bucket, Key=key,
                         Metadata=_clean_metadata(metadata or {}))
                     async def send(number, body, length):
-                        result = await s3.upload_part(Bucket=bucket, Key=key, UploadId=mp['UploadId'],
+                        result = await _s3_file_request(s3, 'upload_part', Bucket=bucket, Key=key, UploadId=mp['UploadId'],
                             PartNumber=number, Body=body, ContentLength=length)
                         return {'PartNumber': number, 'ETag': result['ETag']}
                     try:
                         parts = await send_file_parts(file_path, size, part_size=part_size,
                             concurrency=concurrency, send=send)
-                        await s3.complete_multipart_upload(Bucket=bucket, Key=key,
+                        await _s3_create_only(s3, 'complete_multipart_upload', overwrite=overwrite, Bucket=bucket, Key=key,
                             UploadId=mp['UploadId'], MultipartUpload={'Parts': parts})
                     except BaseException:
                         try:
-                            await s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=mp['UploadId'])
+                            await finish_io(s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=mp['UploadId']))
                         except Exception:
                             pass
                         raise
@@ -453,9 +508,9 @@ class SeaweedStore:
             content_md5=None, last_modified=head["LastModified"],
         )
 
-    async def _upload_encrypted_file(self, container, path, file_path, size, *, metadata, tenant_id):
+    async def _upload_encrypted_file(self, container, path, file_path, size, *, metadata, tenant_id, overwrite):
         from shared.provider_runtime import storage_buffer_budget
-        from shared.storage.file_upload import file_upload_capacity, file_identity, part_size_for, send_spooled_parts
+        from shared.storage.file_upload import file_upload_capacity, file_identity, part_size_for, send_spooled_parts, finish_io
         identity, hasher = file_identity(file_path), hashlib.sha256()
         if identity[2] != size:
             raise OSError('upload source size differs from its declared size')
@@ -471,11 +526,13 @@ class SeaweedStore:
                     hasher.update(piece)
                     yield piece
         async with storage_buffer_budget(reservation), self._client_ctx() as s3:
+            if not overwrite:
+                await _s3_require_absent(s3, bucket, key)
             plain = plaintext()
             cipher, encrypted = await _crypto_runtime.maybe_encrypt_stream(plain, tenant_id)
             mp = await s3.create_multipart_upload(Bucket=bucket, Key=key, Metadata=_clean_metadata(metadata or {}))
             async def send(number, body, length):
-                result = await s3.upload_part(Bucket=bucket, Key=key, UploadId=mp['UploadId'],
+                result = await _s3_file_request(s3, 'upload_part', Bucket=bucket, Key=key, UploadId=mp['UploadId'],
                     PartNumber=number, Body=body, ContentLength=length)
                 return {'PartNumber': number, 'ETag': result['ETag']}
             try:
@@ -483,11 +540,11 @@ class SeaweedStore:
                     concurrency=concurrency, send=send)
                 if file_identity(file_path) != identity:
                     raise OSError('upload source changed during encryption')
-                await s3.complete_multipart_upload(Bucket=bucket, Key=key,
+                await _s3_create_only(s3, 'complete_multipart_upload', overwrite=overwrite, Bucket=bucket, Key=key,
                     UploadId=mp['UploadId'], MultipartUpload={'Parts': parts})
             except BaseException:
                 try:
-                    await s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=mp['UploadId'])
+                    await finish_io(s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=mp['UploadId']))
                 except Exception:
                     pass
                 raise

@@ -1,17 +1,53 @@
 """Owned seekable multipart bodies; part size does not determine heap usage."""
 import asyncio
-import io
 import os
 
 READ_SIZE = 1024 * 1024
 
 
-class FileBody(io.RawIOBase):
+class FileBody:
     def __init__(self, source, start, length):
-        super().__init__()
+        self.closed, self._closing, self._reads = False, False, set()
         self.source, self.start, self.length = source, start, length
-        self.position = 0
+        self.position, self._epoch, self._pending_seek = 0, 0, None
         source.seek(start)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        self._closing = True
+        try:
+            await finish_io(asyncio.gather(*self._reads, return_exceptions=True))
+        finally:
+            self.closed = True
+
+    def close(self):
+        # The SDK borrows this body for each HTTP attempt. Its transport may
+        # close an attempt before retrying; only the owning async scope closes it.
+        pass
+
+    def __aiter__(self):
+        return self._iterate(self._epoch)
+
+    async def _iterate(self, epoch):
+        while not self.closed and not self._closing and epoch == self._epoch:
+            if self._reads:
+                await finish_io(asyncio.gather(*self._reads, return_exceptions=True))
+            if epoch != self._epoch:
+                return
+            self._apply_seek()
+            task = asyncio.create_task(asyncio.to_thread(self.read, READ_SIZE))
+            self._reads.add(task)
+            def completed(task):
+                self._reads.discard(task)
+                if not task.cancelled():
+                    task.exception()
+            task.add_done_callback(completed)
+            data = await asyncio.shield(task)
+            if not data or epoch != self._epoch:
+                return
+            yield data
 
     def __len__(self):
         return self.length
@@ -23,15 +59,28 @@ class FileBody(io.RawIOBase):
         return True
 
     def tell(self):
-        return self.position
+        return self._pending_seek if self._pending_seek is not None else self.position
 
     def seek(self, offset, whence=os.SEEK_SET):
-        target = offset + (0 if whence == os.SEEK_SET else self.position if whence == os.SEEK_CUR else self.length)
+        target = offset + (0 if whence == os.SEEK_SET else self.tell() if whence == os.SEEK_CUR else self.length)
         if whence not in (os.SEEK_SET, os.SEEK_CUR, os.SEEK_END) or not 0 <= target <= self.length:
             raise ValueError('file part seek outside its range')
-        self.source.seek(self.start + target)
-        self.position = target
+        self._epoch += 1
+        self._pending_seek = target
+        if not self._reads:
+            self._apply_seek()
         return target
+
+    def _apply_seek(self):
+        if self._pending_seek is not None:
+            self.source.seek(self.start + self._pending_seek)
+            self.position, self._pending_seek = self._pending_seek, None
+
+    async def prepare_to_sign(self):
+        # A retry can start signing before aiohttp's previous body read exits.
+        # Join that borrowed read before synchronous SigV4 hashing uses the cursor.
+        await finish_io(asyncio.gather(*self._reads, return_exceptions=True))
+        self._apply_seek()
 
     def read(self, size=-1):
         if self.closed:
@@ -42,6 +91,23 @@ class FileBody(io.RawIOBase):
             raise OSError('upload source ended before its declared size')
         self.position += len(result)
         return result
+
+
+async def finish_io(awaitable):
+    """Join owned I/O even if cancellation is repeated during cleanup."""
+    task, cancelled = asyncio.ensure_future(awaitable), False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+        except BaseException:
+            break
+    if cancelled:
+        if not task.cancelled():
+            task.exception()
+        raise asyncio.CancelledError
+    return task.result()
 
 
 def part_size_for(size, *, max_parts, minimum, maximum):
@@ -74,11 +140,12 @@ async def send_file_parts(path, size, *, part_size, concurrency, send):
     if identity[2] != size:
         raise OSError('upload source size differs from its declared size')
     async def part(number, offset, length):
-        with open(path, 'rb') as source, FileBody(source, offset, length) as body:
-            result = await send(number, body, length)
-            if body.tell() != length:
-                raise OSError('upload did not consume its declared part')
-            return number, result
+        with open(path, 'rb') as source:
+            async with FileBody(source, offset, length) as body:
+                result = await send(number, body, length)
+                if body.tell() != length:
+                    raise OSError('upload did not consume its declared part')
+                return number, result
     pending, results = set(), []
     count = max(1, (size+part_size-1)//part_size)
     next_part = 1
@@ -101,7 +168,7 @@ async def send_file_parts(path, size, *, part_size, concurrency, send):
     finally:
         for task in pending:
             task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
+        await finish_io(asyncio.gather(*pending, return_exceptions=True))
 
 
 async def send_spooled_parts(source, *, part_size, concurrency, send):
@@ -113,7 +180,7 @@ async def send_spooled_parts(source, *, part_size, concurrency, send):
     async def send_part(file, number, length):
         try:
             file.seek(0)
-            with FileBody(file, 0, length) as body:
+            async with FileBody(file, 0, length) as body:
                 result = await send(number, body, length)
                 if body.tell() != length:
                     raise OSError('upload did not consume its declared part')
@@ -167,9 +234,11 @@ async def send_spooled_parts(source, *, part_size, concurrency, send):
             current.close()
         for task in pending:
             task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        for file in files.values():
-            file.close()
-        close = getattr(source, 'aclose', None)
-        if close is not None:
-            await close()
+        try:
+            await finish_io(asyncio.gather(*pending, return_exceptions=True))
+        finally:
+            for file in files.values():
+                file.close()
+            close = getattr(source, 'aclose', None)
+            if close is not None:
+                await finish_io(close())
