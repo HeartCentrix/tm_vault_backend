@@ -25,7 +25,10 @@ async def ledger(request):
     async with engine.begin() as conn:
         await conn.execute(text(f'CREATE SCHEMA "{schema}"'))
         await conn.execute(text('CREATE TABLE resources(id uuid PRIMARY KEY,tenant_id uuid,type text)'))
-        await conn.execute(text('CREATE TABLE snapshots(id uuid PRIMARY KEY,resource_id uuid REFERENCES resources(id) ON DELETE CASCADE,status text,created_at timestamp)'))
+        await conn.execute(text('CREATE TABLE snapshots(id uuid PRIMARY KEY,resource_id uuid REFERENCES resources(id) ON DELETE CASCADE,status text,created_at timestamp)' + (' PARTITION BY HASH(id)' if request.param else '')))
+        if request.param:
+            for n in range(2):
+                await conn.execute(text(f'CREATE TABLE snapshots_p{n} PARTITION OF snapshots FOR VALUES WITH(MODULUS 2,REMAINDER {n})'))
         await conn.execute(text('CREATE TABLE snapshot_items(id uuid NOT NULL,snapshot_id uuid NOT NULL,external_id text,item_type text,content_size bigint,is_deleted boolean,created_at timestamp)' + (' PARTITION BY HASH(snapshot_id)' if request.param else '')))
         if request.param:
             for n in range(2):
@@ -64,7 +67,9 @@ async def ledger(request):
     yield SimpleNamespace(factory=factory,sql=sql,snapshot=snapshot,item=item,summary=summary,drain=drain,resource=resource,tenant=tenant,schema=schema,partitioned=request.param)
     async with engine.begin() as conn:
         # Schema-specific event trigger must be removed before its function.
-        await conn.execute(text(f'DROP EVENT TRIGGER IF EXISTS "protected_size_{schema}"'))
+        from shared.protected_size_schema import event_trigger_names
+        for trigger in event_trigger_names(schema):
+            await conn.execute(text(f'DROP EVENT TRIGGER IF EXISTS "{trigger}"'))
         await conn.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
     await engine.dispose()
 
@@ -247,3 +252,224 @@ async def test_prepopulated_partition_attach_backfills_retained_rows(ledger):
     assert (await ledger.summary())['freshness']!='fresh'
     await ledger.drain()
     assert (await ledger.summary())['totalBytes']==23
+
+
+async def test_known_sum_remains_visible_with_missing_resource(ledger):
+    s=await ledger.snapshot()
+    await ledger.item(s,'known',11)
+    await ledger.drain()
+    other=uuid4()
+    await ledger.sql("INSERT INTO resources VALUES(:r,:t,'USER_MAIL')",r=other,t=ledger.tenant)
+    await ledger.snapshot(resource_id=other)
+    result=await ledger.summary()
+    assert result['totalBytes']==11 and result['partial']
+    assert result['missingCount']==1 and result['freshCount']==1
+
+
+async def test_bounded_cleanup_runs_after_resource_deleted_and_journal_retention(ledger):
+    s=await ledger.snapshot()
+    for n in range(6):
+        await ledger.item(s,str(n),1)
+    await ledger.drain()
+    await ledger.sql('DELETE FROM resources WHERE id=:r',r=ledger.resource)
+    assert (await ledger.summary())['totalBytes']==0
+    turns=await ledger.drain(page_size=1)
+    assert (await ledger.sql('SELECT count(*) FROM protected_size_refs')).scalar()==0
+    assert (await ledger.sql('SELECT count(*) FROM protected_size_winners')).scalar()==0
+    assert max(t.get('cleanupRows',0) for t in turns)<=6
+    await ledger.sql("UPDATE protected_size_journal SET created_at=now()-interval '2 days'")
+    await ledger.drain(page_size=1)
+    assert (await ledger.sql('SELECT count(*) FROM protected_size_journal')).scalar()==0
+
+
+async def test_nonmetric_metadata_and_content_noops_do_not_append_events(ledger):
+    s=await ledger.snapshot()
+    i=await ledger.item(s,'x',1)
+    await ledger.drain()
+    before=(await ledger.sql('SELECT count(*) FROM protected_size_journal')).scalar()
+    await ledger.sql("UPDATE snapshot_items SET item_type='new-type',content_size=content_size WHERE id=:i",i=i)
+    await ledger.sql("UPDATE snapshots SET created_at=now(),status='PARTIAL' WHERE id=:s",s=s)
+    assert (await ledger.sql('SELECT count(*) FROM protected_size_journal')).scalar()==before
+    assert (await ledger.summary())['freshness']=='fresh'
+
+
+async def test_snapshot_deletion_restores_prior_version_and_item_reparent(ledger):
+    a,b=await ledger.snapshot(),await ledger.snapshot('PENDING_DELETION')
+    await ledger.item(a,'x',12)
+    newest=await ledger.item(b,'x',3,when='2026-02-01')
+    await ledger.drain()
+    await ledger.sql('DELETE FROM snapshots WHERE id=:s',s=b)
+    await ledger.drain()
+    assert (await ledger.summary())['totalBytes']==12
+    # A raw SQL move from a retained snapshot must invalidate both resources.
+    r2=uuid4()
+    await ledger.sql("INSERT INTO resources VALUES(:r,:t,'USER_CHATS')",r=r2,t=ledger.tenant)
+    c=await ledger.snapshot(resource_id=r2)
+    await ledger.sql('UPDATE snapshot_items SET snapshot_id=:s WHERE snapshot_id=:old',s=c,old=a)
+    await ledger.drain()
+    assert (await ledger.summary(types=('USER_MAIL',)))['totalBytes']==0
+    assert (await ledger.summary(types=('USER_CHATS',)))['totalBytes']==12
+
+
+async def test_detach_partition_removes_old_refs_and_reattach_restores_them(ledger):
+    if not ledger.partitioned:
+        return
+    s=await ledger.snapshot()
+    await ledger.item(s,'x',14)
+    await ledger.drain()
+    part=(await ledger.sql('SELECT tableoid::regclass::text FROM snapshot_items WHERE snapshot_id=:s',s=s)).scalar()
+    remainder=0 if part.endswith('p0') else 1
+    await ledger.sql(f'ALTER TABLE snapshot_items DETACH PARTITION {part}')
+    await ledger.drain()
+    assert (await ledger.summary())['totalBytes']==0
+    await ledger.sql(f'ALTER TABLE snapshot_items ATTACH PARTITION {part} FOR VALUES WITH(MODULUS 2,REMAINDER {remainder})')
+    await ledger.drain()
+    assert (await ledger.summary())['totalBytes']==14
+
+
+async def test_unbounded_source_identity_and_hash_collisions_preserve_exact_identity(ledger,monkeypatch):
+    from shared import protected_size
+    monkeypatch.setattr(protected_size,'_identity_hash',lambda _: 'forced-collision',raising=False)
+    s=await ledger.snapshot()
+    # Incompressible IDs exceed a B-tree tuple's limit and remain legal source text.
+    key=''.join(uuid4().hex for _ in range(150))
+    await ledger.item(s,key,3)
+    await ledger.item(s,key+'different',7)
+    await ledger.drain()
+    assert (await ledger.summary())['totalBytes']==10
+
+
+async def test_discovery_page_cannot_resurrect_deleted_snapshot(ledger):
+    from shared.protected_size import _claim,_source_page,_apply
+    s=await ledger.snapshot()
+    await ledger.item(s,'x',10)
+    work=await _claim(ledger.factory,uuid4(),5000)
+    page=await _source_page(ledger.factory,work,2,5000,False)
+    await ledger.sql('DELETE FROM snapshots WHERE id=:s',s=s)
+    await _apply(ledger.factory,work,page,2,5000)
+    assert (await ledger.summary())['eligibleCount']==0
+    await ledger.drain()
+    assert (await ledger.summary())['totalBytes']==0
+
+
+async def test_snapshot_partition_detach_reconciles_known_eligibility(ledger):
+    if not ledger.partitioned:
+        return
+    s=await ledger.snapshot()
+    await ledger.item(s,'x',15)
+    await ledger.drain()
+    part=(await ledger.sql('SELECT tableoid::regclass::text FROM snapshots WHERE id=:s',s=s)).scalar()
+    await ledger.sql(f'ALTER TABLE snapshots DETACH PARTITION {part}')
+    await ledger.drain()
+    result=await ledger.summary()
+    assert result['eligibleCount']==0 and result['totalBytes']==0
+
+
+async def test_partition_attach_restarts_existing_snapshot_job_cursor(ledger):
+    if not ledger.partitioned:
+        return
+    from shared.protected_size import refresh_once
+    s=await ledger.snapshot()
+    existing=await ledger.item(s,'existing',30)
+    for _ in range(30):
+        await refresh_once(ledger.factory,page_size=1)
+        cursor=(await ledger.sql("SELECT cursor FROM protected_size_jobs WHERE snapshot_id=:s AND phase='source'",s=s)).scalar()
+        if cursor is not None:
+            break
+    assert cursor is not None
+    part=(await ledger.sql('SELECT tableoid::regclass::text FROM snapshot_items WHERE snapshot_id=:s',s=s)).scalar()
+    remainder=0 if part.endswith('p0') else 1
+    await ledger.sql(f'ALTER TABLE snapshot_items DETACH PARTITION {part}')
+    for op in ('insert','update','delete'):
+        await ledger.sql(f'DROP TRIGGER protected_size_{op} ON {part}')
+    await ledger.item(s,'behind-cursor',30,item_id=__import__('uuid').UUID(int=1),table=part)
+    await ledger.sql(f'ALTER TABLE snapshot_items ATTACH PARTITION {part} FOR VALUES WITH(MODULUS 2,REMAINDER {remainder})')
+    await ledger.drain(page_size=1)
+    assert (await ledger.summary())['totalBytes']==60
+
+
+async def test_item_committing_after_snapshot_reparent_routes_to_current_owner(ledger):
+    s=await ledger.snapshot()
+    await ledger.item(s,'base',10)
+    await ledger.drain()
+    other=uuid4()
+    await ledger.sql("INSERT INTO resources VALUES(:r,:t,'USER_CHATS')",r=other,t=ledger.tenant)
+    async with ledger.factory() as delayed:
+        await delayed.execute(text("INSERT INTO snapshot_items VALUES(:i,:s,'late','mail',99,false,now())"),{'i':uuid4(),'s':s})
+        await ledger.sql('UPDATE snapshots SET resource_id=:r WHERE id=:s',r=other,s=s)
+        await ledger.drain()
+        assert (await ledger.summary(types=('USER_CHATS',)))['totalBytes']==10
+        await delayed.commit()
+    result=await ledger.summary(types=('USER_CHATS',))
+    assert result['freshness']=='stale'
+    await ledger.drain()
+    assert (await ledger.summary(types=('USER_CHATS',)))['totalBytes']==109
+
+
+async def test_drop_populated_partition_invalidates_and_prunes_retained_references(ledger):
+    if not ledger.partitioned:
+        return
+    s=await ledger.snapshot()
+    await ledger.item(s,'x',10)
+    await ledger.drain()
+    part=(await ledger.sql('SELECT tableoid::regclass::text FROM snapshot_items WHERE snapshot_id=:s',s=s)).scalar()
+    await ledger.sql(f'DROP TABLE {part}')
+    assert (await ledger.summary())['freshness']!='fresh'
+    await ledger.drain()
+    assert (await ledger.summary())['totalBytes']==0
+
+
+async def test_repeated_physical_uuid_across_snapshots_stays_one_identity_per_page(ledger):
+    from shared.protected_size import _claim,_source_page,_apply
+    same=uuid4()
+    snapshots=[await ledger.snapshot() for _ in range(5)]
+    for n,s in enumerate(snapshots):
+        await ledger.item(s,str(n),1,item_id=same)
+    await ledger.drain(page_size=1)
+    await ledger.sql('UPDATE snapshot_items SET content_size=2 WHERE snapshot_id=:s AND id=:i',s=snapshots[0],i=same)
+    work=await _claim(ledger.factory,uuid4(),5000)
+    assert work['event']['kind']=='items'
+    page=await _source_page(ledger.factory,work,1,5000,False)
+    assert len(page['rows'])==1
+    await _apply(ledger.factory,work,page,1,5000)
+    await ledger.drain(page_size=1)
+    assert (await ledger.summary())['totalBytes']==6
+
+
+async def test_backfill_page_gets_turn_under_continuous_item_events(ledger):
+    from shared.protected_size import refresh_once
+    s=await ledger.snapshot()
+    await ledger.sql("INSERT INTO snapshot_items SELECT gen_random_uuid(),:s,'bulk-'||n,'mail',1,false,now() FROM generate_series(1,30) n",s=s)
+    while not (await ledger.sql('SELECT discovery_done FROM protected_size_control')).scalar():
+        await refresh_once(ledger.factory,page_size=1)
+    phases=[]
+    for n in range(8):
+        await ledger.item(s,'new-'+str(n),1)
+        phases.append((await refresh_once(ledger.factory,page_size=1)).get('phase'))
+    assert 'job' in phases
+
+
+async def test_truncate_sources_fails_closed(ledger):
+    from sqlalchemy.exc import DBAPIError
+    for table in ('snapshot_items','snapshots'):
+        with pytest.raises(DBAPIError,match='TRUNCATE is unsupported'):
+            await ledger.sql(f'TRUNCATE {table}')
+    if ledger.partitioned:
+        with pytest.raises(DBAPIError,match='TRUNCATE is unsupported'):
+            await ledger.sql('TRUNCATE snapshot_items_p0')
+
+
+async def test_old_pending_journal_cleanup_sweeps_bounded_candidates(ledger):
+    from shared.protected_size import refresh_once
+    s=await ledger.snapshot()
+    for n in range(9):
+        await ledger.item(s,str(n),1)
+    await ledger.sql("UPDATE protected_size_journal SET created_at='2020-01-01'")
+    turns=[]
+    for _ in range(6):
+        turns.append(await refresh_once(ledger.factory,page_size=1))
+    assert any(t['status']=='progress' for t in turns)
+    # Sweep moves one candidate at a time instead of rescanning an old pending prefix.
+    assert (await ledger.sql('SELECT retirement_id FROM protected_size_control')).scalar()>0
+    await ledger.drain(page_size=1)
+    assert (await ledger.summary())['totalBytes']==9
