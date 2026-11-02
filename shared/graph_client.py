@@ -3,7 +3,7 @@ import asyncio
 import logging
 import os
 import httpx
-from contextlib import contextmanager
+from contextlib import contextmanager, asynccontextmanager
 from contextvars import ContextVar
 from typing import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator, List, Optional, Dict, Any, Set, Tuple, Union
 from datetime import datetime, timedelta
@@ -162,10 +162,10 @@ class GraphClient:
         Re-creates if the previous client was closed (defensive, in
         case some path called aclose() prematurely)."""
         if self._http is not None and not self._http.is_closed:
-            return self._http
+            return self._admitted_http(self._http)
         async with self._http_lock:
             if self._http is not None and not self._http.is_closed:
-                return self._http
+                return self._admitted_http(self._http)
             # Generous default timeout — individual call sites can
             # tighten via per-call `timeout=` kwarg on .get/.post.
             # connect=30 covers TLS handshake under WAN jitter.
@@ -230,7 +230,26 @@ class GraphClient:
                 # 3xx; safe default.
                 follow_redirects=True,
             )
-            return self._http
+            return self._admitted_http(self._http)
+
+    def _admitted_http(self, raw):
+        from shared.graph_rate_limiter import graph_rate_limiter
+        if not graph_rate_limiter.scoped_enabled:
+            return raw
+        from shared.provider_http import AdmittedHttpClient
+        return AdmittedHttpClient(raw, self)
+
+    @asynccontextmanager
+    async def _admit_data_request(self, url, *, method="GET", operation=None):
+        from shared.graph_rate_limiter import graph_rate_limiter
+        if not graph_rate_limiter.scoped_enabled:
+            await graph_rate_limiter.acquire(reason="provider_data_request")
+            yield
+            return
+        from shared.provider_http import admitted, request_context
+        context = request_context(self, url, operation=operation)
+        async with admitted(graph_rate_limiter, context):
+            yield
 
     def _http_session(self, timeout=None):
         """Drop-in replacement for `async with httpx.AsyncClient(timeout=X)`.
@@ -406,6 +425,11 @@ class GraphClient:
         manager already does adaptive ban-ladder bookkeeping. Caching would
         invite stale-token bugs on the slow path.
         """
+        from shared.graph_rate_limiter import graph_rate_limiter
+        # Scoped pacing and capture receipts pin effective credentials. A
+        # different app has no proven equivalent visibility, even in one tenant.
+        if graph_rate_limiter.scoped_enabled:
+            return None, None
         from shared.multi_app_manager import multi_app_manager
         if multi_app_manager.app_count <= 1:
             return None, None
@@ -414,7 +438,7 @@ class GraphClient:
         # apps are throttled (least-loaded fallback) so we double-check
         # is_throttled + client_id distinct here.
         pick = multi_app_manager.get_next_app()
-        if not pick or pick.client_id == throttled_app_id or pick.is_throttled:
+        if not pick or pick.tenant_id != self.tenant_id or pick.client_id == throttled_app_id or pick.is_throttled:
             return None, None
         try:
             async with self._http_session() as client:
@@ -442,7 +466,7 @@ class GraphClient:
     @property
     def _policy(self) -> RateLimitPolicy:
         """Lazy per-client RateLimitPolicy; rebuilt if settings change."""
-        existing = getattr(self, "__policy_cached", None)
+        existing = getattr(self, "_policy_cached", None)
         if existing is not None:
             return existing
         from shared.config import settings as s
@@ -454,7 +478,7 @@ class GraphClient:
             jitter_ratio=s.GRAPH_JITTER_RATIO,
             cumulative_cap_s=s.GRAPH_MAX_CUMULATIVE_WAIT_SECONDS,
         )
-        self.__policy_cached = p
+        self._policy_cached = p
         return p
 
     async def _get(self, url: str, params: Optional[Dict] = None,
@@ -770,7 +794,7 @@ class GraphClient:
         """
         from shared.config import settings as s
         from shared.multi_app_manager import multi_app_manager
-        policy = self._policy
+        policy = self._policy.for_operation()
 
         def _activity() -> None:
             if on_activity is None:
@@ -1142,7 +1166,7 @@ class GraphClient:
         from shared.config import settings as s
         from shared.multi_app_manager import multi_app_manager
         from shared.graph_rate_limiter import graph_rate_limiter
-        policy = self._policy
+        policy = self._policy.for_operation()
         original_app = self.client_id
         current_app = original_app
         pages_on_failover = 0
@@ -5373,7 +5397,7 @@ class GraphClient:
         inline_cap = inline_buffer_mb * 1024 * 1024
         disk_cap = disk_threshold_mb * 1024 * 1024
         chunk_bytes = max(chunk_mb * 1024 * 1024, 1024 * 1024)
-        policy = self._policy
+        policy = self._policy.for_operation()
 
         async with self._http_session() as client:
             while True:
@@ -5497,7 +5521,7 @@ class GraphClient:
         from shared.multi_app_manager import multi_app_manager
 
         url = f"{self.GRAPH_URL}/drives/{drive_id}/items/{item_id}/versions/{version_id}/content"
-        policy = self._policy
+        policy = self._policy.for_operation()
 
         async with self._http_session() as client:
             while True:

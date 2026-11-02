@@ -11,6 +11,7 @@ import logging
 import math
 import os
 import time
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from shared.provider_read import ProviderReadError
@@ -137,6 +138,43 @@ class GraphRateLimiter:
         self._bucket = self._local  # may be replaced by Redis bucket in ``maybe_init_redis``
         self._rate = rate
         self._burst = burst
+
+    @property
+    def scoped_enabled(self):
+        return os.environ.get("PROVIDER_SCOPED_ADMISSION_ENABLED", "false").lower() == "true"
+
+    async def _scoped_coordinator(self, context):
+        from shared.provider_admission import AdmissionLimits, ProviderDeferred, ScopedProviderAdmission
+        existing = getattr(self, "_scoped", None)
+        if existing is not None:
+            return existing
+        try:
+            await self.maybe_init_redis()
+        except ProviderReadError:
+            raise ProviderDeferred(context, 5, stage="coordinator_unavailable") from None
+        if not isinstance(self._bucket, _RedisTokenBucket):
+            raise ProviderDeferred(context, 5, stage="coordinator_unconfigured")
+        self._scoped = ScopedProviderAdmission(self._bucket._redis,
+            limits=AdmissionLimits(rate=self._rate, burst=self._burst,
+                global_concurrency=int(os.environ.get("PROVIDER_GLOBAL_CONCURRENCY", "16")),
+                tenant_concurrency=int(os.environ.get("PROVIDER_TENANT_CONCURRENCY", "8")),
+                resource_concurrency=int(os.environ.get("PROVIDER_RESOURCE_CONCURRENCY", "4"))),
+            namespace=os.environ.get("PROVIDER_ADMISSION_NAMESPACE", "tmvault"))
+        return self._scoped
+
+    @asynccontextmanager
+    async def admit(self, context, *, cost=1, wait_budget=1):
+        if not self.scoped_enabled:
+            yield
+            return
+        coordinator = await self._scoped_coordinator(context)
+        async with coordinator.admit(context, cost=cost, wait_budget=wait_budget):
+            yield
+
+    async def cooldown(self, context, seconds):
+        if self.scoped_enabled:
+            coordinator = await self._scoped_coordinator(context)
+            return await coordinator.cooldown(context, seconds)
 
     async def maybe_init_redis(self) -> None:
         """Promote to Redis-backed bucket if ``REDIS_URL`` is configured.

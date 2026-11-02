@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import email.utils
+import math
+from collections import deque
 import random
 import time
 from dataclasses import dataclass, field
@@ -100,21 +102,9 @@ class AsyncTokenBucket:
     immediately. This is the degraded-mode fallback so turning a pace
     knob to 0 in env disables it without code changes.
 
-    Priority semantics (added 2026-04-24):
-        When multiple callers are waiting on an empty bucket,
-        the one with the HIGHEST `priority` value is served first,
-        regardless of arrival order. priority=0 is NORMAL (default).
-        priority>0 jumps the queue.
-
-        Implementation uses an asyncio.Condition with a per-iteration
-        predicate: `tokens_available AND we_are_at_highest_waiting_priority`.
-        Every refill-point wakes all waiters; each one re-checks the
-        predicate and only the highest-priority one succeeds. Others
-        loop back to sleep. This fixes the race where shorter-sleep
-        alone didn't beat asyncio.Lock FIFO ordering.
-
-        Same-priority callers still serve in near-FIFO order (asyncio
-        Condition wakes in registration order within a priority band).
+    Waiting priorities receive positive weighted round-robin shares (1..8).
+    Higher priority receives more turns; sustained urgent traffic cannot
+    starve a normal waiter. Within each priority, arrivals remain FIFO.
     """
 
     def __init__(self, rate_per_sec: float, capacity: int = 1):
@@ -124,14 +114,17 @@ class AsyncTokenBucket:
         self._last_refill = time.monotonic()
         # Condition wraps an internal Lock; all state under _cond.
         self._cond = asyncio.Condition()
-        # Priority-indexed count of currently-parked waiters, used to
-        # compute _highest_waiting_priority() at O(1). Dict preserves
-        # only currently-waiting priorities (entries removed at 0).
-        self._waiting: dict = {}
+        self._waiting = {}
+        self._turns = tuple(p for p in range(7, -1, -1) for _ in range(p + 1))
+        self._turn = 0
 
-    def _highest_waiting_priority(self) -> int:
-        """Max priority currently blocked on this bucket (or -1 if none)."""
-        return max(self._waiting.keys(), default=-1)
+    def _next_waiter(self):
+        for offset in range(len(self._turns)):
+            turn = (self._turn + offset) % len(self._turns)
+            queue = self._waiting.get(self._turns[turn])
+            if queue:
+                return queue[0], turn
+        return None, self._turn
 
     def _refill_tokens(self) -> None:
         """Advance the token count based on monotonic time elapsed.
@@ -144,58 +137,33 @@ class AsyncTokenBucket:
         self._last_refill = now
 
     async def acquire(self, cost: float = 1.0, priority: int = 0) -> None:
-        """Acquire `cost` tokens. Blocks until available.
-
-        priority=0 (NORMAL) is the default — matches pre-priority
-        semantics for a single-priority workload. priority>0 jumps
-        ahead of lower-priority waiters deterministically.
-        """
+        """Wait for a real token and a fair turn; cancellation leaves no waiter."""
+        if not math.isfinite(cost) or cost <= 0 or cost > self._capacity:
+            raise ValueError("pacing cost must fit capacity")
         if self._rate <= 0:
             return
-        priority = max(0, int(priority))
+        priority = min(7, max(0, int(priority)))
+        ticket = object()
         async with self._cond:
-            # Register before sleeping so higher-priority arrivals
-            # correctly observe us in _highest_waiting_priority().
-            self._waiting[priority] = self._waiting.get(priority, 0) + 1
+            queue = self._waiting.setdefault(priority, deque())
+            queue.append(ticket)
             try:
                 while True:
                     self._refill_tokens()
-                    # Claim only when (a) enough tokens AND (b) no
-                    # higher-priority waiter is ahead of us. This is
-                    # the key invariant — without it, URGENT could
-                    # lose to HIGH that happened to wake first.
-                    if (
-                        self._tokens >= cost
-                        and priority >= self._highest_waiting_priority()
-                    ):
+                    selected, turn = self._next_waiter()
+                    if selected is ticket and self._tokens >= cost:
                         self._tokens -= cost
-                        # Wake others so the next-highest-priority
-                        # waiter can re-evaluate and take its turn.
-                        self._cond.notify_all()
+                        self._turn = (turn + 1) % len(self._turns)
                         return
-                    # Sleep until either a notify_all wakes us or the
-                    # deficit-based timeout refills enough tokens.
-                    deficit = cost - self._tokens
-                    # Minimum 10ms so we always make at least some
-                    # forward progress even if rate is huge.
-                    wait = max(deficit / self._rate, 0.01)
+                    wait = max((cost - self._tokens) / self._rate, 0.01)
                     try:
-                        await asyncio.wait_for(
-                            self._cond.wait(), timeout=wait,
-                        )
+                        await asyncio.wait_for(self._cond.wait(), timeout=wait)
                     except asyncio.TimeoutError:
                         pass
-                    # Loop: re-check predicate.
             finally:
-                # Deregister; drop empty priority slots so
-                # _highest_waiting_priority stays accurate.
-                self._waiting[priority] -= 1
-                if self._waiting[priority] <= 0:
+                queue.remove(ticket)
+                if not queue:
                     del self._waiting[priority]
-                # One more notify so the NEXT waiter (if any) can
-                # re-evaluate — needed for the case where we were
-                # the highest-priority waiter and someone lower is
-                # now eligible.
                 self._cond.notify_all()
 
     def rate(self) -> float:
@@ -240,6 +208,16 @@ class RateLimitPolicy:
         self._throttle_walker = BackoffWalker(throttle_sequence, jitter_ratio)
         self._transient_walker = BackoffWalker(transient_sequence, jitter_ratio)
         self._cumulative_cap = cumulative_cap_s
+
+    def for_operation(self):
+        """Share pacing buckets, but never retry counters between operations."""
+        import copy
+        operation = copy.copy(self)
+        operation._throttle_walker = BackoffWalker(
+            list(self._throttle_walker.sequence), self._throttle_walker.jitter_ratio)
+        operation._transient_walker = BackoffWalker(
+            list(self._transient_walker.sequence), self._transient_walker.jitter_ratio)
+        return operation
 
     def decide(
         self, *, status_code: int, retry_after: Optional[str]
