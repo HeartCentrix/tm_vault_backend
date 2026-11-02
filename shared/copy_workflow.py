@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+import asyncio
 from datetime import timedelta
 import json
 import os
@@ -34,6 +35,20 @@ class CopyCollection:
     expected_partition_token: int | None = None
     expected_job_token: int | None = None
     sealed_result: dict | None = None
+    seal_receipt: _SealReceipt | None = None
+
+
+@dataclass(frozen=True)
+class _SealReceipt:
+    workflow_id: UUID
+    generation: int
+    capture_attempt: int
+    parents: tuple
+    continuation: dict
+
+    def result(self):
+        return {'copy_waiting': True, 'copy_workflow_id': str(self.workflow_id),
+                'snapshot_id': str(self.parents[1][0])}
 
 
 @dataclass(frozen=True)
@@ -186,6 +201,33 @@ async def has_pending_copy(session, *, snapshot_id=None, partition_id=None, job_
     return value is True
 
 
+def _copy_connection_error(exc):
+    if isinstance(exc, (CopyWorkConflict, ValueError)): return False
+    from shared.db_retry import _chain, first_db_sqlstate, is_transient_db_error
+    code = first_db_sqlstate(exc)
+    if code:
+        return code.startswith('08') or code in ('53300', '57P01', '57P02', '57P03')
+    if any('canceling statement due to statement timeout' in str(link).lower() for link in _chain(exc)):
+        return False
+    return is_transient_db_error(exc)
+
+
+async def _run_copy_transaction(operation):
+    # Registration/seal have durable identities, so connection ambiguity is
+    # recoverable here without widening the generic transaction retry policy.
+    from shared.db_retry import is_retryable_db_transaction_error
+    for number in range(3):
+        try:
+            async with async_session_factory.begin() as session:
+                result = await operation(session)
+            return result
+        except Exception as exc:
+            if (isinstance(exc, (CopyWorkConflict, ValueError)) or number == 2
+                or not (is_retryable_db_transaction_error(exc) or _copy_connection_error(exc))):
+                raise
+            await asyncio.sleep(0.05 * 2 ** number)
+
+
 async def defer_current_copy(kind, params, lane='giant'):
     global _COPY_GUARDS_ACTIVE
     capture=_COLLECTION.get()
@@ -193,15 +235,20 @@ async def defer_current_copy(kind, params, lane='giant'):
     try:
         target=_uuid(params.get('target_snapshot_id') or capture.snapshot_id)
         if target!=capture.snapshot_id: raise CopyWorkConflict('copy target differs from current leaf')
-        async with async_session_factory.begin() as session:
+        request=CopyRequest(kind=kind,lane=lane,target_snapshot_id=target,
+            partition_id=capture.partition_id,params=params)
+
+        async def register(session):
             pointer=await session.get(Snapshot,target)
             if pointer is None: raise CopyWorkConflict('copy source capture parent disappeared')
             job=await session.get(Job,pointer.job_id,with_for_update={'read':True},populate_existing=True)
             snapshot=await session.get(Snapshot,target,with_for_update={'read':True},populate_existing=True)
             partition=await session.get(SnapshotPartition,capture.partition_id,
                 with_for_update={'read':True},populate_existing=True) if capture.partition_id else None
-            for expected,actual in ((capture.expected_job_token,job.lease_token if job else None),
-                    (capture.expected_snapshot_token,snapshot.lease_token if snapshot else None),
+            if job is None or snapshot is None or (capture.partition_id and partition is None):
+                raise CopyWorkConflict('copy source capture parent disappeared')
+            for expected,actual in ((capture.expected_job_token,job.lease_token),
+                    (capture.expected_snapshot_token,snapshot.lease_token),
                     (capture.expected_partition_token,partition.lease_token if partition else None)):
                 if expected is not None and expected!=actual:
                     raise CopyWorkConflict('copy source capture generation has moved')
@@ -209,13 +256,14 @@ async def defer_current_copy(kind, params, lane='giant'):
             if capture.expected_job_token is None: capture.expected_job_token=job.lease_token
             if partition is not None and capture.expected_partition_token is None:
                 capture.expected_partition_token=partition.lease_token
-            task=await enqueue(session,CopyRequest(kind=kind,lane=lane,target_snapshot_id=target,
-                partition_id=capture.partition_id,params=params))
-            delegated=DeferredCopy(task.id,task.workflow_id)
+            task=await enqueue(session,request)
+            return DeferredCopy(task.id,task.workflow_id)
+
+        delegated=await _run_copy_transaction(register)
         _COPY_GUARDS_ACTIVE=True
         return delegated
     except BaseException as exc:
-        capture.error=exc
+        if capture.error is None: capture.error=exc
         raise
 
 
@@ -258,41 +306,91 @@ async def verify_copy_resume(session, *, lock=True):
     return True
 
 
+def _parent_identity(job, snapshot, partition):
+    return tuple((row.id,row.lease_token,row.lease_owner_id) if row is not None else None
+                 for row in (job,snapshot,partition))
+
+
+def _sealed_parents(receipt):
+    parents=list(receipt.parents)
+    leaf_index=2 if parents[2] is not None else 1
+    leaf_id,token,_=parents[leaf_index]
+    parents[leaf_index]=(leaf_id,token+1,None)
+    return tuple(parents)
+
+
+def _matches_seal_receipt(receipt, workflow, job, snapshot, partition):
+    parents=_sealed_parents(receipt)
+    return (workflow.id==receipt.workflow_id and workflow.state=='WAITING'
+        and workflow.generation==receipt.generation+1 and workflow.capture_attempt==receipt.capture_attempt
+        and workflow.continuation==receipt.continuation and workflow.lease_owner_id is None
+        and workflow.lease_expires_at is None and _parent_identity(job,snapshot,partition)==parents
+        and workflow.parent_lease_token==(parents[2] or parents[1])[1]
+        and workflow.snapshot_lease_token==parents[1][1] and workflow.job_lease_token==parents[0][1])
+
+
 async def seal_current_copy(continuation):
     capture=_COLLECTION.get()
     if capture is None: return None
     if capture.error is not None: raise CopyWorkConflict('required copy intent persistence failed') from capture.error
+    encoded=json.dumps(continuation,default=str)
+    if len(encoded.encode())>65536: raise ValueError('copy continuation must contain bounded scalars and durable references')
+    continuation=json.loads(encoded)
+    if capture.seal_receipt is not None and capture.seal_receipt.continuation!=continuation:
+        raise CopyWorkConflict('copy continuation differs from original seal')
     if capture.sealed_result is not None: return capture.sealed_result
-    if capture.partition_id is None and _RESUMING.get() is None:
+    if capture.partition_id is None and _RESUMING.get() is None and capture.seal_receipt is None:
         from shared.models import ChatPresentationPlan
         async with async_session_factory() as session:
             plan = await session.get(ChatPresentationPlan, capture.snapshot_id)
         if plan is not None and plan.state not in ('PUBLISHED', 'ABORTED'):
             await defer_current_copy('CHAT_PRESENTATION', {}, lane='giant')
-    encoded=json.dumps(continuation,default=str)
-    if len(encoded.encode())>65536: raise ValueError('copy continuation must contain bounded scalars and durable references')
-    async with async_session_factory.begin() as session:
+
+    async def seal(session, *, receipt_only=False):
         leaf_key=('partition:'+str(capture.partition_id)) if capture.partition_id else ('snapshot:'+str(capture.snapshot_id))
         workflow=await session.scalar(select(CopyWorkflow).where(CopyWorkflow.leaf_key==leaf_key))
-        if workflow is None: return None
+        if workflow is None:
+            if capture.seal_receipt is not None: raise CopyWorkConflict('copy seal workflow disappeared')
+            return None
         job,snapshot,partition=await _lock_parents(session,workflow)
-        workflow=await session.scalar(select(CopyWorkflow).where(CopyWorkflow.id==workflow.id).with_for_update())
+        workflow=await session.scalar(select(CopyWorkflow).where(CopyWorkflow.id==workflow.id)
+            .with_for_update().execution_options(populate_existing=True))
+        if workflow is None or job is None or snapshot is None or (capture.partition_id and partition is None):
+            raise CopyWorkConflict('copy seal parent disappeared')
+        receipt=capture.seal_receipt
         own = _RESUMING.get()
-        if workflow.state == 'RESUMING' and own is not None and own.workflow_id == workflow.id:
+        if receipt is None and workflow.state == 'RESUMING' and own is not None and own.workflow_id == workflow.id:
             if not await verify_copy_resume(session, lock=False):
                 raise CopyWorkConflict('copy publication resume ownership moved')
             return None
-        if workflow.state!='DRAINING' or job.status.value not in ('RUNNING','QUEUED','PENDING','RETRYING') or snapshot.status.value!='IN_PROGRESS':
+        if (job.status.value not in ('RUNNING','QUEUED','PENDING','RETRYING') or snapshot.status.value!='IN_PROGRESS'
+            or (snapshot.extra_data or {}).get('cancelled_at')):
             raise CopyWorkConflict('copy parent no longer permits suspension')
-        leaf=partition or snapshot
         if partition is not None and partition.status!='IN_PROGRESS': raise CopyWorkConflict('copy partition is terminal')
+        if receipt is not None:
+            if _matches_seal_receipt(receipt,workflow,job,snapshot,partition): return receipt.result()
+            if (workflow.id!=receipt.workflow_id or workflow.generation!=receipt.generation
+                or workflow.capture_attempt!=receipt.capture_attempt
+                or _parent_identity(job,snapshot,partition)!=receipt.parents):
+                raise CopyWorkConflict('copy seal ownership or continuation moved')
+        if workflow.state!='DRAINING': raise CopyWorkConflict('copy parent no longer permits suspension')
+        for expected,actual in ((capture.expected_job_token,job.lease_token),
+                (capture.expected_snapshot_token,snapshot.lease_token),
+                (capture.expected_partition_token,partition.lease_token if partition else None)):
+            if expected is not None and expected!=actual:
+                raise CopyWorkConflict('copy source capture generation has moved')
+        leaf=partition or snapshot
         if leaf.lease_token!=workflow.parent_lease_token: raise CopyWorkConflict('copy leaf ownership moved during capture')
+        if receipt_only: return None
+        if receipt is None:
+            receipt=capture.seal_receipt=_SealReceipt(workflow.id,workflow.generation,
+                workflow.capture_attempt,_parent_identity(job,snapshot,partition),continuation)
         leaf.lease_token+=1
         leaf.lease_owner_id=None;leaf.lease_expires_at=None
         workflow.parent_lease_token=leaf.lease_token
         workflow.snapshot_lease_token=snapshot.lease_token
         workflow.job_lease_token=job.lease_token
-        workflow.continuation=json.loads(encoded)
+        workflow.continuation=continuation
         from shared.copy_work import align_ready_workflow
         await align_ready_workflow(session,workflow.id)
         workflow.state='WAITING';workflow.generation+=1
@@ -304,8 +402,18 @@ async def seal_current_copy(continuation):
             CopyWorkTask.capture_attempt==workflow.capture_attempt,CopyWorkTask.state=='READY')
             .values(ready_at=now,queue_entered_at=now,cumulative_wait_s=0))
         snapshot.extra_data={**(snapshot.extra_data or {}),'copy_workflow_id':str(workflow.id),'copy_phase':'QUEUED'}
-        capture.sealed_result={'copy_waiting':True,'copy_workflow_id':str(workflow.id),'snapshot_id':str(snapshot.id)}
-        return capture.sealed_result
+        return receipt.result()
+
+    try:
+        result=await _run_copy_transaction(seal)
+    except Exception as exc:
+        if capture.seal_receipt is None or not _copy_connection_error(exc): raise
+        # The final write may have committed despite its lost acknowledgement.
+        # Read only: an exhausted budget must never execute another suspension.
+        result=await _run_copy_transaction(lambda session: seal(session,receipt_only=True))
+        if result is None: raise
+    capture.sealed_result=result
+    return result
 
 
 async def begin_resume(factory, workflow_id, owner_id):
