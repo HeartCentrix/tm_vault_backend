@@ -34,9 +34,10 @@ def _route_pending(resource):
         AND ack.resource_id={resource} AND ack.acknowledged_at IS NOT NULL))"""
 
 
+# Legacy dashboard writers may still update bytes/computed_at during rollout.
 SUMMARY_SQL = f"""
       WITH scoped AS (
-        SELECT r.id,p.bytes,p.computed_at,p.ledger_published,
+        SELECT r.id,p.ledger_bytes bytes,p.ledger_computed_at computed_at,p.ledger_published,
           EXISTS(SELECT 1 FROM protected_size_targets t WHERE t.resource_id=r.id AND t.acknowledged_at IS NULL)
           OR EXISTS(SELECT 1 FROM protected_size_jobs j WHERE j.resource_id=r.id) OR {_route_pending('r.id')} pending
         FROM resources r LEFT JOIN resource_protected_bytes p ON p.resource_id=r.id
@@ -650,7 +651,7 @@ async def _apply(factory, work, page, page_size, ms):
                 )
         else:
             await db.execute(
-                text("""UPDATE resource_protected_bytes p SET bytes=working_bytes,computed_at=clock_timestamp(),ledger_published=true,
+                text("""UPDATE resource_protected_bytes p SET ledger_bytes=working_bytes,ledger_computed_at=statement_timestamp(),bytes=working_bytes,computed_at=statement_timestamp(),ledger_published=true,
               latest_snapshot_id=(SELECT snapshot_id FROM protected_size_snapshots s WHERE s.resource_id=p.resource_id AND s.eligible ORDER BY snapshot_id DESC LIMIT 1)
               WHERE resource_id=:r AND (SELECT discovery_done FROM protected_size_control WHERE singleton)
               AND NOT EXISTS(SELECT 1 FROM protected_size_jobs WHERE resource_id=:r)
@@ -684,7 +685,7 @@ async def _apply(factory, work, page, page_size, ms):
             ):
                 await db.execute(
                     text(
-                        "UPDATE resource_protected_bytes SET bytes=working_bytes,computed_at=clock_timestamp(),ledger_published=true WHERE resource_id=:r"
+                        "UPDATE resource_protected_bytes SET ledger_bytes=working_bytes,ledger_computed_at=statement_timestamp(),bytes=working_bytes,computed_at=statement_timestamp(),ledger_published=true WHERE resource_id=:r"
                     ),
                     {"r": rid},
                 )

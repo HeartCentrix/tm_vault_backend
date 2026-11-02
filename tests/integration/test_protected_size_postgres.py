@@ -1029,3 +1029,319 @@ async def test_ddl_between_source_read_and_apply_preserves_last_published_bytes(
     ).scalar() == 1
     await ledger.drain()
     assert (await ledger.summary())["totalBytes"] == 2
+
+
+async def test_legacy_cache_writer_cannot_replace_authoritative_ledger_publication(
+    ledger,
+):
+    s = await ledger.snapshot()
+    item = await ledger.item(s, "x", 25)
+    await ledger.drain()
+    before = await ledger.summary()
+    # Exact old dashboard cache-upsert shape from the rolling predecessor.
+    await ledger.sql(
+        """INSERT INTO resource_protected_bytes(resource_id,latest_snapshot_id,bytes,computed_at)
+      VALUES(:r,:s,100,now()) ON CONFLICT(resource_id) DO UPDATE SET
+      latest_snapshot_id=EXCLUDED.latest_snapshot_id,bytes=EXCLUDED.bytes,computed_at=EXCLUDED.computed_at""",
+        r=ledger.resource,
+        s=s,
+    )
+    assert (await ledger.drain())[-1]["status"] == "idle"
+    after = await ledger.summary()
+    assert after["totalBytes"] == 25 and after["freshness"] == "fresh"
+    assert after["asOf"] == before["asOf"]
+    await ledger.sql("UPDATE snapshot_items SET content_size=7 WHERE id=:i", i=item)
+    await ledger.drain()
+    assert (await ledger.summary())["totalBytes"] == 7
+
+
+@pytest_asyncio.fixture
+async def runtime_store():
+    """DBA installs into existing sources owned by an ordinary application role."""
+    url = os.environ.get("TMVAULT_TEST_RUNTIME_DATABASE_URL") or os.environ.get(
+        "TMVAULT_TEST_DATABASE_URL"
+    )
+    if not url:
+        pytest.skip("requires an explicitly disposable PostgreSQL database")
+    token = uuid4().hex
+    schema = "ps-runtime-schema_" + token
+    other_schema = "ps_other_schema_" + token
+    source_role, app_role, other_role = [
+        "ps_" + prefix + "_" + token for prefix in ("source", "app", "other")
+    ]
+    engine = create_async_engine(
+        url,
+        connect_args={"statement_cache_size": 0, "prepared_statement_cache_size": 0},
+    )
+
+    @event.listens_for(engine.sync_engine, "begin")
+    def isolated(conn):
+        conn.exec_driver_sql(f'SET LOCAL search_path TO "{schema}"')
+
+    async with engine.begin() as db:
+        for role in (source_role, app_role, other_role):
+            await db.execute(
+                text(
+                    f'CREATE ROLE "{role}" NOSUPERUSER NOCREATEDB NOCREATEROLE NOLOGIN'
+                )
+            )
+        await db.execute(
+            text(f'CREATE SCHEMA "{schema}" AUTHORIZATION "{source_role}"')
+        )
+        await db.execute(
+            text(f'CREATE SCHEMA "{other_schema}" AUTHORIZATION "{other_role}"')
+        )
+        await db.execute(text(f'SET LOCAL ROLE "{source_role}"'))
+        for ddl in (
+            "CREATE TABLE resources(id uuid PRIMARY KEY,tenant_id uuid,type text)",
+            "CREATE TABLE snapshots(id uuid PRIMARY KEY,resource_id uuid REFERENCES resources(id) ON DELETE CASCADE,status text,created_at timestamp)",
+            "CREATE TABLE snapshot_items(id uuid NOT NULL,snapshot_id uuid NOT NULL,external_id text,item_type text,content_size bigint,is_deleted boolean,created_at timestamp) PARTITION BY HASH(snapshot_id)",
+            "CREATE TABLE snapshot_items_p0 PARTITION OF snapshot_items FOR VALUES WITH(MODULUS 2,REMAINDER 0)",
+            "CREATE TABLE snapshot_items_p1 PARTITION OF snapshot_items FOR VALUES WITH(MODULUS 2,REMAINDER 1)",
+            "CREATE TABLE resource_protected_bytes(resource_id uuid PRIMARY KEY REFERENCES resources(id) ON DELETE CASCADE,latest_snapshot_id uuid NOT NULL,bytes bigint NOT NULL DEFAULT 0,computed_at timestamptz NOT NULL DEFAULT now())",
+        ):
+            await db.execute(text(ddl))
+    admin = async_sessionmaker(engine, expire_on_commit=False)
+    role_engines = []
+
+    def factory(role, *, target_schema=schema):
+        role_engine = create_async_engine(
+            url,
+            connect_args={
+                "statement_cache_size": 0,
+                "prepared_statement_cache_size": 0,
+            },
+        )
+
+        @event.listens_for(role_engine.sync_engine, "begin")
+        def scope(conn):
+            conn.exec_driver_sql(f'SET LOCAL ROLE "{role}"')
+            conn.exec_driver_sql(f'SET LOCAL search_path TO "{target_schema}"')
+
+        role_engines.append(role_engine)
+        return async_sessionmaker(role_engine, expire_on_commit=False)
+
+    async def install(**kwargs):
+        from shared.protected_size_schema import install
+
+        async with admin.begin() as db:
+            await install(await db.connection(), **kwargs)
+
+    try:
+        yield SimpleNamespace(
+            admin=admin,
+            install=install,
+            factory=factory,
+            schema=schema,
+            other_schema=other_schema,
+            source_role=source_role,
+            app_role=app_role,
+            other_role=other_role,
+        )
+    finally:
+        from shared.protected_size_schema import event_trigger_names
+
+        for role_engine in role_engines:
+            await role_engine.dispose()
+        async with engine.begin() as db:
+            for trigger in event_trigger_names(schema):
+                await db.execute(text(f'DROP EVENT TRIGGER IF EXISTS "{trigger}"'))
+            await db.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+            await db.execute(text(f'DROP SCHEMA "{other_schema}" CASCADE'))
+            for role in (source_role, app_role, other_role):
+                await db.execute(text(f'DROP ROLE "{role}"'))
+        await engine.dispose()
+
+
+@pytest.mark.parametrize("explicit_runtime", [False, True])
+async def test_dba_migration_preserves_ordinary_source_owner_capture_read_and_refresh(
+    runtime_store,
+    explicit_runtime,
+):
+    from shared.protected_size import read_summary, refresh_once
+
+    if explicit_runtime:
+        async with runtime_store.admin.begin() as db:
+            await db.execute(
+                text(
+                    f'GRANT USAGE ON SCHEMA "{runtime_store.schema}" TO "{runtime_store.app_role}"'
+                )
+            )
+            await db.execute(
+                text(
+                    f'GRANT SELECT ON resources,snapshots,snapshot_items TO "{runtime_store.app_role}"'
+                )
+            )
+    await runtime_store.install(
+        **({"runtime_role": runtime_store.app_role} if explicit_runtime else {})
+    )
+    factory = runtime_store.factory(runtime_store.source_role)
+    worker = (
+        runtime_store.factory(runtime_store.app_role) if explicit_runtime else factory
+    )
+    tenant, resource, snapshot, item = [uuid4() for _ in range(4)]
+    async with factory.begin() as db:
+        await db.execute(
+            text("INSERT INTO resources VALUES(:r,:t,'USER_MAIL')"),
+            {"r": resource, "t": tenant},
+        )
+        await db.execute(
+            text("INSERT INTO snapshots VALUES(:s,:r,'IN_PROGRESS',now())"),
+            {"s": snapshot, "r": resource},
+        )
+        await db.execute(
+            text("INSERT INTO snapshot_items VALUES(:i,:s,'x','mail',9,false,now())"),
+            {"i": item, "s": snapshot},
+        )
+        await db.execute(
+            text("UPDATE snapshots SET status='COMPLETED' WHERE id=:s"), {"s": snapshot}
+        )
+    for _ in range(30):
+        if (await refresh_once(worker, page_size=1))["status"] == "idle":
+            break
+    async with worker.begin() as db:
+        result = await read_summary(db, tenant_ids=(tenant,), service_types=None)
+        assert result["totalBytes"] == 9 and result["freshness"] == "fresh"
+        if explicit_runtime:
+            assert not await db.scalar(
+                text(
+                    "SELECT has_table_privilege(current_user,'snapshot_items','INSERT')"
+                )
+            )
+    async with factory.begin() as db:
+        # Ordinary source-owner DDL creates a future covered direct-write leaf.
+        await db.execute(
+            text("ALTER TABLE snapshot_items DETACH PARTITION snapshot_items_p0")
+        )
+        await db.execute(text("DROP TABLE snapshot_items_p0"))
+        await db.execute(
+            text(
+                "CREATE TABLE snapshot_items_p0 PARTITION OF snapshot_items FOR VALUES WITH(MODULUS 2,REMAINDER 0)"
+            )
+        )
+
+        leaf = (
+            "snapshot_items_p0"
+            if await db.scalar(
+                text(
+                    "SELECT satisfies_hash_partition('snapshot_items'::regclass,2,0,CAST(:s AS uuid))"
+                ),
+                {"s": snapshot},
+            )
+            else "snapshot_items_p1"
+        )
+        await db.execute(
+            text(f"INSERT INTO {leaf} VALUES(:i,:s,'new','mail',3,false,now())"),
+            {"i": uuid4(), "s": snapshot},
+        )
+        assert await db.scalar(text("SELECT count(*) FROM protected_size_journal")) > 0
+        await db.execute(text("DELETE FROM resources WHERE id=:r"), {"r": resource})
+    for _ in range(30):
+        if (await refresh_once(worker, page_size=1))["status"] == "idle":
+            break
+    async with worker.begin() as db:
+        assert (await read_summary(db, tenant_ids=(tenant,)))["totalBytes"] == 0
+        assert await db.scalar(text("SELECT count(*) FROM protected_size_orphans")) == 0
+
+
+async def test_unrelated_ordinary_schema_ddl_does_not_need_ledger_schema_usage(
+    runtime_store,
+):
+    await runtime_store.install()
+    async with runtime_store.admin.begin() as db:
+        before = await db.scalar(
+            text("SELECT discovery_epoch FROM protected_size_control")
+        )
+    factory = runtime_store.factory(
+        runtime_store.other_role, target_schema=runtime_store.other_schema
+    )
+    async with factory.begin() as db:
+        assert not await db.scalar(
+            text("SELECT has_schema_privilege(current_user,:s,'USAGE')"),
+            {"s": runtime_store.schema},
+        )
+        await db.execute(text("CREATE TABLE unrelated(id integer)"))
+        await db.execute(text("ALTER TABLE unrelated ADD COLUMN more integer"))
+        await db.execute(text("DROP TABLE unrelated"))
+    async with runtime_store.admin.begin() as db:
+        assert (
+            await db.scalar(text("SELECT discovery_epoch FROM protected_size_control"))
+            == before
+        )
+
+
+@pytest.mark.parametrize("failure", ["missing", "usage", "select", "split_owner"])
+async def test_runtime_role_preflight_rejects_before_ledger_ddl(runtime_store, failure):
+    from shared.protected_size_schema import statements
+
+    selected = runtime_store.app_role
+    expected = {
+        "missing": "does not exist",
+        "usage": "schema USAGE",
+        "select": "existing SELECT",
+        "split_owner": "split ownership",
+    }[failure]
+    async with runtime_store.admin.begin() as db:
+        if failure == "missing":
+            selected = "missing_" + uuid4().hex
+        elif failure == "select":
+            await db.execute(
+                text(f'GRANT USAGE ON SCHEMA "{runtime_store.schema}" TO "{selected}"')
+            )
+        elif failure == "split_owner":
+            await db.execute(text(f'ALTER TABLE snapshots OWNER TO "{selected}"'))
+        # Even an executor committing each yielded statement must fail before schema changes.
+        entries = iter(statements(runtime_store.schema, runtime_role=selected))
+        await db.execute(text(next(entries)))
+        with pytest.raises(Exception, match=expected):
+            async with db.begin_nested():
+                await db.execute(text(next(entries)))
+        assert (
+            await db.scalar(text("SELECT to_regclass('protected_size_control')"))
+            is None
+        )
+        assert not await db.scalar(
+            text(
+                "SELECT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='resource_protected_bytes'::regclass AND attname='ledger_bytes')"
+            )
+        )
+        assert await db.scalar(
+            text(
+                "SELECT attnotnull FROM pg_attribute WHERE attrelid='resource_protected_bytes'::regclass AND attname='latest_snapshot_id'"
+            )
+        )
+
+
+async def test_ddl_helpers_are_private_fixed_path_and_migration_owned(runtime_store):
+    await runtime_store.install()
+    async with runtime_store.admin.begin() as db:
+        rows = (
+            (
+                await db.execute(
+                    text("""SELECT p.proname,p.prosecdef,p.proconfig,p.proowner=(SELECT oid FROM pg_roles WHERE rolname=current_user) migration_owned,
+          EXISTS(SELECT 1 FROM aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) a WHERE a.grantee=0 AND a.privilege_type='EXECUTE') public_execute
+          FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname=:schema AND p.proname LIKE 'protected_size_%'"""),
+                    {"schema": runtime_store.schema},
+                )
+            )
+            .mappings()
+            .all()
+        )
+    helpers = {
+        "protected_size_install_triggers",
+        "protected_size_partition_ddl",
+        "protected_size_partition_drop",
+    }
+    assert {r["proname"] for r in rows if r["prosecdef"]} == helpers
+    for row in rows:
+        assert row["migration_owned"]
+        if row["proname"] in helpers:
+            assert not row["public_execute"]
+            assert row["proconfig"] == [
+                f'search_path=pg_catalog, "{runtime_store.schema}", pg_temp'
+            ]
+    factory = runtime_store.factory(runtime_store.source_role)
+    async with factory.begin() as db:
+        with pytest.raises(Exception, match="permission denied for function"):
+            async with db.begin_nested():
+                await db.execute(text("SELECT protected_size_install_triggers()"))

@@ -11,6 +11,8 @@ from sqlalchemy import text
 
 DDL = (
     "ALTER TABLE resource_protected_bytes ALTER COLUMN latest_snapshot_id DROP NOT NULL",
+    "ALTER TABLE resource_protected_bytes ADD COLUMN IF NOT EXISTS ledger_bytes bigint NOT NULL DEFAULT 0",
+    "ALTER TABLE resource_protected_bytes ADD COLUMN IF NOT EXISTS ledger_computed_at timestamptz",
     "ALTER TABLE resource_protected_bytes ADD COLUMN IF NOT EXISTS working_bytes bigint NOT NULL DEFAULT 0",
     "ALTER TABLE resource_protected_bytes ADD COLUMN IF NOT EXISTS ledger_published boolean NOT NULL DEFAULT false",
     "ALTER TABLE resource_protected_bytes ADD COLUMN IF NOT EXISTS last_turn timestamptz NOT NULL DEFAULT 'epoch'",
@@ -67,13 +69,45 @@ def event_trigger_names(schema):
     return ("protected_size_ddl_" + suffix, "protected_size_drop_" + suffix)
 
 
-def statements(schema):
-    """SQL shared by Alembic and disposable integration fixtures."""
+def statements(schema, runtime_role=None):
+    """Install as DBA; default runtime role is the existing source owner.
+
+    Sources (including partitions/cache) must share that owner. An explicit
+    worker role must already have schema USAGE and SELECT on the three sources;
+    migration grants only derived-state access and existing-owner capture rights.
+    """
     q = '"' + schema.replace('"', '""') + '"'
+    runtime = (
+        "NULL" if runtime_role is None else "'" + runtime_role.replace("'", "''") + "'"
+    )
     ddl_event, drop_event = event_trigger_names(schema)
     event_name = '"' + ddl_event + '"'
     yield """DO $fn$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=current_user AND rolsuper)
       THEN RAISE EXCEPTION 'Protected-size migration requires a superuser to install partition DDL capture; no startup or privilege fallback is supported'; END IF; END $fn$"""
+    # Validate the existing authorization contract before creating any ledger object.
+    yield f"""DO $fn$
+    DECLARE source_owner oid := (SELECT relowner FROM pg_class WHERE oid='snapshot_items'::regclass);
+      runtime_oid oid; selected_role text := {runtime}; relation oid;
+    BEGIN
+      IF selected_role IS NULL THEN selected_role := pg_get_userbyid(source_owner); END IF;
+      SELECT oid INTO runtime_oid FROM pg_roles WHERE rolname=selected_role;
+      IF runtime_oid IS NULL THEN RAISE EXCEPTION 'Protected-size runtime role % does not exist',selected_role; END IF;
+      IF EXISTS(SELECT 1 FROM pg_class WHERE oid IN ('resources'::regclass,'snapshots'::regclass,'resource_protected_bytes'::regclass)
+          AND relowner<>source_owner)
+        OR EXISTS(SELECT 1 FROM pg_class WHERE oid IN
+          (SELECT relid FROM pg_partition_tree('snapshots'::regclass) UNION SELECT relid FROM pg_partition_tree('snapshot_items'::regclass))
+          AND relowner<>source_owner) THEN
+        RAISE EXCEPTION 'Protected-size migration requires one source owner for resources, snapshots, snapshot_items, their partitions and resource_protected_bytes; reconcile split ownership before migration';
+      END IF;
+      IF NOT has_schema_privilege(runtime_oid,current_schema(),'USAGE') THEN
+        RAISE EXCEPTION 'Protected-size runtime role % requires existing schema USAGE',selected_role;
+      END IF;
+      FOREACH relation IN ARRAY ARRAY['resources'::regclass::oid,'snapshots'::regclass::oid,'snapshot_items'::regclass::oid] LOOP
+        IF NOT has_table_privilege(runtime_oid,relation,'SELECT') THEN
+          RAISE EXCEPTION 'Protected-size runtime role % requires existing SELECT on %',selected_role,relation::regclass;
+        END IF;
+      END LOOP;
+    END $fn$"""
     yield from DDL
     yield f"""CREATE FUNCTION protected_size_capture() RETURNS trigger LANGUAGE plpgsql SET search_path={q} AS $fn$
     DECLARE source_sql text; batch record; eid bigint; ids uuid[]; resources uuid[];
@@ -128,7 +162,7 @@ def statements(schema):
     END $fn$"""
     yield f"""CREATE FUNCTION protected_size_reject_truncate() RETURNS trigger LANGUAGE plpgsql SET search_path={q} AS $fn$
       BEGIN RAISE EXCEPTION 'TRUNCATE is unsupported on protected-size sources; use DELETE or partition DDL so retained references reconcile'; END $fn$"""
-    yield f"""CREATE FUNCTION protected_size_install_triggers() RETURNS void LANGUAGE plpgsql SET search_path={q} AS $fn$
+    yield f"""CREATE FUNCTION protected_size_install_triggers() RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,{q},pg_temp AS $fn$
     DECLARE relation record; operation text; transition text;
     BEGIN
       FOR relation IN
@@ -154,12 +188,13 @@ def statements(schema):
         END LOOP;
       END LOOP;
     END $fn$"""
+    yield "REVOKE ALL ON FUNCTION protected_size_install_triggers() FROM PUBLIC"
     yield "SELECT protected_size_install_triggers()"
     yield f"""CREATE FUNCTION protected_size_resource_delete() RETURNS trigger LANGUAGE plpgsql SET search_path={q} AS $fn$
       BEGIN INSERT INTO protected_size_orphans SELECT id FROM resource_old ON CONFLICT DO NOTHING; RETURN NULL; END $fn$"""
     yield """CREATE TRIGGER protected_size_resource_delete AFTER DELETE ON resources REFERENCING OLD TABLE AS resource_old
       FOR EACH STATEMENT EXECUTE FUNCTION protected_size_resource_delete()"""
-    yield f"""CREATE FUNCTION protected_size_partition_ddl() RETURNS event_trigger LANGUAGE plpgsql SET search_path={q} AS $fn$
+    yield f"""CREATE FUNCTION protected_size_partition_ddl() RETURNS event_trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,{q},pg_temp AS $fn$
       BEGIN
         IF EXISTS(SELECT 1 FROM pg_event_trigger_ddl_commands() d
           WHERE d.classid='pg_class'::regclass AND
@@ -173,17 +208,36 @@ def statements(schema):
           UPDATE protected_size_control SET discovery_done=false,discovery_cursor=NULL,discovery_phase='source',discovery_epoch=discovery_epoch+1;
         END IF;
       END $fn$"""
+    yield "REVOKE ALL ON FUNCTION protected_size_partition_ddl() FROM PUBLIC"
     yield f"""CREATE EVENT TRIGGER {event_name} ON ddl_command_end WHEN TAG IN ('CREATE TABLE','ALTER TABLE')
       EXECUTE FUNCTION protected_size_partition_ddl()"""
-    yield f"""CREATE FUNCTION protected_size_partition_drop() RETURNS event_trigger LANGUAGE plpgsql SET search_path={q} AS $fn$
+    yield f"""CREATE FUNCTION protected_size_partition_drop() RETURNS event_trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,{q},pg_temp AS $fn$
       BEGIN IF EXISTS(SELECT 1 FROM pg_event_trigger_dropped_objects() d JOIN protected_size_source_relations r ON r.relid=d.objid
         WHERE d.classid='pg_class'::regclass) THEN
         UPDATE protected_size_control SET discovery_done=false,discovery_cursor=NULL,discovery_phase='source',discovery_epoch=discovery_epoch+1;
       END IF; END $fn$"""
+    yield "REVOKE ALL ON FUNCTION protected_size_partition_drop() FROM PUBLIC"
     yield f"""CREATE EVENT TRIGGER "{drop_event}" ON sql_drop EXECUTE FUNCTION protected_size_partition_drop()"""
 
+    yield f"""DO $fn$
+    DECLARE source_role text := pg_get_userbyid((SELECT relowner FROM pg_class WHERE oid='snapshot_items'::regclass));
+      selected_role text := COALESCE({runtime},source_role);
+    BEGIN
+      EXECUTE format('GRANT SELECT,INSERT,UPDATE ON resource_protected_bytes TO %I',selected_role);
+      EXECUTE format('GRANT SELECT,UPDATE ON protected_size_control TO %I',selected_role);
+      EXECUTE format('GRANT SELECT,INSERT,UPDATE,DELETE ON protected_size_snapshots,protected_size_targets,protected_size_jobs,protected_size_refs TO %I',selected_role);
+      EXECUTE format('GRANT SELECT,INSERT,DELETE ON protected_size_identities,protected_size_winners,protected_size_retired TO %I',selected_role);
+      EXECUTE format('GRANT SELECT,INSERT,UPDATE ON protected_size_tenant_turns TO %I',selected_role);
+      EXECUTE format('GRANT SELECT,DELETE ON protected_size_journal,protected_size_event_snapshots,protected_size_orphans TO %I',selected_role);
+      EXECUTE format('GRANT USAGE ON SEQUENCE protected_size_identities_id_seq TO %I',selected_role);
+      -- Existing source writers retain transactional invoker capture, even with a separate worker role.
+      EXECUTE format('GRANT SELECT,INSERT,UPDATE ON protected_size_snapshots TO %I',source_role);
+      EXECUTE format('GRANT SELECT,INSERT ON protected_size_journal,protected_size_targets,protected_size_event_snapshots,protected_size_orphans TO %I',source_role);
+      EXECUTE format('GRANT USAGE ON SEQUENCE protected_size_journal_id_seq TO %I',source_role);
+    END $fn$"""
 
-async def install(connection):
+
+async def install(connection, runtime_role=None):
     schema = await connection.scalar(text("SELECT current_schema()"))
-    for statement in statements(schema):
+    for statement in statements(schema, runtime_role=runtime_role):
         await connection.execute(text(statement))
