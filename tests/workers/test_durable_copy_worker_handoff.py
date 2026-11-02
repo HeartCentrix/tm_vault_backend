@@ -180,6 +180,8 @@ async def test_user_leaf_seals_after_buffers_drain_and_returns_waiting(
     worker.worker_id = "test-worker"
     worker.create_snapshot = AsyncMock(return_value=snapshot)
     worker._maybe_backup_chat_catalogue = AsyncMock(return_value=None)
+    import shared.snapshot_item_writes as chat_writes
+    monkeypatch.setattr(chat_writes, "capture_chat_write_scope", AsyncMock(return_value=None))
     worker.get_sla_policy = AsyncMock(return_value=None)
 
     async def flush(**kwargs):

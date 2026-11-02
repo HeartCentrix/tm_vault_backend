@@ -135,7 +135,10 @@ def test_enumeration_failed_from_the_list_reaches_backup_one():
         "the /chats list call must stay inside _fetch_for so its raise is "
         "caught by _backup_one's `except EnumerationFailed`"
     )
-    handler = SRC[backup_one: backup_one + 2000]
+    # Ownership capture can grow the wrapper; inspect the actual capture
+    # body instead of an arbitrary character window around its caller.
+    capture = SRC.index("async def _capture_one(", backup_one)
+    handler = SRC[capture: capture + 2000]
     assert "except EnumerationFailed" in handler
     assert "_record_enumeration_failure(" in handler
 

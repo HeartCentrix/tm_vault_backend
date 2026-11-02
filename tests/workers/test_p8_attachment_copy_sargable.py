@@ -152,7 +152,7 @@ def test_p8_copy_runs_on_skip_by_activity_arm_too():
     run — lost its attachment chips from that restore point. Pin that the
     arm now runs the same P8 copy, with the same failure accounting, as the
     skip-claim arm."""
-    start = _SRC.find('label=f"chat_pointer_skip:')
+    start = _SRC.find('_n_rows, _bytes = await _write_skip_pointers()')
     assert start > 0, "skip-by-activity pointer write missing"
     end = _SRC.find("no activity since cursor", start)
     assert end > start
@@ -163,7 +163,7 @@ def test_p8_copy_runs_on_skip_by_activity_arm_too():
 
 
 def test_p8_copy_still_runs_on_skip_claim_arm():
-    start = _SRC.find('label=f"chat_pointer_reuse:')
+    start = _SRC.find('_n_rows, _bytes = await _write_reuse_pointers()')
     assert start > 0, "skip-claim pointer write missing"
     end = _SRC.find("pointer-write on", start)
     arm = _SRC[start:end]

@@ -52,6 +52,7 @@ async def test_sparse_paths_skip_copy_only_with_prior_inventory(drain_code, clai
         "_load_chat_thread_messages_for_pointer": load, "_chat_pointer_db_gate": gate,
         "_build_chat_pointer_rows": Mock(return_value=([{"external_id": "message"}], 5)),
         "async_session_factory": gate, "_bulk_upsert_snapshot_items": AsyncMock(),
+        "_persist_chat_snapshot_items": AsyncMock(),
         "_copy_chat_attachment_rows_to_snapshot": copy, "_mark_chat_thread_drained": mark,
         "_progress": {"chats_done": 0, "msgs": 0}, "_chat_outcomes": {"ok": 0, "failed": 0, "suppressed": 0},
         "_chat_att_copy": {"failed": 0}, "cancel_check_every": 100,

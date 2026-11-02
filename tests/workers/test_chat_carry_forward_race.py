@@ -101,8 +101,10 @@ def test_chat_carry_forward_still_runs_under_the_giant_slot():
 
 def test_call_site_retries_and_flags_failure():
     src = _call_site_src()
-    # retried through the shared transient-fault helper
-    assert "run_with_db_retry" in src
+    # The helper owns registration and legacy SQL retry budgets; an outer
+    # generic loop would renew those budgets after exhaustion.
+    assert "run_owned_db_operation" in _cf_src()
+    assert "run_with_db_retry" not in src
     assert "_carry_forward_prior_chat_snapshot_items(" in src
     # a failure is no longer only printed: degrade + flag
     failure = src[src.find("carry-forward failed"):]

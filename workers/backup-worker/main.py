@@ -338,6 +338,16 @@ async def _bulk_upsert_snapshot_items(session, rows: List[Dict[str, Any]]) -> in
     return total
 
 
+async def _persist_chat_snapshot_items(rows):
+    from shared.snapshot_item_writes import current_chat_write_scope, persist_chat_snapshot_rows
+    try:
+        return await persist_chat_snapshot_rows(async_session_factory, rows,
+            current_chat_write_scope(), _insert_snapshot_items)
+    except Exception as exc:
+        exc._chat_snapshot_persistence_failed = True
+        raise
+
+
 def _email_item_name(msg: Dict[str, Any], msg_id: str) -> str:
     """``snapshot_items.name`` for an EMAIL row.
 
@@ -1409,95 +1419,105 @@ async def _carry_forward_prior_chat_snapshot_items(
     })
     if delegated is not None:
         return delegated
-    async with carry_forward_slot_session(
-        str(resource_id), lane="giant", what="chat carry-forward",
-    ) as s:
-        from sqlalchemy.exc import IntegrityError as _IntegrityError
-        try:
-            result = await s.execute(
-                text(
-                    "INSERT INTO snapshot_items ("
-                    "  id, snapshot_id, tenant_id, item_type, external_id, "
-                    "  parent_external_id, name, folder_path, content_hash, "
-                    "  content_checksum, content_size, blob_path, "
-                    "  encryption_key_id, backup_version, metadata, is_deleted, "
-                    "  indexed_at, backend_id, created_at"
-                    ") "
-                    "SELECT gen_random_uuid(), :tsid, src.tenant_id, src.item_type, "
-                    "       src.external_id, src.parent_external_id, src.name, "
-                    "       src.folder_path, src.content_hash, src.content_checksum, "
-                    "       src.content_size, src.blob_path, src.encryption_key_id, "
-                    "       COALESCE(src.backup_version, 1), src.metadata, "
-                    "       COALESCE(src.is_deleted, false), src.indexed_at, "
-                    "       src.backend_id, NOW() "
-                    "  FROM snapshot_items src "
-                    "  JOIN snapshots ps ON ps.id = src.snapshot_id "
-                    " WHERE ps.resource_id = :rid "
-                    "   AND ps.id <> :tsid "
-                    "   AND ps.status IN ('COMPLETED', 'PARTIAL') "
-                    # TEAMS_CHAT_MESSAGE is what every writer actually
-                    # persists (_build_chat_pointer_rows + the legacy and
-                    # channel paths); 'CHAT_MESSAGE' matched nothing, so
-                    # carry-forward silently skipped MESSAGES while working
-                    # for attachments/hosted-content — the helper's whole
-                    # purpose (each snapshot a point-in-time superset, so
-                    # bytes_total doesn't collapse and retention can reap
-                    # predecessors safely) was a no-op for the primary rows.
-                    # Both spellings are listed: the legacy name costs
-                    # nothing and covers any historical rows.
-                    "   AND src.item_type IN ("
-                    "         'TEAMS_CHAT_MESSAGE', 'TEAMS_MESSAGE', 'TEAMS_MESSAGE_REPLY',"
-                    "         'CHAT_MESSAGE', 'CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT'"
-                    "       ) "
-                    "   AND ps.id = ("
-                    "         SELECT s2.id FROM snapshots s2 "
-                    "          WHERE s2.resource_id = :rid "
-                    "            AND s2.id <> :tsid "
-                    "            AND s2.status IN ('COMPLETED', 'PARTIAL') "
-                    "            AND s2.created_at < (SELECT t.created_at FROM snapshots t WHERE t.id = :tsid) "
-                    # 2026-10-16: the predecessor must hold chat rows. A 0-row
-                    # COMPLETED placeholder (scheduler skipped_concurrent, or a
-                    # run whose own carry-forward failed and drained nothing)
-                    # would otherwise become the source and the chain restarts
-                    # empty — the mail helper has had this guard since 09/04.
-                    "            AND EXISTS ("
-                    "                  SELECT 1 FROM snapshot_items x "
-                    "                   WHERE x.snapshot_id = s2.id "
-                    "                     AND x.item_type IN ("
-                    "                           'TEAMS_CHAT_MESSAGE', 'TEAMS_MESSAGE', 'TEAMS_MESSAGE_REPLY',"
-                    "                           'CHAT_MESSAGE', 'CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT'"
-                    "                         )"
-                    "                ) "
-                    "          ORDER BY s2.created_at DESC "
-                    "          LIMIT 1"
-                    "       ) "
-                    "   AND NOT EXISTS ("
-                    "         SELECT 1 FROM snapshot_items dst "
-                    "          WHERE dst.snapshot_id = :tsid "
-                    "            AND dst.external_id = src.external_id "
-                    "            AND dst.item_type = src.item_type"
-                    "       ) "
-                    # 2026-10-16: sibling shards upsert into this snapshot while
-                    # the copy runs; NOT EXISTS cannot see a row that lands after
-                    # the SELECT, so without this clause one such row aborts the
-                    # whole copy (UniqueViolationError, see docstring).
-                    'ORDER BY src.external_id COLLATE "C", src.item_type COLLATE "C" '
-                    "ON CONFLICT (snapshot_id, external_id, item_type) DO NOTHING"
-                ),
-                {
-                    "tsid": target_snapshot_id,
-                    "rid": resource_id,
-                },
-            )
-        except _IntegrityError as exc:
-            if "snapshot_items_snapshot_id_fkey" in str(exc):
-                await s.rollback()
-                raise SnapshotVanishedError(
-                    f"snapshot {target_snapshot_id} no longer exists; aborting chat carry-forward"
-                ) from exc
-            raise
-        await s.commit()
-        return result.rowcount or 0
+    from shared.db_retry import run_owned_db_operation
+    from shared.snapshot_item_writes import current_chat_write_scope, validate_chat_write_scope
+    scope = current_chat_write_scope()
+    async def copy_once():
+        async with carry_forward_slot_session(
+            str(resource_id), lane="giant", what="chat carry-forward",
+        ) as s:
+            if scope is not None:
+                if str(scope.snapshot_id) != str(target_snapshot_id):
+                    raise ChatCatalogueWorkLeaseMoved("chat copy target differs from source-work capture")
+                await validate_chat_write_scope(s, scope)
+            from sqlalchemy.exc import IntegrityError as _IntegrityError
+            try:
+                result = await s.execute(
+                    text(
+                        "INSERT INTO snapshot_items ("
+                        "  id, snapshot_id, tenant_id, item_type, external_id, "
+                        "  parent_external_id, name, folder_path, content_hash, "
+                        "  content_checksum, content_size, blob_path, "
+                        "  encryption_key_id, backup_version, metadata, is_deleted, "
+                        "  indexed_at, backend_id, created_at"
+                        ") "
+                        "SELECT gen_random_uuid(), :tsid, src.tenant_id, src.item_type, "
+                        "       src.external_id, src.parent_external_id, src.name, "
+                        "       src.folder_path, src.content_hash, src.content_checksum, "
+                        "       src.content_size, src.blob_path, src.encryption_key_id, "
+                        "       COALESCE(src.backup_version, 1), src.metadata, "
+                        "       COALESCE(src.is_deleted, false), src.indexed_at, "
+                        "       src.backend_id, NOW() "
+                        "  FROM snapshot_items src "
+                        "  JOIN snapshots ps ON ps.id = src.snapshot_id "
+                        " WHERE ps.resource_id = :rid "
+                        "   AND ps.id <> :tsid "
+                        "   AND ps.status IN ('COMPLETED', 'PARTIAL') "
+                        # TEAMS_CHAT_MESSAGE is what every writer actually
+                        # persists (_build_chat_pointer_rows + the legacy and
+                        # channel paths); 'CHAT_MESSAGE' matched nothing, so
+                        # carry-forward silently skipped MESSAGES while working
+                        # for attachments/hosted-content — the helper's whole
+                        # purpose (each snapshot a point-in-time superset, so
+                        # bytes_total doesn't collapse and retention can reap
+                        # predecessors safely) was a no-op for the primary rows.
+                        # Both spellings are listed: the legacy name costs
+                        # nothing and covers any historical rows.
+                        "   AND src.item_type IN ("
+                        "         'TEAMS_CHAT_MESSAGE', 'TEAMS_MESSAGE', 'TEAMS_MESSAGE_REPLY',"
+                        "         'CHAT_MESSAGE', 'CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT'"
+                        "       ) "
+                        "   AND ps.id = ("
+                        "         SELECT s2.id FROM snapshots s2 "
+                        "          WHERE s2.resource_id = :rid "
+                        "            AND s2.id <> :tsid "
+                        "            AND s2.status IN ('COMPLETED', 'PARTIAL') "
+                        "            AND s2.created_at < (SELECT t.created_at FROM snapshots t WHERE t.id = :tsid) "
+                        # 2026-10-16: the predecessor must hold chat rows. A 0-row
+                        # COMPLETED placeholder (scheduler skipped_concurrent, or a
+                        # run whose own carry-forward failed and drained nothing)
+                        # would otherwise become the source and the chain restarts
+                        # empty — the mail helper has had this guard since 09/04.
+                        "            AND EXISTS ("
+                        "                  SELECT 1 FROM snapshot_items x "
+                        "                   WHERE x.snapshot_id = s2.id "
+                        "                     AND x.item_type IN ("
+                        "                           'TEAMS_CHAT_MESSAGE', 'TEAMS_MESSAGE', 'TEAMS_MESSAGE_REPLY',"
+                        "                           'CHAT_MESSAGE', 'CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT'"
+                        "                         )"
+                        "                ) "
+                        "          ORDER BY s2.created_at DESC "
+                        "          LIMIT 1"
+                        "       ) "
+                        "   AND NOT EXISTS ("
+                        "         SELECT 1 FROM snapshot_items dst "
+                        "          WHERE dst.snapshot_id = :tsid "
+                        "            AND dst.external_id = src.external_id "
+                        "            AND dst.item_type = src.item_type"
+                        "       ) "
+                        # 2026-10-16: sibling shards upsert into this snapshot while
+                        # the copy runs; NOT EXISTS cannot see a row that lands after
+                        # the SELECT, so without this clause one such row aborts the
+                        # whole copy (UniqueViolationError, see docstring).
+                        'ORDER BY src.external_id COLLATE "C", src.item_type COLLATE "C" '
+                        "ON CONFLICT (snapshot_id, external_id, item_type) DO NOTHING"
+                    ),
+                    {
+                        "tsid": target_snapshot_id,
+                        "rid": resource_id,
+                    },
+                )
+            except _IntegrityError as exc:
+                if "snapshot_items_snapshot_id_fkey" in str(exc):
+                    await s.rollback()
+                    raise SnapshotVanishedError(
+                        f"snapshot {target_snapshot_id} no longer exists; aborting chat carry-forward"
+                    ) from exc
+                raise
+            await s.commit()
+            return result.rowcount or 0
+
+    return await run_owned_db_operation(copy_once)
 
 
 async def _carry_forward_prior_mail_snapshot_items(
@@ -1940,20 +1960,30 @@ async def _copy_chat_attachment_rows_to_snapshot(
     # claim-skipped users — thousands of calls per chats run, each
     # scanning tenant-wide attachment rows. 260 of these convoyed the
     # buffer manager after the giant carry-forwards were bounded.
-    async with carry_forward_slot_session(
-        str(chat_id), what="P8 attachment copy",
-        # MICRO copy, called per claim-skipped chat (thousands/run): fast
-        # poll — see file-version site.
-        wait_base_s=0.25, wait_jitter_s=0.5,
-    ) as s:
-        from shared.chat_attachment_copy import copy_legacy_chat_attachments
+    from shared.db_retry import run_owned_db_operation
+    from shared.snapshot_item_writes import current_chat_write_scope, validate_chat_write_scope
+    scope = current_chat_write_scope()
+    async def copy_once():
+        async with carry_forward_slot_session(
+            str(chat_id), what="P8 attachment copy",
+            # MICRO copy, called per claim-skipped chat (thousands/run): fast
+            # poll — see file-version site.
+            wait_base_s=0.25, wait_jitter_s=0.5,
+        ) as s:
+            if scope is not None:
+                if str(scope.snapshot_id) != str(target_snapshot_id):
+                    raise ChatCatalogueWorkLeaseMoved("chat copy target differs from source-work capture")
+                await validate_chat_write_scope(s, scope)
+            from shared.chat_attachment_copy import copy_legacy_chat_attachments
 
-        inserted = await copy_legacy_chat_attachments(
-            s, tenant_id=tenant_id, target_snapshot_id=target_snapshot_id,
-            chat_id=chat_id,
-        )
-        await s.commit()
-        return inserted
+            inserted = await copy_legacy_chat_attachments(
+                s, tenant_id=tenant_id, target_snapshot_id=target_snapshot_id,
+                chat_id=chat_id,
+            )
+            await s.commit()
+            return inserted
+
+    return await run_owned_db_operation(copy_once)
 
 
 async def _is_job_cancelled(job_id) -> bool:
@@ -10087,6 +10117,7 @@ class BackupWorker:
                              message's downloads concurrently below.
                         Plain text-only messages (~95%) skip both paths."""
                         nonlocal _hc_items_total, _hc_bytes_total
+                        msgs = [m for m in msgs if not m.get("_hc_persistence_failed")]
 
                         # Phase 1: bulk-resolve hostedContents lists via
                         # /v1.0/$batch for msgs that need them.
@@ -10184,13 +10215,13 @@ class BackupWorker:
                                     # Mark the message dict so Phase 2
                                     # filter (line ~2127) excludes it.
                                     m["_hc_interleaved"] = True
+                                except (SnapshotVanishedError, ChatCatalogueWorkLeaseMoved):
+                                    raise
                                 except Exception as _e:
-                                    # Leave msg OUT of the done-set so
-                                    # Phase 2 can retry it from items_data,
-                                    # AND record it — in detached mode
-                                    # Phase 2's filter has already run, so
-                                    # the finalizer's retry pass is the
-                                    # only thing that will look again.
+                                    if getattr(_e, "_chat_snapshot_persistence_failed", False):
+                                        m["_hc_persistence_failed"] = True
+                                    # Retain missing-content evidence. Source failures
+                                    # may retry; exhausted pointer writes stay failed.
                                     _hc_failed_msgs.append((m_chat_id, m))
                                     print(
                                         f"[{self.worker_id}] [USER_CHATS] "
@@ -10214,15 +10245,13 @@ class BackupWorker:
                         interleaved item. Mirror _userchats_backup_
                         hosted_contents which also persists internally."""
                         nonlocal _att_bytes_total, _att_items_total_count
-                        msgs_with_att = [m for m in msgs if m.get("attachments")]
+                        msgs_with_att = [m for m in msgs if m.get("attachments")
+                                         and not m.get("_att_persistence_failed")]
                         if not msgs_with_att:
                             return
                         async with _att_chat_sem:
-                            # Flips False only when BOTH the add_all and
-                            # the per-row upsert fallback fail. Pre-fix the
-                            # messages were marked _att_interleaved anyway,
-                            # so Phase 2 skipped attachments that had been
-                            # downloaded but never committed.
+                            # Mark messages done only after their required
+                            # pointer transaction commits.
                             _att_persist_ok = True
                             try:
                                 items, b = await self._userchats_backup_attachments(
@@ -10230,49 +10259,20 @@ class BackupWorker:
                                     att_dedup=_att_dedup,
                                 )
                                 if items:
+                                    from shared.snapshot_item_writes import snapshot_item_rows
                                     try:
-                                        async with async_session_factory() as session:
-                                            session.add_all(items)
-                                            await session.commit()
+                                        await _persist_chat_snapshot_items(snapshot_item_rows(items))
+                                    except (SnapshotVanishedError, ChatCatalogueWorkLeaseMoved):
+                                        raise
                                     except Exception as _att_commit_err:
-                                        # Same fallback as Phase-2's commit
-                                        # block: on UNIQUE violation, switch
-                                        # to per-row upsert so a single
-                                        # collision doesn't drop a whole
-                                        # chat's attachments.
-                                        print(
-                                            f"[{self.worker_id}] [CHAT-ATT-INTERLEAVE] "
-                                            f"session.add_all of {len(items)} items "
-                                            f"failed: {type(_att_commit_err).__name__}: "
-                                            f"{_att_commit_err}. Retrying per-row."
-                                        )
-                                        att_rows = [{
-                                            "id": it.id,
-                                            "snapshot_id": it.snapshot_id,
-                                            "tenant_id": it.tenant_id,
-                                            "external_id": it.external_id,
-                                            "item_type": it.item_type,
-                                            "name": it.name,
-                                            "folder_path": it.folder_path,
-                                            "content_hash": it.content_hash,
-                                            "content_size": it.content_size,
-                                            "content_checksum": it.content_checksum,
-                                            "extra_data": it.extra_data,
-                                        } for it in items]
-                                        try:
-                                            async with async_session_factory() as session:
-                                                await _bulk_upsert_snapshot_items(session, att_rows)
-                                        except Exception as _retry_err:
-                                            _att_persist_ok = False
-                                            print(
-                                                f"[{self.worker_id}] [CHAT-ATT-INTERLEAVE] "
-                                                f"bulk-upsert fallback ALSO failed: "
-                                                f"{type(_retry_err).__name__}: {_retry_err}"
-                                            )
+                                        _att_persist_ok = False
+                                        if getattr(_att_commit_err, "_chat_snapshot_persistence_failed", False):
+                                            for m in msgs_with_att:
+                                                m["_att_persistence_failed"] = True
+                                        print(f"[{self.worker_id}] [CHAT-ATT-INTERLEAVE] required pointer write failed: {type(_att_commit_err).__name__}")
                                 if not _att_persist_ok:
-                                    # Nothing committed — do NOT mark the
-                                    # messages done and do NOT count the
-                                    # bytes. Record them for the retry pass.
+                                    # Keep failure evidence without counting
+                                    # uncommitted attachment bytes.
                                     for m in msgs_with_att:
                                         _att_failed_msgs.append((cid, m))
                                 else:
@@ -10283,8 +10283,12 @@ class BackupWorker:
                                         if m_id:
                                             _att_interleaved_msg_ids.add(m_id)
                                         m["_att_interleaved"] = True
+                            except (SnapshotVanishedError, ChatCatalogueWorkLeaseMoved):
+                                raise
                             except Exception as _e:
                                 for m in msgs_with_att:
+                                    if getattr(_e, "_chat_snapshot_persistence_failed", False):
+                                        m["_att_persistence_failed"] = True
                                     _att_failed_msgs.append((cid, m))
                                 print(
                                     f"[{self.worker_id}] [USER_CHATS] "
@@ -10414,8 +10418,7 @@ class BackupWorker:
                         rows, local_bytes = _build_chat_pointer_rows(
                             cid, msgs, full_messages=True,
                         )
-                        async with async_session_factory() as _sess:
-                            await _bulk_upsert_snapshot_items(_sess, rows)
+                        await _persist_chat_snapshot_items(rows)
                         return len(rows), local_bytes
 
                     async def _drain_one_chat(cid: str) -> Tuple[str, List[Dict[str, Any]], Optional[str]]:
@@ -10571,22 +10574,16 @@ class BackupWorker:
 
                                     async def _write_reuse_pointers():
                                         async with _chat_pointer_db_gate():
-                                            _p = await _load_chat_thread_messages_for_pointer(
-                                                thread_id=thread_id,
-                                            )
+                                            _p = await _db_retry(lambda: _load_chat_thread_messages_for_pointer(thread_id=thread_id), label="chat_pointer_source")
                                             if not _p:
                                                 return 0, 0
                                             _r, _b = _build_chat_pointer_rows(
                                                 cid, _p, full_messages=False,
                                             )
-                                            async with async_session_factory() as _ps:
-                                                await _bulk_upsert_snapshot_items(_ps, _r)
+                                            await _persist_chat_snapshot_items(_r)
                                             return len(_r), _b
 
-                                    _n_rows, _bytes = await _db_retry(
-                                        _write_reuse_pointers,
-                                        label=f"chat_pointer_reuse:{cid[:8]}",
-                                    )
+                                    _n_rows, _bytes = await _write_reuse_pointers()
                                     _persisted_total += _n_rows
                                     _persisted_bytes += _bytes
                                     # Plan P8 — also copy CHAT_ATTACHMENT and
@@ -10836,22 +10833,16 @@ class BackupWorker:
 
                                         async def _write_skip_pointers():
                                             async with _chat_pointer_db_gate():
-                                                _pts = await _load_chat_thread_messages_for_pointer(
-                                                    thread_id=thread_id,
-                                                )
+                                                _pts = await _db_retry(lambda: _load_chat_thread_messages_for_pointer(thread_id=thread_id), label="chat_pointer_source")
                                                 if _pts:
                                                     _r, _b = _build_chat_pointer_rows(
                                                         cid, _pts, full_messages=False,
                                                     )
-                                                    async with async_session_factory() as _ps:
-                                                        await _bulk_upsert_snapshot_items(_ps, _r)
+                                                    await _persist_chat_snapshot_items(_r)
                                                     return len(_r), _b
                                                 return 0, 0
 
-                                        _n_rows, _bytes = await _db_retry(
-                                            _write_skip_pointers,
-                                            label=f"chat_pointer_skip:{cid[:8]}",
-                                        )
+                                        _n_rows, _bytes = await _write_skip_pointers()
                                         _persisted_total += _n_rows
                                         _persisted_bytes += _bytes
                                         # Plan P8 here too (2026-10-16). This arm
@@ -11319,13 +11310,10 @@ class BackupWorker:
                                         f"live item_count bump failed: "
                                         f"{_bump_err}"
                                     )
-                            except SnapshotVanishedError as snap_gone:
-                                # Snapshot row was deleted out from under
-                                # us (admin purge or user-cancel revert).
-                                # Trip the fanout-cancelled flag so the
-                                # remaining ~N chats short-circuit at the
-                                # next semaphore boundary instead of each
-                                # logging the same FK violation.
+                            except (SnapshotVanishedError, ChatCatalogueWorkLeaseMoved) as snap_gone:
+                                # A lost target must not advance the shared
+                                # thread checkpoint under the former owner.
+                                drain_succeeded = False
                                 if not _chat_fanout_cancelled:
                                     _chat_fanout_cancelled = True
                                     print(
@@ -11333,7 +11321,24 @@ class BackupWorker:
                                         f"{user_label}: {snap_gone} — "
                                         f"short-circuiting remaining chats"
                                     )
+                                raise
                             except Exception as persist_err:
+                                drain_succeeded = False
+                                new_failures[cid] = {
+                                    **_thread_failure_state,
+                                    "count": _prior_count + 1,
+                                    "last_error": (
+                                        f"required snapshot pointer persistence: "
+                                        f"{type(persist_err).__name__}: {str(persist_err)[:160]}"
+                                    ),
+                                    "error_class": "TRANSIENT",
+                                    "granted_scopes_at_failure": _current_fp,
+                                    "shard_app_id": _shard_client.client_id,
+                                    "first_failed_at": _prior_failure.get(
+                                        "first_failed_at", datetime.utcnow().isoformat() + "Z",
+                                    ),
+                                    "last_failed_at": datetime.utcnow().isoformat() + "Z",
+                                }
                                 print(
                                     f"[{self.worker_id}] [USER_CHATS] "
                                     f"chat {cid[:8]} streaming persist "
@@ -11797,6 +11802,8 @@ class BackupWorker:
                                         *_detached_hc_tasks, return_exceptions=True,
                                     )
                                     for r in results:
+                                        if isinstance(r, (SnapshotVanishedError, ChatCatalogueWorkLeaseMoved)):
+                                            raise r
                                         if isinstance(r, Exception):
                                             _gather_errors += 1
                                 if _detached_att_tasks:
@@ -11804,20 +11811,20 @@ class BackupWorker:
                                         *_detached_att_tasks, return_exceptions=True,
                                     )
                                     for r in results:
+                                        if isinstance(r, (SnapshotVanishedError, ChatCatalogueWorkLeaseMoved)):
+                                            raise r
                                         if isinstance(r, Exception):
                                             _gather_errors += 1
-                                # One bounded retry pass over the messages
-                                # whose interleave failed. Phase-2's filter
-                                # in _backup_one already ran, so nothing
-                                # else will look at them again. Both kick
-                                # helpers are idempotent (_exists_hosted_item
-                                # / ON CONFLICT), so a message Phase 2 also
-                                # picked up just no-ops here.
+                                # One bounded source retry pass. Exhausted
+                                # pointer transactions retain their failure
+                                # evidence without replaying Graph/uploads.
                                 _hc_retry = group_failed_interleaves(
-                                    list(_hc_failed_msgs),
+                                    entry for entry in _hc_failed_msgs
+                                    if not entry[1].get("_hc_persistence_failed")
                                 )
                                 _att_retry = group_failed_interleaves(
-                                    list(_att_failed_msgs),
+                                    entry for entry in _att_failed_msgs
+                                    if not entry[1].get("_att_persistence_failed")
                                 )
                                 if _hc_retry or _att_retry:
                                     print(
@@ -11829,13 +11836,23 @@ class BackupWorker:
                                         f"{sum(len(v) for v in _att_retry.values())} "
                                         f"att message(s)"
                                     )
-                                    _hc_failed_msgs.clear()
-                                    _att_failed_msgs.clear()
+                                    # Exhausted DB-only writes keep their failure evidence;
+                                    # only source failures receive this external retry.
+                                    for _failures, _marker in (
+                                        (_hc_failed_msgs, "_hc_persistence_failed"),
+                                        (_att_failed_msgs, "_att_persistence_failed"),
+                                    ):
+                                        _retained = [entry for entry in _failures if entry[1].get(_marker)]
+                                        _failures.clear()
+                                        for entry in _retained:
+                                            _failures.append(entry)
                                     for _r_cid, _r_msgs in _hc_retry.items():
                                         try:
                                             await _kick_hosted_content_for_chat(
                                                 _r_cid, _r_msgs,
                                             )
+                                        except (SnapshotVanishedError, ChatCatalogueWorkLeaseMoved):
+                                            raise
                                         except Exception as _rex:
                                             _gather_errors += 1
                                             print(
@@ -11849,6 +11866,8 @@ class BackupWorker:
                                             await _kick_attachments_for_chat(
                                                 _r_cid, _r_msgs,
                                             )
+                                        except (SnapshotVanishedError, ChatCatalogueWorkLeaseMoved):
+                                            raise
                                         except Exception as _rex:
                                             _gather_errors += 1
                                             print(
@@ -11899,6 +11918,8 @@ class BackupWorker:
                                     f"(overlapped with next user's drain)"
                                     + (f" — {_status_reason}" if _status_reason else "")
                                 )
+                            except (SnapshotVanishedError, ChatCatalogueWorkLeaseMoved):
+                                raise
                             except Exception as _e:
                                 status = "FAILED"
                                 _status_reason = (
@@ -12025,7 +12046,10 @@ class BackupWorker:
                         # before deciding what to skip.
                         if _interleave_hc and _hc_tasks:
                             hc_started_mono = time.monotonic()
-                            await asyncio.gather(*_hc_tasks, return_exceptions=True)
+                            _hc_barrier_results = await asyncio.gather(*_hc_tasks, return_exceptions=True)
+                            for r in _hc_barrier_results:
+                                if isinstance(r, (SnapshotVanishedError, ChatCatalogueWorkLeaseMoved)):
+                                    raise r
                             hc_elapsed = time.monotonic() - hc_started_mono
                             print(
                                 f"[{self.worker_id}] [USER_CHATS] hc interleave "
@@ -12040,7 +12064,10 @@ class BackupWorker:
                         # accumulated items list before it computes the fall-through.
                         if _interleave_att and _att_tasks:
                             att_started_mono = time.monotonic()
-                            await asyncio.gather(*_att_tasks, return_exceptions=True)
+                            _att_barrier_results = await asyncio.gather(*_att_tasks, return_exceptions=True)
+                            for r in _att_barrier_results:
+                                if isinstance(r, (SnapshotVanishedError, ChatCatalogueWorkLeaseMoved)):
+                                    raise r
                             att_elapsed = time.monotonic() - att_started_mono
                             print(
                                 f"[{self.worker_id}] [USER_CHATS] att interleave "
@@ -12500,7 +12527,20 @@ class BackupWorker:
                         resource, snapshot, tenant, graph_client, message, job_id)
                     if catalogue_result is not None:
                         return catalogue_result
-            with _worker_copy_collection(
+            from shared.snapshot_item_writes import capture_chat_write_scope, chat_write_scope
+            source_scope = None
+            if resource.type == ResourceType.USER_CHATS:
+                partition_id = message.get("partitionId")
+                record = _partition_lease_record(partition_id) if partition_id else None
+                if partition_id and (not record or record.get("stolen")):
+                    raise ChatCatalogueWorkLeaseMoved("chat source capture has no claimed partition")
+                lease = record["lease"] if record else None
+                source_scope = await capture_chat_write_scope(async_session_factory, snapshot.id,
+                    expected_snapshot_token=getattr(snapshot, "lease_token", None),
+                    expected_job_token=message.get("_job_lease_token"), partition_id=partition_id,
+                    expected_partition_token=lease.token if lease else None,
+                    expected_partition_owner=lease.owner_id if lease else None)
+            with chat_write_scope(source_scope), _worker_copy_collection(
                 snapshot.id, message.get("partitionId"), resource.id,
                 expected_snapshot_token=getattr(snapshot, "lease_token", None),
                 expected_job_token=message.get("_job_lease_token"),
@@ -12686,7 +12726,10 @@ class BackupWorker:
                             "content_checksum": None,
                         })
                     if db_rows:
-                        await _bulk_upsert_snapshot_items(session, db_rows)
+                        if resource.type == ResourceType.USER_CHATS:
+                            await _persist_chat_snapshot_items(db_rows)
+                        else:
+                            await _bulk_upsert_snapshot_items(session, db_rows)
 
                 # Second pass: per-message attachment capture. The main
                 # snapshot items hold the raw Graph objects; attachments are
@@ -12744,6 +12787,7 @@ class BackupWorker:
                         if isinstance(extra, dict) and isinstance(extra.get("raw"), dict)
                         and extra["raw"].get("attachments")
                         and not extra["raw"].get("_att_interleaved")
+                        and not extra["raw"].get("_att_persistence_failed")
                     ]
                     if chats_with_att:
                         # Fresh dedup scoped to this fallback batch. The
@@ -12775,10 +12819,9 @@ class BackupWorker:
                     # unmarked and fall through to this phase as a
                     # natural retry path.
                     # Two-tier filter for Phase-2 hostedContent retry (fix #2):
-                    #   * Tier A — interleave already attempted and populated
-                    #     m["hostedContents"] but the persist call failed; we
-                    #     retry here. `_hc_interleaved` stays unset on failure
-                    #     so this is the natural retry path.
+                    #   * Tier A — interleave populated hostedContents but
+                    #     its source download failed. Exhausted persistence
+                    #     is excluded below and keeps the snapshot incomplete.
                     #   * Tier B — interleave was disabled OR the per-msg
                     #     hostedContents GET hasn't been issued yet (e.g.
                     #     interleave was off, or fetch is deferred). Detect
@@ -12788,6 +12831,7 @@ class BackupWorker:
                         extra.get("raw") for (_t, _n, _e, extra, *_rest) in items_data
                         if isinstance(extra, dict) and isinstance(extra.get("raw"), dict)
                         and not extra["raw"].get("_hc_interleaved")
+                        and not extra["raw"].get("_hc_persistence_failed")
                         and (
                             extra["raw"].get("hostedContents")
                             or _msg_likely_has_hosted_content(extra["raw"])
@@ -12821,6 +12865,8 @@ class BackupWorker:
                         _msg_sem = asyncio.Semaphore(_msg_concurrency)
 
                         async def _one_msg(message: Dict[str, Any]) -> Tuple[int, int]:
+                            if message.get("_hc_persistence_failed"):
+                                return 0, 0
                             m_chat_id = (
                                 message.get("chatId")
                                 or (message.get("channelIdentity") or {}).get("channelId")
@@ -12857,18 +12903,30 @@ class BackupWorker:
                             if not hc_values:
                                 return 0, 0
                             async with _msg_sem:
-                                return await bw_self._userchats_backup_hosted_contents(
-                                    snapshot_id=snap_id_local,
-                                    user_id=user_id_local,
-                                    chat_id=m_chat_id,
-                                    message_id=message["id"],
-                                    hosted_contents=hc_values,
-                                )
+                                try:
+                                    return await bw_self._userchats_backup_hosted_contents(
+                                        snapshot_id=snap_id_local,
+                                        user_id=user_id_local,
+                                        chat_id=m_chat_id,
+                                        message_id=message["id"],
+                                        hosted_contents=hc_values,
+                                    )
+                                except Exception as exc:
+                                    if getattr(exc, "_chat_snapshot_persistence_failed", False):
+                                        message["_hc_persistence_failed"] = True
+                                    raise
 
                         hc_results = await asyncio.gather(
                             *[_one_msg(m) for m in msgs_with_hc], return_exceptions=True,
                         )
                         for r in hc_results:
+                            if isinstance(r, (SnapshotVanishedError, ChatCatalogueWorkLeaseMoved)):
+                                raise r
+                        for r in hc_results:
+                            if isinstance(r, Exception):
+                                await self._stamp_snapshot_degraded(snapshot.id,
+                                    "required chat hosted content failed: " + type(r).__name__)
+                                raise r
                             if isinstance(r, tuple):
                                 hc_items, hc_bytes = r
                                 # _userchats_backup_hosted_contents persists
@@ -12878,6 +12936,14 @@ class BackupWorker:
                                 # SnapshotItem list committed below).
                                 bytes_total += hc_bytes
                                 total_hosted_items += hc_items
+
+                    if any(isinstance(extra, dict) and isinstance(extra.get("raw"), dict)
+                           and (extra["raw"].get("_hc_persistence_failed")
+                                or extra["raw"].get("_att_persistence_failed"))
+                           for (_t, _n, _e, extra, *_rest) in items_data):
+                        await self._stamp_snapshot_degraded(snapshot.id,
+                            "required chat content persistence failed")
+                        raise RuntimeError("required chat content persistence failed")
 
                     # Fold in anything the Stage-2 interleave already
                     # processed so snapshot.item_count + bytes_added
@@ -12944,7 +13010,17 @@ class BackupWorker:
                                     graph_client, resource, snapshot, tenant, drive_id, file_items,
                                 )
 
-                if att_items:
+                if att_items and resource.type == ResourceType.USER_CHATS:
+                    from shared.snapshot_item_writes import snapshot_item_rows
+                    try:
+                        await _persist_chat_snapshot_items(snapshot_item_rows(att_items))
+                    except (ChatCatalogueWorkLeaseMoved, SnapshotVanishedError):
+                        raise
+                    except Exception as exc:
+                        await self._stamp_snapshot_degraded(snapshot.id,
+                            "required chat attachment persistence failed: " + type(exc).__name__)
+                        raise
+                elif att_items:
                     # Guard against IntegrityError on session.add_all(). If
                     # a rogue duplicate sneaks past the phase-level dedup
                     # (e.g., cross-resource race across parallel _backup_one
@@ -12970,21 +13046,8 @@ class BackupWorker:
                         # Per-row fallback via the same upsert helper
                         # Phase 1 uses. Any row that legitimately conflicts
                         # is silently skipped.
-                        att_rows = []
-                        for it in att_items:
-                            att_rows.append({
-                                "id": it.id,
-                                "snapshot_id": it.snapshot_id,
-                                "tenant_id": it.tenant_id,
-                                "external_id": it.external_id,
-                                "item_type": it.item_type,
-                                "name": it.name,
-                                "folder_path": it.folder_path,
-                                "content_hash": it.content_hash,
-                                "content_size": it.content_size,
-                                "content_checksum": it.content_checksum,
-                                "extra_data": it.extra_data,
-                            })
+                        from shared.snapshot_item_writes import snapshot_item_rows
+                        att_rows = snapshot_item_rows(att_items)
                         try:
                             async with async_session_factory() as session:
                                 await _bulk_upsert_snapshot_items(session, att_rows)
@@ -13011,26 +13074,9 @@ class BackupWorker:
                 # SeaweedFS blobs are tenant-deduped (no blob copies).
                 if resource.type.value == "USER_CHATS":
                     try:
-                        # Retried on transient DB faults (2026-10-16): the
-                        # copy is idempotent (NOT EXISTS + ON CONFLICT DO
-                        # NOTHING), and losing it silently strips every
-                        # incrementally-drained chat of its history in this
-                        # restore point.
-                        from shared.db_retry import (
-                            run_with_db_retry as _cf_db_retry,
-                        )
-
-                        async def _run_chat_carry_forward():
-                            return await _carry_forward_prior_chat_snapshot_items(
-                                tenant_id=str(tenant.id),
-                                resource_id=str(resource.id),
-                                target_snapshot_id=str(snapshot.id),
-                            )
-
-                        _cf = await _cf_db_retry(
-                            _run_chat_carry_forward,
-                            label=f"chat_carry_forward:{str(resource.id)[:8]}",
-                        )
+                        _cf = await _carry_forward_prior_chat_snapshot_items(
+                            tenant_id=str(tenant.id), resource_id=str(resource.id),
+                            target_snapshot_id=str(snapshot.id))
                         if isinstance(_cf, int) and _cf:
                             print(
                                 f"[{self.worker_id}] [USER_CHATS] "
@@ -14976,6 +15022,10 @@ class BackupWorker:
                 extra_data[k] = v
         clean["extra_data"] = extra_data
         clean.setdefault("id", uuid.uuid4())
+        from shared.snapshot_item_writes import CHAT_ITEM_TYPES
+        if clean.get("item_type") in CHAT_ITEM_TYPES:
+            await _persist_chat_snapshot_items([clean])
+            return
         async with async_session_factory() as session:
             session.add(SnapshotItem(**clean))
             await session.commit()
