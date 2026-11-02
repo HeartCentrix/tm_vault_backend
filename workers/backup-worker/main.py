@@ -6121,6 +6121,8 @@ class BackupWorker:
             # Detach so we can use these objects after the session closes.
             session.expunge_all()
         # Connection released to pool here.
+        message = dict(message)
+        message["_job_lease_token"] = int(job.lease_token or 0)
 
         if other_active is not None:
             other_id, other_job, other_started = other_active
@@ -15712,6 +15714,7 @@ class BackupWorker:
                     payload={
                         "drive_ids": shard_dids,
                         "site_id": resource.external_id,
+                        "owns_site_inventory": idx == 0,
                     },
                     shard_unit_count=len(shard_dids),  # unit: SharePoint drives
                     total_bytes_est=shard_bytes,
@@ -19727,7 +19730,8 @@ class BackupWorker:
             "tenantId": str(tenant_id),
             "type": "INCREMENTAL",
             "priority": 3,
-            "partitionFilter": {"driveIds": shard_drive_ids},
+            "partitionFilter": {"driveIds": shard_drive_ids,
+                "ownsSiteInventory": payload.get("owns_site_inventory", partition_index == 0)},
             "partitionId": str(partition_id),
             "partitionIndex": partition_index,
             "partitionTotal": total_partitions,
@@ -28614,11 +28618,14 @@ class BackupWorker:
         }
         drive_delta_tokens_by_site: Dict[str, Dict[str, str]] = _legacy_nested
 
+        from shared.sharepoint_scope import owns_site_inventory
+        _sp_owns_inventory = owns_site_inventory(message)
+        _subsite_enum_failed = False
         site_targets: List[tuple[str, str, Optional[str]]] = [
             (resource.external_id, resource.display_name, delta_token)
         ]
         try:
-            subsites = await graph_client.get_sharepoint_subsites(resource.external_id)
+            subsites = await graph_client.get_sharepoint_subsites(resource.external_id) if _sp_owns_inventory else {"value": []}
             for subsite in subsites.get("value", []):
                 subsite_id = (subsite.get("id") or "").replace(",", "/")
                 if not subsite_id:
@@ -28629,6 +28636,7 @@ class BackupWorker:
                     subsite_delta_tokens.get(subsite_id),
                 ))
         except Exception as exc:
+            _subsite_enum_failed = True
             logger.warning("Failed to enumerate SharePoint subsites for %s: %s", resource.display_name, exc)
 
         # ── Cross-replica partition split (Phase 3.3 — Tier-1) ──
@@ -28731,7 +28739,7 @@ class BackupWorker:
             "list_folders": 0,
             # Producers that died mid-walk (libraries/lists never
             # enumerated) — gates PARTIAL + the cursor hold.
-            "enum_fail": 0,
+            "enum_fail": int(_subsite_enum_failed),
             "new_delta": None,
             "new_subsite_tokens": {},
             # Per-(site, drive) delta tokens written by the multi-drive
@@ -28844,7 +28852,7 @@ class BackupWorker:
 
         async def list_producer(site_id: str, site_label: str):
             try:
-                lists_resp = await graph_client.get_sharepoint_site_lists(site_id)
+                lists_resp = await graph_client.get_sharepoint_site_lists(site_id, strict_rest=True)
             except Exception as exc:
                 # Same rule as drive_producer: an un-enumerated list set
                 # must not pass as a complete snapshot.
@@ -28855,22 +28863,13 @@ class BackupWorker:
                       f"finalize PARTIAL, cursors held")
                 return
 
-            # Derive hostname + site web URL once — every list on the site
-            # shares the same tenant host / site path.
-            sp_hostname: Optional[str] = None
-            sp_site_web_url: Optional[str] = None
-            for _l in (lists_resp.get("value") or []):
-                _wu = _l.get("webUrl") or ""
-                if _wu:
-                    from urllib.parse import urlparse as _up
-                    _p = _up(_wu)
-                    sp_hostname = _p.netloc
-                    _parts = _p.path.strip("/").split("/")
-                    if len(_parts) >= 2 and _parts[0] == "sites":
-                        sp_site_web_url = f"{_p.scheme}://{_p.netloc}/sites/{_parts[1]}"
-                    else:
-                        sp_site_web_url = f"{_p.scheme}://{_p.netloc}"
-                    break
+            # Exact web metadata comes from /sites/{id}, never from a list path.
+            from urllib.parse import urlsplit as _urlsplit
+            sp_site_web_url = lists_resp.get("_site_web_url")
+            if not sp_site_web_url:
+                stats["rest_enum_fail"] = stats.get("rest_enum_fail", 0) + 1
+                return
+            sp_hostname = _urlsplit(sp_site_web_url).hostname
 
             for lst in (lists_resp.get("value") or []):
                 lst_id = lst.get("id") or ""
@@ -29163,7 +29162,8 @@ class BackupWorker:
         producer_tasks = []
         for sid, slabel, stok in site_targets:
             producer_tasks.append(asyncio.create_task(drive_producer(sid, slabel, stok)))
-            producer_tasks.append(asyncio.create_task(list_producer(sid, slabel)))
+            if _sp_owns_inventory:
+                producer_tasks.append(asyncio.create_task(list_producer(sid, slabel)))
 
         print(f"[{self.worker_id}]   [SP_PIPELINE] producers={len(producer_tasks)} "
               f"drive_consumers={num_drive_consumers} rest_consumers={num_rest_consumers}")

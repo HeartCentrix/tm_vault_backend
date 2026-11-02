@@ -110,6 +110,9 @@ class _Policy:
         self.transient_exhausted = transient_exhausted
         self.transient_calls = 0
 
+    def for_operation(self):
+        return self
+
     def reset_on_success(self):
         return None
 
@@ -128,12 +131,8 @@ def _bare(script, monkeypatch, policy=None):
     pol = policy or _Policy()
     g._http_session = lambda: _Session(fake)
     g._effective_priority = lambda: 5
-    # NB: the _policy property reads getattr(self, "__policy_cached") — the
-    # UNMANGLED literal — while its setter writes the mangled
-    # _GraphClient__policy_cached. Injecting the mangled name (as
-    # test_graph_paged_token_refresh.py does) silently fails to take effect, so
-    # set the name the getter actually reads.
-    setattr(g, "__policy_cached", pol)
+    # Inject the operation policy at the production cache seam.
+    setattr(g, "_policy_cached", pol)
 
     async def _tok():
         return "tok"

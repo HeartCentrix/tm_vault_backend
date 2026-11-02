@@ -41,7 +41,12 @@ def request_context(owner, url, *, operation=None):
         if not parts or parts[0] not in ('v1.0', 'beta'):
             raise ValueError('unsupported Graph data route')
         parts = parts[1:]
-        if 'chats' in parts:
+        lowered = [part.lower() for part in parts]
+        if 'exchange' in lowered and 'mailboxes' in lowered:
+            workload = 'exchange'
+            i = lowered.index('mailboxes')
+            resource = 'mailbox:' + parts[i+1] if len(parts) > i+1 else None
+        elif 'chats' in parts:
             workload = 'teams'
             i = parts.index('chats')
             resource = 'chat:' + parts[i+1] if len(parts) > i+1 else None

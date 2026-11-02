@@ -53,7 +53,7 @@ def client_factory(monkeypatch):
 async def test_denial_after_page_is_not_successful_eof(client_factory):
     def route(req, n):
         if n == 1:
-            return httpx.Response(200, json={"value": [{"Id": 1}], "odata.nextLink": WEB + "/next"})
+            return httpx.Response(200, json={"value": [{"Id": 1}], "odata.nextLink": WEB + "/_api/web/lists(guid'list')/items?cursor=next"})
         return httpx.Response(403, json={"error": {"code": "accessDenied", "message": "private-url?token=secret"}})
     async with client_factory(route) as (client, state):
         rows = []
@@ -123,3 +123,40 @@ async def test_stream_target_checked_before_credentials(client_factory):
         with pytest.raises(ValueError):
             _ = [x async for x in client.stream_sharepoint_file_via_rest(HOST, "https://evil.invalid", "/x")]
         assert state["calls"] == state["tokens"] == 0
+
+
+from shared.provider_read import ProviderReadError
+
+
+async def test_list_discovery_preserves_exact_subweb_and_reports_rest_failure(monkeypatch):
+    gc = GraphClient('app', 'secret', 'tenant')
+    called = []
+    async def get(url, params=None, **kwargs):
+        if url.endswith('/lists'):
+            return {'value': [{'id': 'list', 'webUrl': 'https://tenant.sharepoint.com/sites/main/sub/Lists/L'}]}
+        return {'webUrl': 'https://tenant.sharepoint.com/sites/main/sub'}
+    async def rest(host, url):
+        called.append((host, url))
+        raise ProviderReadError('list_collection', status=403)
+    monkeypatch.setattr(gc, '_get', get)
+    monkeypatch.setattr(gc, '_get_sharepoint_lists_via_rest', rest)
+    with pytest.raises(ProviderReadError):
+        await gc.get_sharepoint_site_lists('tenant.sharepoint.com,collection,web', strict_rest=True)
+    assert called == [('tenant.sharepoint.com', 'https://tenant.sharepoint.com/sites/main/sub')]
+
+
+async def test_rest_collection_follows_all_pages_and_detects_multi_page_cycle(monkeypatch):
+    gc = GraphClient('app', 'secret', 'tenant')
+    calls = []
+    async def unexpected_token(*args):
+        pytest.fail('list discovery bypassed bounded REST reader')
+    monkeypatch.setattr(gc, '_get_sharepoint_token', unexpected_token)
+    first = 'https://tenant.sharepoint.com/sites/sub/_api/web/lists'
+    second = first + '?cursor=two'
+    async def page(host, url, **kwargs):
+        calls.append(url)
+        return {'value': [{'Id': '1' if url == first else '2'}], '@odata.nextLink': second if url == first else first}
+    monkeypatch.setattr(gc, '_sharepoint_rest_json', page)
+    with pytest.raises(ProviderReadError):
+        await gc._get_sharepoint_lists_via_rest('tenant.sharepoint.com', 'https://tenant.sharepoint.com/sites/sub')
+    assert calls == [first, second]

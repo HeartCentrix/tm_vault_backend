@@ -3357,7 +3357,7 @@ class GraphClient:
             raise RuntimeError(f"Could not resolve SharePoint hostname from root site: {root}")
         return parsed.netloc
 
-    async def get_sharepoint_site_lists(self, site_id: str) -> Dict[str, Any]:
+    async def get_sharepoint_site_lists(self, site_id: str, *, strict_rest: bool = False) -> Dict[str, Any]:
         """
         Get SharePoint site lists.
         Graph API: GET /sites/{site-id}/lists
@@ -3388,46 +3388,25 @@ class GraphClient:
         graph_lists = graph_result.get("value") or []
         seen_ids = {l.get("id") for l in graph_lists if l.get("id")}
 
-        # SharePoint REST pass — picks up system / _catalogs lists that
-        # Graph silently filters. Best-effort: if auth/site-URL lookup
-        # fails we still return whatever Graph gave us.
+        # The site's own metadata is authoritative. A list URL cannot prove
+        # its web root: /sites/Root/Sub/Lists/X must retain /Sub.
         sp_lists: List[Dict[str, Any]] = []
+        site_web_url = None
         try:
-            # Derive site URL from the composite id:
-            #   "qfion.sharepoint.com,<scid>,<webid>" → "qfion.sharepoint.com"
-            parts = site_id.replace(",", "/").split("/")
-            hostname = parts[0] if parts else ""
-            if hostname:
-                # The site's webUrl lives on the Graph response itself.
-                # First look for the root site in the existing Graph
-                # result; otherwise fetch it.
-                site_web_url = None
-                for l in graph_lists:
-                    # parentReference.siteUrl isn't a standard field but
-                    # webUrl of any list lets us derive the site root.
-                    web_url = l.get("webUrl") or ""
-                    if web_url:
-                        # https://<host>/... → strip any /Lists/... suffix
-                        from urllib.parse import urlparse
-                        parsed = urlparse(web_url)
-                        site_web_url = f"{parsed.scheme}://{parsed.netloc}"
-                        # Include site path if present (e.g. /sites/Foo).
-                        path_parts = parsed.path.strip("/").split("/")
-                        if len(path_parts) >= 2 and path_parts[0] == "sites":
-                            site_web_url += f"/sites/{path_parts[1]}"
-                        break
-                # Fallback to Graph's /sites/{id}?$select=webUrl
-                if not site_web_url:
-                    site_meta = await self._get(
-                        f"{self.GRAPH_URL}/sites/{graph_site_id}",
-                        params={"$select": "webUrl"},
-                    )
-                    site_web_url = site_meta.get("webUrl")
-
-                if site_web_url:
-                    sp_lists = await self._get_sharepoint_lists_via_rest(hostname, site_web_url)
+            site_meta = await self._get(
+                f"{self.GRAPH_URL}/sites/{graph_site_id}", params={"$select": "webUrl"})
+            site_web_url = site_meta.get("webUrl")
+            if not isinstance(site_web_url, str) or not site_web_url:
+                raise ProviderReadError("missing_site_web_url")
+            hostname = urlsplit(site_web_url).hostname or ""
+            self._assert_sharepoint_target(hostname, site_web_url)
+            sp_lists = await self._get_sharepoint_lists_via_rest(hostname, site_web_url)
         except Exception as exc:
-            print(f"[GraphClient] SP REST lists fetch failed for {site_id}: {type(exc).__name__}: {exc}")
+            from shared.provider_admission import ProviderDeferred
+            if strict_rest or isinstance(exc, ProviderDeferred):
+                raise
+            logger.warning("SharePoint supplemental list discovery failed: %s", type(exc).__name__)
+        graph_result["_site_web_url"] = site_web_url
 
         # Merge — prefer Graph's shape when both sources have the same id.
         merged = list(graph_lists)
@@ -3611,28 +3590,12 @@ class GraphClient:
         Returns list objects normalised to roughly the Graph shape so
         callers don't need to know which source each list came from.
         """
-        token = await self._get_sharepoint_token(hostname)
         url = f"{site_web_url.rstrip('/')}/_api/web/lists"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json;odata=nometadata",
-        }
-        # `$select` reduces response size + matches what Graph gives us.
-        params = {
-            "$top": "5000",
-            "$select": "Id,Title,Description,DefaultViewUrl,Created,LastItemModifiedDate,BaseTemplate,Hidden,IsCatalog,IsSystemList",
-        }
-
-        async with self._http_session() as client:
-            _assert_graph_target(url)  # Check 17 SSRF guard
-            resp = await client.get(url, headers=headers, params=params)
-            if resp.status_code == 403 or resp.status_code == 401:
-                print(f"[GraphClient] SP REST denied for {site_web_url} (status={resp.status_code}); is AllSites.Read granted on THIS app registration?")
-                return []
-            resp.raise_for_status()
-            data = resp.json()
-
-        raw = data.get("value") or data.get("d", {}).get("results") or []
+        params = {"$top": "1000",
+            "$select": "Id,Title,Description,DefaultViewUrl,Created,LastItemModifiedDate,BaseTemplate,Hidden,IsCatalog,IsSystemList"}
+        raw = []
+        async for row in self._iter_sharepoint_rest_rows(hostname, url, params=params, stage="list_collection"):
+            raw.append(row)
         out: List[Dict[str, Any]] = []
         # Derive a Graph-style composite site id from the webUrl so callers
         # that key on list.id can still join this back to the site row.
@@ -3731,21 +3694,32 @@ class GraphClient:
                 "$top": str(page_size),
                 "$select": "Id,FileRef,FileLeafRef,FileSystemObjectType",
             }
-        next_url: Optional[str] = url
+        async for row in self._iter_sharepoint_rest_rows(hostname, url, params=params, stage="list_page"):
+            yield row
+
+    async def _iter_sharepoint_rest_rows(self, hostname, url, *, params, stage):
+        next_url, seen = url, set()
         while next_url:
-            data = await self._sharepoint_rest_json(
-                hostname, next_url, params=params, stage="list_page",
-            )
+            parsed = urlsplit(next_url)
+            origin = urlsplit(url)
+            if parsed.path != origin.path:
+                raise ProviderReadError("page_cursor_changed_collection")
+            fingerprint = hashlib.sha256(next_url.encode()).digest()
+            if fingerprint in seen:
+                raise ProviderReadError("page_cursor_cycle")
+            seen.add(fingerprint)
+            data = await self._sharepoint_rest_json(hostname, next_url, params=params, stage=stage)
             rows = data.get("value")
+            if rows is None and isinstance(data.get("d"), dict):
+                rows = data["d"].get("results")
             if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
                 raise ProviderReadError("invalid_page_payload")
             for row in rows:
                 yield row
-            following = data.get("odata.nextLink") or data.get("@odata.nextLink")
-            if following is not None and (not isinstance(following, str) or following == next_url):
+            following = data.get("odata.nextLink") or data.get("@odata.nextLink") or (data.get("d") or {}).get("__next")
+            if following is not None and (not isinstance(following, str) or not following):
                 raise ProviderReadError("invalid_page_cursor")
-            next_url = following
-            params = None
+            next_url, params = following, None
 
     @staticmethod
     def _assert_sharepoint_target(hostname: str, url: str) -> None:
