@@ -44,6 +44,7 @@ Pinned by tests/shared/test_db_retry_transient_classification.py.
 from __future__ import annotations
 
 import asyncio
+import random
 from typing import Any, Optional
 
 # Connection-layer / resource-layer failures. Every one of these means
@@ -246,33 +247,56 @@ async def run_with_db_retry(
     raise last  # type: ignore[misc]
 
 
-def is_retryable_catalogue_transaction_error(exc: Optional[BaseException]) -> bool:
-    """Only deadlock/serialization SQLSTATEs permit a full catalogue retry.
-
-    The first database code wins; an already-aborted transaction cannot inherit
-    retry eligibility from an earlier error left in its exception context.
-    """
+def first_db_sqlstate(exc: Optional[BaseException]) -> Optional[str]:
+    """Return the first actual code, without inheriting an older error's policy."""
     for link in _chain(exc):
         code = getattr(link, "sqlstate", None) or getattr(link, "pgcode", None)
         if code:
-            return code in {"40P01", "40001"}
-    return False
+            return code
+    return None
 
 
-async def run_catalogue_transaction(session_factory, operation, attempts=3):
-    """Run a DB-only operation in a fresh session/transaction on every attempt.
+def is_retryable_db_transaction_error(exc: Optional[BaseException]) -> bool:
+    """Only deadlock/serialization aborts permit full owned-transaction replay."""
+    return first_db_sqlstate(exc) in {"40P01", "40001"}
 
-    Never pass Graph, storage or other externally side-effecting operations.
-    Existing generic retry classification and callers remain unchanged.
+
+def is_retryable_catalogue_transaction_error(exc: Optional[BaseException]) -> bool:
+    """Compatibility predicate for existing catalogue callers."""
+    return is_retryable_db_transaction_error(exc)
+
+
+async def run_owned_db_operation(operation, attempts=3):
+    """Retry a DB-only operation that owns and closes a fresh transaction.
+
+    Each invocation must close/roll back its session before raising. Graph,
+    storage and other external side effects must stay outside the operation.
     """
     if type(attempts) is not int or attempts < 1:
         raise ValueError("attempts must be a positive integer")
+    attempts = min(attempts, 3)
     for number in range(attempts):
         try:
-            async with session_factory() as session:
-                async with session.begin():
-                    return await operation(session)
+            return await operation()
         except Exception as exc:
-            if number + 1 == attempts or not is_retryable_catalogue_transaction_error(exc):
+            if number + 1 == attempts or not is_retryable_db_transaction_error(exc):
                 raise
-            await asyncio.sleep(min(0.5, 0.05 * 2 ** min(number, 4)))
+            await asyncio.sleep(random.uniform(0.05, min(0.5, 0.05 * 2 ** (number + 1))))
+
+
+async def run_db_transaction(session_factory, operation, attempts=3):
+    """Run a DB-only operation in a fresh session/transaction on each attempt.
+
+    The operation receives the session and must not commit or roll it back.
+    Only full transaction aborts are retried; other error policies are unchanged.
+    """
+    async def owned_operation():
+        async with session_factory() as session:
+            async with session.begin():
+                return await operation(session)
+    return await run_owned_db_operation(owned_operation, attempts=attempts)
+
+
+async def run_catalogue_transaction(session_factory, operation, attempts=3):
+    """Compatibility entry point for existing catalogue DB-only transactions."""
+    return await run_db_transaction(session_factory, operation, attempts=attempts)

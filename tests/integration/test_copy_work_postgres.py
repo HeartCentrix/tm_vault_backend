@@ -198,3 +198,12 @@ async def test_new_leaf_generation_reopens_abandoned_capture_without_old_task_re
     async with store.factory.begin() as db:
         chosen=await api().claim(db,owner_id=uuid4())
         assert chosen.task_id==retry.id
+
+
+async def test_execution_budget_provenance_does_not_change_intent_identity(store):
+    first = await request(store)
+    async with store.factory.begin() as db:
+        again = await api().enqueue(db, api().CopyRequest(kind=first.kind, lane=first.lane,
+            target_snapshot_id=first.params['target_snapshot_id'],
+            params={**first.params, '_copy_execution_budget_v1': True}))
+        assert again.id == first.id

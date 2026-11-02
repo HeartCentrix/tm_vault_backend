@@ -9,11 +9,13 @@ from shared.copy_workflow import copy_work_guards_enabled
 _POLICY_LIMIT = 32
 _GAP_CODES = (
     'copy_admission_timeout', 'copy_parent_cancelled', 'copy_parent_terminal',
-    'copy_cancelled', 'copy_statement_timeout', 'copy_deadlock', 'copy_execution_failed',
+    'copy_cancelled', 'copy_statement_timeout', 'copy_deadlock', 'copy_serialization_failure',
+    'copy_execution_failed', 'copy_execution_unsettled',
 )
 _WAIT_CODES = (
     'copy_resource_busy', 'copy_target_busy', 'copy_tenant_busy', 'copy_lane_busy',
     'copy_aggregate_busy', 'copy_protocol_disabled', 'copy_lock_timeout', 'copy_admission_wait',
+    'copy_deadlock', 'copy_serialization_failure',
 )
 _COUNTS = """
     COUNT(*) FILTER (WHERE state IN ('READY','RUNNING','CAPTURING')) AS pending_tasks,

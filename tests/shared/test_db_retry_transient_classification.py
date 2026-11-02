@@ -256,3 +256,44 @@ def test_db_error_label_is_bounded_and_names_the_class():
     label = db_error_label(ConnectionDoesNotExistError("x" * 900))
     assert label.startswith("ConnectionDoesNotExistError: ")
     assert len(label) < 400
+
+
+@pytest.mark.parametrize("code,expected", [
+    ("40P01", True), ("40001", True), ("25P02", False),
+    ("23503", False), ("57014", False), ("08006", False),
+])
+def test_shared_transaction_classifier_uses_first_actual_sqlstate(code, expected):
+    from shared.db_retry import first_db_sqlstate, is_retryable_db_transaction_error
+    previous = RuntimeError("previous serialization failure")
+    previous.sqlstate = "40001"
+    current = RuntimeError("current database failure")
+    current.pgcode = code
+    current.__context__ = previous
+    wrapped = DBAPIError("database operation failed", orig=current)
+    assert first_db_sqlstate(wrapped) == code
+    assert is_retryable_db_transaction_error(wrapped) is expected
+
+
+def test_shared_transaction_classifier_walks_cause_beyond_codeless_orig():
+    from shared.db_retry import first_db_sqlstate, is_retryable_db_transaction_error
+    wrapped = DBAPIError("wrapper", orig=RuntimeError("no database code"))
+    cause = RuntimeError("serialization failure")
+    cause.sqlstate = "40001"
+    wrapped.__cause__ = cause
+    assert first_db_sqlstate(wrapped) == "40001"
+    assert is_retryable_db_transaction_error(wrapped)
+    assert first_db_sqlstate(None) is None
+
+
+@pytest.mark.parametrize("code", ["40P01", "40001", "25P02"])
+def test_generic_retry_does_not_adopt_transaction_abort_policy(code):
+    calls = []
+    error = RuntimeError("transaction error")
+    error.sqlstate = code
+    async def operation():
+        calls.append(code)
+        raise error
+    with pytest.raises(RuntimeError) as raised:
+        _run(run_with_db_retry(operation, attempts=3, base_delay=0))
+    assert raised.value is error
+    assert calls == [code]

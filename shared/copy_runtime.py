@@ -9,7 +9,7 @@ import logging
 import math
 from uuid import uuid4
 
-from sqlalchemy import and_, exists, func, or_, select, text, update
+from sqlalchemy import and_, case, exists, func, or_, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from shared import copy_admission, copy_work, copy_workflow
@@ -118,7 +118,11 @@ class CopyWorkRunner:
                     CopyWorkTask.generation == claim.generation).values(
                         state='READY', lease_owner_id=None, lease_expires_at=None,
                         ready_at=func.clock_timestamp(), queue_entered_at=func.clock_timestamp(),
-                        attempts=func.greatest(CopyWorkTask.attempts - 1, 0)))
+                        # Cancellation cannot prove that SQL never executed.
+                        # Keep v1 reservations until a committed checkpoint or
+                        # explicit nonexecution/capacity settlement clears them.
+                        attempts=case((CopyWorkTask.params.op('->>')('_copy_execution_budget_v1') == 'true',
+                            CopyWorkTask.attempts), else_=func.greatest(CopyWorkTask.attempts - 1, 0))))
         except Exception as exc:
             logger.warning('copy_shutdown_release_failed task_id=%s error_type=%s', claim.task_id, type(exc).__name__)
 

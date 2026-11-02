@@ -1,7 +1,9 @@
 """Bounded SQL batches with transactional physical capacity and owner fences."""
+import asyncio
 from dataclasses import dataclass
 from datetime import timedelta
 import hashlib
+import random
 from time import monotonic
 
 from sqlalchemy import func, select, text
@@ -10,6 +12,7 @@ from sqlalchemy.dialects.postgresql import insert
 from shared import copy_executor
 from shared.copy_work import ACTIVE_WORKFLOWS, CopyClaim
 from shared.database import CARRY_FORWARD_BUCKETS, GIANT_CARRY_FORWARD_BUCKETS
+from shared.db_retry import first_db_sqlstate
 from shared.models import CopyWorkControl, CopyWorkflow, CopyWorkTask, Job, Snapshot, SnapshotPartition
 
 
@@ -34,6 +37,10 @@ class _ParentEnded(Exception):
     pass
 
 
+class _ExecutionUnsettled(Exception):
+    pass
+
+
 class _Deferred(Exception):
     def __init__(self, code):
         self.code = code
@@ -46,17 +53,6 @@ def _status(row):
 def _lock_key(*parts):
     return int.from_bytes(hashlib.blake2s(':'.join(map(str, parts)).encode(), digest_size=4).digest(),
                           byteorder='big', signed=True)
-
-
-def _sqlstate(exc):
-    seen = set()
-    while exc is not None and id(exc) not in seen:
-        seen.add(id(exc))
-        state = getattr(exc, 'sqlstate', None) or getattr(exc, 'pgcode', None)
-        if state:
-            return state
-        exc = getattr(exc, 'orig', None) or exc.__cause__ or exc.__context__
-    return None
 
 
 async def _settings(session, claim, statement_timeout_ms, lock_timeout_ms):
@@ -142,7 +138,7 @@ async def _physical_guards(session, task, workflow, control):
         raise _Deferred('copy_aggregate_busy')
 
 
-async def _settle(factory, claim, *, status, error, queued_seconds=0.0, spend_attempt=True, execution_s=0.0):
+async def _settle_once(factory, claim, *, status, error, queued_seconds=0.0, spend_attempt=True, execution_s=0.0):
     """Fresh transaction after rollback; never release a replacement's claim."""
     try:
         async with factory.begin() as session:
@@ -160,7 +156,12 @@ async def _settle(factory, claim, *, status, error, queued_seconds=0.0, spend_at
             if status == 'DEFERRED':
                 previous=(task.error or {}).get('execution_failures',0)
                 failures=previous if type(previous) is int and 0<=previous<=3 else 0
-                if spend_attempt: failures+=1
+                if spend_attempt:
+                    if (task.params or {}).get('_copy_execution_budget_v1') is True:
+                        # A prior expired claim may have executed but failed to
+                        # settle. Its committed reservation survives rollback.
+                        failures = max(failures, task.attempts - 1)
+                    failures += 1
                 if failures:
                     error={**error,'execution_failures':failures}
                     if failures>=3: status='FAILED'
@@ -178,10 +179,17 @@ async def _settle(factory, claim, *, status, error, queued_seconds=0.0, spend_at
         return status
     except _Stale:
         return 'STALE'
-    except Exception as exc:
-        if _sqlstate(exc) in {'55P03', '57014', '40P01'}:
-            return 'DEFERRED'
-        raise
+
+
+async def _settle(factory, claim, **kwargs):
+    """Retry only settlement; DEFERRED always means its READY update committed."""
+    for attempt in range(3):
+        try:
+            return await _settle_once(factory, claim, **kwargs)
+        except Exception as exc:
+            if attempt == 2 or first_db_sqlstate(exc) not in {'55P03', '57014', '40P01', '40001'}:
+                raise
+            await asyncio.sleep(random.uniform(0.05, min(0.5, 0.05 * 2 ** (attempt + 1))))
 
 
 async def run_batch(factory, claim: CopyClaim, *, batch_size=512,
@@ -203,6 +211,10 @@ async def run_batch(factory, claim: CopyClaim, *, batch_size=512,
                 if task.wait_max_s and task.cumulative_wait_s >= task.wait_max_s:
                     raise _Deferred('copy_admission_timeout')
                 await _physical_guards(session, task, workflow, control)
+                if (task.params or {}).get('_copy_execution_budget_v1') is True and task.attempts > 3:
+                    # Unsettled expired claims cannot prove nonexecution. Stop
+                    # before a fourth execution, without diagnosing a deadlock.
+                    raise _ExecutionUnsettled
                 query_started = monotonic()
                 if not task.prepared:
                     await copy_executor.prepare_manifest(session, task)
@@ -216,12 +228,18 @@ async def run_batch(factory, claim: CopyClaim, *, batch_size=512,
                 task.state = 'COMPLETED' if result['done'] else 'READY'
                 task.lease_owner_id = task.lease_expires_at = None
                 task.error = None
+                task.attempts = 0
                 if not result['done']:
                     task.ready_at = task.queue_entered_at = await session.scalar(select(func.clock_timestamp()))
                 status = task.state
             return BatchResult(status, claim.task_id, result['rows'], result['bytes'], query_seconds)
         except _Stale:
             return BatchResult('STALE', claim.task_id, query_seconds=query_seconds)
+        except _ExecutionUnsettled:
+            status = await _settle(factory, claim, status='FAILED',
+                error={'code': 'copy_execution_unsettled', 'execution_failures': 3},
+                execution_s=query_seconds)
+            return BatchResult(status, claim.task_id, query_seconds=query_seconds)
         except (_Cancelled, _ParentEnded) as exc:
             status = await _settle(factory, claim, status='CANCELLED' if isinstance(exc, _Cancelled) else 'FAILED',
                 error={'code': 'copy_parent_cancelled' if isinstance(exc, _Cancelled) else 'copy_parent_terminal'},execution_s=query_seconds)
@@ -233,14 +251,18 @@ async def run_batch(factory, claim: CopyClaim, *, batch_size=512,
         except Exception as exc:
             if query_started is not None:
                 query_seconds += monotonic() - query_started
-            state = _sqlstate(exc)
-            if state in {'40P01', '57014'} and attempt < 3:
+            state = first_db_sqlstate(exc)
+            if state == '57014' and attempt < 3:
                 continue
-            if state == '55P03':
+            if state in {'40P01', '40001'}:
+                code = 'copy_deadlock' if state == '40P01' else 'copy_serialization_failure'
+                status = await _settle(factory, claim, status='DEFERRED',
+                    error={'code': code, 'sqlstate': state}, execution_s=query_seconds)
+            elif state == '55P03':
                 status = await _settle(factory, claim, status='DEFERRED',
                     error={'code': 'copy_lock_timeout'}, spend_attempt=query_started is not None,execution_s=query_seconds)
             else:
-                code = {'57014': 'copy_statement_timeout', '40P01': 'copy_deadlock'}.get(state, 'copy_execution_failed')
+                code = 'copy_statement_timeout' if state == '57014' else 'copy_execution_failed'
                 error = {'code': code}
                 if state:
                     error.update(sqlstate=state, attempts=attempt)

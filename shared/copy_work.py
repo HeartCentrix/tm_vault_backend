@@ -141,6 +141,7 @@ async def enqueue(session, request: CopyRequest) -> CopyWorkTask:
             plan.expected_count, plan.published_count = 0, 0
     from shared.database import CARRY_FORWARD_WAIT_MAX_S
     params = {**request.params, 'target_snapshot_id': str(snapshot.id)}
+    params.pop('_copy_execution_budget_v1', None)
     # Derived source evidence is not part of the producer's idempotency key.
     # Re-enqueueing a returned task's params must reuse its original intent.
     source_fixed = params.pop('_copy_source_fixed', False)
@@ -272,6 +273,12 @@ async def claim(session, *, owner_id, lease_seconds=90) -> CopyClaim | None:
     if task.wait_max_s and task.cumulative_wait_s >= task.wait_max_s:
         task.state, task.error = 'FAILED', {'code': 'copy_admission_timeout'}
         return None
+    if (task.params or {}).get('_copy_execution_budget_v1') is not True:
+        # Earlier attempts were lifetime claim counts. Start per-checkpoint
+        # reservations from known failures, preserving old prepared manifests.
+        previous = (task.error or {}).get('execution_failures', 0)
+        task.attempts = previous if type(previous) is int and 0 <= previous <= 3 else 0
+        task.params = {**(task.params or {}), '_copy_execution_budget_v1': True}
     task.state = 'RUNNING'
     task.generation += 1
     task.lease_owner_id = _uuid(owner_id)

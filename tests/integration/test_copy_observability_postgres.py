@@ -149,3 +149,17 @@ async def test_parent_retry_obligation_remains_visible_after_copy_tasks_finish(p
         await db.execute(text("UPDATE copy_workflows SET parent_settle_pending=true WHERE id=:w"),
                          {"w":await db.scalar(text("SELECT id FROM copy_workflows LIMIT 1"))})
     assert (await progress_db.summary())["state"] == "WAITING_RESUME"
+
+
+@pytest.mark.parametrize("code", ["copy_deadlock", "copy_serialization_failure"])
+async def test_transaction_abort_wait_and_exhaustion_keep_typed_reason(progress_db, code):
+    await progress_db.task("READY", code=code)
+    await progress_db.task("FAILED", code=code)
+    summary = await progress_db.summary()
+    assert summary["wait_reasons"] == {code: 1}
+    assert summary["gap_counts"] == {code: 1}
+
+
+async def test_unsettled_execution_exhaustion_has_honest_typed_gap(progress_db):
+    await progress_db.task("FAILED", code="copy_execution_unsettled")
+    assert (await progress_db.summary())["gap_counts"] == {"copy_execution_unsettled": 1}

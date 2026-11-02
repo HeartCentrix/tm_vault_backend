@@ -292,23 +292,93 @@ async def test_resource_exclusion_and_per_tenant_capacity_are_server_held(store,
         await asyncio.gather(execution, return_exceptions=True)
 
 
-async def test_deadlock_retry_rolls_back_copied_rows_before_fresh_transaction(store, monkeypatch):
-    target, task_id, claim = await queued(store)
-    original, calls = copy_executor.copy_manifest_batch, 0
-    async def transient(db, task, **kwargs):
+@pytest.mark.parametrize(('sqlstate', 'code'), [
+    ('40P01', 'copy_deadlock'), ('40001', 'copy_serialization_failure'),
+])
+async def test_transaction_abort_requeues_once_and_persists_budget_across_restart_and_capacity(
+        store, monkeypatch, sqlstate, code):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    target, task_id, current = await queued(store, capacity=1)
+    original, calls, transactions = copy_executor.copy_manifest_batch, 0, []
+    async def abort_after_copy(db, task, **kwargs):
         nonlocal calls
         calls += 1
+        transactions.append(await db.scalar(text('SELECT txid_current()')))
+        await original(db, task, **kwargs)
+        await db.execute(text(f"DO $$ BEGIN RAISE EXCEPTION USING ERRCODE='{sqlstate}'; END $$"))
+    monkeypatch.setattr(copy_executor, 'copy_manifest_batch', abort_after_copy)
+
+    async def reclaim():
+        async with store.factory.begin() as db:
+            task = await db.get(models.CopyWorkTask, task_id)
+            task.ready_at = await db.scalar(select(func.clock_timestamp()))
+        async with store.factory.begin() as db:
+            result = await copy_work.claim(db, owner_id=uuid4())
+            assert result is not None
+            return result
+
+    for failures in range(1, 4):
+        # A recreated factory has no in-memory retry history, as after restart.
+        restarted = async_sessionmaker(store.engine, expire_on_commit=False)
+        result = await api().run_batch(restarted, current)
+        assert calls == failures
+        assert result.status == ('FAILED' if failures == 3 else 'DEFERRED')
+        async with store.factory.begin() as db:
+            task = await db.get(models.CopyWorkTask, task_id)
+            assert task.error == {'code': code, 'sqlstate': sqlstate, 'execution_failures': failures}
+            assert task.state == ('FAILED' if failures == 3 else 'READY')
+            assert task.checkpoint == task.row_count == 0 and not task.prepared
+            assert task.lease_owner_id is task.lease_expires_at is None
+            assert await db.scalar(select(func.count()).select_from(models.SnapshotItem)
+                .where(models.SnapshotItem.snapshot_id == target.snapshot_id)) == 0
+            # Both physical permits are free while ready_at still delays retry.
+            assert await db.scalar(text('SELECT pg_try_advisory_xact_lock(420018,1000000)'))
+            assert await db.scalar(text('SELECT pg_try_advisory_xact_lock(420020,0)'))
+            if failures < 3:
+                assert task.ready_at > await db.scalar(select(func.clock_timestamp()))
+        if failures == 1:
+            current = await reclaim()
+            async with store.factory.begin() as holder:
+                assert await holder.scalar(text('SELECT pg_try_advisory_xact_lock(420018,1000000)'))
+                assert (await api().run_batch(restarted, current)).status == 'DEFERRED'
+            async with store.factory() as db:
+                task = await db.get(models.CopyWorkTask, task_id)
+                assert task.error == {'code': 'copy_lane_busy', 'execution_failures': 1}
+                assert task.attempts == 1
+            assert calls == 1
+        if failures < 3:
+            current = await reclaim()
+    assert len(set(transactions)) == 3
+
+
+async def test_successful_checkpoint_clears_execution_failure_budget(store, monkeypatch):
+    _, task_id, current = await queued(store, rows=3)
+    original, fail_next = copy_executor.copy_manifest_batch, True
+    async def sometimes_abort(db, task, **kwargs):
+        nonlocal fail_next
         result = await original(db, task, **kwargs)
-        if calls < 3:
-            await db.execute(text("DO $$ BEGIN RAISE EXCEPTION USING ERRCODE='40P01'; END $$"))
+        if fail_next:
+            fail_next = False
+            await db.execute(text("DO $$ BEGIN RAISE EXCEPTION USING ERRCODE='40001'; END $$"))
         return result
-    monkeypatch.setattr(copy_executor, 'copy_manifest_batch', transient)
-    result = await api().run_batch(store.factory, claim)
-    assert result.status == 'COMPLETED' and result.rows == 2 and calls == 3
+    monkeypatch.setattr(copy_executor, 'copy_manifest_batch', sometimes_abort)
+    assert (await api().run_batch(store.factory, current, batch_size=1)).status == 'DEFERRED'
+    async with store.factory.begin() as db:
+        task = await db.get(models.CopyWorkTask, task_id)
+        task.ready_at = await db.scalar(select(func.clock_timestamp()))
+    async with store.factory.begin() as db:
+        current = await copy_work.claim(db, owner_id=uuid4())
+    assert (await api().run_batch(store.factory, current, batch_size=1)).status == 'READY'
+    async with store.factory.begin() as db:
+        task = await db.get(models.CopyWorkTask, task_id)
+        assert task.error is None and task.checkpoint == task.row_count == 1
+        current = await copy_work.claim(db, owner_id=uuid4())
+    fail_next = True
+    assert (await api().run_batch(store.factory, current, batch_size=1)).status == 'DEFERRED'
     async with store.factory() as db:
-        assert (await db.get(models.CopyWorkTask, task_id)).row_count == 2
-        assert await db.scalar(select(func.count()).select_from(models.SnapshotItem)
-            .where(models.SnapshotItem.snapshot_id == target.snapshot_id)) == 2
+        task = await db.get(models.CopyWorkTask, task_id)
+        assert task.error['execution_failures'] == 1
+        assert task.checkpoint == task.row_count == 1
 
 
 async def test_unknown_error_stores_typed_code_without_provider_urls(store, monkeypatch):
@@ -371,3 +441,202 @@ async def test_repeated_sql_lock_failures_are_bounded_without_spending_capacity_
             async with store.factory.begin() as db:
                 current=await copy_work.claim(db,owner_id=uuid4())
     assert states==['DEFERRED','DEFERRED','FAILED']
+
+
+async def test_settlement_contention_retries_without_replaying_copy_and_survives_restart(store, monkeypatch):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    module = api()
+    _, task_id, current = await queued(store, capacity=1)
+    original_settle, original_sleep = module._settle, asyncio.sleep
+    copy_calls, settlement_waits = 0, []
+    holder_session = None
+    async def abort(db, task, **kwargs):
+        nonlocal copy_calls
+        copy_calls += 1
+        await db.execute(text("DO $$ BEGIN RAISE EXCEPTION USING ERRCODE='40001'; END $$"))
+    async def contend(factory, claim, **kwargs):
+        nonlocal holder_session
+        async with factory.begin() as holder:
+            holder_session = holder
+            await holder.scalar(select(models.CopyWorkTask).where(
+                models.CopyWorkTask.id == task_id).with_for_update())
+            return await original_settle(factory, claim, **kwargs)
+    async def release_after_failed_settlement(delay):
+        settlement_waits.append(delay)
+        await holder_session.rollback()
+        async with store.factory.begin() as observer:
+            assert await observer.scalar(text('SELECT pg_try_advisory_xact_lock(420018,1000000)'))
+            assert await observer.scalar(text('SELECT pg_try_advisory_xact_lock(420020,0)'))
+        await original_sleep(0)
+    monkeypatch.setattr(copy_executor, 'copy_manifest_batch', abort)
+    monkeypatch.setattr(module, '_settle', contend)
+    monkeypatch.setattr(asyncio, 'sleep', release_after_failed_settlement)
+    states = []
+    for failures in range(1, 4):
+        restarted = async_sessionmaker(store.engine, expire_on_commit=False)
+        result = await module.run_batch(restarted, current)
+        states.append(result.status)
+        assert copy_calls == failures
+        async with restarted.begin() as db:
+            task = await db.get(models.CopyWorkTask, task_id)
+            assert task.error == {'code': 'copy_serialization_failure', 'sqlstate': '40001',
+                                  'execution_failures': failures}
+            assert task.state == ('FAILED' if failures == 3 else 'READY')
+            assert task.lease_owner_id is task.lease_expires_at is None
+            if failures < 3:
+                task.ready_at = await db.scalar(select(func.clock_timestamp()))
+        if failures < 3:
+            async with restarted.begin() as db:
+                current = await copy_work.claim(db, owner_id=uuid4())
+                assert current is not None
+    assert states == ['DEFERRED', 'DEFERRED', 'FAILED']
+    assert len(settlement_waits) == 3
+
+
+@pytest.mark.parametrize('sqlstate', ['55P03', '57014', '40P01', '40001'])
+async def test_settlement_retry_exhaustion_is_reported_without_false_deferral(store, monkeypatch, sqlstate):
+    from sqlalchemy.exc import DBAPIError
+    module = api()
+    _, task_id, claim = await queued(store)
+    original_settings = module._settings
+    copy_calls, settlement_calls = 0, []
+    async def abort(db, task, **kwargs):
+        nonlocal copy_calls
+        copy_calls += 1
+        await db.execute(text("DO $$ BEGIN RAISE EXCEPTION USING ERRCODE='40001'; END $$"))
+    async def reject_settlement(db, claimed, statement_timeout_ms, lock_timeout_ms):
+        await original_settings(db, claimed, statement_timeout_ms, lock_timeout_ms)
+        if statement_timeout_ms == 5000:
+            settlement_calls.append(await db.scalar(text('SELECT txid_current()')))
+            await db.execute(text(f"DO $$ BEGIN RAISE EXCEPTION USING ERRCODE='{sqlstate}'; END $$"))
+    async def no_wait(delay):
+        pass
+    monkeypatch.setattr(copy_executor, 'copy_manifest_batch', abort)
+    monkeypatch.setattr(module, '_settings', reject_settlement)
+    monkeypatch.setattr(asyncio, 'sleep', no_wait)
+    with pytest.raises(DBAPIError) as failed:
+        await module.run_batch(store.factory, claim)
+    assert failed.value.orig.sqlstate == sqlstate
+    assert copy_calls == 1
+    assert len(set(settlement_calls)) == 3
+    async with store.factory() as db:
+        task = await db.get(models.CopyWorkTask, task_id)
+        assert task.state == 'RUNNING' and task.error is None
+
+
+@pytest.mark.parametrize('recovery', ['expiry', 'shutdown'])
+async def test_unsettled_aborts_keep_conservative_budget_across_reclaim_and_restart(store, monkeypatch, recovery):
+    from sqlalchemy.exc import DBAPIError
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    module = api()
+    _, task_id, current = await queued(store)
+    original_settings = module._settings
+    blocked, copy_calls = True, 0
+    async def abort(db, task, **kwargs):
+        nonlocal copy_calls
+        copy_calls += 1
+        await db.execute(text("DO $$ BEGIN RAISE EXCEPTION USING ERRCODE='40001'; END $$"))
+    async def settlement_unavailable(db, claim, statement_timeout_ms, lock_timeout_ms):
+        await original_settings(db, claim, statement_timeout_ms, lock_timeout_ms)
+        if blocked and statement_timeout_ms == 5000:
+            await db.execute(text("DO $$ BEGIN RAISE EXCEPTION USING ERRCODE='55P03'; END $$"))
+    async def no_wait(delay):
+        pass
+    monkeypatch.setattr(copy_executor, 'copy_manifest_batch', abort)
+    monkeypatch.setattr(module, '_settings', settlement_unavailable)
+    monkeypatch.setattr(asyncio, 'sleep', no_wait)
+    for executions in range(1, 4):
+        restarted = async_sessionmaker(store.engine, expire_on_commit=False)
+        with pytest.raises(DBAPIError):
+            await module.run_batch(restarted, current)
+        assert copy_calls == executions
+        async with restarted.begin() as db:
+            task = await db.get(models.CopyWorkTask, task_id)
+            assert task.state == 'RUNNING' and task.error is None
+            assert task.attempts == executions
+            task.lease_expires_at = (await db.scalar(select(func.clock_timestamp()))) - timedelta(seconds=1)
+        if recovery == 'shutdown':
+            from shared.copy_runtime import CopyWorkRunner
+            runner = CopyWorkRunner(restarted, None)
+            await runner._release_cancelled_claim(current)
+        async with restarted.begin() as db:
+            current = await copy_work.claim(db, owner_id=uuid4())
+            assert current is not None
+    blocked = False
+    assert (await module.run_batch(restarted, current)).status == 'FAILED'
+    assert copy_calls == 3
+    async with restarted() as db:
+        task = await db.get(models.CopyWorkTask, task_id)
+        # These expired claims could not record their outcomes. Do not claim
+        # the recovery cap diagnosed a proven deadlock or capacity miss.
+        assert task.error == {'code': 'copy_execution_unsettled', 'execution_failures': 3}
+        assert task.state == 'FAILED' and task.lease_owner_id is task.lease_expires_at is None
+
+
+async def test_normal_capacity_waits_never_spend_per_checkpoint_execution_reservation(store):
+    _, task_id, current = await queued(store, capacity=1, rows=3)
+    for _ in range(4):
+        async with store.factory.begin() as holder:
+            assert await holder.scalar(text('SELECT pg_try_advisory_xact_lock(420018,1000000)'))
+            assert (await api().run_batch(store.factory, current)).status == 'DEFERRED'
+        async with store.factory.begin() as db:
+            task = await db.get(models.CopyWorkTask, task_id)
+            assert task.attempts == 0 and 'execution_failures' not in task.error
+            task.ready_at = await db.scalar(select(func.clock_timestamp()))
+        async with store.factory.begin() as db:
+            current = await copy_work.claim(db, owner_id=uuid4())
+            assert current is not None
+    for expected in ['READY', 'READY', 'COMPLETED']:
+        assert (await api().run_batch(store.factory, current, batch_size=1)).status == expected
+        async with store.factory.begin() as db:
+            task = await db.get(models.CopyWorkTask, task_id)
+            assert task.attempts == 0 and task.error is None
+            if expected == 'READY':
+                current = await copy_work.claim(db, owner_id=uuid4())
+                assert current is not None
+
+
+@pytest.mark.parametrize('known_failures', [0, 2])
+async def test_legacy_cumulative_claims_are_normalized_without_losing_known_failure_budget(
+        store, monkeypatch, known_failures):
+    _, task_id, _ = await queued(store)
+    async with store.factory.begin() as db:
+        task = await db.get(models.CopyWorkTask, task_id)
+        task.state, task.lease_owner_id, task.lease_expires_at = 'READY', None, None
+        task.attempts = 100
+        task.params = {key: value for key, value in task.params.items()
+                       if key != '_copy_execution_budget_v1'}
+        task.error = {'code': 'copy_lock_timeout', 'execution_failures': 2} if known_failures else None
+        task.ready_at = await db.scalar(select(func.clock_timestamp()))
+    async with store.factory.begin() as db:
+        current = await copy_work.claim(db, owner_id=uuid4())
+        task = await db.get(models.CopyWorkTask, task_id)
+        assert task.attempts == known_failures + 1
+        assert task.params['_copy_execution_budget_v1'] is True
+    if known_failures:
+        async def abort(db, task, **kwargs):
+            await db.execute(text("DO $$ BEGIN RAISE EXCEPTION USING ERRCODE='40001'; END $$"))
+        monkeypatch.setattr(copy_executor, 'copy_manifest_batch', abort)
+    assert (await api().run_batch(store.factory, current)).status == ('FAILED' if known_failures else 'COMPLETED')
+    async with store.factory() as db:
+        task = await db.get(models.CopyWorkTask, task_id)
+        assert task.params['_copy_execution_budget_v1'] is True
+        if known_failures:
+            assert task.error['execution_failures'] == 3
+        else:
+            assert task.attempts == 0
+
+
+async def test_shutdown_release_keeps_legacy_unreserved_claim_behavior(store):
+    from shared.copy_runtime import CopyWorkRunner
+    _, task_id, current = await queued(store)
+    async with store.factory.begin() as db:
+        task = await db.get(models.CopyWorkTask, task_id)
+        task.params = {key: value for key, value in task.params.items()
+                       if key != '_copy_execution_budget_v1'}
+        task.attempts = 10
+    await CopyWorkRunner(store.factory, None)._release_cancelled_claim(current)
+    async with store.factory() as db:
+        task = await db.get(models.CopyWorkTask, task_id)
+        assert task.state == 'READY' and task.attempts == 9
+        assert task.lease_owner_id is task.lease_expires_at is None
