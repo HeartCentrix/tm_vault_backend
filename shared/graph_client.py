@@ -234,7 +234,8 @@ class GraphClient:
 
     def _admitted_http(self, raw):
         from shared.graph_rate_limiter import graph_rate_limiter
-        if not graph_rate_limiter.scoped_enabled:
+        from shared.provider_http import has_response_byte_limit
+        if not graph_rate_limiter.scoped_enabled and not has_response_byte_limit():
             return raw
         from shared.provider_http import AdmittedHttpClient
         return AdmittedHttpClient(raw, self)
@@ -508,9 +509,12 @@ class GraphClient:
         round-trips at all. The callback must never raise into the client.
         """
         from shared.config import settings as _s
-        if _s.GRAPH_HARDENING_ENABLED:
-            return await self._get_hardened(url, params, on_activity=on_activity, on_page=on_page)
-        return await self._get_legacy(url, params, on_activity=on_activity, on_page=on_page)
+        from shared.provider_http import response_byte_limit
+        limit = int(os.getenv('ARCHIVE_PAGE_MAX_RESPONSE_BYTES', str(16 * 1024 * 1024))) if on_page is not None else None
+        with response_byte_limit(limit):
+            if _s.GRAPH_HARDENING_ENABLED:
+                return await self._get_hardened(url, params, on_activity=on_activity, on_page=on_page)
+            return await self._get_legacy(url, params, on_activity=on_activity, on_page=on_page)
 
     async def _post_json(
         self, url: str, body: Dict[str, Any], timeout: Optional[float] = None,

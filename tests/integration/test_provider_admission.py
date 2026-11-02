@@ -77,3 +77,19 @@ async def test_one_app_cannot_escape_workload_cooldown_by_rotation(redis_client)
         async with admission.admit(replace(first, app_id='different'), wait_budget=0):
             pytest.fail('rotated around tenant workload cooldown')
     assert error.value.retry_after > 590
+
+
+async def test_batch_costs_are_atomic_and_include_all_workloads(redis_client):
+    module = importlib.import_module('shared.provider_admission')
+    admission = module.ScopedProviderAdmission(redis_client,
+        limits=module.AdmissionLimits(rate=1, burst=10), namespace='batch')
+    mail = scope(module, workload='exchange')
+    files = scope(module, workload='sharepoint')
+    await admission.cooldown(files, 600)
+    with pytest.raises(module.ProviderDeferred):
+        async with admission.admit_many([(mail, 3), (files, 2)], wait_budget=0):
+            pytest.fail('partially granted a throttled mixed workload batch')
+    keys, _, _ = admission._keys(mail)
+    assert float(await redis_client.hget(keys[-1], 'tokens')) == 10
+    async with admission.admit(mail, cost=10, wait_budget=0):
+        pass

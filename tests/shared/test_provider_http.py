@@ -111,3 +111,84 @@ async def test_graphclient_shared_transport_uses_admission_and_nested_seam_once(
         assert [e[0] for e in limiter.events[2:]] == ['enter', 'enter', 'exit', 'exit']
     finally:
         await gc.aclose()
+
+
+async def test_archive_page_sink_has_an_actual_response_byte_bound(monkeypatch):
+    from shared.graph_client import GraphClient
+    from shared.provider_read import ProviderReadError
+    from shared.graph_rate_limiter import graph_rate_limiter
+    from shared.config import settings
+    monkeypatch.setenv('PROVIDER_SCOPED_ADMISSION_ENABLED', 'false')
+    monkeypatch.setenv('ARCHIVE_PAGE_MAX_RESPONSE_BYTES', '65536')
+    monkeypatch.setattr(settings, 'GRAPH_HARDENING_ENABLED', False)
+    async def no_limit(*a, **k): pass
+    monkeypatch.setattr(graph_rate_limiter, 'acquire', no_limit)
+    gc = GraphClient('app', 'secret', 'tenant')
+    async def token(): return 'synthetic'
+    monkeypatch.setattr(gc, '_get_token', token)
+    calls = []
+    class BigPage(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'{"value":[{"id":"one","oversized":"'
+            for _ in range(100):
+                calls.append(1)
+                yield b'x' * 65536
+            yield b'"}]}'
+    gc._http = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, stream=BigPage())))
+    async def sink(*args):
+        pytest.fail('oversized page must not reach durable commit')
+    try:
+        with pytest.raises(ProviderReadError, match='response_byte_limit'):
+            await gc._get('https://graph.microsoft.com/beta/admin/exchange/mailboxes/primary/folders', on_page=sink)
+        assert len(calls) <= 2
+    finally:
+        await gc.aclose()
+
+
+async def test_bounded_json_response_is_not_decompressed_twice():
+    import gzip
+    from shared.provider_http import AdmittedHttpClient, response_byte_limit
+    compressed = gzip.compress(b'{"value":[{"id":"one"}]}')
+    class Body(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield compressed
+    async def handler(request):
+        return httpx.Response(200, headers={'Content-Encoding': 'gzip'}, stream=Body())
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as raw:
+        client = AdmittedHttpClient(raw, Owner(), limiter=Limiter())
+        with response_byte_limit(1024):
+            response = await client.get('https://graph.microsoft.com/v1.0/users')
+        assert response.json() == {'value': [{'id': 'one'}]}
+
+
+async def test_batch_charges_subrequests_and_defers_only_retryable_reads():
+    from shared.provider_http import AdmittedHttpClient
+    from shared.provider_admission import ProviderDeferred
+    class BatchLimiter(Limiter):
+        @asynccontextmanager
+        async def admit_many(self, requirements, **kwargs):
+            self.requirements = requirements
+            yield
+    limiter = BatchLimiter()
+    calls = []
+    async def handler(request):
+        calls.append(1)
+        return httpx.Response(200, json={'responses': [
+            {'id': 'mail', 'status': 200, 'body': {}},
+            {'id': 'site', 'status': 429, 'headers': {'Retry-After': '600'}, 'body': {}},
+        ]})
+    payload = {'requests': [
+        {'id': 'mail', 'method': 'GET', 'url': '/users/a/messages/x'},
+        {'id': 'site', 'method': 'GET', 'url': '/sites/s/lists/x'},
+    ]}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as raw:
+        client = AdmittedHttpClient(raw, Owner(), limiter=limiter)
+        with pytest.raises(ProviderDeferred):
+            await client.post('https://graph.microsoft.com/v1.0/$batch', json=payload)
+        assert [r[0].workload for r in limiter.requirements] == ['batch', 'exchange', 'sharepoint']
+        assert [r[0].workload for r in limiter.requirements if r[1] == 1] == ['batch', 'exchange', 'sharepoint']
+        payload['requests'][0]['method'] = 'POST'
+        response = await client.post('https://graph.microsoft.com/v1.0/$batch', json=payload)
+        assert response.status_code == 200
+    assert len(calls) == 2
+    assert all(e[1].workload == 'sharepoint' for e in limiter.events if e[0] == 'cooldown')

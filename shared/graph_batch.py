@@ -137,7 +137,11 @@ class BatchClient:
                 # sub. Treating a lone gateway blip as final silently
                 # dropped all 20 subs (empty channel replies / chat member
                 # lists in a "successful" snapshot).
-                if resp.status in (429, 502, 503, 504):
+                if by_id[resp.id].method.upper() not in ("GET", "HEAD"):
+                    # A non-read subrequest may have executed before an error.
+                    # Its caller owns idempotency/reconciliation, never this loop.
+                    collected[resp.id] = resp
+                elif resp.status in (429, 502, 503, 504):
                     any_throttle = True
                     ra = parse_retry_after(resp.headers.get("Retry-After"))
                     if ra is not None:

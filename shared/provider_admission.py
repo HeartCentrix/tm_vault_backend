@@ -147,7 +147,7 @@ class ScopedProviderAdmission:
     def _keys(self, context):
         tenant = self.prefix + _hash(context.cloud, context.tenant_id)
         workload = tenant + ':' + _hash(context.workload)
-        buckets = [tenant, workload, workload + ':' + _hash(context.app_id)]
+        buckets = [self.prefix + 'rate', tenant, workload, workload + ':' + _hash(context.app_id)]
         slots = [self.prefix + 'active', tenant + ':active']
         limits = [self.limits.global_concurrency, self.limits.tenant_concurrency]
         if context.resource:
@@ -162,19 +162,39 @@ class ScopedProviderAdmission:
             raise ValueError('invalid provider cooldown')
         buckets, _, _ = self._keys(context)
         try:
-            return float(await self._cooldown(keys=[buckets[1]], args=[seconds]))
+            return float(await self._cooldown(keys=[buckets[2]], args=[seconds]))
         except Exception:
             raise ProviderDeferred(context, max(5, seconds), stage='coordinator_unavailable') from None
 
     @asynccontextmanager
     async def admit(self, context, *, cost=1, wait_budget=1):
+        async with self.admit_many([(context, cost)], wait_budget=wait_budget):
+            yield
+
+    @asynccontextmanager
+    async def admit_many(self, requirements, *, wait_budget=1):
+        if not requirements or len(requirements) > 21:
+            raise ValueError('provider batch must contain at most20 subrequests and its outer request')
+        context = requirements[0][0]
         if not isinstance(context, ProviderRequestContext):
             raise ValueError('provider admission requires verified request context')
-        if not math.isfinite(cost) or cost <= 0 or cost > self.limits.burst:
+        costs, slot_limits = {}, {}
+        for scope, cost in requirements:
+            if (not isinstance(scope, ProviderRequestContext) or
+                    (scope.tenant_id, scope.app_id, scope.cloud) != (context.tenant_id, context.app_id, context.cloud)):
+                raise ValueError('a provider batch cannot cross credential owners')
+            if not math.isfinite(cost) or cost <= 0:
+                raise ValueError('invalid provider admission cost')
+            scoped_buckets, scoped_slots, scoped_limits = self._keys(scope)
+            for key in scoped_buckets:
+                costs[key] = costs.get(key, 0) + cost
+            for key, limit in zip(scoped_slots, scoped_limits):
+                slot_limits[key] = min(slot_limits.get(key, limit), limit)
+        if max(costs.values()) > self.limits.burst:
             raise ValueError('provider cost exceeds available burst; split request')
         if not math.isfinite(wait_budget) or wait_budget < 0:
             raise ValueError('invalid provider wait budget')
-        buckets, slots, limits = self._keys(context)
+        buckets, slots, limits = list(costs), list(slot_limits), list(slot_limits.values())
         cancelled = self.prefix + 'cancelled'
         token = uuid4().hex
         started = time.monotonic()
@@ -197,7 +217,7 @@ class ScopedProviderAdmission:
             while True:
                 try:
                     granted, delay, clock = await self._grant(keys=[*buckets, *slots, cancelled], args=[
-                        json.dumps([[self.limits.rate, self.limits.burst, cost] for _ in buckets]),
+                        json.dumps([[self.limits.rate, self.limits.burst, costs[key]] for key in buckets]),
                         json.dumps(limits), token, self.limits.lease_seconds])
                 except Exception:
                     raise ProviderDeferred(context, 5, stage='coordinator_unavailable') from None

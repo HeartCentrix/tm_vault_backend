@@ -176,3 +176,28 @@ def test_batch_passthrough_reached_with_key(client):
 def test_health_stays_public(client):
     r = client.get("/health")
     assert r.status_code == 200, r.text
+
+
+def test_throttled_mutation_is_not_replayed_and_slot_is_released(client, monkeypatch):
+    attempts = []
+    async def throttled(self, request, **kwargs):
+        attempts.append(request.method)
+        return httpx.Response(429, headers={'Retry-After': '600'}, json={'error': {'code': 'throttled'}}, request=request)
+    monkeypatch.setattr(_FakeGraphClient, 'send', throttled)
+    async def no_sleep(delay):
+        pytest.fail('proxy must return provider cooldown without sleeping or replaying a mutation')
+    monkeypatch.setattr(_gp.asyncio, 'sleep', no_sleep)
+    result = client.post(f'/graph/users?tenant_id={_TENANT}', json={'displayName': 'x'}, headers={'X-Internal-Api-Key': KEY})
+    assert result.status_code == 429 and result.headers['Retry-After'] == '600'
+    assert attempts == ['POST']
+    assert _gp.throttle_manager.tenant_states[_TENANT].concurrent_requests == 0
+
+
+def test_transport_failure_releases_proxy_slot_without_exposing_payload(client, monkeypatch):
+    async def failed(self, request, **kwargs):
+        raise httpx.ConnectError('private token content', request=request)
+    monkeypatch.setattr(_FakeGraphClient, 'send', failed)
+    result = client.get(f'/graph/users?tenant_id={_TENANT}', headers={'X-Internal-Api-Key': KEY})
+    assert result.status_code == 503
+    assert 'private token' not in result.text
+    assert _gp.throttle_manager.tenant_states[_TENANT].concurrent_requests == 0

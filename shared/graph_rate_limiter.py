@@ -171,6 +171,15 @@ class GraphRateLimiter:
         async with coordinator.admit(context, cost=cost, wait_budget=wait_budget):
             yield
 
+    @asynccontextmanager
+    async def admit_many(self, requirements, *, wait_budget=1):
+        if not self.scoped_enabled:
+            yield
+            return
+        coordinator = await self._scoped_coordinator(requirements[0][0])
+        async with coordinator.admit_many(requirements, wait_budget=wait_budget):
+            yield
+
     async def cooldown(self, context, seconds):
         if self.scoped_enabled:
             coordinator = await self._scoped_coordinator(context)

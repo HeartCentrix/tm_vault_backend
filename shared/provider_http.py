@@ -7,7 +7,8 @@ only bounded workload/resource names are selected from approved routes.
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
+import httpx
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from urllib.parse import unquote, urlsplit
 
@@ -16,6 +17,22 @@ from shared.provider_admission import ProviderDeferred, ProviderRequestContext
 from shared.provider_read import ProviderReadError
 
 _active = ContextVar('provider_admitted_request', default=None)
+_response_limit = ContextVar('provider_response_byte_limit', default=None)
+
+
+@contextmanager
+def response_byte_limit(limit):
+    if limit is not None and (type(limit) is not int or limit < 1024):
+        raise ValueError('invalid provider response byte budget')
+    marker = _response_limit.set(limit)
+    try:
+        yield
+    finally:
+        _response_limit.reset(marker)
+
+
+def has_response_byte_limit():
+    return _response_limit.get() is not None
 
 
 def _target(url):
@@ -78,6 +95,10 @@ def request_context(owner, url, *, operation=None):
         # and workload parent still enforce a common cap; never key by its token.
     else:
         raise ValueError('unsupported provider data host')
+    if operation == 'archive_export':
+        if workload != 'exchange' or not path.endswith('/exportItems'):
+            raise ValueError('archive export requires its validated Exchange route')
+        operation = None
     if operation is not None:
         # Only adapter-owned immutable contexts may supply opaque route scope.
         if not isinstance(operation, ProviderRequestContext) or (
@@ -89,6 +110,14 @@ def request_context(owner, url, *, operation=None):
 
 @asynccontextmanager
 async def admitted(limiter, context, **kwargs):
+    from shared.provider_runtime import provider_request_scope
+    async with provider_request_scope():
+        async with _admitted(limiter, context, **kwargs):
+            yield
+
+
+@asynccontextmanager
+async def _admitted(limiter, context, **kwargs):
     active = _active.get()
     task = asyncio.current_task()
     if active == (task, context):
@@ -130,19 +159,102 @@ class AdmittedHttpClient:
             await response.aclose()
             raise ProviderDeferred(context, delay, stage='provider_throttle')
 
+    async def _batch(self, method, url, **kwargs):
+        from shared.provider_runtime import account_provider_attempt, provider_request_scope
+        context = request_context(self.owner, url)
+        payload = kwargs.get('json')
+        entries = payload.get('requests') if isinstance(payload, dict) else None
+        if not isinstance(entries, list) or not 1 <= len(entries) <= 20:
+            raise ValueError('Graph batch requires1..20 explicit subrequests')
+        requests, costs, readonly = {}, [(context, 1)], True
+        for item in entries:
+            if not isinstance(item, dict) or not isinstance(item.get('id'), str) or item['id'] in requests:
+                raise ValueError('invalid batch identity')
+            route = item.get('url')
+            if not isinstance(route, str) or not route.startswith('/') or route.startswith('//'):
+                raise ValueError('batch subrequest must use a relative Graph route')
+            verb = item.get('method', '').upper()
+            if verb not in ('GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'):
+                raise ValueError('invalid batch method')
+            readonly = readonly and verb in ('GET', 'HEAD')
+            sub = request_context(self.owner, 'https://graph.microsoft.com/v1.0' + route)
+            requests[item['id']] = sub
+            costs.append((sub, 1))
+        async with provider_request_scope():
+            async with self.limiter.admit_many(costs):
+                await account_provider_attempt(context)
+                response = await self.raw.request(method, url, **kwargs)
+                if response.status_code in (429, 503):
+                    delay = max(1.0, parse_retry_after(response.headers.get('Retry-After')) or 5.0)
+                    for sub in set(requests.values()):
+                        await self.limiter.cooldown(sub, delay)
+                    await self._response(response, context, 'GET' if readonly else method)
+                    return response
+                if response.status_code != 200:
+                    return response
+                try:
+                    results = response.json().get('responses')
+                    if not isinstance(results, list):
+                        raise ValueError
+                    seen, deferred = set(), []
+                    for result in results:
+                        if (not isinstance(result, dict) or result.get('id') not in requests
+                                or result['id'] in seen or type(result.get('status')) is not int):
+                            raise ValueError
+                        seen.add(result['id'])
+                        if result['status'] in (429, 503):
+                            headers = httpx.Headers(result.get('headers') or {})
+                            delay = max(1.0, parse_retry_after(headers.get('Retry-After')) or 5.0)
+                            sub = requests[result['id']]
+                            await self.limiter.cooldown(sub, delay)
+                            if readonly and delay > 1:
+                                deferred.append(ProviderDeferred(sub, delay, stage='provider_batch_throttle'))
+                    if seen != set(requests):
+                        raise ValueError
+                except (ValueError, TypeError, AttributeError):
+                    raise ProviderReadError('invalid_batch_response') from None
+                if deferred:
+                    await response.aclose()
+                    raise max(deferred, key=lambda error: error.retry_after)
+                return response
+
     async def request(self, method, url, **kwargs):
         if identity_request(self.owner, url):
             return await self.raw.request(method, url, **kwargs)
+        if _target(url).path in ('/v1.0/$batch', '/beta/$batch'):
+            return await self._batch(method, url, **kwargs)
         context = request_context(self.owner, url)
         async with admitted(self.limiter, context):
-            response = await self.raw.request(method, url, **kwargs)
-            await self._response(response, context, method)
+            from shared.provider_runtime import account_provider_attempt
+            await account_provider_attempt(context)
+            limit = _response_limit.get()
+            if limit is None:
+                response = await self.raw.request(method, url, **kwargs)
+            else:
+                async with self.raw.stream(method, url, **kwargs) as streamed:
+                    # Reject/defer provider statuses before reading a large body.
+                    await self._response(streamed, context, method)
+                    body = bytearray()
+                    async for chunk in streamed.aiter_bytes(chunk_size=65536):
+                        if len(body) + len(chunk) > limit:
+                            raise ProviderReadError('response_byte_limit', status=streamed.status_code)
+                        body.extend(chunk)
+                    headers = dict(streamed.headers)
+                    for header in ('content-encoding', 'content-length', 'transfer-encoding'):
+                        headers.pop(header, None)
+                    response = httpx.Response(streamed.status_code, headers=headers,
+                        content=bytes(body), request=streamed.request, extensions=streamed.extensions)
+                response.elapsed = streamed.elapsed
+            if limit is None:
+                await self._response(response, context, method)
             return response
 
     @asynccontextmanager
     async def stream(self, method, url, **kwargs):
         context = request_context(self.owner, url)
         async with admitted(self.limiter, context):
+            from shared.provider_runtime import account_provider_attempt
+            await account_provider_attempt(context)
             async with self.raw.stream(method, url, **kwargs) as response:
                 await self._response(response, context, method)
                 yield response
