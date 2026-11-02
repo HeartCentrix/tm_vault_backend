@@ -32,6 +32,7 @@ def _assert_graph_target(url: str) -> None:
     if h not in _ALLOWED_GRAPH_HOSTS and not h.endswith(_ALLOWED_GRAPH_SUFFIXES):
         raise ValueError(f"refusing credentialed request to non-allowlisted host {h}")
 
+from shared.provider_read import ProviderReadBudget, ProviderReadError
 from shared.power_bi_client import PowerBIClient
 from shared.graph_ratelimit import (
     RateLimitPolicy, GraphRetryExhaustedError,
@@ -3662,12 +3663,7 @@ class GraphClient:
         columns like MasterPageUrl / ThemeUrl / ImageUrl / FontSchemeUrl,
         not the underlying file bytes.
         """
-        token = await self._get_sharepoint_token(hostname)
         url = f"{site_web_url.rstrip('/')}/_api/web/lists(guid'{list_id}')/items"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json;odata=nometadata",
-        }
         # File-reference columns (FileRef / FileLeafRef / FileSystemObjectType)
         # aren't always returned by the default projection of SP REST's
         # /items endpoint — some tenants drop them, leaving the backup
@@ -3694,63 +3690,63 @@ class GraphClient:
                 "$select": "Id,FileRef,FileLeafRef,FileSystemObjectType",
             }
         next_url: Optional[str] = url
-        backoff = 1.0  # seconds; doubled per consecutive transient failure
-        async with self._http_session() as client:
-            while next_url:
-                _assert_graph_target(next_url)  # Check 17 SSRF guard
-                try:
-                    resp = await client.get(
-                        next_url,
-                        headers=headers,
-                        params=params if next_url == url else None,
-                    )
-                except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as exc:
-                    if backoff > 60:
-                        print(f"[GraphClient] SP REST items transport giving up after {backoff}s: {exc}")
-                        return
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, 60.0)
-                    continue
+        while next_url:
+            data = await self._sharepoint_rest_json(
+                hostname, next_url, params=params, stage="list_page",
+            )
+            rows = data.get("value")
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                raise ProviderReadError("invalid_page_payload")
+            for row in rows:
+                yield row
+            following = data.get("odata.nextLink") or data.get("@odata.nextLink")
+            if following is not None and (not isinstance(following, str) or following == next_url):
+                raise ProviderReadError("invalid_page_cursor")
+            next_url = following
+            params = None
 
-                if resp.status_code == 429 or resp.status_code == 503:
-                    retry_after = _parse_retry_after(resp)
-                    print(f"[GraphClient] SP REST 429/503 for list {list_id}, sleeping {retry_after:.1f}s")
-                    await asyncio.sleep(retry_after)
-                    continue  # retry same URL
-                if resp.status_code in (401, 403):
-                    print(f"[GraphClient] SP REST items denied for list {list_id} ({resp.status_code}): {resp.text[:180]}")
-                    return
-                if resp.status_code >= 400:
-                    print(f"[GraphClient] SP REST items {resp.status_code} for list {list_id}: {resp.text[:180]}")
-                    return
-                backoff = 1.0  # reset after a good page
-                data = resp.json()
-                for row in (data.get("value") or []):
-                    yield row
-                next_url = data.get("odata.nextLink") or data.get("@odata.nextLink")
-                params = None  # next_url already includes query
+    @staticmethod
+    def _assert_sharepoint_target(hostname: str, url: str) -> None:
+        _assert_graph_target(url)
+        parsed = urlsplit(url)
+        if (parsed.hostname != hostname.lower() or parsed.username or parsed.password
+                or parsed.port not in (None, 443) or parsed.fragment
+                or not hostname.lower().endswith(_ALLOWED_GRAPH_SUFFIXES)):
+            raise ValueError("SharePoint request must retain its authenticated host")
 
-    async def get_sharepoint_file_metadata_via_rest(self, hostname: str, site_web_url: str, server_relative_url: str) -> Optional[Dict[str, Any]]:
-        """HEAD-style metadata for a SharePoint file (Length, Name,
-        TimeLastModified, UIVersionLabel) without downloading bytes.
-        Returns None on any failure (treated as non-existent / not a file).
-        """
-        token = await self._get_sharepoint_token(hostname)
+    async def _sharepoint_rest_json(self, hostname: str, url: str, *, params=None, stage: str):
+        self._assert_sharepoint_target(hostname, url)
+        budget = ProviderReadBudget()
+        while True:
+            budget.attempts += 1
+            token = await self._get_sharepoint_token(hostname)
+            try:
+                async with self._http_session() as client:
+                    response = await client.get(url, params=params, headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/json;odata=nometadata",
+                    })
+                if response.status_code >= 400:
+                    error = ProviderReadError.from_response(response, stage, attempts=budget.attempts)
+                    if response.status_code not in (429, 500, 502, 503, 504):
+                        raise error
+                else:
+                    try:
+                        data = response.json()
+                    except ValueError:
+                        raise ProviderReadError("invalid_payload", status=response.status_code) from None
+                    if not isinstance(data, dict):
+                        raise ProviderReadError("invalid_payload", status=response.status_code)
+                    return data
+            except httpx.TransportError:
+                error = ProviderReadError(stage, code="transport", attempts=budget.attempts)
+            await asyncio.sleep(budget.retry_delay(error))
+
+    async def get_sharepoint_file_metadata_via_rest(self, hostname: str, site_web_url: str, server_relative_url: str) -> Dict[str, Any]:
+        """Read file metadata; absence/denial cannot masquerade as a non-file row."""
         safe_path = server_relative_url.replace("'", "''")
         url = f"{site_web_url.rstrip('/')}/_api/web/GetFileByServerRelativeUrl('{safe_path}')"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json;odata=nometadata",
-        }
-        async with self._http_session() as client:
-            _assert_graph_target(url)  # Check 17 SSRF guard
-            resp = await client.get(url, headers=headers)
-            if resp.status_code >= 400:
-                return None
-            try:
-                return resp.json()
-            except Exception:
-                return None
+        return await self._sharepoint_rest_json(hostname, url, stage="file_metadata")
 
     async def download_sharepoint_file_via_rest(self, hostname: str, site_web_url: str, server_relative_url: str) -> bytes:
         """Buffered download of a SharePoint file by its server-relative URL.
@@ -3760,14 +3756,9 @@ class GraphClient:
         should use ``stream_sharepoint_file_via_rest`` to avoid OOM on large
         files.
         """
-        token = await self._get_sharepoint_token(hostname)
-        safe_path = server_relative_url.replace("'", "''")
-        url = f"{site_web_url.rstrip('/')}/_api/web/GetFileByServerRelativeUrl('{safe_path}')/$value"
-        async with self._http_session() as client:
-            _assert_graph_target(url)  # Check 17 SSRF guard
-            resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
-            resp.raise_for_status()
-            return resp.content
+        return b"".join([chunk async for chunk in self.stream_sharepoint_file_via_rest(
+            hostname, site_web_url, server_relative_url,
+        )])
 
     async def stream_sharepoint_file_via_rest(
         self,
@@ -3775,38 +3766,58 @@ class GraphClient:
         site_web_url: str,
         server_relative_url: str,
         chunk_size: int = 1 * 1024 * 1024,
+        *,
+        expected_size: Optional[int] = None,
+        expected_etag: Optional[str] = None,
     ):
-        """Stream a SharePoint file's bytes via SP REST ``$value`` endpoint.
-
-        Yields raw chunks so callers can pipe directly into a temp file /
-        block-blob uploader without buffering the full body. Honours 429 /
-        503 Retry-After by retrying the same URL after the indicated delay.
-        Falls through to a single retry on connection errors.
-        """
-        token = await self._get_sharepoint_token(hostname)
+        """Retry only before yielding bytes; the caller owns whole-file restarts."""
         safe_path = server_relative_url.replace("'", "''")
         url = f"{site_web_url.rstrip('/')}/_api/web/GetFileByServerRelativeUrl('{safe_path}')/$value"
-        headers = {"Authorization": f"Bearer {token}"}
-        attempt = 0
+        self._assert_sharepoint_target(hostname, url)
+        budget = ProviderReadBudget()
         while True:
-            attempt += 1
+            budget.attempts += 1
+            token = await self._get_sharepoint_token(hostname)
+            headers = {"Authorization": f"Bearer {token}", "Accept-Encoding": "identity"}
+            if expected_etag:
+                headers["If-Match"] = expected_etag
+            received = 0
             try:
                 async with self._http_session() as client:
-                    async with client.stream("GET", url, headers=headers) as resp:
-                        if resp.status_code in (429, 503):
-                            retry_after = _parse_retry_after(resp)
-                            print(f"[GraphClient] SP REST stream 429/503 for {server_relative_url}, sleeping {retry_after:.1f}s")
-                            await asyncio.sleep(retry_after)
-                            continue
-                        resp.raise_for_status()
-                        async for chunk in resp.aiter_bytes(chunk_size):
-                            if chunk:
-                                yield chunk
-                        return
-            except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as exc:
-                if attempt >= 3:
-                    raise
-                await asyncio.sleep(min(2 ** attempt, 30))
+                    async with client.stream("GET", url, headers=headers) as response:
+                        if response.status_code >= 400:
+                            error = ProviderReadError.from_response(response, "file_stream", attempts=budget.attempts)
+                            if response.status_code not in (429, 500, 502, 503, 504):
+                                raise error
+                        elif response.status_code != 200:
+                            raise ProviderReadError("unexpected_stream_status", status=response.status_code)
+                        else:
+                            etag = response.headers.get("ETag")
+                            if expected_etag and etag and etag != expected_etag:
+                                raise ProviderReadError("file_version_changed")
+                            length = response.headers.get("Content-Length")
+                            try:
+                                length = int(length) if length is not None else None
+                            except ValueError:
+                                raise ProviderReadError("invalid_content_length") from None
+                            if length is not None and (length < 0 or (expected_size is not None and length != expected_size)):
+                                raise ProviderReadError("content_length_mismatch")
+                            async for chunk in response.aiter_bytes(chunk_size):
+                                if chunk:
+                                    received += len(chunk)
+                                    if expected_size is not None and received > expected_size:
+                                        raise ProviderReadError("content_length_exceeded")
+                                    yield chunk
+                            if ((length is not None and received != length)
+                                    or (expected_size is not None and received != expected_size)):
+                                raise ProviderReadError("truncated_content_length")
+                            return
+            except httpx.TransportError:
+                error = ProviderReadError("file_stream", code="transport", attempts=budget.attempts)
+                if received:
+                    raise error from None
+            # Both response and connection scope are released before waiting.
+            await asyncio.sleep(budget.retry_delay(error))
 
     async def get_sharepoint_site_list_items(self, site_id: str, list_id: str, delta_token: str = None) -> Dict[str, Any]:
         """
