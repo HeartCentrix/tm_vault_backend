@@ -4,77 +4,78 @@ No history is read here. Transition-table capture is transactional and never
 locks a resource counter. Event triggers keep direct leaf writes covered when
 partitions are created/attached later; installing requires that DDL privilege.
 """
+
 import hashlib
 
 from sqlalchemy import text
 
 DDL = (
-    'ALTER TABLE resource_protected_bytes ALTER COLUMN latest_snapshot_id DROP NOT NULL',
-    'ALTER TABLE resource_protected_bytes ADD COLUMN IF NOT EXISTS working_bytes bigint NOT NULL DEFAULT 0',
-    'ALTER TABLE resource_protected_bytes ADD COLUMN IF NOT EXISTS ledger_published boolean NOT NULL DEFAULT false',
-    'ALTER TABLE resource_protected_bytes ADD COLUMN IF NOT EXISTS last_turn timestamptz NOT NULL DEFAULT \'epoch\'',
-    'ALTER TABLE resource_protected_bytes ADD COLUMN IF NOT EXISTS prefer_build boolean NOT NULL DEFAULT false',
-    'ALTER TABLE resource_protected_bytes ADD COLUMN IF NOT EXISTS fence bigint NOT NULL DEFAULT 0',
-    'ALTER TABLE resource_protected_bytes ADD COLUMN IF NOT EXISTS next_attempt timestamptz NOT NULL DEFAULT \'epoch\'',
-    '''CREATE TABLE protected_size_control(singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
+    "ALTER TABLE resource_protected_bytes ALTER COLUMN latest_snapshot_id DROP NOT NULL",
+    "ALTER TABLE resource_protected_bytes ADD COLUMN IF NOT EXISTS working_bytes bigint NOT NULL DEFAULT 0",
+    "ALTER TABLE resource_protected_bytes ADD COLUMN IF NOT EXISTS ledger_published boolean NOT NULL DEFAULT false",
+    "ALTER TABLE resource_protected_bytes ADD COLUMN IF NOT EXISTS last_turn timestamptz NOT NULL DEFAULT 'epoch'",
+    "ALTER TABLE resource_protected_bytes ADD COLUMN IF NOT EXISTS prefer_build boolean NOT NULL DEFAULT false",
+    "ALTER TABLE resource_protected_bytes ADD COLUMN IF NOT EXISTS fence bigint NOT NULL DEFAULT 0",
+    "ALTER TABLE resource_protected_bytes ADD COLUMN IF NOT EXISTS next_attempt timestamptz NOT NULL DEFAULT 'epoch'",
+    """CREATE TABLE protected_size_control(singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
         discovery_cursor uuid, discovery_done boolean NOT NULL DEFAULT false,
-        retirement_at timestamptz NOT NULL DEFAULT 'epoch',retirement_id bigint NOT NULL DEFAULT 0,
+        retirement_at timestamptz NOT NULL DEFAULT 'epoch',retirement_id bigint NOT NULL DEFAULT 0,retired_cursor bigint NOT NULL DEFAULT 0,
         discovery_epoch bigint NOT NULL DEFAULT 0,discovery_phase text NOT NULL DEFAULT 'source',instance_id uuid NOT NULL DEFAULT gen_random_uuid(),
-        owner uuid, lease_until timestamptz, fence bigint NOT NULL DEFAULT 0)''',
-    'INSERT INTO protected_size_control(singleton) VALUES(true)',
-    '''CREATE TABLE protected_size_snapshots(snapshot_id uuid PRIMARY KEY,resource_id uuid NOT NULL,
-        eligible boolean NOT NULL,present boolean NOT NULL DEFAULT true,revision bigint NOT NULL DEFAULT 0)''',
-    'CREATE INDEX ON protected_size_snapshots(resource_id,snapshot_id)',
-    'CREATE INDEX protected_size_snapshot_tombstones ON protected_size_snapshots(snapshot_id) WHERE NOT present',
-    '''CREATE TABLE protected_size_source_relations(relid oid PRIMARY KEY)''',
-    '''CREATE TABLE protected_size_journal(id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        owner uuid, lease_until timestamptz, fence bigint NOT NULL DEFAULT 0)""",
+    "INSERT INTO protected_size_control(singleton) VALUES(true)",
+    """CREATE TABLE protected_size_snapshots(snapshot_id uuid PRIMARY KEY,resource_id uuid NOT NULL,
+        eligible boolean NOT NULL,present boolean NOT NULL DEFAULT true,revision bigint NOT NULL DEFAULT 0)""",
+    "CREATE INDEX ON protected_size_snapshots(resource_id,snapshot_id)",
+    "CREATE INDEX protected_size_snapshot_tombstones ON protected_size_snapshots(snapshot_id) WHERE NOT present",
+    """CREATE TABLE protected_size_source_relations(relid oid PRIMARY KEY)""",
+    """CREATE TABLE protected_size_journal(id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         kind text NOT NULL CHECK(kind IN ('items','snapshots')),snapshot_ids uuid[] NOT NULL,
         item_ids uuid[] NOT NULL,created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-        CHECK(cardinality(snapshot_ids)<=1000 AND cardinality(item_ids)<=1000))''',
-    '''CREATE TABLE protected_size_event_snapshots(snapshot_id uuid NOT NULL,event_id bigint NOT NULL REFERENCES protected_size_journal(id),
-        PRIMARY KEY(snapshot_id,event_id))''',
-    'CREATE INDEX ON protected_size_event_snapshots(event_id)',
-    '''CREATE TABLE protected_size_retired(event_id bigint PRIMARY KEY REFERENCES protected_size_journal(id))''',
-    '''CREATE TABLE protected_size_targets(event_id bigint REFERENCES protected_size_journal(id),
-        resource_id uuid NOT NULL,acknowledged_at timestamptz,processed_offset integer NOT NULL DEFAULT 0,PRIMARY KEY(resource_id,event_id))''',
-    'CREATE INDEX ON protected_size_targets(event_id)',
-    'CREATE INDEX ON protected_size_targets(acknowledged_at)',
-    'CREATE INDEX ON protected_size_journal(created_at,id)',
-    '''CREATE TABLE protected_size_orphans(resource_id uuid PRIMARY KEY)''',
-    'CREATE INDEX ON protected_size_targets(resource_id,event_id) WHERE acknowledged_at IS NULL',
-    '''CREATE TABLE protected_size_jobs(resource_id uuid NOT NULL,snapshot_id uuid NOT NULL,cursor uuid,
-        phase text NOT NULL DEFAULT 'source',PRIMARY KEY(resource_id,snapshot_id))''',
-    '''CREATE TABLE protected_size_refs(resource_id uuid NOT NULL,snapshot_id uuid NOT NULL,item_id uuid NOT NULL,
+        CHECK(cardinality(snapshot_ids)<=1000 AND cardinality(item_ids)<=1000))""",
+    """CREATE TABLE protected_size_event_snapshots(snapshot_id uuid NOT NULL,event_id bigint NOT NULL REFERENCES protected_size_journal(id),
+        PRIMARY KEY(snapshot_id,event_id))""",
+    "CREATE INDEX ON protected_size_event_snapshots(event_id)",
+    """CREATE TABLE protected_size_retired(event_id bigint PRIMARY KEY REFERENCES protected_size_journal(id))""",
+    """CREATE TABLE protected_size_targets(event_id bigint REFERENCES protected_size_journal(id),
+        resource_id uuid NOT NULL,acknowledged_at timestamptz,processed_offset integer NOT NULL DEFAULT 0,PRIMARY KEY(resource_id,event_id))""",
+    "CREATE INDEX ON protected_size_targets(event_id)",
+    "CREATE INDEX ON protected_size_targets(acknowledged_at)",
+    "CREATE INDEX ON protected_size_journal(created_at,id)",
+    """CREATE TABLE protected_size_orphans(resource_id uuid PRIMARY KEY)""",
+    "CREATE INDEX ON protected_size_targets(resource_id,event_id) WHERE acknowledged_at IS NULL",
+    """CREATE TABLE protected_size_jobs(resource_id uuid NOT NULL,snapshot_id uuid NOT NULL,cursor uuid,
+        phase text NOT NULL DEFAULT 'source',PRIMARY KEY(resource_id,snapshot_id))""",
+    """CREATE TABLE protected_size_refs(resource_id uuid NOT NULL,snapshot_id uuid NOT NULL,item_id uuid NOT NULL,
         identity_id bigint NOT NULL,created_at timestamp,size bigint NOT NULL,
-        PRIMARY KEY(resource_id,snapshot_id,item_id))''',
-    'CREATE INDEX protected_size_ref_winner ON protected_size_refs(resource_id,identity_id,created_at DESC NULLS FIRST,item_id DESC)',
-    'CREATE INDEX protected_size_ref_item ON protected_size_refs(resource_id,item_id)',
-    '''CREATE TABLE protected_size_tenant_turns(tenant_id uuid PRIMARY KEY,last_turn timestamptz NOT NULL)''',
-    '''CREATE TABLE protected_size_identities(id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-        resource_id uuid NOT NULL,identity_hash text NOT NULL,identity text NOT NULL)''',
-    'CREATE INDEX protected_size_identity_lookup ON protected_size_identities(resource_id,identity_hash)',
-    '''CREATE TABLE protected_size_winners(resource_id uuid NOT NULL,identity_id bigint NOT NULL,
-        size bigint NOT NULL,PRIMARY KEY(resource_id,identity_id))''',
-    'CREATE INDEX IF NOT EXISTS ix_protected_size_snapshot_items_identity ON snapshot_items(id)',
-    'CREATE INDEX IF NOT EXISTS ix_protected_size_snapshot_items_page ON snapshot_items(snapshot_id,id)',
-    'CREATE INDEX IF NOT EXISTS ix_protected_size_snapshots_page ON snapshots(id)',
+        PRIMARY KEY(resource_id,snapshot_id,item_id))""",
+    "CREATE INDEX protected_size_ref_winner ON protected_size_refs(resource_id,identity_id,created_at DESC NULLS FIRST,item_id DESC)",
+    "CREATE INDEX protected_size_ref_item ON protected_size_refs(resource_id,item_id)",
+    """CREATE TABLE protected_size_tenant_turns(tenant_id uuid PRIMARY KEY,last_turn timestamptz NOT NULL)""",
+    """CREATE TABLE protected_size_identities(id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        resource_id uuid NOT NULL,identity_hash text NOT NULL,identity text NOT NULL)""",
+    "CREATE INDEX protected_size_identity_lookup ON protected_size_identities(resource_id,identity_hash)",
+    """CREATE TABLE protected_size_winners(resource_id uuid NOT NULL,identity_id bigint NOT NULL,
+        size bigint NOT NULL,PRIMARY KEY(resource_id,identity_id))""",
+    "CREATE INDEX IF NOT EXISTS ix_protected_size_snapshot_items_identity ON snapshot_items(id)",
+    "CREATE INDEX IF NOT EXISTS ix_protected_size_snapshot_items_page ON snapshot_items(snapshot_id,id)",
+    "CREATE INDEX IF NOT EXISTS ix_protected_size_snapshots_page ON snapshots(id)",
 )
 
 
 def event_trigger_names(schema):
-    suffix=hashlib.sha256(schema.encode()).hexdigest()[:20]
-    return ('protected_size_ddl_'+suffix,'protected_size_drop_'+suffix)
+    suffix = hashlib.sha256(schema.encode()).hexdigest()[:20]
+    return ("protected_size_ddl_" + suffix, "protected_size_drop_" + suffix)
 
 
 def statements(schema):
     """SQL shared by Alembic and disposable integration fixtures."""
     q = '"' + schema.replace('"', '""') + '"'
-    ddl_event,drop_event=event_trigger_names(schema)
-    event_name='"'+ddl_event+'"'
-    yield '''DO $fn$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=current_user AND rolsuper)
-      THEN RAISE EXCEPTION 'Protected-size migration requires a superuser to install partition DDL capture; no startup or privilege fallback is supported'; END IF; END $fn$'''
+    ddl_event, drop_event = event_trigger_names(schema)
+    event_name = '"' + ddl_event + '"'
+    yield """DO $fn$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=current_user AND rolsuper)
+      THEN RAISE EXCEPTION 'Protected-size migration requires a superuser to install partition DDL capture; no startup or privilege fallback is supported'; END IF; END $fn$"""
     yield from DDL
-    yield f'''CREATE FUNCTION protected_size_capture() RETURNS trigger LANGUAGE plpgsql SET search_path={q} AS $fn$
+    yield f"""CREATE FUNCTION protected_size_capture() RETURNS trigger LANGUAGE plpgsql SET search_path={q} AS $fn$
     DECLARE source_sql text; batch record; eid bigint; ids uuid[]; resources uuid[];
     BEGIN
       IF TG_ARGV[0]='snapshots' THEN
@@ -124,10 +125,10 @@ def statements(schema):
           SELECT eid,r FROM unnest(resources) r WHERE r IS NOT NULL GROUP BY r ON CONFLICT DO NOTHING;
       END LOOP;
       RETURN NULL;
-    END $fn$'''
-    yield f'''CREATE FUNCTION protected_size_reject_truncate() RETURNS trigger LANGUAGE plpgsql SET search_path={q} AS $fn$
-      BEGIN RAISE EXCEPTION 'TRUNCATE is unsupported on protected-size sources; use DELETE or partition DDL so retained references reconcile'; END $fn$'''
-    yield f'''CREATE FUNCTION protected_size_install_triggers() RETURNS void LANGUAGE plpgsql SET search_path={q} AS $fn$
+    END $fn$"""
+    yield f"""CREATE FUNCTION protected_size_reject_truncate() RETURNS trigger LANGUAGE plpgsql SET search_path={q} AS $fn$
+      BEGIN RAISE EXCEPTION 'TRUNCATE is unsupported on protected-size sources; use DELETE or partition DDL so retained references reconcile'; END $fn$"""
+    yield f"""CREATE FUNCTION protected_size_install_triggers() RETURNS void LANGUAGE plpgsql SET search_path={q} AS $fn$
     DECLARE relation record; operation text; transition text;
     BEGIN
       FOR relation IN
@@ -152,13 +153,13 @@ def statements(schema):
           END IF;
         END LOOP;
       END LOOP;
-    END $fn$'''
-    yield 'SELECT protected_size_install_triggers()'
-    yield f'''CREATE FUNCTION protected_size_resource_delete() RETURNS trigger LANGUAGE plpgsql SET search_path={q} AS $fn$
-      BEGIN INSERT INTO protected_size_orphans SELECT id FROM resource_old ON CONFLICT DO NOTHING; RETURN NULL; END $fn$'''
-    yield '''CREATE TRIGGER protected_size_resource_delete AFTER DELETE ON resources REFERENCING OLD TABLE AS resource_old
-      FOR EACH STATEMENT EXECUTE FUNCTION protected_size_resource_delete()'''
-    yield f'''CREATE FUNCTION protected_size_partition_ddl() RETURNS event_trigger LANGUAGE plpgsql SET search_path={q} AS $fn$
+    END $fn$"""
+    yield "SELECT protected_size_install_triggers()"
+    yield f"""CREATE FUNCTION protected_size_resource_delete() RETURNS trigger LANGUAGE plpgsql SET search_path={q} AS $fn$
+      BEGIN INSERT INTO protected_size_orphans SELECT id FROM resource_old ON CONFLICT DO NOTHING; RETURN NULL; END $fn$"""
+    yield """CREATE TRIGGER protected_size_resource_delete AFTER DELETE ON resources REFERENCING OLD TABLE AS resource_old
+      FOR EACH STATEMENT EXECUTE FUNCTION protected_size_resource_delete()"""
+    yield f"""CREATE FUNCTION protected_size_partition_ddl() RETURNS event_trigger LANGUAGE plpgsql SET search_path={q} AS $fn$
       BEGIN
         IF EXISTS(SELECT 1 FROM pg_event_trigger_ddl_commands() d
           WHERE d.classid='pg_class'::regclass AND
@@ -171,20 +172,18 @@ def statements(schema):
           -- Restart compact snapshot discovery, never a synchronous item walk.
           UPDATE protected_size_control SET discovery_done=false,discovery_cursor=NULL,discovery_phase='source',discovery_epoch=discovery_epoch+1;
         END IF;
-      END $fn$'''
-    yield f'''CREATE EVENT TRIGGER {event_name} ON ddl_command_end WHEN TAG IN ('CREATE TABLE','ALTER TABLE')
-      EXECUTE FUNCTION protected_size_partition_ddl()'''
-    yield f'''CREATE FUNCTION protected_size_partition_drop() RETURNS event_trigger LANGUAGE plpgsql SET search_path={q} AS $fn$
+      END $fn$"""
+    yield f"""CREATE EVENT TRIGGER {event_name} ON ddl_command_end WHEN TAG IN ('CREATE TABLE','ALTER TABLE')
+      EXECUTE FUNCTION protected_size_partition_ddl()"""
+    yield f"""CREATE FUNCTION protected_size_partition_drop() RETURNS event_trigger LANGUAGE plpgsql SET search_path={q} AS $fn$
       BEGIN IF EXISTS(SELECT 1 FROM pg_event_trigger_dropped_objects() d JOIN protected_size_source_relations r ON r.relid=d.objid
         WHERE d.classid='pg_class'::regclass) THEN
         UPDATE protected_size_control SET discovery_done=false,discovery_cursor=NULL,discovery_phase='source',discovery_epoch=discovery_epoch+1;
-      END IF; END $fn$'''
-    yield f'''CREATE EVENT TRIGGER "{drop_event}" ON sql_drop EXECUTE FUNCTION protected_size_partition_drop()'''
-
+      END IF; END $fn$"""
+    yield f"""CREATE EVENT TRIGGER "{drop_event}" ON sql_drop EXECUTE FUNCTION protected_size_partition_drop()"""
 
 
 async def install(connection):
-    schema = await connection.scalar(text('SELECT current_schema()'))
+    schema = await connection.scalar(text("SELECT current_schema()"))
     for statement in statements(schema):
         await connection.execute(text(statement))
-
