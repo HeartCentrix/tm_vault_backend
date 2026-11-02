@@ -109,9 +109,9 @@ def seaweed_source(data, monkeypatch):
     return source
 
 
-async def capture_binary(store, monkeypatch, *, body="Captured old body", **evidence_changes):
+async def capture_binary(store, monkeypatch, *, body="Captured old body", observation_version=1, **evidence_changes):
     scope = await store.new_scope()
-    lease = await store.begin(scope)
+    lease = await store.begin(scope, observation_hash_version=observation_version)
     binary = await store.binary(lease)
     inline_data = b"inline captured bytes"
     inline = CapturedChatItem("CHAT_HOSTED_CONTENT", "inline-alpha", "message-alpha", {},
@@ -119,6 +119,11 @@ async def capture_binary(store, monkeypatch, *, body="Captured old body", **evid
             None, 1, base64.b64encode(inline_data).decode(), None, None, None, None))
     items = [parent_for(binary, inline, parent=message(body)), binary, inline]
     await store.stage(lease, items)
+    if observation_version != 1:
+        from shared.chat_catalogue_identity import source_inventory_fingerprint
+        fingerprint = source_inventory_fingerprint(scope=scope, items=items, observation_hash_version=observation_version)
+        evidence_changes = dict(observation_hash_version=observation_version,
+            membership_sha256=fingerprint, reconciliation_sha256=fingerprint, **evidence_changes)
     await store.observe(scope, lease, items, **evidence_changes)
     result = await store.publish(lease)
     async with store.factory.begin() as session:
@@ -145,8 +150,9 @@ async def archive(store, scope, router, target):
 
 
 @pytest.mark.asyncio
-async def test_dr_roundtrip_preserves_exact_metadata_inline_and_real_decrypted_bytes_without_primary_cache(store, monkeypatch, tmp_path):
-    scope, binary, inline_data, router, calls = await capture_binary(store, monkeypatch)
+@pytest.mark.parametrize('observation_version', [1, 2])
+async def test_dr_roundtrip_preserves_exact_metadata_inline_and_real_decrypted_bytes_without_primary_cache(store, monkeypatch, tmp_path, observation_version):
+    scope, binary, inline_data, router, calls = await capture_binary(store, monkeypatch, observation_version=observation_version)
     target = DiskTarget(tmp_path)
     async def pins_are_live():
         async with store.factory() as session:

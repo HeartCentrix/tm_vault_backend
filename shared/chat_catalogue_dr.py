@@ -24,9 +24,10 @@ from sqlalchemy import select
 from shared.chat_catalogue import ChatCatalogueIntegrityError
 from shared.chat_catalogue_gc import catalogue_read_pin
 from shared.chat_catalogue_identity import (
-    CapturedChatItem, ChatCaptureScope, ChatContentDescriptor, _digest, _payload,
+    CapturedChatItem, ChatCaptureScope, ChatContentDescriptor, _payload,
     authentication_context_fingerprint, canonical_payload_sha256,
     canonical_version_fingerprint, qualified_chat_item_key,
+    observation_semantic, validate_observation_hash_version,
 )
 from shared.models import (ChatBlobObject, ChatCaptureAttempt, ChatInventory,
     ChatInventoryItem, ChatItemVersion, Resource, ResourceType, SlaPolicy, Snapshot,
@@ -443,18 +444,16 @@ class _Index:
             auth = authentication_context_fingerprint(scope)
             if attempt["tenant_id"] != tenant or attempt["chat_id"] != chat or owner["tenant_id"] != tenant or owner["chat_id"] != chat or attempt["authentication_context_sha256"] != auth or owner["authentication_context_sha256"] != auth:
                 raise ChatCatalogueIntegrityError("DR capture authentication scope differs")
-            source = hashlib.sha256(b'["chat-source-inventory-v1",' + _json(auth) + b",[")
+            observation_version = validate_observation_hash_version(inventory.get('observation_hash_version', 1))
+            source = hashlib.sha256(b'[' + _json(f'chat-source-inventory-v{observation_version}') + b',' + _json(auth) + b",[")
             representation, first, count, size = hashlib.sha256(b"["), True, 0, 0
             for entry in self.records("inventory_item", parent=inventory["id"]):
                 version = self.get("version", entry["version_id"])
                 item = _captured(version)
                 if version["chat_id"] != chat or entry["logical_key"] != version["logical_key"]:
                     raise ChatCatalogueIntegrityError("DR inventory item scope differs")
-                content = item.content
-                semantic = ([content.source_drive_id, content.source_item_id, content.source_etag,
-                    content.source_ctag, content.sha256, content.size] if content else None)
                 separator = b"" if first else b","
-                source.update(separator + _json([entry["logical_key"], _digest([_payload(item.payload), semantic])]))
+                source.update(separator + _json([entry["logical_key"], observation_semantic(item, observation_version)]))
                 representation.update(separator + _json([entry["logical_key"], version["version_sha256"]]))
                 first, count, size = False, count + 1, size + _logical_size(item)
             source.update(b"]]")
