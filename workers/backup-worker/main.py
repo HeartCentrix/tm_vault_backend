@@ -4292,6 +4292,7 @@ def sharepoint_total_failures(stats: Dict[str, Any]) -> int:
         int(stats.get("drive_fail", 0) or 0)
         + int(stats.get("rest_fail", 0) or 0)
         + int(stats.get("enum_fail", 0) or 0)
+        + int(stats.get("rest_enum_fail", 0) or 0)
     )
 
 
@@ -29063,6 +29064,7 @@ class BackupWorker:
                             "template": template,
                         })
                 except Exception as exc:
+                    stats["rest_enum_fail"] = stats.get("rest_enum_fail", 0) + 1
                     logger.warning("SP REST stream failed for list %s/%s: %s", site_label, display, exc)
 
         # --- Consumers ----------------------------------------------------
@@ -29167,7 +29169,11 @@ class BackupWorker:
               f"drive_consumers={num_drive_consumers} rest_consumers={num_rest_consumers}")
 
         # Wait for all producers to finish pushing.
-        await asyncio.gather(*producer_tasks, return_exceptions=True)
+        producer_results = await asyncio.gather(*producer_tasks, return_exceptions=True)
+        for result in producer_results:
+            if isinstance(result, BaseException):
+                stats["enum_fail"] += 1
+                logger.warning("SharePoint producer failed: %s", type(result).__name__)
 
         # Drain queues (consumers still running).
         await drive_queue.join()
@@ -29221,7 +29227,7 @@ class BackupWorker:
                     + _sp_failed
                 ),
                 "files_failed": _sp_failed,
-                "enumeration_incomplete": bool(_sp_enum_fail),
+                "enumeration_incomplete": bool(_sp_enum_fail or stats.get("rest_enum_fail", 0)),
             })
             snapshot.delta_tokens_json = _sp_tracking
             async with async_session_factory() as _fs:
@@ -29336,7 +29342,7 @@ class BackupWorker:
             # so the large sites this gate exists for stop posing as
             # complete restore points.
             "files_failed": _sp_failed,
-            "enumeration_incomplete": bool(_sp_enum_fail),
+            "enumeration_incomplete": bool(_sp_enum_fail or stats.get("rest_enum_fail", 0)),
         }
 
     async def _backup_sp_rest_row(
@@ -29362,6 +29368,7 @@ class BackupWorker:
         get exponential backoff, not silent loss.
         """
         import tempfile
+        from shared.provider_read import ProviderReadError, sharepoint_file_identity
         row = work["row"]
         lst_id = work["lst_id"]
         display = work["list_display"]
@@ -29436,40 +29443,29 @@ class BackupWorker:
         elif is_folder:
             stats["rest_rows_folder"] += 1
 
+        file_identity = None
         if srv_rel and not is_folder:
             try:
                 file_info = await graph_client.get_sharepoint_file_metadata_via_rest(
                     sp_hostname, sp_site_web_url, srv_rel,
                 )
-            except Exception as _meta_exc:
-                stats["rest_rows_meta_fail"] += 1
-                if stats["rest_rows_meta_fail"] <= 3:
-                    print(f"[{self.worker_id}]   [SP_REST META FAIL] {site_label}/{display}/{name}: "
-                          f"{type(_meta_exc).__name__}: {_meta_exc}")
-                file_info = None
-            if file_info is None:
-                # Distinct from meta-fail: the call succeeded but
-                # returned None/empty (e.g. row has FileRef but file
-                # was deleted, or endpoint returned 204).
-                if stats["rest_rows_meta_none"] == 0:
-                    print(f"[{self.worker_id}]   [SP_REST META NONE] {site_label}/{display}/{name} srv_rel={srv_rel}")
-                stats["rest_rows_meta_none"] += 1
-            if file_info:
-                size = int(file_info.get("Length") or 0)
+                file_identity = sharepoint_file_identity(file_info)
+                size = file_identity[0]
                 if size == 0:
                     stats["rest_rows_size_zero"] += 1
+            except Exception as exc:
+                stats["rest_rows_meta_fail"] += 1
+                stats["rest_fail"] += 1
+                logger.warning("SP REST file metadata failed: %s", type(exc).__name__)
+                file_info = None
 
-        # Idempotency — skip re-downloading catalog files that already have a
-        # matching blob from a prior snapshot (same server_relative_url + size).
-        existing_blob_path = None
-        existing_hash: Optional[str] = None
-        if file_info and size > 0:
+        if file_info is not None:
             blob_path_candidate = azure_storage_manager.build_blob_path(
                 str(tenant.id), str(resource.id), str(snapshot.id),
                 f"splist_{lst_id}_{it_id}",
             )
             # Stream download → temp file → block-blob upload.
-            if size > 0:
+            if size >= 0:
                 tmp_path = None
                 try:
                     async with self.backup_semaphore:
@@ -29479,11 +29475,19 @@ class BackupWorker:
                         with open(tmp_path, "wb") as fp:
                             async for chunk in graph_client.stream_sharepoint_file_via_rest(
                                 sp_hostname, sp_site_web_url, srv_rel,
+                                expected_size=size, expected_etag=file_identity[1],
                             ):
                                 fp.write(chunk)
                                 sha.update(chunk)
                         content_hash = sha.hexdigest()
                         downloaded_bytes = os.path.getsize(tmp_path)
+                        if downloaded_bytes != size:
+                            raise ProviderReadError("download_length_mismatch")
+                        current_info = await graph_client.get_sharepoint_file_metadata_via_rest(
+                            sp_hostname, sp_site_web_url, srv_rel,
+                        )
+                        if sharepoint_file_identity(current_info) != file_identity:
+                            raise ProviderReadError("file_version_changed")
                         upload_result = await upload_blob_with_retry_from_file(
                             container_name=container,
                             blob_path=blob_path_candidate,
@@ -29500,11 +29504,10 @@ class BackupWorker:
                         )
                     if isinstance(upload_result, dict) and upload_result.get("success"):
                         blob_path = blob_path_candidate
-                        stats["rest_files_ok"] += 1
-                        stats["rest_bytes"] += downloaded_bytes
                     else:
                         stats["rest_fail"] += 1
                 except Exception as exc:
+                    content_hash = None
                     # Ghosted catalog files (Web Part Gallery et al) 404 on
                     # /$value forever by design — they must not settle the
                     # site PARTIAL on every run. Everything else still does.
@@ -29581,7 +29584,11 @@ class BackupWorker:
                 ))
                 await sess.commit()
             stats["rest_rows"] += 1
+            if blob_path:
+                stats["rest_files_ok"] += 1
+                stats["rest_bytes"] += downloaded_bytes
         except Exception as exc:
+            stats["rest_fail"] += 1
             logger.warning("sp_rest_row persist failed for %s/%s/%s: %s", site_label, display, name, exc)
 
     @staticmethod

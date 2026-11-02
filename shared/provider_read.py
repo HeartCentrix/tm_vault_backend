@@ -64,3 +64,24 @@ class ProviderReadBudget:
             raise error
         self.waited += delay
         return delay
+
+
+def sharepoint_file_identity(metadata):
+    """Require a length and source-version proof before publishing file bytes."""
+    if not isinstance(metadata, dict) or "Length" not in metadata:
+        raise ProviderReadError("invalid_file_metadata")
+    try:
+        size = int(metadata["Length"])
+    except (TypeError, ValueError):
+        raise ProviderReadError("invalid_file_length") from None
+    if size < 0:
+        raise ProviderReadError("invalid_file_length")
+    etag = metadata.get("ETag") or metadata.get("@odata.etag") or metadata.get("odata.etag")
+    if not etag and isinstance(metadata.get("__metadata"), dict):
+        etag = metadata["__metadata"].get("etag")
+    if etag is not None and (not isinstance(etag, str) or not etag or "\r" in etag or "\n" in etag):
+        raise ProviderReadError("invalid_file_version")
+    version = tuple(metadata.get(key) for key in ("UniqueId", "UIVersionLabel", "TimeLastModified"))
+    if not etag and not all(version):
+        raise ProviderReadError("missing_file_version")
+    return size, etag, version
