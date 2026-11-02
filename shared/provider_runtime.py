@@ -16,6 +16,7 @@ from shared.provider_admission import ProviderDeferred
 logger = logging.getLogger(__name__)
 _EXECUTION = ContextVar('provider_execution', default=None)
 _UNIT = ContextVar('provider_unit', default=None)
+_PREPAID_STORAGE = ContextVar('prepaid_storage_bytes', default=None)
 
 
 class ProviderTurnDeferred(BaseException):
@@ -58,11 +59,14 @@ class ExecutionBudget:
             self._bytes_changed.notify_all()
 
     @asynccontextmanager
-    async def bytes(self, amount):
+    async def bytes(self, amount, *, includes_storage=False):
         await self.acquire_bytes(amount)
+        token = _PREPAID_STORAGE.set((self, asyncio.current_task(), amount)) if includes_storage else None
         try:
             yield
         finally:
+            if token is not None:
+                _PREPAID_STORAGE.reset(token)
             await asyncio.shield(self.release_bytes(amount))
 
 
@@ -75,6 +79,20 @@ def execution_budget():
             control=int(os.getenv('PROVIDER_CONTROL_RESERVE', '2')),
             resident_bytes=int(os.getenv('PROVIDER_RESIDENT_BYTES', str(128 * 1024 * 1024))))
     return _budget
+
+
+@asynccontextmanager
+async def storage_buffer_budget(amount):
+    """Consume an explicit same-task prepaid scope, or reserve standalone buffers."""
+    budget = execution_budget()
+    prepaid = _PREPAID_STORAGE.get()
+    if prepaid and prepaid[0] is budget and prepaid[1] is asyncio.current_task():
+        if amount > prepaid[2]:
+            raise ValueError('storage buffers exceed prepaid reservation')
+        yield
+    else:
+        async with budget.bytes(amount):
+            yield
 
 
 @dataclass

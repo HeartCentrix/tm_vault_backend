@@ -36,3 +36,37 @@ async def test_byte_reservation_cancellation_does_not_leak_capacity():
     assert budget.used_bytes == 0
     async with budget.bytes(100):
         assert budget.used_bytes == 100
+
+async def test_prepaid_storage_scope_reuses_only_own_matching_budget(monkeypatch):
+    from shared import provider_runtime as runtime
+    from shared.provider_runtime import storage_buffer_budget
+    budget = ExecutionBudget(content=2, control=1, resident_bytes=100)
+    monkeypatch.setattr(runtime, '_budget', budget)
+    async with budget.bytes(100, includes_storage=True):
+        async with asyncio.timeout(1):
+            async with storage_buffer_budget(80):
+                assert budget.used_bytes == 100
+        with pytest.raises(ValueError, match='prepaid'):
+            async with storage_buffer_budget(101):
+                pass
+        waiting = asyncio.create_task(storage_buffer_budget(1).__aenter__())
+        await asyncio.sleep(0)
+        assert not waiting.done()
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+    assert budget.used_bytes == 0
+
+async def test_standalone_storage_operations_share_budget_and_cancel_waiter(monkeypatch):
+    from shared import provider_runtime as runtime
+    from shared.provider_runtime import storage_buffer_budget
+    budget = ExecutionBudget(resident_bytes=100)
+    monkeypatch.setattr(runtime, '_budget', budget)
+    async with storage_buffer_budget(90):
+        task = asyncio.create_task(storage_buffer_budget(20).__aenter__())
+        await asyncio.sleep(0)
+        assert not task.done()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert budget.used_bytes == 0
