@@ -117,6 +117,70 @@ async def test_chat_pacing_is_shared_across_sources_and_request_types(source_fac
     assert sent == [0.0, 1.0, 2.0, 2.0]
 
 
+async def test_pinned_capture_admits_and_accounts_metadata_and_binary(source_factory, monkeypatch):
+    from shared.graph_rate_limiter import graph_rate_limiter
+    from shared import provider_runtime
+    events = []
+    monkeypatch.setenv("PROVIDER_SCOPED_ADMISSION_ENABLED", "true")
+
+    @asynccontextmanager
+    async def admit(context, **kwargs):
+        events.append(("admit", context.workload, context.resource))
+        try:
+            yield
+        finally:
+            events.append(("release",))
+
+    async def account(context):
+        events.append(("account", context.workload, context.resource))
+
+    monkeypatch.setattr(graph_rate_limiter, "admit", admit)
+    monkeypatch.setattr(provider_runtime, "account_provider_attempt", account)
+
+    def handler(request):
+        events.append(("send", request.url.path.endswith("/$value")))
+        if request.url.path.endswith("/$value"):
+            return httpx.Response(200, content=b"hosted")
+        return httpx.Response(200, json={"value": []})
+
+    make, *_ = source_factory
+    async with make(handler) as source:
+        assert [page async for page in source.iter_message_pages("chat")] == [[]]
+        async with source.open_hosted("chat", "message", "hosted") as (body, _, _):
+            assert b"".join([chunk async for chunk in body]) == b"hosted"
+    assert [event[0] for event in events] == ["admit", "account", "send", "release"] * 2
+    assert [event[1:] for event in events if event[0] == "account"] == [("teams", "chat:chat")] * 2
+
+
+async def test_pinned_capture_preserves_long_cooldown_for_durable_handoff(source_factory, monkeypatch):
+    from shared.graph_rate_limiter import graph_rate_limiter
+    from shared.provider_admission import ProviderDeferred
+    from shared.chat_capture_graph import StrictChatGraphSource
+    monkeypatch.setenv("PROVIDER_SCOPED_ADMISSION_ENABLED", "true")
+    cooldowns = []
+
+    @asynccontextmanager
+    async def admit(context, **kwargs):
+        yield
+
+    async def cooldown(context, delay):
+        cooldowns.append(delay)
+
+    async def pause(*args):
+        pytest.fail("long cooldown must leave the capture for durable handoff")
+
+    monkeypatch.setattr(graph_rate_limiter, "admit", admit)
+    monkeypatch.setattr(graph_rate_limiter, "cooldown", cooldown)
+    monkeypatch.setattr(StrictChatGraphSource, "_pause", pause)
+    make, requests, *_ = source_factory
+    async with make(lambda request: httpx.Response(429, headers={"Retry-After": "900"})) as source:
+        with pytest.raises(ProviderDeferred) as caught:
+            _ = [page async for page in source.iter_message_pages("chat")]
+    assert caught.value.retry_after == 900
+    assert cooldowns == [900]
+    assert sum(request.url.host == "graph.microsoft.com" for request in requests) == 1
+
+
 async def test_user_chat_lists_have_separate_shared_pacing(source_factory, pacing_clock):
     make, *_ = source_factory
     sent = []

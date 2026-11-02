@@ -56,7 +56,7 @@ class _PinnedGraphClient(GraphClient):
                         timeout=httpx.Timeout(connect=30, read=120, write=30, pool=30),
                         limits=httpx.Limits(max_connections=16, max_keepalive_connections=16),
                     )
-        return self._http
+        return self._admitted_http(self._http)
 
 
 def _target(url: str, *, graph: bool) -> None:
