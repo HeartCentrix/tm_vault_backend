@@ -652,7 +652,8 @@ async def _apply(factory, work, page, page_size, ms):
             await db.execute(
                 text("""UPDATE resource_protected_bytes p SET bytes=working_bytes,computed_at=clock_timestamp(),ledger_published=true,
               latest_snapshot_id=(SELECT snapshot_id FROM protected_size_snapshots s WHERE s.resource_id=p.resource_id AND s.eligible ORDER BY snapshot_id DESC LIMIT 1)
-              WHERE resource_id=:r AND NOT EXISTS(SELECT 1 FROM protected_size_jobs WHERE resource_id=:r)
+              WHERE resource_id=:r AND (SELECT discovery_done FROM protected_size_control WHERE singleton)
+              AND NOT EXISTS(SELECT 1 FROM protected_size_jobs WHERE resource_id=:r)
               AND NOT EXISTS(SELECT 1 FROM protected_size_targets WHERE resource_id=:r AND acknowledged_at IS NULL)"""),
                 {"r": rid},
             )
@@ -676,7 +677,11 @@ async def _apply(factory, work, page, page_size, ms):
               OR EXISTS(SELECT 1 FROM protected_size_targets WHERE resource_id=:r AND acknowledged_at IS NULL) OR {_route_pending(':r')}"""),
                 {"r": rid},
             )
-            if not pending:
+            if not pending and await db.scalar(
+                text(
+                    "SELECT discovery_done FROM protected_size_control WHERE singleton"
+                )
+            ):
                 await db.execute(
                     text(
                         "UPDATE resource_protected_bytes SET bytes=working_bytes,computed_at=clock_timestamp(),ledger_published=true WHERE resource_id=:r"

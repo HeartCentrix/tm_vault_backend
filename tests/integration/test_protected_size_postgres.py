@@ -1008,3 +1008,24 @@ async def test_retired_cleanup_pages_candidates_before_dependent_row_checks(ledg
         plan = json.loads(plan)
     assert plan[0]["Plan"]["Shared Hit Blocks"] < 100
     assert len(args["ids"]) == 1
+
+
+async def test_ddl_between_source_read_and_apply_preserves_last_published_bytes(ledger):
+    from shared.protected_size import _claim, _source_page, _apply
+
+    s = await ledger.snapshot()
+    item = await ledger.item(s, "x", 1)
+    await ledger.drain()
+    await ledger.sql("UPDATE snapshot_items SET content_size=2 WHERE id=:i", i=item)
+    work = await _claim(ledger.factory, uuid4(), 5000)
+    page = await _source_page(ledger.factory, work, 1, 5000, False)
+    await ledger.sql("ALTER TABLE snapshot_items ADD COLUMN unrelated_metadata text")
+    await _apply(ledger.factory, work, page, 1, 5000)
+    assert (
+        await ledger.sql(
+            "SELECT bytes FROM resource_protected_bytes WHERE resource_id=:r",
+            r=ledger.resource,
+        )
+    ).scalar() == 1
+    await ledger.drain()
+    assert (await ledger.summary())["totalBytes"] == 2
