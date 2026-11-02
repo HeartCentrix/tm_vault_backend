@@ -254,3 +254,22 @@ async def test_batch_response_obeys_byte_envelope_before_json_parse():
             await AdmittedHttpClient(raw, Owner(), limiter=BatchLimiter()).post(
                 'https://graph.microsoft.com/v1.0/$batch', json={'requests': [
                     {'id': 'one', 'method': 'GET', 'url': '/users/a/messages'}]})
+
+
+async def test_preauthenticated_archive_import_is_metered_without_auth_or_replay(monkeypatch):
+    from shared.archive_export import post_json_no_auth
+    from shared.graph_rate_limiter import graph_rate_limiter
+    limiter, sent = Limiter(), []
+    monkeypatch.setenv('PROVIDER_SCOPED_ADMISSION_ENABLED', 'true')
+    monkeypatch.setattr(graph_rate_limiter, 'admit', limiter.admit)
+    monkeypatch.setattr(graph_rate_limiter, 'cooldown', limiter.cooldown)
+    async def handler(request):
+        sent.append(request)
+        assert 'authorization' not in request.headers
+        return httpx.Response(429, headers={'Retry-After': '600'})
+    with pytest.raises(httpx.HTTPStatusError):
+        await post_json_no_auth('https://outlook.office365.com/synthetic/import', {},
+            graph_client=Owner(), _client_transport=httpx.MockTransport(handler))
+    assert len(sent) == 1
+    assert limiter.events[0][1].workload == 'exchange'
+    assert limiter.events[0][1].tenant_id == 'verified-tenant'

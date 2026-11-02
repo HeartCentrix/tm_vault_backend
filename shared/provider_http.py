@@ -86,6 +86,10 @@ def request_context(owner, url, *, operation=None):
                 resource = 'mailbox:' + parts[i+1] if len(parts) > i+1 else None
         elif parts == ['$batch']:
             workload = 'batch'
+    elif host in ('outlook.office365.com', 'outlook.office.com'):
+        # Preauthenticated Exchange import/attachment sessions. Identity still
+        # comes from the client that obtained the session, never its URL token.
+        workload = 'exchange'
     elif host.endswith(('.sharepoint.com', '.sharepoint.us')):
         workload = 'sharepoint'
         if '/_api/' in path:

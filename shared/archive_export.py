@@ -30,6 +30,7 @@ from shared import archive_graph
 
 async def post_json_no_auth(
     url: str, body: Dict[str, Any], *, _client_transport: Optional[Any] = None,
+    graph_client=None,
 ) -> Dict[str, Any]:
     """POST JSON to a preauthenticated import URL with NO Authorization header.
 
@@ -45,7 +46,9 @@ async def post_json_no_auth(
     kwargs: Dict[str, Any] = {"timeout": timeout}
     if _client_transport is not None:
         kwargs["transport"] = _client_transport
-    async with httpx.AsyncClient(**kwargs) as client:
+    async with httpx.AsyncClient(**kwargs) as raw:
+        from shared.provider_http import download_client
+        client = download_client(raw, graph_client)
         resp = await client.post(url, json=body)
         resp.raise_for_status()
         return resp.json() if resp.content else {}
@@ -157,6 +160,9 @@ class LiveStagingOps:
         self.user_id = user_id
         self.primary_mailbox_id = primary_mailbox_id
         self.folder_name = folder_name
+        if post_json is post_json_no_auth:
+            from functools import partial
+            post_json = partial(post_json_no_auth, graph_client=gc)
         self.post_json = post_json
         self.read_page_size = read_page_size
 
