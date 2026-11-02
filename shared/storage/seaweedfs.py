@@ -211,7 +211,18 @@ class SeaweedStore:
             content_md5=None, last_modified=head["LastModified"],
         )
 
-    async def upload_stream(
+    async def upload_stream(self, container, path, byte_stream, total_size, metadata=None,
+                            chunk_size=8*1024*1024, max_parallel_parts=None, *, tenant_id=None):
+        from shared.provider_runtime import execution_budget, storage_buffer_budget
+        if chunk_size <= 0 or (max_parallel_parts is not None and max_parallel_parts < 1):
+            raise ValueError('multipart buffers must be positive')
+        parallel = max_parallel_parts if max_parallel_parts is not None else self._upload_concurrency
+        parallel = min(parallel, max(1, execution_budget().resident_bytes//chunk_size-6))
+        async with storage_buffer_budget(chunk_size*(parallel+6)):
+            return await self._upload_stream(container, path, byte_stream, total_size,
+                metadata=metadata, chunk_size=chunk_size, max_parallel_parts=parallel, tenant_id=tenant_id)
+
+    async def _upload_stream(
         self, container, path,
         byte_stream: "AsyncIterator[bytes]",
         total_size: int,
@@ -392,32 +403,47 @@ class SeaweedStore:
 
     async def upload_from_file(self, container, path, file_path, size,
                                metadata=None, overwrite=True, *, tenant_id=None) -> BlobInfo:
-        # When encryption is on, seal the file by streaming it through the
-        # multipart encrypt path (never buffers the whole file); otherwise keep
-        # the fast zero-copy upload_fileobj path unchanged.
         if _crypto_runtime.is_write_enabled() and (tenant_id or self._tenant_id):
-            async def _file_chunks():
-                with open(file_path, "rb") as f:
-                    while True:
-                        b = f.read(8 * 1024 * 1024)
-                        if not b:
-                            break
-                        yield b
-            return await self.upload_stream(
-                container, path, _file_chunks(), size,
-                metadata=metadata, tenant_id=tenant_id,
-            )
+            return await self._upload_encrypted_file(container, path, file_path, size,
+                metadata=metadata, tenant_id=tenant_id or self._tenant_id)
 
-        bucket = self._bucket(container)
-        key = self._key(container, path)
+        from shared.provider_runtime import storage_buffer_budget
+        from shared.storage.file_upload import FileBody, file_upload_capacity, file_identity, part_size_for, send_file_parts
+        bucket, key = self._bucket(container), self._key(container, path)
+        concurrency, reservation = file_upload_capacity(self._upload_concurrency)
+        part_size = part_size_for(size, max_parts=10000, minimum=8*1024*1024, maximum=5*1024**3)
         try:
-            async with self._client_ctx() as s3:
-                with open(file_path, "rb") as f:
-                    await s3.upload_fileobj(
-                        f, bucket, key,
-                        ExtraArgs={"Metadata": _clean_metadata(metadata or {})},
-                    )
+            async with storage_buffer_budget(reservation), self._client_ctx() as s3:
+                if size < part_size:
+                    identity = file_identity(file_path)
+                    if identity[2] != size:
+                        raise OSError('upload source size differs from its declared size')
+                    with open(file_path, 'rb') as source, FileBody(source, 0, size) as body:
+                        await s3.put_object(Bucket=bucket, Key=key, Body=body, ContentLength=size,
+                            Metadata=_clean_metadata(metadata or {}))
+                        if body.tell() != size or file_identity(file_path) != identity:
+                            raise OSError('upload source changed or was not consumed exactly')
+                else:
+                    mp = await s3.create_multipart_upload(Bucket=bucket, Key=key,
+                        Metadata=_clean_metadata(metadata or {}))
+                    async def send(number, body, length):
+                        result = await s3.upload_part(Bucket=bucket, Key=key, UploadId=mp['UploadId'],
+                            PartNumber=number, Body=body, ContentLength=length)
+                        return {'PartNumber': number, 'ETag': result['ETag']}
+                    try:
+                        parts = await send_file_parts(file_path, size, part_size=part_size,
+                            concurrency=concurrency, send=send)
+                        await s3.complete_multipart_upload(Bucket=bucket, Key=key,
+                            UploadId=mp['UploadId'], MultipartUpload={'Parts': parts})
+                    except BaseException:
+                        try:
+                            await s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=mp['UploadId'])
+                        except Exception:
+                            pass
+                        raise
                 head = await s3.head_object(Bucket=bucket, Key=key)
+                if head['ContentLength'] != size:
+                    raise BackendUnreachableError('upload returned a different stored size')
         except ClientError as e:
             raise BackendUnreachableError(str(e)) from e
         return BlobInfo(
@@ -426,6 +452,56 @@ class SeaweedStore:
             url=f"{self._endpoint}/{bucket}/{key}",
             content_md5=None, last_modified=head["LastModified"],
         )
+
+    async def _upload_encrypted_file(self, container, path, file_path, size, *, metadata, tenant_id):
+        from shared.provider_runtime import storage_buffer_budget
+        from shared.storage.file_upload import file_upload_capacity, file_identity, part_size_for, send_spooled_parts
+        identity, hasher = file_identity(file_path), hashlib.sha256()
+        if identity[2] != size:
+            raise OSError('upload source size differs from its declared size')
+        # TMVE's existing1MiB framing adds20 bytes/frame plus55 bytes/header.
+        # A conservative upper bound selects legal part count without changing framing.
+        upper_size = size + max(1, (size+1048575)//1048576)*64+128
+        part_size = part_size_for(upper_size, max_parts=10000, minimum=8*1024*1024, maximum=5*1024**3)
+        concurrency, reservation = file_upload_capacity(self._upload_concurrency, extra_bytes=8*1024*1024)
+        bucket, key = self._bucket(container), self._key(container, path)
+        async def plaintext():
+            with open(file_path, 'rb') as source:
+                while piece := source.read(65536):
+                    hasher.update(piece)
+                    yield piece
+        async with storage_buffer_budget(reservation), self._client_ctx() as s3:
+            plain = plaintext()
+            cipher, encrypted = await _crypto_runtime.maybe_encrypt_stream(plain, tenant_id)
+            mp = await s3.create_multipart_upload(Bucket=bucket, Key=key, Metadata=_clean_metadata(metadata or {}))
+            async def send(number, body, length):
+                result = await s3.upload_part(Bucket=bucket, Key=key, UploadId=mp['UploadId'],
+                    PartNumber=number, Body=body, ContentLength=length)
+                return {'PartNumber': number, 'ETag': result['ETag']}
+            try:
+                parts, stored_size = await send_spooled_parts(cipher, part_size=part_size,
+                    concurrency=concurrency, send=send)
+                if file_identity(file_path) != identity:
+                    raise OSError('upload source changed during encryption')
+                await s3.complete_multipart_upload(Bucket=bucket, Key=key,
+                    UploadId=mp['UploadId'], MultipartUpload={'Parts': parts})
+            except BaseException:
+                try:
+                    await s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=mp['UploadId'])
+                except Exception:
+                    pass
+                raise
+            finally:
+                await cipher.aclose()
+                await plain.aclose()
+            head = await s3.head_object(Bucket=bucket, Key=key)
+            if head['ContentLength'] != stored_size:
+                raise BackendUnreachableError('encrypted upload returned a different stored size')
+        _record_blob_write(encrypted)
+        return BlobInfo(backend_id=self.backend_id, container=container, path=path,
+            size=head['ContentLength'], etag=head['ETag'].strip('"'),
+            url=f'{self._endpoint}/{bucket}/{key}', content_md5=hasher.hexdigest(),
+            last_modified=head['LastModified'])
 
     async def head_is_encrypted(self, container, path) -> bool:
         """True if the stored blob begins with a TMVE envelope. Cheap ranged read

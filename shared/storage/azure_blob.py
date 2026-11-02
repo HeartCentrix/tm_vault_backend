@@ -113,7 +113,16 @@ class AzureBlobStore:
             last_modified=props["last_modified"] if props else datetime.utcnow(),
         )
 
-    async def upload_stream(
+    async def upload_stream(self, container, path, byte_stream, total_size, metadata=None,
+                            chunk_size=8*1024*1024, max_parallel_parts=4):
+        from shared.provider_runtime import storage_buffer_budget
+        if chunk_size <= 0:
+            raise ValueError('block buffer must be positive')
+        async with storage_buffer_budget(chunk_size*4):
+            return await self._upload_stream(container, path, byte_stream, total_size,
+                metadata=metadata, chunk_size=chunk_size, max_parallel_parts=max_parallel_parts)
+
+    async def _upload_stream(
         self, container, path,
         byte_stream, total_size: int,
         metadata=None,

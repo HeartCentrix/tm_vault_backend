@@ -21,8 +21,8 @@ class S3:
     async def create_bucket(self, Bucket):
         self.buckets.add(Bucket)
 
-    async def upload_fileobj(self, file, bucket, key, **kwargs):
-        self.content[bucket, key] = file.read()
+    async def put_object(self, Bucket, Key, Body, **kwargs):
+        self.content[Bucket, Key] = Body.read()
 
     async def head_object(self, Bucket, Key):
         return {"ContentLength": len(self.content[Bucket, Key]), "ETag": '"etag"', "LastModified": datetime(2026, 1, 1)}

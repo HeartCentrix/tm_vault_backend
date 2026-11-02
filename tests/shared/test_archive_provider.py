@@ -174,3 +174,77 @@ async def test_owned_export_long_cooldown_yields_after_releasing_http(monkeypatc
         assert not graph.active
     finally:
         runtime._EXECUTION.reset(marker)
+
+async def test_spooled_export_reserves_metadata_and_upload_until_receipt_without_nested_wait(monkeypatch):
+    from shared import provider_runtime as runtime
+    from shared.archive_provider import export_items_spooled
+    from shared.storage.file_upload import file_upload_capacity
+    budget = runtime.ExecutionBudget(resident_bytes=64*1024*1024)
+    monkeypatch.setattr(runtime, '_budget', budget)
+    class Graph:
+        async def _get_token(self): return 'synthetic'
+        @asynccontextmanager
+        async def _admit_data_request(self,*a,**kw): yield
+        @asynccontextmanager
+        async def _http_session(self):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r:
+                httpx.Response(200,json={'value':[{'itemId':'one','data':'YWJj'}]}))) as client: yield client
+    async with export_items_spooled(Graph(),URL,['one'],timeout=10):
+        assert 0 < budget.used_bytes <= budget.resident_bytes
+        _, amount = file_upload_capacity(100,extra_bytes=8*1024*1024)
+        assert amount < budget.used_bytes
+        async with asyncio.timeout(1), runtime.storage_buffer_budget(amount):
+            pass
+    assert budget.used_bytes == 0
+
+async def test_spooled_export_releases_buffers_before_transport_backoff(monkeypatch):
+    from shared import provider_runtime as runtime
+    from shared.archive_provider import export_items_spooled
+    budget = runtime.ExecutionBudget()
+    monkeypatch.setattr(runtime,'_budget',budget)
+    calls, waits = [], []
+    class Broken(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            assert budget.used_bytes > 0
+            yield b'{"value":['
+            raise httpx.ReadError('synthetic')
+    class Graph:
+        async def _get_token(self): return 'synthetic'
+        @asynccontextmanager
+        async def _admit_data_request(self,*a,**kw): yield
+        @asynccontextmanager
+        async def _http_session(self):
+            def respond(r):
+                calls.append(r)
+                return httpx.Response(200,stream=Broken()) if len(calls)==1 else httpx.Response(200,json={'value':[]})
+            async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client: yield client
+    async def pause(delay):
+        assert budget.used_bytes == 0
+        waits.append(delay)
+    monkeypatch.setattr('shared.archive_provider.asyncio.sleep',pause)
+    async with export_items_spooled(Graph(),URL,['one'],timeout=10) as response:
+        assert response == {'value':[]}
+    assert len(calls)==2 and len(waits)==1 and budget.used_bytes==0
+
+async def test_spool_directory_failure_releases_reserved_buffers(monkeypatch):
+    from shared import provider_runtime as runtime
+    from shared.archive_provider import export_items_spooled
+    import tempfile
+    budget = runtime.ExecutionBudget()
+    monkeypatch.setattr(runtime,'_budget',budget)
+    original = tempfile.TemporaryDirectory
+    def directory(*args,**kwargs):
+        if kwargs.get('prefix') == 'attempt-': raise OSError('synthetic no space')
+        return original(*args,**kwargs)
+    monkeypatch.setattr(tempfile,'TemporaryDirectory',directory)
+    class Graph:
+        async def _get_token(self): return 'synthetic'
+        @asynccontextmanager
+        async def _admit_data_request(self,*a,**kw): yield
+        @asynccontextmanager
+        async def _http_session(self):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r:
+                httpx.Response(200,json={'value':[]}))) as client: yield client
+    with pytest.raises(OSError):
+        async with export_items_spooled(Graph(),URL,['one'],timeout=10): pass
+    assert budget.used_bytes == 0

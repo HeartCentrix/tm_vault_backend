@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 import tempfile
 from urllib.parse import urlsplit
 
@@ -98,12 +98,36 @@ async def export_items(graph, url, ids, *, timeout, byte_limit=16 * 1024 * 1024)
 
 @asynccontextmanager
 async def export_items_spooled(graph, url, ids, *, timeout, metadata_limit=4 * 1024 * 1024):
-    """Keep opaque bytes on disk through upload/receipt, then remove all spools."""
+    """Reserve bounded metadata and upload buffers together through the receipt."""
     from shared.archive_spool import ExportSpoolDecoder
+    from shared.provider_runtime import execution_budget
+    budget = execution_budget()
+    # Envelope/string/JSON input payload copies plus decoder chunks. Python
+    # object overhead is not a byte-for-byte RSS promise.
+    metadata_bytes = metadata_limit*3+6*65536
+    upload_bytes = min(38*1024*1024, budget.resident_bytes-metadata_bytes)
+    if metadata_limit < 1 or upload_bytes < 17*1024*1024:
+        raise ValueError('archive metadata and upload buffers exceed configured capacity')
     with tempfile.TemporaryDirectory(prefix='tmvault-archive-') as directory:
-        async def read(response):
-            with ExportSpoolDecoder(directory, metadata_limit=metadata_limit) as parser:
-                async for chunk in response.aiter_bytes(chunk_size=65536):
-                    parser.feed(chunk)
-                return parser.finish()
-        yield await _request_export(graph, url, ids, timeout=timeout, read_body=read)
+        async with AsyncExitStack() as retained:
+            async def read(response):
+                reservation = budget.bytes(metadata_bytes+upload_bytes, includes_storage=upload_bytes)
+                await reservation.__aenter__()
+                attempt = None
+                try:
+                    attempt = tempfile.TemporaryDirectory(prefix='attempt-', dir=directory)
+                    with ExportSpoolDecoder(attempt.name, metadata_limit=metadata_limit) as parser:
+                        async for chunk in response.aiter_bytes(chunk_size=65536):
+                            parser.feed(chunk)
+                        result = parser.finish()
+                except BaseException:
+                    try:
+                        if attempt is not None:
+                            attempt.cleanup()
+                    finally:
+                        await reservation.__aexit__(None, None, None)
+                    raise
+                retained.push_async_exit(reservation)
+                retained.callback(attempt.cleanup)
+                return result
+            yield await _request_export(graph, url, ids, timeout=timeout, read_body=read)
