@@ -37,6 +37,7 @@ from shared.multi_app_manager import multi_app_manager
 from shared.message_bus import message_bus
 from shared.storage_rollup import exclude_tier2_storage_dupes_clause
 from shared.copy_observability import copy_work_summaries
+from shared.activity_diagnostics import activity_phase, activity_span, trace_activity
 from shared.copy_workflow import copy_work_guards_enabled, initialize_copy_guards
 
 # Sibling-file load: audit-service has a hyphen so a plain
@@ -937,6 +938,7 @@ async def health():
     return {"status": "healthy", "service": "audit-log"}
 
 
+@activity_span("batch_with_shape")
 async def _list_activities_batch(
     *,
     tenantId: Optional[str],
@@ -1017,7 +1019,7 @@ async def _list_activities_batch(
                 size=fetch_limit,
                 offset=0,
             )
-            rows = (await db.execute(stmt)).all()
+            rows = (await activity_phase("batch_db_including_pool", db.execute(stmt))).all()
             for r in rows:
                 row = shape_batch_row(r)
                 if status and status != "Warning":
@@ -1040,7 +1042,7 @@ async def _list_activities_batch(
                 select(AuditEvent).where(and_(*wfilters))
                 .order_by(desc(AuditEvent.occurred_at)).limit(fetch_limit)
             )
-            for event in (await db.execute(wstmt)).scalars().all():
+            for event in (await activity_phase("warnings_db_including_pool", db.execute(wstmt))).scalars().all():
                 details = event.details or {}
                 message = details.get("message")
                 if not message:
@@ -1087,7 +1089,7 @@ async def _list_activities_batch(
                 select(AuditEvent).where(and_(*dfilters))
                 .order_by(desc(AuditEvent.occurred_at)).limit(fetch_limit)
             )
-            dev = (await db.execute(dstmt)).scalars().all()
+            dev = (await activity_phase("discovery_db_including_pool", db.execute(dstmt))).scalars().all()
             started_sorted = sorted(
                 (e for e in dev if e.action == "DISCOVERY_STARTED"),
                 key=lambda e: e.occurred_at or datetime.min,
@@ -1206,6 +1208,7 @@ async def _list_activities_batch(
     }
 
 
+@activity_span("batch_v2_with_shape")
 async def _list_activities_batch_v2(
     *,
     tenantId: Optional[str],
@@ -1314,6 +1317,7 @@ async def _list_activities_batch_v2(
         return out
 
 
+@activity_span("final_copy_summary")
 async def _attach_activity_copy_work(payload, *, session=None):
     """One content-free copy aggregate for the final authorized Activity page."""
     if not copy_work_guards_enabled():
@@ -1362,6 +1366,7 @@ async def _attach_activity_copy_work(payload, *, session=None):
 
 
 @app.get("/api/v1/activity", dependencies=[Depends(require_principal)])
+@trace_activity
 async def list_activities(
     tenantId: Optional[str] = Query(None),
     serviceType: Optional[str] = Query(None),
