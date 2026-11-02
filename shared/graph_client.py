@@ -5,7 +5,7 @@ import os
 import httpx
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import AsyncGenerator, AsyncIterator, Callable, Iterator, List, Optional, Dict, Any, Set, Tuple, Union
+from typing import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator, List, Optional, Dict, Any, Set, Tuple, Union
 from datetime import datetime, timedelta
 import hashlib
 import time
@@ -458,7 +458,8 @@ class GraphClient:
         return p
 
     async def _get(self, url: str, params: Optional[Dict] = None,
-                   on_activity: Optional[Callable[[], None]] = None) -> Dict[str, Any]:
+                   on_activity: Optional[Callable[[], None]] = None, *,
+                   on_page: Optional[Callable[[Dict[str, Any], str], Awaitable[None]]] = None) -> Dict[str, Any]:
         """Make authenticated GET request with pagination, throttling, and timeout retry.
 
         Branches on GRAPH_HARDENING_ENABLED: when off (default), runs the
@@ -484,8 +485,8 @@ class GraphClient:
         """
         from shared.config import settings as _s
         if _s.GRAPH_HARDENING_ENABLED:
-            return await self._get_hardened(url, params, on_activity=on_activity)
-        return await self._get_legacy(url, params, on_activity=on_activity)
+            return await self._get_hardened(url, params, on_activity=on_activity, on_page=on_page)
+        return await self._get_legacy(url, params, on_activity=on_activity, on_page=on_page)
 
     async def _post_json(
         self, url: str, body: Dict[str, Any], timeout: Optional[float] = None,
@@ -581,7 +582,8 @@ class GraphClient:
                 raise
 
     async def _get_legacy(self, url: str, params: Optional[Dict] = None,
-                          on_activity: Optional[Callable[[], None]] = None) -> Dict[str, Any]:
+                          on_activity: Optional[Callable[[], None]] = None, *,
+                   on_page: Optional[Callable[[Dict[str, Any], str], Awaitable[None]]] = None) -> Dict[str, Any]:
         """Pre-hardening _get — preserved verbatim as the kill-switch path.
         ``on_activity`` fires per round-trip — see _get."""
         def _activity() -> None:
@@ -602,6 +604,8 @@ class GraphClient:
         current_app_id = self.client_id
         auth_retried = False  # one forced-refresh retry per page on 401
         all_items = []
+        observed_count = 0
+        delivering_page = False
         needs_consistency = bool(params and params.get("$count") == "true")
         next_url = url
         max_retries = 5
@@ -706,10 +710,16 @@ class GraphClient:
 
                     # Single-object response (e.g. /users/{id}, /users/{id}/drive)
                     # These have no "value" array — return the object directly
-                    if "value" not in data and "@odata.nextLink" not in data:
+                    if on_page is not None:
+                        delivering_page = True
+                        await on_page(data, next_url)
+                        delivering_page = False
+                    elif "value" not in data and "@odata.nextLink" not in data:
                         return data
 
-                    all_items.extend(data.get("value", []))
+                    observed_count += len(data.get("value", []))
+                    if on_page is None:
+                        all_items.extend(data.get("value", []))
 
                     # Capture delta link for incremental sync
                     if "@odata.deltaLink" in data:
@@ -719,6 +729,8 @@ class GraphClient:
                     params = None  # params only on first request
 
             except httpx.TransportError as e:
+                if delivering_page:
+                    raise  # Sink failures are not HTTP retries.
                 # All network-level transients — incl. ReadError from a
                 # stale keepalive conn (2026-07-29 archive pilot), not
                 # just timeouts.
@@ -735,7 +747,7 @@ class GraphClient:
 
         result = {
             "value": all_items,
-            "@odata.count": last_data.get("@odata.count", len(all_items)),
+            "@odata.count": last_data.get("@odata.count", observed_count),
         }
         # Preserve delta link so callers can save it for incremental backups
         if delta_link:
@@ -748,7 +760,8 @@ class GraphClient:
 
     async def _get_hardened(
         self, url: str, params: Optional[Dict] = None,
-        on_activity: Optional[Callable[[], None]] = None,
+        on_activity: Optional[Callable[[], None]] = None, *,
+        on_page: Optional[Callable[[Dict[str, Any], str], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
         """Policy-driven GET: pacing + Retry-After + backoff + cumulative cap.
 
@@ -775,6 +788,7 @@ class GraphClient:
         migrated = False      # riding a 429-swapped alternate-app token
         auth_retried = False  # one forced-refresh retry per page on 401
         all_items: List[Dict[str, Any]] = []
+        observed_count = 0
         needs_consistency = bool(params and params.get("$count") == "true")
         next_url: Optional[str] = url
         delta_link: Optional[str] = None
@@ -919,10 +933,14 @@ class GraphClient:
                     continue
                 last_data = data
 
-                if "value" not in data and "@odata.nextLink" not in data:
+                if on_page is not None:
+                    await on_page(data, next_url)
+                elif "value" not in data and "@odata.nextLink" not in data:
                     return data
 
-                all_items.extend(data.get("value", []))
+                observed_count += len(data.get("value", []))
+                if on_page is None:
+                    all_items.extend(data.get("value", []))
                 if "@odata.deltaLink" in data:
                     delta_link = data["@odata.deltaLink"]
                 next_url = data.get("@odata.nextLink")
@@ -930,7 +948,7 @@ class GraphClient:
 
         result: Dict[str, Any] = {
             "value": all_items,
-            "@odata.count": last_data.get("@odata.count", len(all_items)),
+            "@odata.count": last_data.get("@odata.count", observed_count),
         }
         if delta_link:
             result["@odata.deltaLink"] = delta_link

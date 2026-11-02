@@ -33,8 +33,8 @@ def _fn_block(name: str) -> str:
 def test_get_threads_on_activity_to_both_paths():
     blk = _fn_block("_get")
     assert "on_activity: Optional[Callable[[], None]] = None" in blk
-    assert "self._get_hardened(url, params, on_activity=on_activity)" in blk
-    assert "self._get_legacy(url, params, on_activity=on_activity)" in blk
+    assert "self._get_hardened(url, params, on_activity=on_activity, on_page=on_page)" in blk
+    assert "self._get_legacy(url, params, on_activity=on_activity, on_page=on_page)" in blk
 
 
 def test_hardened_fires_activity_per_page_and_per_retry():
