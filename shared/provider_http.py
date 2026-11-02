@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import httpx
+import time
+from datetime import timedelta
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from urllib.parse import unquote, urlsplit
@@ -143,18 +145,22 @@ class AdmittedHttpClient:
             raise AttributeError('use admitted request or stream for provider data')
         return getattr(self.raw, name)
 
-    async def _response(self, response, context, method):
-        if response.status_code not in (429, 503):
-            return
-        delay = parse_retry_after(response.headers.get('Retry-After'))
-        delay = max(1.0, delay if delay is not None else 5.0)
+    async def _cooldown_after_send(self, context, delay, *, readonly, status):
         try:
             await self.limiter.cooldown(context, delay)
         except ProviderDeferred:
             # A mutation was already transmitted. Do not report it as unsent.
-            if method.upper() not in ('GET', 'HEAD'):
-                raise ProviderReadError('provider_cooldown_unavailable', status=response.status_code, retry_after=delay) from None
+            if not readonly:
+                raise ProviderReadError('provider_cooldown_unavailable', status=status, retry_after=delay) from None
             raise
+
+    async def _response(self, response, context, method):
+        if response.status_code not in (429, 500, 502, 503, 504):
+            return
+        delay = parse_retry_after(response.headers.get('Retry-After'))
+        delay = max(1.0, delay if delay is not None else 5.0)
+        await self._cooldown_after_send(context, delay, readonly=method.upper() in ('GET', 'HEAD'),
+            status=response.status_code)
         if method.upper() in ('GET', 'HEAD') and delay > 1:
             await response.aclose()
             raise ProviderDeferred(context, delay, stage='provider_throttle')
@@ -183,11 +189,19 @@ class AdmittedHttpClient:
         async with provider_request_scope():
             async with self.limiter.admit_many(costs):
                 await account_provider_attempt(context)
-                response = await self.raw.request(method, url, **kwargs)
-                if response.status_code in (429, 503):
+                kwargs['follow_redirects'] = False
+                async with self.raw.stream(method, url, **kwargs) as streamed:
+                    if streamed.status_code in (429, 500, 502, 503, 504):
+                        # Headers establish cooldown even when an error body is
+                        # oversized. No response payload is required to defer.
+                        response = httpx.Response(streamed.status_code, headers=streamed.headers,
+                            request=streamed.request)
+                    else:
+                        response = await self._read_response(streamed, _response_limit.get() or 16 * 1024 * 1024)
+                if response.status_code in (429, 500, 502, 503, 504):
                     delay = max(1.0, parse_retry_after(response.headers.get('Retry-After')) or 5.0)
                     for sub in set(requests.values()):
-                        await self.limiter.cooldown(sub, delay)
+                        await self._cooldown_after_send(sub, delay, readonly=readonly, status=response.status_code)
                     await self._response(response, context, 'GET' if readonly else method)
                     return response
                 if response.status_code != 200:
@@ -202,11 +216,11 @@ class AdmittedHttpClient:
                                 or result['id'] in seen or type(result.get('status')) is not int):
                             raise ValueError
                         seen.add(result['id'])
-                        if result['status'] in (429, 503):
+                        if result['status'] in (429, 500, 502, 503, 504):
                             headers = httpx.Headers(result.get('headers') or {})
                             delay = max(1.0, parse_retry_after(headers.get('Retry-After')) or 5.0)
                             sub = requests[result['id']]
-                            await self.limiter.cooldown(sub, delay)
+                            await self._cooldown_after_send(sub, delay, readonly=readonly, status=result['status'])
                             if readonly and delay > 1:
                                 deferred.append(ProviderDeferred(sub, delay, stage='provider_batch_throttle'))
                     if seen != set(requests):
@@ -218,46 +232,68 @@ class AdmittedHttpClient:
                     raise max(deferred, key=lambda error: error.retry_after)
                 return response
 
+    @staticmethod
+    async def _read_response(response, limit):
+        if limit is None:
+            await response.aread()
+            return response
+        body = bytearray()
+        async for chunk in response.aiter_bytes(chunk_size=min(65536, limit + 1)):
+            if len(body) + len(chunk) > limit:
+                raise ProviderReadError('response_byte_limit', status=response.status_code)
+            body.extend(chunk)
+        headers = dict(response.headers)
+        for header in ('content-encoding', 'content-length', 'transfer-encoding'):
+            headers.pop(header, None)
+        return httpx.Response(response.status_code, headers=headers,
+            content=bytes(body), request=response.request, extensions=response.extensions)
+
+    @asynccontextmanager
+    async def _stream_hops(self, method, url, **kwargs):
+        from shared.provider_runtime import account_provider_attempt
+        original = request_context(self.owner, url)
+        follow = kwargs.pop('follow_redirects', self.raw.follow_redirects)
+        # Restore mutations retain their explicit operation-specific redirect policy.
+        follow = bool(follow and method.upper() in ('GET', 'HEAD'))
+        auth = kwargs.pop('auth', httpx.USE_CLIENT_DEFAULT)
+        request = self.raw.build_request(method, url, **kwargs)
+        for hop in range(6):
+            # Validate every target, including preauthenticated download redirects.
+            request_context(self.owner, request.url)
+            # Opaque CDN routes retain the verified originating workload/resource.
+            async with admitted(self.limiter, original):
+                await account_provider_attempt(original)
+                response = await self.raw.send(request, stream=True, follow_redirects=False, auth=auth)
+                try:
+                    await self._response(response, original, request.method)
+                    next_request = response.next_request if follow else None
+                    if next_request is None:
+                        yield response
+                        return
+                    if hop == 5:
+                        raise ProviderReadError('provider_redirect_limit', status=response.status_code)
+                    # httpx builds redirect headers and strips cross-origin auth.
+                    request = next_request
+                    auth = None
+                finally:
+                    await response.aclose()
+        raise ProviderReadError('provider_redirect_limit')
+
     async def request(self, method, url, **kwargs):
         if identity_request(self.owner, url):
             return await self.raw.request(method, url, **kwargs)
         if _target(url).path in ('/v1.0/$batch', '/beta/$batch'):
             return await self._batch(method, url, **kwargs)
-        context = request_context(self.owner, url)
-        async with admitted(self.limiter, context):
-            from shared.provider_runtime import account_provider_attempt
-            await account_provider_attempt(context)
-            limit = _response_limit.get()
-            if limit is None:
-                response = await self.raw.request(method, url, **kwargs)
-            else:
-                async with self.raw.stream(method, url, **kwargs) as streamed:
-                    # Reject/defer provider statuses before reading a large body.
-                    await self._response(streamed, context, method)
-                    body = bytearray()
-                    async for chunk in streamed.aiter_bytes(chunk_size=65536):
-                        if len(body) + len(chunk) > limit:
-                            raise ProviderReadError('response_byte_limit', status=streamed.status_code)
-                        body.extend(chunk)
-                    headers = dict(streamed.headers)
-                    for header in ('content-encoding', 'content-length', 'transfer-encoding'):
-                        headers.pop(header, None)
-                    response = httpx.Response(streamed.status_code, headers=headers,
-                        content=bytes(body), request=streamed.request, extensions=streamed.extensions)
-                response.elapsed = streamed.elapsed
-            if limit is None:
-                await self._response(response, context, method)
-            return response
+        started = time.monotonic()
+        async with self._stream_hops(method, url, **kwargs) as streamed:
+            response = await self._read_response(streamed, _response_limit.get())
+        response.elapsed = timedelta(seconds=time.monotonic() - started)
+        return response
 
     @asynccontextmanager
     async def stream(self, method, url, **kwargs):
-        context = request_context(self.owner, url)
-        async with admitted(self.limiter, context):
-            from shared.provider_runtime import account_provider_attempt
-            await account_provider_attempt(context)
-            async with self.raw.stream(method, url, **kwargs) as response:
-                await self._response(response, context, method)
-                yield response
+        async with self._stream_hops(method, url, **kwargs) as response:
+            yield response
 
     async def get(self, url, **kwargs):
         return await self.request('GET', url, **kwargs)
@@ -276,3 +312,22 @@ class AdmittedHttpClient:
 
     async def head(self, url, **kwargs):
         return await self.request('HEAD', url, **kwargs)
+
+
+def download_client(raw, graph_client):
+    """Signed URLs retain the verified originating client's credential scope."""
+    from shared.graph_rate_limiter import graph_rate_limiter
+    if not graph_rate_limiter.scoped_enabled:
+        return raw
+    if graph_client is None:
+        raise ProviderReadError('missing_download_context', retry_after=5)
+    return AdmittedHttpClient(raw, graph_client)
+
+
+async def bounded_error_body(response, limit=16384):
+    body = bytearray()
+    async for block in response.aiter_bytes(chunk_size=4096):
+        if len(body) + len(block) > limit:
+            return b''
+        body.extend(block)
+    return bytes(body)

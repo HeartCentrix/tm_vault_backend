@@ -95,11 +95,15 @@ class _FakeBucket:
 
 
 class _FakeAction:
+    reason = "synthetic retry"
     exhausted = False
     sleep_seconds = 0.0
 
 
 class _FakePolicy:
+    def for_operation(self):
+        return self
+
     stream_bucket = _FakeBucket()
 
     def reset_on_success(self):
@@ -120,7 +124,7 @@ def _bare_client(script, monkeypatch):
     fake = _FakeClient(script)
     g._http_session = lambda: _FakeSession(fake)
     g._effective_priority = lambda: 5
-    setattr(g, "_GraphClient__policy_cached", _FakePolicy())
+    setattr(g, "_policy_cached", _FakePolicy())
 
     counter = {"n": 0}
 

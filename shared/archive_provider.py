@@ -63,7 +63,17 @@ async def _request_export(graph, url, ids, *, timeout, read_body):
             retry = ProviderReadError('archive_export_transport', attempts=budget.attempts)
         if retry is not None:
             # Close the response, client context and physical admission before delay.
-            await asyncio.sleep(budget.retry_delay(retry))
+            try:
+                delay = budget.retry_delay(retry)
+            except ProviderReadError:
+                from shared.provider_runtime import current_execution, defer_provider
+                if current_execution() is not None:
+                    from shared.provider_admission import ProviderDeferred
+                    from shared.provider_http import request_context
+                    defer_provider(ProviderDeferred(request_context(graph, url, operation='archive_export'),
+                        max(1.0, retry.retry_after or 5), stage=retry.stage))
+                raise
+            await asyncio.sleep(delay)
 
 
 async def export_items(graph, url, ids, *, timeout, byte_limit=16 * 1024 * 1024):

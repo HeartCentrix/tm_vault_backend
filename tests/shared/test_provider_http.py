@@ -108,7 +108,7 @@ async def test_graphclient_shared_transport_uses_admission_and_nested_seam_once(
         import asyncio
         async with gc._admit_data_request(url):
             await asyncio.create_task(client.get(url))
-        assert [e[0] for e in limiter.events[2:]] == ['enter', 'enter', 'exit', 'exit']
+        assert [e[0] for e in limiter.events[2:]] == ['enter', 'exit']
     finally:
         await gc.aclose()
 
@@ -192,3 +192,65 @@ async def test_batch_charges_subrequests_and_defers_only_retryable_reads():
         assert response.status_code == 200
     assert len(calls) == 2
     assert all(e[1].workload == 'sharepoint' for e in limiter.events if e[0] == 'cooldown')
+
+
+@pytest.mark.parametrize('outer_status', [429, 200])
+async def test_sent_mutation_batch_never_becomes_an_unsent_deferral(outer_status):
+    from shared.provider_http import AdmittedHttpClient
+    from shared.provider_admission import ProviderDeferred
+    from shared.provider_read import ProviderReadError
+    class FailedCoordinator(Limiter):
+        @asynccontextmanager
+        async def admit_many(self, requirements):
+            yield
+        async def cooldown(self, context, delay):
+            raise ProviderDeferred(context, delay, stage='redis_unavailable')
+    sent = []
+    async def handler(request):
+        sent.append(request)
+        return httpx.Response(outer_status, headers={'Retry-After': '600'}, json={'responses': [
+            {'id': 'write', 'status': 429, 'headers': {'Retry-After': '600'}}]})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as raw:
+        client = AdmittedHttpClient(raw, Owner(), limiter=FailedCoordinator())
+        with pytest.raises(ProviderReadError, match='provider_cooldown_unavailable'):
+            await client.post('https://graph.microsoft.com/v1.0/$batch', json={
+                'requests': [{'id': 'write', 'method': 'POST', 'url': '/users/a/messages'}]})
+    assert len(sent) == 1
+
+
+@pytest.mark.parametrize('target', ['https://tenant.sharepoint.com/file', 'https://attacker.invalid/file'])
+async def test_redirects_are_checked_and_charged_per_hop(target):
+    from shared.provider_http import AdmittedHttpClient
+    limiter, sent = Limiter(), []
+    async def handler(request):
+        sent.append(request)
+        if len(sent) == 1:
+            return httpx.Response(302, headers={'Location': target})
+        assert 'authorization' not in request.headers
+        return httpx.Response(200, content=b'abc')
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=True) as raw:
+        client = AdmittedHttpClient(raw, Owner(), limiter=limiter)
+        call = client.get('https://graph.microsoft.com/v1.0/drives/d/items/i/content', headers={'Authorization': 'Bearer test'})
+        if 'attacker' in target:
+            with pytest.raises(ValueError, match='host'):
+                await call
+            assert len(sent) == 1
+        else:
+            assert (await call).content == b'abc'
+            assert len(sent) == 2
+            assert [e[0] for e in limiter.events] == ['enter', 'exit', 'enter', 'exit']
+            assert all(e[1].resource == 'drive:d' for e in limiter.events)
+
+
+async def test_batch_response_obeys_byte_envelope_before_json_parse():
+    from shared.provider_http import AdmittedHttpClient, response_byte_limit
+    from shared.provider_read import ProviderReadError
+    class BatchLimiter(Limiter):
+        @asynccontextmanager
+        async def admit_many(self, requirements): yield
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r:
+            httpx.Response(200, content=b'x' * 2048))) as raw:
+        with response_byte_limit(1024), pytest.raises(ProviderReadError, match='response_byte_limit'):
+            await AdmittedHttpClient(raw, Owner(), limiter=BatchLimiter()).post(
+                'https://graph.microsoft.com/v1.0/$batch', json={'requests': [
+                    {'id': 'one', 'method': 'GET', 'url': '/users/a/messages'}]})

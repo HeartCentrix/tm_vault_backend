@@ -21087,6 +21087,7 @@ class BackupWorker:
                                         metadata=stream_meta,
                                         segment_size=segment_size,
                                         segment_concurrency=segment_concurrency,
+                                        graph_client=graph_client,
                                     )
                             return await self._stream_graph_to_backend(
                                 download_url=download_url,
@@ -21096,6 +21097,7 @@ class BackupWorker:
                                 shard=shard,
                                 file_name=file_name,
                                 metadata=stream_meta,
+                                graph_client=graph_client,
                             )
                         if per_file_timeout > 0:
                             upload_result = await asyncio.wait_for(
@@ -21780,6 +21782,7 @@ class BackupWorker:
                     "quickxor": qxh or "",
                     "rescue": "true",
                 },
+                graph_client=graph_client,
             )
         except Exception as e:
             return False, f"stream: {type(e).__name__}: {e}"
@@ -22122,6 +22125,7 @@ class BackupWorker:
             async with self.backup_semaphore:
                 tmp_path, sha256 = await self._download_to_temp_resumable(
                     download_url=download_url, expected_size=size, file_name=file_name,
+                    graph_client=graph_client,
                 )
                 upload_result = await upload_blob_with_retry_from_file(
                     container_name=container, blob_path=blob_path,
@@ -22800,154 +22804,37 @@ class BackupWorker:
         segment_concurrency: int = 4,
         chunk_size: int = 8 * 1024 * 1024,
         max_parallel_parts: int = 4,
+        graph_client: Optional[GraphClient] = None,
     ) -> Dict[str, Any]:
-        """Parallel Range GET → ordered multipart upload. For huge
-        files (TB-scale VMs, GB-sized media) a single TCP stream from
-        Graph/CDN caps around 50–100 MB/s. Splitting the file into K
-        segments and fetching K of them in parallel multiplies
-        effective bandwidth by ~K on enterprise networks.
-
-        In-order handoff: segments complete in arbitrary order but
-        are yielded to the storage backend strictly by index, so the
-        S3 multipart / Azure block-list sees the exact byte stream it
-        would have seen from a serial download. Dedup, sha256 and
-        resume semantics remain identical to `_stream_graph_to_backend`.
-
-        Peak memory per file ≈ `segment_concurrency * segment_size`;
-        at the default 4 × 64 MB that's 256 MB per large-file upload.
-        With ONEDRIVE_BACKUP_FILE_CONCURRENCY concurrent files, total
-        peak is bounded — chosen to fit comfortably on a 16 GB worker.
-        """
+        """Bounded ordered ranges; completed segments stay on disk until consumed."""
         import httpx as _httpx
-
+        from shared.provider_http import download_client
+        from shared.provider_runtime import execution_budget
+        from shared.range_download import ordered_ranges, RangeProofUnavailable
         if expected_size <= 0:
-            raise RuntimeError(
-                f"parallel range requires known size (got "
-                f"{expected_size} for {file_name})"
-            )
-
-        # Build segment list [(idx, lo, hi), ...] covering [0, size).
-        segments: List[Tuple[int, int, int]] = []
-        offset = 0
-        while offset < expected_size:
-            end = min(offset + segment_size, expected_size) - 1
-            segments.append((len(segments), offset, end))
-            offset = end + 1
-
-        # If the file would only produce a single segment, fall back
-        # to the simpler serial streaming pipeline.
-        if len(segments) <= 1:
-            return await self._stream_graph_to_backend(
-                download_url=download_url, expected_size=expected_size,
-                container=container, blob_path=blob_path, shard=shard,
-                file_name=file_name, metadata=metadata,
-                chunk_size=chunk_size,
-                max_parallel_parts=max_parallel_parts,
-            )
-
-        timeout = _httpx.Timeout(
-            connect=15.0, read=300.0, write=60.0, pool=15.0,
-        )
-        limits = _httpx.Limits(
-            max_keepalive_connections=segment_concurrency * 2,
-            max_connections=segment_concurrency * 2,
-        )
-
-        completed: Dict[int, bytes] = {}
-        ready = asyncio.Event()
-        worker_err: List[BaseException] = []
-
-        async def _byte_iter():
-            sem = asyncio.Semaphore(segment_concurrency)
-            async with _httpx.AsyncClient(
-                timeout=timeout, limits=limits,
-                follow_redirects=True, http2=False,
-            ) as client:
-                async def _fetch(idx: int, lo: int, hi: int):
-                    try:
-                        async with sem:
-                            headers = {"Range": f"bytes={lo}-{hi}"}
-                            async with client.stream(
-                                "GET", download_url, headers=headers,
-                            ) as resp:
-                                # 206 ONLY. A 200 to a ranged GET means the
-                                # CDN ignored Range and sent the WHOLE file:
-                                # every segment would hold the full file and
-                                # the ordered reassembly would emit it K
-                                # times, storing a corrupt blob that nothing
-                                # downstream size-checks (the serial path
-                                # guards this same case explicitly). Fail the
-                                # file instead — it gets counted and retried.
-                                if resp.status_code != 206:
-                                    body = await resp.aread()
-                                    raise RuntimeError(
-                                        f"Range {lo}-{hi} HTTP "
-                                        f"{resp.status_code} (expected 206) for "
-                                        f"{file_name}: {body[:200]!r}"
-                                    )
-                                buf = bytearray()
-                                async for part in resp.aiter_bytes(chunk_size):
-                                    if part:
-                                        buf.extend(part)
-                                _seg_len = hi - lo + 1
-                                if len(buf) != _seg_len:
-                                    raise RuntimeError(
-                                        f"Range {lo}-{hi} for {file_name}: got "
-                                        f"{len(buf)} bytes, expected {_seg_len} "
-                                        f"— refusing to assemble a corrupt blob"
-                                    )
-                        completed[idx] = bytes(buf)
-                    except BaseException as exc:
-                        worker_err.append(exc)
-                    finally:
-                        ready.set()
-
-                tasks = [
-                    asyncio.create_task(_fetch(idx, lo, hi))
-                    for idx, lo, hi in segments
-                ]
+            raise ValueError('parallel download requires a known positive size')
+        budget = execution_budget()
+        # Include the backend's bounded multipart buffers plus the read chunk.
+        chunk_size = min(chunk_size, max(65536, budget.resident_bytes // (max_parallel_parts + 8)))
+        reservation = chunk_size * (max_parallel_parts + 6) + segment_concurrency * 65536
+        fallback = False
+        async with budget.bytes(reservation):
+            async with _httpx.AsyncClient(timeout=_httpx.Timeout(connect=15, read=300, write=60, pool=15),
+                    follow_redirects=True, http2=False) as raw:
+                client = download_client(raw, graph_client)
                 try:
-                    next_idx = 0
-                    transferred = 0
-                    last_heartbeat = 0
-                    while next_idx < len(segments):
-                        while next_idx not in completed:
-                            if worker_err:
-                                raise worker_err[0]
-                            ready.clear()
-                            await ready.wait()
-                        buf = completed.pop(next_idx)
-                        next_idx += 1
-                        off = 0
-                        while off < len(buf):
-                            yield buf[off:off + chunk_size]
-                            off += chunk_size
-                        transferred += len(buf)
-                        if transferred - last_heartbeat >= 256 * 1024 * 1024:
-                            print(
-                                f"[{self.worker_id}] [USER_ONEDRIVE] "
-                                f"{file_name}: "
-                                f"{transferred/(1024**2):.0f} MB "
-                                f"(parallel segs "
-                                f"{next_idx}/{len(segments)})"
-                            )
-                            last_heartbeat = transferred
-                finally:
-                    for t in tasks:
-                        if not t.done():
-                            t.cancel()
-                    for t in tasks:
-                        try:
-                            await t
-                        except (asyncio.CancelledError, Exception):
-                            pass
-
-        return await shard.upload_blob_stream(
-            container, blob_path, _byte_iter(), expected_size,
-            metadata=metadata,
-            chunk_size=chunk_size,
-            max_parallel_parts=max_parallel_parts,
-        )
+                    async with ordered_ranges(client, download_url, expected_size,
+                            segment_size=segment_size, concurrency=segment_concurrency, chunk_size=chunk_size) as source:
+                        return await shard.upload_blob_stream(container, blob_path, source, expected_size,
+                            metadata=metadata, chunk_size=chunk_size, max_parallel_parts=max_parallel_parts)
+                except RangeProofUnavailable:
+                    # Start one full response when the CDN cannot prove ranges
+                    # belong to one version. No range bytes have been published.
+                    fallback = True
+        if fallback:
+            return await self._stream_graph_to_backend(download_url, expected_size, container,
+                blob_path, shard, file_name, metadata, chunk_size=chunk_size,
+                max_parallel_parts=max_parallel_parts, graph_client=graph_client)
 
     async def _stream_graph_to_backend(
         self,
@@ -22960,6 +22847,7 @@ class BackupWorker:
         metadata: Dict[str, str],
         chunk_size: int = 8 * 1024 * 1024,
         max_parallel_parts: int = 4,
+        graph_client: Optional[GraphClient] = None,
     ) -> Dict[str, Any]:
         """Stream bytes from a Graph pre-signed URL directly into the
         active storage backend's multipart upload (S3 multipart for
@@ -22989,6 +22877,10 @@ class BackupWorker:
             so callers treat success/failure uniformly.
         """
         import httpx as _httpx
+        from shared.provider_http import download_client, bounded_error_body
+        from shared.provider_read import ProviderReadError
+        from shared.provider_runtime import execution_budget
+        from shared.range_download import strong_etag, validate_range
         timeout = _httpx.Timeout(connect=15.0, read=300.0, write=60.0, pool=15.0)
         limits = _httpx.Limits(max_keepalive_connections=4, max_connections=8)
         max_resumes = int(os.getenv("ONEDRIVE_STREAM_MAX_RESUMES", "4"))
@@ -22997,14 +22889,19 @@ class BackupWorker:
             transferred = 0
             last_heartbeat = 0
             resume_attempt = 0
+            source_etag = None
             async with _httpx.AsyncClient(
                 timeout=timeout, limits=limits,
                 follow_redirects=True, http2=False,
-            ) as client:
+            ) as raw:
+                client = download_client(raw, graph_client)
                 while True:
-                    headers: Dict[str, str] = {}
+                    headers: Dict[str, str] = {'Accept-Encoding': 'identity'}
                     if transferred > 0:
+                        if not source_etag or expected_size <= 0:
+                            raise ProviderReadError("missing_resume_version_proof")
                         headers["Range"] = f"bytes={transferred}-"
+                        headers["If-Match"] = source_etag
                     try:
                         async with client.stream(
                             "GET", download_url, headers=headers,
@@ -23020,7 +22917,7 @@ class BackupWorker:
                             # this, the previous code raised on 429
                             # immediately and the file was lost.
                             if resp.status_code in (429, 503):
-                                body = await resp.aread()
+                                body = await bounded_error_body(resp)
                                 # Default backoff: exponential per resume
                                 # attempt (2s, 4s, 8s, 16s — cap 30s).
                                 # Replaces the prior fixed 10s default,
@@ -23081,7 +22978,7 @@ class BackupWorker:
                             # multipart, corrupting the upload.
                             if transferred == 0:
                                 if resp.status_code not in (200, 206):
-                                    body = await resp.aread()
+                                    body = await bounded_error_body(resp)
                                     raise RuntimeError(
                                         f"Graph download HTTP "
                                         f"{resp.status_code} for "
@@ -23089,7 +22986,7 @@ class BackupWorker:
                                     )
                             else:
                                 if resp.status_code != 206:
-                                    body = await resp.aread()
+                                    body = await bounded_error_body(resp)
                                     raise RuntimeError(
                                         f"Range resume rejected "
                                         f"(HTTP {resp.status_code}) "
@@ -23097,8 +22994,17 @@ class BackupWorker:
                                         f"{transferred}: "
                                         f"{body[:200]!r}"
                                     )
+                            if resp.status_code == 206 and expected_size > 0:
+                                validate_range(resp, transferred, expected_size, end=expected_size - 1, etag=source_etag)
+                            if transferred == 0:
+                                if expected_size > 0 and resp.status_code == 200 and resp.headers.get('Content-Length') is not None:
+                                    if int(resp.headers['Content-Length']) != expected_size:
+                                        raise ProviderReadError('download_source_length_changed')
+                                source_etag = strong_etag(resp)
                             async for chunk in resp.aiter_bytes(chunk_size):
                                 if chunk:
+                                    if expected_size > 0 and transferred + len(chunk) > expected_size:
+                                        raise ProviderReadError("download_length_exceeded")
                                     transferred += len(chunk)
                                     if transferred - last_heartbeat >= 256 * 1024 * 1024:
                                         print(
@@ -23108,20 +23014,18 @@ class BackupWorker:
                                         )
                                         last_heartbeat = transferred
                                     yield chunk
-                        # Stream completed normally — done.
+                        if expected_size > 0 and transferred != expected_size:
+                            raise _httpx.ReadError("download ended before its declared length")
                         return
                     except (
                         _httpx.RemoteProtocolError,
                         _httpx.ReadError,
                         _httpx.ReadTimeout,
                     ) as exc:
-                        # Connection dropped mid-stream. If size is
-                        # known and we got everything, treat as
-                        # success (some CDNs close the connection
-                        # right after the last byte without proper
-                        # framing). Otherwise resume from offset.
-                        if expected_size > 0 and transferred >= expected_size:
-                            return
+                        # Source metadata can be stale. A matching byte count
+                        # cannot certify an interrupted response without EOF.
+                        if expected_size > 0 and transferred == expected_size:
+                            raise ProviderReadError('download_missing_eof') from exc
                         if resume_attempt >= max_resumes:
                             raise
                         resume_attempt += 1
@@ -23137,12 +23041,15 @@ class BackupWorker:
                         await asyncio.sleep(backoff)
                         # Loop reissues GET with Range: bytes=N-
 
-        return await shard.upload_blob_stream(
-            container, blob_path, _byte_iter(), expected_size,
-            metadata=metadata,
-            chunk_size=chunk_size,
-            max_parallel_parts=max_parallel_parts,
-        )
+        budget = execution_budget()
+        chunk_size = min(chunk_size, max(65536, budget.resident_bytes // (max_parallel_parts + 8)))
+        async with budget.bytes(chunk_size * (max_parallel_parts + 6)):
+            source = _byte_iter()
+            try:
+                return await shard.upload_blob_stream(container, blob_path, source, expected_size,
+                    metadata=metadata, chunk_size=chunk_size, max_parallel_parts=max_parallel_parts)
+            finally:
+                await source.aclose()
 
     async def _download_to_temp_resumable(
         self,
@@ -23151,6 +23058,7 @@ class BackupWorker:
         file_name: str,
         max_attempts: int = 6,
         chunk_size: int = 4 * 1024 * 1024,
+        graph_client: Optional[GraphClient] = None,
     ) -> tuple[str, str]:
         """
         Download a file from a Graph/SharePoint pre-signed URL to a temp file,
@@ -23168,32 +23076,52 @@ class BackupWorker:
             RuntimeError if the file cannot be fully downloaded after all
             retries, or if progress stalls.
         """
+        from shared.provider_http import download_client, bounded_error_body
+        from shared.range_download import strong_etag, validate_range
+        from shared.provider_read import ProviderReadError
+        import shutil
+        from shared.provider_runtime import execution_budget
+        budget = execution_budget()
+        if max_attempts < 1 or chunk_size < 1:
+            raise ValueError('download limits must be positive')
+        chunk_size = min(chunk_size, max(1, budget.resident_bytes // 4))
+        completed = False
+        space_check = 0
         hasher = hashlib.sha256()
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".part", prefix="backup_dl_")
         os.close(tmp_fd)
 
         bytes_received = 0
+        source_etag = None
         consecutive_no_progress = 0
 
         timeout = httpx.Timeout(connect=15.0, read=120.0, write=60.0, pool=15.0)
         limits = httpx.Limits(max_keepalive_connections=4, max_connections=8)
 
         try:
-            async with httpx.AsyncClient(
+            async with budget.bytes(chunk_size * 2), httpx.AsyncClient(
                 timeout=timeout,
                 limits=limits,
                 follow_redirects=True,
                 http2=False,  # Force HTTP/1.1; some MS CDN edges misbehave on HTTP/2
-            ) as client:
+            ) as raw:
+                client = download_client(raw, graph_client)
                 for attempt in range(1, max_attempts + 1):
+                    if bytes_received and (not source_etag or expected_size <= 0):
+                        # Resume requires a strong version proof. Without it,
+                        # restart the private spool instead of mixing versions.
+                        bytes_received, hasher = 0, hashlib.sha256()
+                        with open(tmp_path, "wb"):
+                            pass
                     progress_before = bytes_received
 
                     # Build headers — only set Range if we have partial progress.
                     # IMPORTANT: do NOT add Authorization. The pre-signed URL
                     # is anonymously accessible; an auth header makes CDN reject.
-                    headers = {}
+                    headers = {'Accept-Encoding': 'identity'}
                     if bytes_received > 0:
                         headers["Range"] = f"bytes={bytes_received}-"
+                        headers["If-Match"] = source_etag
 
                     try:
                         async with client.stream("GET", download_url, headers=headers) as resp:
@@ -23249,7 +23177,7 @@ class BackupWorker:
 
                             if resp.status_code not in (200, 206):
                                 # 4xx other than 416 and 429 = unrecoverable
-                                body = await resp.aread()
+                                body = await bounded_error_body(resp)
                                 raise RuntimeError(
                                     f"Download failed with HTTP {resp.status_code} "
                                     f"for {file_name}: {body!r}"
@@ -23270,18 +23198,33 @@ class BackupWorker:
                                 with open(tmp_path, "wb"):
                                     pass
 
+                            if resp.status_code == 206 and expected_size > 0:
+                                validate_range(resp, bytes_received, expected_size, end=expected_size - 1, etag=source_etag if bytes_received else None)
+                            if bytes_received == 0:
+                                if expected_size > 0 and resp.status_code == 200 and resp.headers.get('Content-Length') is not None:
+                                    if int(resp.headers['Content-Length']) != expected_size:
+                                        raise ProviderReadError('download_source_length_changed')
+                                source_etag = strong_etag(resp)
+
                             # ----- Stream chunks to disk -----
                             mode = "ab" if bytes_received > 0 else "wb"
                             with open(tmp_path, mode) as f:
                                 async for chunk in resp.aiter_bytes(chunk_size=chunk_size):
                                     if not chunk:
                                         continue
+                                    if expected_size > 0 and bytes_received + len(chunk) > expected_size:
+                                        raise ProviderReadError("download_length_exceeded")
+                                    if bytes_received >= space_check:
+                                        if shutil.disk_usage(tmp_path).free < len(chunk) + 256 * 1024 * 1024:
+                                            raise ProviderReadError('download_spool_capacity', retry_after=30)
+                                        space_check = bytes_received + 4 * 1024 * 1024
                                     f.write(chunk)
                                     hasher.update(chunk)
                                     bytes_received += len(chunk)
 
                         # Stream completed without exception
-                        if bytes_received >= expected_size:
+                        if bytes_received == expected_size or expected_size <= 0:
+                            completed = True
                             break  # success — exit retry loop
 
                         # Stream ended early without raising; loop will resume via Range
@@ -23315,7 +23258,7 @@ class BackupWorker:
                         )
 
                 # ----- Final completeness check -----
-                if bytes_received < expected_size:
+                if not completed:
                     raise RuntimeError(
                         f"Download incomplete for {file_name} after {max_attempts} "
                         f"attempts: got {bytes_received}/{expected_size} bytes"
@@ -23323,8 +23266,8 @@ class BackupWorker:
 
             return tmp_path, hasher.hexdigest()
 
-        except Exception:
-            # Cleanup on any failure path
+        except BaseException:
+            # Cleanup on cancellation/provider handoff as well as ordinary errors.
             try:
                 if os.path.exists(tmp_path):
                     os.unlink(tmp_path)
@@ -27701,7 +27644,8 @@ class BackupWorker:
                     snapshot_owner=snapshot.lease_owner_id,
                     partition_id=uuid.UUID(str(_copy_partition_id)) if _copy_partition_id else None,
                     partition_token=_copy_claim["lease"].token if _copy_claim else None,
-                    partition_owner=uuid.UUID(str(_copy_claim["lease"].owner_id)) if _copy_claim else None,
+                    partition_owner=uuid.UUID(str(_copy_claim["lease"].owner_id))
+                        if _copy_claim and _copy_claim["lease"].owner_id is not None else None,
                 ),
                 copy_capture=capture,
                 force_full=bool((message or {}).get("forceFullBackup") or (message or {}).get("type") == "FULL"),
@@ -30181,7 +30125,8 @@ class BackupWorker:
                 live.bytes_total = int(summary.get('bytes_total', result.get('bytes_total', 0)))
                 live.bytes_added = int(summary.get('bytes_added', result.get('bytes_added', 0)))
                 live.status = SnapshotStatus.PARTIAL if summary['files_failed'] else SnapshotStatus.COMPLETED
-                if (live.extra_data or {}).get(SNAPSHOT_DEGRADED_REASON_KEY):
+                if ((live.extra_data or {}).get(SNAPSHOT_DEGRADED_REASON_KEY)
+                        or (live.extra_data or {}).get('copy_required_failed')):
                     live.status = SnapshotStatus.PARTIAL
                 live.completed_at = datetime.utcnow()
                 if live.started_at:

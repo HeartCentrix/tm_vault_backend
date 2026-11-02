@@ -247,9 +247,11 @@ class GraphClient:
             await graph_rate_limiter.acquire(reason="provider_data_request")
             yield
             return
-        from shared.provider_http import admitted, request_context
-        context = request_context(self, url, operation=operation)
-        async with admitted(graph_rate_limiter, context):
+        from shared.provider_http import request_context
+        from shared.provider_runtime import provider_request_scope
+        request_context(self, url, operation=operation)
+        # Physical admission belongs to the shared HTTP adapter, once per hop.
+        async with provider_request_scope():
             yield
 
     def _http_session(self, timeout=None):

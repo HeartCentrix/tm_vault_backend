@@ -86,6 +86,9 @@ class _FakeAction:
 
 
 class _FakePolicy:
+    def for_operation(self):
+        return self
+
     stream_bucket = _FakeBucket()
 
     def reset_on_success(self):

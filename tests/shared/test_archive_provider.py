@@ -146,3 +146,31 @@ async def test_large_singleton_spools_through_receipt_lifetime_and_cleans_up():
             expected.update(block)
         assert data.sha256 == expected.hexdigest()
     assert not path.exists()
+
+
+async def test_owned_export_long_cooldown_yields_after_releasing_http(monkeypatch):
+    from types import SimpleNamespace
+    from shared import provider_runtime as runtime
+    graph = SimpleNamespace(tenant_id='tenant', client_id='app', active=False)
+    async def token(): return 'synthetic'
+    @asynccontextmanager
+    async def admit(*a, **kw):
+        graph.active = True
+        try: yield
+        finally: graph.active = False
+    @asynccontextmanager
+    async def http():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r:
+                httpx.Response(429, headers={'Retry-After': '600'}))) as client:
+            yield client
+    graph._get_token, graph._admit_data_request, graph._http_session = token, admit, http
+    execution = runtime.ProviderExecution(None, None)
+    marker = runtime._EXECUTION.set(execution)
+    try:
+        with pytest.raises(runtime.ProviderTurnDeferred):
+            await export_items(graph, URL, ['one'], timeout=10)
+        assert execution.deferred.retry_after == 600
+        assert execution.deferred.context.workload == 'exchange'
+        assert not graph.active
+    finally:
+        runtime._EXECUTION.reset(marker)
