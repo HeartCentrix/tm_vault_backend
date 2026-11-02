@@ -855,3 +855,56 @@ async def test_expired_staged_capture_can_be_replaced_without_touching_other_cha
         assert len(links) == 2
         hydrated = await api().materialize_chat_items(session, links)
         assert {i.extra_data["raw"]["body"]["content"] for i in hydrated} == {replacement_body, "other saved body"}
+
+
+async def test_observation_versions_remain_separate_and_both_readable(store):
+    original = message()
+    old_scope, old_lease, old_result = await store.capture([original])
+    scope = await store.new_scope()
+    lease = await store.begin(scope, observation_hash_version=2)
+    assert lease.observation_hash_version == 2
+    await store.stage(lease, [original])
+    fingerprint = source_inventory_fingerprint(scope=scope, items=[original], observation_hash_version=2)
+    await store.observe(scope, lease, [original], observation_hash_version=2,
+        membership_sha256=fingerprint, reconciliation_sha256=fingerprint)
+    result = await store.publish(lease)
+    assert result.outcome == "complete"
+    assert result.inventory_id != old_result.inventory_id
+    async with store.factory() as session:
+        old = await session.get(models.ChatInventory, old_result.inventory_id)
+        new = await session.get(models.ChatInventory, result.inventory_id)
+        assert (old.observation_hash_version, new.observation_hash_version) == (1, 2)
+        assert old.membership_sha256 != new.membership_sha256
+        links = list((await session.scalars(select(models.SnapshotItem).where(
+            models.SnapshotItem.snapshot_id.in_([old_scope.snapshot_id, scope.snapshot_id])))).all())
+        assert len({link.chat_version_id for link in links}) == 1
+        hydrated = await api().materialize_chat_items(session, links)
+        assert len(hydrated) == 2
+
+
+async def test_evidence_hash_version_must_match_inventory(store):
+    scope = await store.new_scope()
+    lease = await store.begin(scope, observation_hash_version=2)
+    await store.stage(lease, [message()])
+    with pytest.raises(api().ChatCatalogueIntegrityError, match="version"):
+        await store.observe(scope, lease, [message()])
+
+
+async def test_observation_migration_preserves_existing_v1_inventory(store):
+    _, _, result = await store.capture([message()])
+    async with store.engine.begin() as connection:
+        await connection.execute(text("ALTER TABLE chat_inventories DROP CONSTRAINT ck_chat_inventory_observation_version"))
+        await connection.execute(text("ALTER TABLE chat_inventories DROP COLUMN observation_hash_version"))
+        def migrate(conn):
+            from alembic.migration import MigrationContext
+            from alembic.operations import Operations
+            spec = importlib.util.spec_from_file_location("observation_migration", Path(__file__).resolve().parents[2] / "alembic/versions/0015_chat_observation_version.py")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            with Operations.context(MigrationContext.configure(conn)):
+                module.upgrade()
+                module.upgrade()
+        await connection.run_sync(migrate)
+    async with store.factory() as session:
+        inventory = await session.get(models.ChatInventory, result.inventory_id)
+        assert inventory.state == "COMPLETE" and inventory.observation_hash_version == 1

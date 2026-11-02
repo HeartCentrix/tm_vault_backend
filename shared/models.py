@@ -1709,6 +1709,7 @@ class ChatInventory(Base):
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
     chat_id = Column(Text, nullable=False)
     authentication_context_sha256 = Column(String(64), nullable=False)
+    observation_hash_version = Column(Integer, nullable=False, default=1, server_default="1")
     state = Column(String(16), nullable=False, default="STAGING")
     membership_sha256 = Column(String(64))
     representation_sha256 = Column(String(64))
@@ -1718,6 +1719,7 @@ class ChatInventory(Base):
     failure_reason = Column(Text)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     __table_args__ = (
+        CheckConstraint("observation_hash_version IN (1, 2)", name="ck_chat_inventory_observation_version"),
         CheckConstraint("state IN ('STAGING','PARTIAL','COMPLETE')", name="ck_chat_inventory_state"),
         CheckConstraint("item_count >= 0 AND logical_bytes >= 0", name="ck_chat_inventory_counts"),
         CheckConstraint("state <> 'COMPLETE' OR (membership_sha256 IS NOT NULL AND representation_sha256 IS NOT NULL AND evidence IS NOT NULL)", name="ck_chat_inventory_complete_evidence"),

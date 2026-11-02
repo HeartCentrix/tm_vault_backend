@@ -355,10 +355,10 @@ def test_stage_counts_cannot_report_more_new_versions_than_successfully_staged_i
 def test_specified_dataclass_field_contract_is_exact():
     contracts = {
         "ChatCaptureScope": "snapshot_id resource_id tenant_id chat_id principal_id permission_scope_hash backend_id partition_id snapshot_lease_token job_lease_token partition_lease_token",
-        "CaptureLease": "attempt_id generation expires_at staged_inventory_id",
+        "CaptureLease": "attempt_id generation expires_at staged_inventory_id observation_hash_version",
         "CapturedChatItem": "item_type graph_id parent_graph_id payload content",
         "ChatContentDescriptor": "object_id backend_id container path sha256 size encryption_key_id backup_version inline_b64 source_drive_id source_item_id source_etag source_ctag",
-        "CaptureEvidence": "enumeration_complete reconciliation_complete membership_sha256 reconciliation_sha256 conflicting_observations required_content_count durable_content_count unresolved_required_count started_at finished_at",
+        "CaptureEvidence": "enumeration_complete reconciliation_complete membership_sha256 reconciliation_sha256 conflicting_observations required_content_count durable_content_count unresolved_required_count started_at finished_at observation_hash_version",
         "CaptureResult": "outcome inventory_id reused item_count logical_bytes uploaded_bytes started_at finished_at failure_reason",
         "StageResult": "staged_items new_versions",
     }

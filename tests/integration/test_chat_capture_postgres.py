@@ -537,3 +537,20 @@ async def test_required_encryption_intent_is_not_lost_if_runtime_changes_during_
     assert result.outcome == "partial"
     async with store.factory() as session:
         assert not list((await session.scalars(select(ChatBlobObject).where(ChatBlobObject.state == "LIVE"))).all())
+
+
+@pytest.mark.parametrize("version,expected_passes,outcome", [(1, 6, "partial"), (2, 2, "complete")])
+async def test_hosted_order_noise_does_not_restart_v2_capture(store, adapters, monkeypatch, version, expected_passes, outcome):
+    from shared.config import settings
+    monkeypatch.setattr(settings, "CHAT_OBSERVATION_HASH_VERSION", version)
+    adapters.source.messages = [message()]
+
+    async def hosted(chat_id, message_id):
+        children = [{"id": "a", "contentType": "image/png"}, {"id": "b", "contentType": "image/png"}]
+        for child in (reversed(children) if adapters.source.passes % 2 == 0 else children):
+            yield child
+
+    monkeypatch.setattr(adapters.source, "iter_hosted_contents", hosted)
+    _, result = await run_capture(store, adapters)
+    assert result.outcome == outcome
+    assert adapters.source.passes == expected_passes

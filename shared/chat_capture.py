@@ -19,7 +19,7 @@ from shared import chat_catalogue as catalogue
 from shared.chat_catalogue_identity import (
     CaptureEvidence, CaptureResult, CapturedChatItem, ChatContentDescriptor,
     _digest, _payload, authentication_context_fingerprint, canonical_version_fingerprint,
-    qualified_chat_item_key,
+    qualified_chat_item_key, observation_semantic, validate_observation_hash_version,
 )
 from shared.chat_capture_graph import StrictChatGraphSource, effective_capture_scope_hash, pinned_chat_source
 from shared.chat_capture_storage import upload_capture_content, verify_catalogue_content
@@ -35,7 +35,8 @@ class ChatSourceMovement(RuntimeError):
 class ChatObservationLedger:
     """Disk-backed hash ordering; retain no whole-chat payload list in memory."""
 
-    def __init__(self, scope):
+    def __init__(self, scope, observation_hash_version=1):
+        self.observation_hash_version = validate_observation_hash_version(observation_hash_version)
         self.scope = scope
         handle = tempfile.NamedTemporaryFile(prefix="chat-observation-", suffix=".sqlite", delete=False)
         self.path = handle.name
@@ -60,9 +61,7 @@ class ChatObservationLedger:
     def record(self, observation, item):
         key = qualified_chat_item_key(self.scope.chat_id, item.item_type, item.graph_id, item.parent_graph_id)
         content = item.content
-        source = ([content.source_drive_id, content.source_item_id, content.source_etag,
-                   content.source_ctag, content.sha256, content.size] if content else None)
-        semantic = _digest([_payload(item.payload), source])
+        semantic = observation_semantic(item, self.observation_hash_version)
         old = self.db.execute("SELECT semantic FROM observed WHERE pass=? AND key=?", (observation, key)).fetchone()
         if old:
             if old[0] != semantic:
@@ -73,7 +72,7 @@ class ChatObservationLedger:
 
     def fingerprint(self, observation):
         digest = hashlib.sha256()
-        prefix = json.dumps(["chat-source-inventory-v1", authentication_context_fingerprint(self.scope)], separators=(",", ":"))
+        prefix = json.dumps([f"chat-source-inventory-v{self.observation_hash_version}", authentication_context_fingerprint(self.scope)], separators=(",", ":"))
         digest.update((prefix[:-1] + ",[").encode())
         separator = b""
         for key, semantic in self.db.execute("SELECT key,semantic FROM observed WHERE pass=? ORDER BY key", (observation,)):
@@ -387,6 +386,8 @@ async def _source(client, principal_id):
 async def capture_chat_inventory(*, scope, graph_client, storage, session_factory,
                                  folder_path=None, exclude_message=None, scope_filter_hash=None) -> CaptureResult:
     """Capture one target's observed chat coverage, with two bounded reconciliations."""
+    from shared.config import settings
+    observation_version = settings.CHAT_OBSERVATION_HASH_VERSION
     started = datetime.now(timezone.utc)
     if exclude_message is not None and not scope_filter_hash:
         raise ValueError("source exclusions require a stable configured filter hash")
@@ -395,7 +396,8 @@ async def capture_chat_inventory(*, scope, graph_client, storage, session_factor
             raise ValueError("capture scope differs from pinned source configuration")
         for retry in range(3):
             async def begin(session):
-                lease = await catalogue.begin_capture(session, scope=scope, folder_path=folder_path)
+                lease = await catalogue.begin_capture(session, scope=scope, folder_path=folder_path,
+                    observation_hash_version=observation_version)
                 if scope_filter_hash is not None:
                     attempt = await session.get(ChatCaptureAttempt, lease.attempt_id)
                     attempt.evidence_history = [{"source_filter_sha256": scope_filter_hash}]
@@ -404,7 +406,7 @@ async def capture_chat_inventory(*, scope, graph_client, storage, session_factor
             keeper = _CaptureLeaseKeeper(session_factory, lease)
             renewer = asyncio.create_task(keeper.run())
             try:
-                with ChatObservationLedger(scope) as ledger:
+                with ChatObservationLedger(scope, observation_hash_version=lease.observation_hash_version) as ledger:
                     first, second = _Pass(), _Pass()
                     movement = False
                     try:
@@ -422,7 +424,8 @@ async def capture_chat_inventory(*, scope, graph_client, storage, session_factor
                     evidence = CaptureEvidence(first.complete, second.complete,
                         ledger.fingerprint(0), ledger.fingerprint(1), first.conflicts + int(movement),
                         ledger.required_count(0), ledger.durable_count(0),
-                        first.unresolved + second.unresolved, started, datetime.now(timezone.utc))
+                        first.unresolved + second.unresolved, started, datetime.now(timezone.utc),
+                        observation_hash_version=lease.observation_hash_version)
                     keeper.check()
                     failure_details = ledger.failure_details()
                     async def finish(session):

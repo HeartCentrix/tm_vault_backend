@@ -652,6 +652,10 @@ class Settings:
         # ── USER_CHATS cross-replica partition ──
         # Immutable catalogue writing is opt-in. Adopted resources fail
         # closed when disabled; they never return to history-union writes.
+        # Activate v2 only after the additive schema/readers are deployed.
+        self.CHAT_OBSERVATION_HASH_VERSION = int(os.getenv("CHAT_OBSERVATION_HASH_VERSION", "1"))
+        if self.CHAT_OBSERVATION_HASH_VERSION not in (1, 2):
+            raise ValueError("CHAT_OBSERVATION_HASH_VERSION must be 1 or 2")
         self.CHAT_CATALOGUE_WRITER_ENABLED = os.getenv(
             "CHAT_CATALOGUE_WRITER_ENABLED", "false",
         ).lower() in ("true", "1", "yes")

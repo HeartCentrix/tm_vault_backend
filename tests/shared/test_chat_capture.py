@@ -78,3 +78,56 @@ def test_capture_heartbeat_other_failure_remains_generic_conflict():
         keeper.check()
     assert type(error.value) is module.catalogue.ChatCatalogueConflict
     assert error.value.__cause__ is failure
+
+
+def _ordered_children(reverse=False):
+    hosted = [{"id": "a"}, {"id": "b"}]
+    manifest = [{"item_type": "CHAT_HOSTED_CONTENT", "graph_id": c["id"], "requires_content": True} for c in hosted]
+    if reverse:
+        hosted.reverse()
+        manifest.reverse()
+    return CapturedChatItem("TEAMS_CHAT_MESSAGE", "m", None, {
+        "id": "m", "body": {"content": "same body"}, "hostedContents": hosted,
+        "chat_catalogue_expected_children": {"complete": True, "items": manifest}}, None)
+
+
+def test_v2_observation_ignores_set_order_without_changing_stored_identity():
+    from shared.chat_catalogue_identity import canonical_payload_sha256
+    module = importlib.import_module("shared.chat_capture")
+    selected = scope()
+    first, second = _ordered_children(), _ordered_children(True)
+    assert canonical_payload_sha256(first.payload) != canonical_payload_sha256(second.payload)
+    with module.ChatObservationLedger(selected, observation_hash_version=2) as ledger:
+        ledger.record(0, first)
+        ledger.record(1, second)
+        assert ledger.fingerprint(0) == ledger.fingerprint(1)
+        assert ledger.fingerprint(0) == source_inventory_fingerprint(
+            scope=selected, items=[first], observation_hash_version=2)
+        assert ledger.fingerprint(0) != source_inventory_fingerprint(scope=selected, items=[first])
+
+
+def test_v2_rejects_conflicting_children_in_same_set():
+    from dataclasses import replace
+    module = importlib.import_module("shared.chat_capture")
+    first = _ordered_children()
+    bad = replace(first, payload=first.payload | {"hostedContents": [{"id": "a", "contentType": "x"}, {"id": "a", "contentType": "y"}]})
+    with module.ChatObservationLedger(scope(), observation_hash_version=2) as ledger:
+        with pytest.raises((ValueError, module.ChatSourceMovement), match="conflict"):
+            ledger.record(0, bad)
+
+
+def test_v2_keeps_body_and_non_set_order_changes():
+    from dataclasses import replace
+    module = importlib.import_module("shared.chat_capture")
+    first = _ordered_children()
+    edited = replace(first, payload=first.payload | {"body": {"content": "edited"}})
+    with module.ChatObservationLedger(scope(), observation_hash_version=2) as ledger:
+        ledger.record(0, first)
+        ledger.record(1, edited)
+        assert ledger.fingerprint(0) != ledger.fingerprint(1)
+
+
+def test_observation_unknown_version_fails_closed():
+    module = importlib.import_module("shared.chat_capture")
+    with pytest.raises(ValueError, match="version"):
+        module.ChatObservationLedger(scope(), observation_hash_version=3)

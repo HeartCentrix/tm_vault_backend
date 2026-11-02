@@ -107,6 +107,48 @@ def _payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     return value
 
 
+
+def validate_observation_hash_version(version: int) -> int:
+    if type(version) is not int or version not in (1, 2):
+        raise ValueError("unsupported chat observation hash version")
+    return version
+
+
+def observation_payload(payload: Mapping[str, Any], version: int) -> dict[str, Any]:
+    """Normalize only observation sets; stored payload identities stay unchanged."""
+    validate_observation_hash_version(version)
+    value = _payload(payload)
+    if version == 1:
+        return value
+
+    def ordered(children, fields):
+        if not isinstance(children, list):
+            raise ValueError("invalid observation child set")
+        members = {}
+        for child in children:
+            if not isinstance(child, dict) or any(not isinstance(child.get(k), str) or not child[k] for k in fields):
+                raise ValueError("invalid observation child identity")
+            key = tuple(child[k] for k in fields)
+            if key in members and members[key] != child:
+                raise ValueError("conflicting observation child identity")
+            members[key] = child
+        return [members[key] for key in sorted(members)]
+
+    if "hostedContents" in value:
+        value["hostedContents"] = ordered(value["hostedContents"], ("id",))
+    manifest = value.get("chat_catalogue_expected_children")
+    if isinstance(manifest, dict) and "items" in manifest:
+        manifest["items"] = ordered(manifest["items"], ("item_type", "graph_id"))
+    return value
+
+
+def observation_semantic(item, version: int) -> str:
+    content = item.content
+    source = ([content.source_drive_id, content.source_item_id, content.source_etag,
+               content.source_ctag, content.sha256, content.size] if content else None)
+    return _digest([observation_payload(item.payload, version), source])
+
+
 def _freeze_json(value: Any) -> Any:
     if isinstance(value, dict):
         return MappingProxyType({key: _freeze_json(child) for key, child in value.items()})
@@ -168,8 +210,10 @@ class CaptureLease:
     generation: int
     expires_at: datetime
     staged_inventory_id: UUID
+    observation_hash_version: int = 1
 
     def __post_init__(self) -> None:
+        validate_observation_hash_version(self.observation_hash_version)
         _uuid(self.attempt_id, "attempt_id")
         _uuid(self.staged_inventory_id, "staged_inventory_id")
         _count(self.generation, "generation")
@@ -259,8 +303,10 @@ class CaptureEvidence:
     unresolved_required_count: int
     started_at: datetime
     finished_at: datetime
+    observation_hash_version: int = 1
 
     def __post_init__(self) -> None:
+        validate_observation_hash_version(self.observation_hash_version)
         for name in ("enumeration_complete", "reconciliation_complete"):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"{name} must be a boolean")
@@ -347,21 +393,19 @@ def canonical_version_fingerprint(*, tenant_id: UUID, chat_id: str,
 
 
 def source_inventory_fingerprint(*, scope: ChatCaptureScope,
-                                 items: Iterable[CapturedChatItem]) -> str:
+                                 items: Iterable[CapturedChatItem], observation_hash_version: int = 1) -> str:
     """Hash observed source membership and versions, independently of storage.
 
     Identical observations deduplicate. Conflicts require reconciliation instead
     of selecting an arbitrary observation. A hash alone certifies no completeness.
     """
+    validate_observation_hash_version(observation_hash_version)
     observations = {}
     for item in items:
         key = qualified_chat_item_key(scope.chat_id, item.item_type, item.graph_id, item.parent_graph_id)
-        content = item.content
-        source = ([content.source_drive_id, content.source_item_id, content.source_etag,
-                   content.source_ctag, content.sha256, content.size] if content else None)
-        semantic = _digest([_payload(item.payload), source])
+        semantic = observation_semantic(item, observation_hash_version)
         if key in observations and observations[key] != semantic:
             raise ValueError("conflicting observations for one logical chat item")
         observations[key] = semantic
-    return _digest(["chat-source-inventory-v1", authentication_context_fingerprint(scope),
+    return _digest([f"chat-source-inventory-v{observation_hash_version}", authentication_context_fingerprint(scope),
                     sorted(observations.items())])

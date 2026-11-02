@@ -32,7 +32,7 @@ from shared.chat_catalogue_identity import (
     ChatCaptureScope, ChatContentDescriptor, StageResult,
     _digest, _payload, authentication_context_fingerprint,
     canonical_payload_sha256, canonical_version_fingerprint,
-    qualified_chat_item_key,
+    qualified_chat_item_key, observation_semantic, validate_observation_hash_version,
 )
 from shared.models import (
     ChatBlobObject, ChatCaptureAttempt, ChatInventory, ChatInventoryItem,
@@ -132,7 +132,9 @@ async def _attempt(session, lease, *, terminal_ok=False):
     return attempt, scope
 
 
-async def begin_capture(session, *, scope: ChatCaptureScope, folder_path: str | None = None) -> CaptureLease:
+async def begin_capture(session, *, scope: ChatCaptureScope, folder_path: str | None = None,
+                        observation_hash_version: int = 1) -> CaptureLease:
+    validate_observation_hash_version(observation_hash_version)
     if folder_path is None:
         folder_path = f"chats/{scope.chat_id}"
     if not isinstance(folder_path, str) or not folder_path.strip():
@@ -179,9 +181,10 @@ async def begin_capture(session, *, scope: ChatCaptureScope, folder_path: str | 
         generation=generation, expires_at=expires, staged_inventory_id=inventory_id))
     await session.flush()
     session.add(ChatInventory(id=inventory_id, capture_attempt_id=attempt_id, tenant_id=scope.tenant_id,
-                              chat_id=scope.chat_id, authentication_context_sha256=auth))
+                              chat_id=scope.chat_id, authentication_context_sha256=auth,
+                              observation_hash_version=observation_hash_version))
     await session.flush()
-    return CaptureLease(attempt_id, generation, expires, inventory_id)
+    return CaptureLease(attempt_id, generation, expires, inventory_id, observation_hash_version)
 
 
 async def renew_capture(session, *, lease: CaptureLease, lease_seconds: int = 300) -> CaptureLease:
@@ -192,7 +195,9 @@ async def renew_capture(session, *, lease: CaptureLease, lease_seconds: int = 30
     now = await session.scalar(select(func.clock_timestamp()))
     attempt.expires_at = now + timedelta(seconds=lease_seconds)
     await session.flush()
-    return CaptureLease(attempt.id, attempt.generation, attempt.expires_at, attempt.staged_inventory_id)
+    inventory = await session.get(ChatInventory, attempt.staged_inventory_id)
+    return CaptureLease(attempt.id, attempt.generation, attempt.expires_at, attempt.staged_inventory_id,
+                        inventory.observation_hash_version)
 
 
 async def _check_expiry(session, attempt):
@@ -383,6 +388,9 @@ def _evidence(value):
 
 async def record_capture_evidence(session, *, lease: CaptureLease, evidence: CaptureEvidence) -> None:
     attempt, _ = await _attempt(session, lease)
+    inventory = await session.get(ChatInventory, attempt.staged_inventory_id)
+    if evidence.observation_hash_version != inventory.observation_hash_version:
+        raise ChatCatalogueIntegrityError("observation evidence version differs from inventory")
     attempt.evidence = _evidence_json(evidence)
     attempt.evidence_history = [*(attempt.evidence_history or []), attempt.evidence]
     attempt.state = "VERIFYING"
@@ -390,6 +398,7 @@ async def record_capture_evidence(session, *, lease: CaptureLease, evidence: Cap
 
 
 async def _staged(session, inventory, scope):
+    validate_observation_hash_version(inventory.observation_hash_version)
     # Lock narrow object records in one deterministic order. Heavy source JSON
     # is validated in bounded batches rather than retained for the whole chat.
     object_ids = select(ChatItemVersion.object_id).join(ChatInventoryItem,
@@ -431,9 +440,7 @@ async def _staged(session, inventory, scope):
             if obj is None or not _object_matches(obj, content, scope) or obj.state in {"DELETING", "DELETED"}:
                 raise ChatCatalogueIntegrityError("required catalogue object is retired or its descriptor differs")
         durable += int(content is not None and (content.object_id is None or objects[content.object_id].state == "LIVE"))
-        source = ([content.source_drive_id, content.source_item_id, content.source_etag,
-                   content.source_ctag, content.sha256, content.size] if content else None)
-        observations[key] = _digest([_payload(item.payload), source])
+        observations[key] = observation_semantic(item, inventory.observation_hash_version)
         expected.add((key, version.id))
         representations.append((key, version.version_sha256))
         logical_bytes += size
@@ -463,7 +470,7 @@ async def _staged(session, inventory, scope):
             raise ChatCatalogueIntegrityError("snapshot link parent, type, visibility or logical size differs")
     required, gaps = _coverage(scope, coverage)
     return SimpleNamespace(expected=expected, item_count=len(expected), logical_bytes=logical_bytes,
-        source_hash=_digest(["chat-source-inventory-v1", authentication_context_fingerprint(scope), sorted(observations.items())]),
+        source_hash=_digest([f"chat-source-inventory-v{inventory.observation_hash_version}", authentication_context_fingerprint(scope), sorted(observations.items())]),
         representation_hash=_digest(representations), durable=durable, required=required, gaps=gaps, objects=objects)
 
 
@@ -542,6 +549,8 @@ async def publish_inventory(session, *, lease: CaptureLease) -> CaptureResult:
     await _check_expiry(session, attempt)
     source_hash, representation_hash = staged.source_hash, staged.representation_hash
     evidence = _evidence(attempt.evidence)
+    if evidence is not None and evidence.observation_hash_version != inventory.observation_hash_version:
+        raise ChatCatalogueIntegrityError("observation evidence version differs from inventory")
     durable, required, gaps = staged.durable, staged.required, staged.gaps
     complete = (not attempt.failure_reason and evidence is not None and evidence.satisfies_completeness_conditions and
                 evidence.membership_sha256 == source_hash and evidence.required_content_count == required and
@@ -567,6 +576,7 @@ async def publish_inventory(session, *, lease: CaptureLease) -> CaptureResult:
     if complete:
         identity = (ChatInventory.tenant_id == scope.tenant_id, ChatInventory.chat_id == scope.chat_id,
             ChatInventory.authentication_context_sha256 == authentication_context_fingerprint(scope),
+            ChatInventory.observation_hash_version == inventory.observation_hash_version,
             ChatInventory.membership_sha256 == source_hash, ChatInventory.representation_sha256 == representation_hash,
             ChatInventory.state == "COMPLETE")
         chosen = await _locked(session, ChatInventory, *identity)
