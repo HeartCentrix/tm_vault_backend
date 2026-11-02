@@ -11,6 +11,7 @@ from fastapi import FastAPI, Depends, HTTPException, Query, Request, Response
 from sqlalchemy import select, String
 
 from shared.config import settings
+from shared.microsoft_oauth import microsoft_login_profile
 from shared.database import get_db, init_db, close_db, AsyncSession, async_session_factory
 from shared.models import PlatformUser, UserRoleMapping, Organization, UserRole, Tenant, TenantType, TenantStatus, AdminConsentToken, Resource, ResourceType
 from shared.power_bi_client import PowerBIClient
@@ -293,30 +294,9 @@ async def get_power_bi_url(
 
 @app.post("/api/v1/auth/callback", response_model=LoginResponse)
 async def oauth_callback(callback: OAuthCallbackRequest, response: Response, db: AsyncSession = Depends(get_db)):
-    # Audit the failure path too: a bad/expired code or a Graph error used to
-    # bubble as an unlogged 500. Emit LOGIN_FAILED before re-raising so a burst
-    # of failed sign-ins is visible in the audit trail (Ops/Data Check 3).
+    # Keep failed sign-ins visible while returning safe provider errors.
     try:
-        async with httpx.AsyncClient() as client:
-            token_response = await client.post(
-                settings.MICROSOFT_TOKEN_URL,
-                data={
-                    "client_id": settings.MICROSOFT_CLIENT_ID,
-                    "client_secret": settings.MICROSOFT_CLIENT_SECRET,
-                    "code": callback.code,
-                    "redirect_uri": f"{settings.FRONTEND_URL}/auth/callback",
-                    "grant_type": "authorization_code",
-                },
-            )
-            token_response.raise_for_status()
-            tokens = token_response.json()
-
-            graph_response = await client.get(
-                "https://graph.microsoft.com/v1.0/me",
-                headers={"Authorization": f"Bearer {tokens['access_token']}"},
-            )
-            graph_response.raise_for_status()
-            profile = graph_response.json()
+        profile = await microsoft_login_profile(callback.code)
     except Exception as exc:
         emit_audit_event_bg(
             action="LOGIN_FAILED",
