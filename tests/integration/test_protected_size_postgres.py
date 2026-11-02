@@ -1153,7 +1153,7 @@ async def runtime_store():
         await engine.dispose()
 
 
-@pytest.mark.parametrize("explicit_runtime", [False, True])
+@pytest.mark.parametrize("explicit_runtime", [None, "reader", "writer"])
 async def test_dba_migration_preserves_ordinary_source_owner_capture_read_and_refresh(
     runtime_store,
     explicit_runtime,
@@ -1172,6 +1172,15 @@ async def test_dba_migration_preserves_ordinary_source_owner_capture_read_and_re
                     f'GRANT SELECT ON resources,snapshots,snapshot_items TO "{runtime_store.app_role}"'
                 )
             )
+            if explicit_runtime == "writer":
+                await db.execute(
+                    text(
+                        f'GRANT INSERT ON resources,snapshots,snapshot_items TO "{runtime_store.app_role}"'
+                    )
+                )
+                await db.execute(
+                    text(f'GRANT UPDATE ON snapshots TO "{runtime_store.app_role}"')
+                )
     await runtime_store.install(
         **({"runtime_role": runtime_store.app_role} if explicit_runtime else {})
     )
@@ -1180,7 +1189,8 @@ async def test_dba_migration_preserves_ordinary_source_owner_capture_read_and_re
         runtime_store.factory(runtime_store.app_role) if explicit_runtime else factory
     )
     tenant, resource, snapshot, item = [uuid4() for _ in range(4)]
-    async with factory.begin() as db:
+    writer = worker if explicit_runtime == "writer" else factory
+    async with writer.begin() as db:
         await db.execute(
             text("INSERT INTO resources VALUES(:r,:t,'USER_MAIL')"),
             {"r": resource, "t": tenant},
@@ -1202,7 +1212,7 @@ async def test_dba_migration_preserves_ordinary_source_owner_capture_read_and_re
     async with worker.begin() as db:
         result = await read_summary(db, tenant_ids=(tenant,), service_types=None)
         assert result["totalBytes"] == 9 and result["freshness"] == "fresh"
-        if explicit_runtime:
+        if explicit_runtime == "reader":
             assert not await db.scalar(
                 text(
                     "SELECT has_table_privilege(current_user,'snapshot_items','INSERT')"
@@ -1244,21 +1254,32 @@ async def test_dba_migration_preserves_ordinary_source_owner_capture_read_and_re
         assert await db.scalar(text("SELECT count(*) FROM protected_size_orphans")) == 0
 
 
+@pytest.mark.parametrize("schema_usage", [False, True])
 async def test_unrelated_ordinary_schema_ddl_does_not_need_ledger_schema_usage(
     runtime_store,
+    schema_usage,
 ):
     await runtime_store.install()
     async with runtime_store.admin.begin() as db:
         before = await db.scalar(
             text("SELECT discovery_epoch FROM protected_size_control")
         )
+        if schema_usage:
+            await db.execute(
+                text(
+                    f'GRANT USAGE ON SCHEMA "{runtime_store.schema}" TO "{runtime_store.other_role}"'
+                )
+            )
     factory = runtime_store.factory(
         runtime_store.other_role, target_schema=runtime_store.other_schema
     )
     async with factory.begin() as db:
-        assert not await db.scalar(
-            text("SELECT has_schema_privilege(current_user,:s,'USAGE')"),
-            {"s": runtime_store.schema},
+        assert (
+            await db.scalar(
+                text("SELECT has_schema_privilege(current_user,:s,'USAGE')"),
+                {"s": runtime_store.schema},
+            )
+            == schema_usage
         )
         await db.execute(text("CREATE TABLE unrelated(id integer)"))
         await db.execute(text("ALTER TABLE unrelated ADD COLUMN more integer"))
@@ -1332,7 +1353,7 @@ async def test_ddl_helpers_are_private_fixed_path_and_migration_owned(runtime_st
         "protected_size_partition_ddl",
         "protected_size_partition_drop",
     }
-    assert {r["proname"] for r in rows if r["prosecdef"]} == helpers
+    assert not any(r["prosecdef"] for r in rows)
     for row in rows:
         assert row["migration_owned"]
         if row["proname"] in helpers:
@@ -1340,8 +1361,101 @@ async def test_ddl_helpers_are_private_fixed_path_and_migration_owned(runtime_st
             assert row["proconfig"] == [
                 f'search_path=pg_catalog, "{runtime_store.schema}", pg_temp'
             ]
-    factory = runtime_store.factory(runtime_store.source_role)
+    async with runtime_store.admin.begin() as db:
+        await db.execute(
+            text(
+                f'GRANT USAGE ON SCHEMA "{runtime_store.schema}" TO "{runtime_store.other_role}"'
+            )
+        )
+    factory = runtime_store.factory(runtime_store.other_role)
     async with factory.begin() as db:
         with pytest.raises(Exception, match="permission denied for function"):
             async with db.begin_nested():
                 await db.execute(text("SELECT protected_size_install_triggers()"))
+
+
+async def test_ddl_helpers_do_not_call_source_schema_format_overloads(runtime_store):
+    factory = runtime_store.factory(runtime_store.source_role)
+    async with factory.begin() as db:
+        for signature in ("text,name,name", "text,text"):
+            await db.execute(
+                text(f"""CREATE FUNCTION format({signature}) RETURNS text LANGUAGE plpgsql AS $fn$
+              BEGIN RAISE EXCEPTION 'source schema overload ran with DBA privileges'; END $fn$""")
+            )
+    await runtime_store.install()
+    async with factory.begin() as db:
+        await db.execute(
+            text("ALTER TABLE snapshot_items DETACH PARTITION snapshot_items_p0")
+        )
+        await db.execute(text("DROP TABLE snapshot_items_p0"))
+        await db.execute(
+            text(
+                "CREATE TABLE snapshot_items_p0 PARTITION OF snapshot_items FOR VALUES WITH(MODULUS 2,REMAINDER 0)"
+            )
+        )
+
+
+async def test_source_owner_replacing_hook_state_does_not_gain_dba_identity(
+    runtime_store,
+):
+    await runtime_store.install()
+    factory = runtime_store.factory(runtime_store.source_role)
+    async with factory.begin() as db:
+        await db.execute(text("CREATE TABLE hook_identity(who name,is_super boolean)"))
+        await db.execute(
+            text(
+                "CREATE TABLE replacement_control (LIKE protected_size_control INCLUDING ALL)"
+            )
+        )
+        await db.execute(
+            text("INSERT INTO replacement_control SELECT * FROM protected_size_control")
+        )
+        await db.execute(text("DROP TABLE protected_size_control"))
+        await db.execute(
+            text("ALTER TABLE replacement_control RENAME TO protected_size_control")
+        )
+        await db.execute(
+            text("""CREATE FUNCTION observe_hook_identity() RETURNS trigger LANGUAGE plpgsql AS $fn$
+          BEGIN INSERT INTO hook_identity SELECT current_user,rolsuper FROM pg_catalog.pg_roles WHERE rolname=current_user; RETURN NEW; END $fn$""")
+        )
+        await db.execute(
+            text(
+                "CREATE TRIGGER observe_hook_identity BEFORE UPDATE ON protected_size_control FOR EACH ROW EXECUTE FUNCTION observe_hook_identity()"
+            )
+        )
+        await db.execute(text("ALTER TABLE snapshot_items ADD COLUMN hook_probe text"))
+        rows = (await db.execute(text("SELECT who,is_super FROM hook_identity"))).all()
+        assert rows == [(runtime_store.source_role, False)]
+
+
+async def test_future_split_owner_attachment_is_rejected_atomically(runtime_store):
+    await runtime_store.install()
+    factory = runtime_store.factory(runtime_store.source_role)
+    async with factory.begin() as db:
+        await db.execute(
+            text("ALTER TABLE snapshot_items DETACH PARTITION snapshot_items_p0")
+        )
+    async with runtime_store.admin.begin() as db:
+        await db.execute(text("CREATE TABLE imported_items (LIKE snapshot_items)"))
+        await db.execute(
+            text(f'ALTER TABLE imported_items OWNER TO "{runtime_store.app_role}"')
+        )
+        before = await db.scalar(
+            text("SELECT discovery_epoch FROM protected_size_control")
+        )
+        with pytest.raises(Exception, match="split ownership"):
+            async with db.begin_nested():
+                await db.execute(
+                    text(
+                        "ALTER TABLE snapshot_items ATTACH PARTITION imported_items FOR VALUES WITH(MODULUS 2,REMAINDER 0)"
+                    )
+                )
+        assert not await db.scalar(
+            text(
+                "SELECT EXISTS(SELECT 1 FROM pg_inherits WHERE inhrelid='imported_items'::regclass)"
+            )
+        )
+        assert (
+            await db.scalar(text("SELECT discovery_epoch FROM protected_size_control"))
+            == before
+        )
