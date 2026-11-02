@@ -186,7 +186,7 @@ class GraphRateLimiter:
             return await coordinator.cooldown(context, seconds)
 
     async def maybe_init_redis(self) -> None:
-        """Promote to Redis-backed bucket if ``REDIS_URL`` is configured.
+        """Promote using the explicit URL or enabled shared Redis settings.
 
         Safe to call multiple times; subsequent calls are no-ops.
         Designed to be invoked from each worker entry point AFTER
@@ -196,7 +196,10 @@ class GraphRateLimiter:
             return
         url = os.environ.get("REDIS_URL")
         if not url:
-            return
+            from shared.config import settings
+            if not settings.REDIS_ENABLED:
+                return
+            url = settings.REDIS_URL_FULL
         try:
             from redis.asyncio import Redis
             client = Redis.from_url(url, decode_responses=True,

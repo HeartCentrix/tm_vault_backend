@@ -47,3 +47,24 @@ async def test_cancelled_denial_does_not_grant_or_fallback(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await bucket.acquire()
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize('enabled', [True, False])
+async def test_coordinator_uses_enabled_individual_redis_settings(monkeypatch, enabled):
+    from unittest.mock import AsyncMock
+    from shared.config import settings
+    from shared.graph_rate_limiter import GraphRateLimiter
+    monkeypatch.delenv('REDIS_URL', raising=False)
+    monkeypatch.setattr(settings, 'REDIS_ENABLED', enabled)
+    url = 'redis://:escaped%2Fpassword@coordinator:6379/4'
+    monkeypatch.setattr(settings, 'REDIS_URL_FULL', url)
+    seen = []
+    client = SimpleNamespace(ping=AsyncMock())
+    def connect(actual, **kwargs):
+        seen.append(actual)
+        return client
+    monkeypatch.setattr('redis.asyncio.Redis.from_url', connect)
+    limiter = GraphRateLimiter()
+    await limiter.maybe_init_redis()
+    assert seen == ([url] if enabled else [])
+    assert isinstance(limiter._bucket, _RedisTokenBucket) is enabled
