@@ -1,34 +1,4 @@
-"""A ghosted Web Part Gallery file is not a backup failure.
-
-Bug (2026-08-13): SHAREPOINT_SITE "IT Projects" settled PARTIAL on every
-single run — 02:11 and 10:12 on 8/13, and the same before that — with
-``snapshot_partitions.failure_state`` reading
-``{"files_failed": 152, "enumeration_incomplete": false}`` identically on
-all four partitions of both runs.
-
-The 152 resolve to **19 distinct files**, every one of them under
-``/sites/projects/_catalogs/wp/`` (the Web Part Gallery), and every failure
-is the same::
-
-    [SP_LIST_STREAM FAIL] IT Projects/Web Part Gallery/FilterActions.dwp:
-    HTTPStatusError: Client error '404 Not Found' for url
-    '.../_api/web/GetFileByServerRelativeUrl(
-        '/sites/projects/_catalogs/wp/FilterActions.dwp')/$value'
-
-608 such lines in one day's logs, 100% 404. These are *ghosted* files:
-provisioned from the site definition on disk, listed in the gallery's
-metadata, but with no content stream in the content database. ``/$value``
-404s for them permanently and by design — no amount of retrying, and no
-permission grant, will ever produce bytes.
-
-Counting them as failures cost two things: the site was reported PARTIAL
-twice a day forever (drowning any real degradation in noise), and
-``files_failed`` carried a number that no operator could act on.
-
-The classification is deliberately NARROW — 404 *and* under ``_catalogs/``.
-A 404 elsewhere is a genuinely missing file and must still fail the run, and
-a 403/500 on a catalog path is a real error, not a ghost.
-"""
+"""Possible catalog templates remain diagnostic;404doesnot prove backup coverage."""
 from __future__ import annotations
 
 import importlib.util
@@ -108,16 +78,16 @@ def test_non_http_exception_is_a_real_failure():
     ) is False
 
 
-def test_ghosted_files_do_not_count_toward_files_failed():
-    """The whole point: a ghost must not drag the snapshot to PARTIAL."""
+def test_possible_ghosted_files_count_toward_missing_content():
+    """Without durable content or a verified restore recipe, coverage is partial."""
     stats = {"drive_fail": 0, "rest_fail": 0, "enum_fail": 0, "rest_ghosted": 19}
-    assert _bw.sharepoint_total_failures(stats) == 0
+    assert _bw.sharepoint_total_failures(stats) == 19
 
 
 def test_real_failures_still_count_alongside_ghosts():
     """Ghost accounting must not mask genuine failures in the same run."""
     stats = {"drive_fail": 1, "rest_fail": 2, "enum_fail": 3, "rest_ghosted": 19}
-    assert _bw.sharepoint_total_failures(stats) == 6
+    assert _bw.sharepoint_total_failures(stats) == 25
 
 
 # ─── the counting seam ────────────────────────────────────────────────────
@@ -158,5 +128,11 @@ def test_recording_accumulates_across_calls():
         )
     assert stats["rest_ghosted"] == 19
     assert stats["rest_fail"] == 2
-    # Only the 2 real ones may reach files_failed / PARTIAL.
-    assert _bw.sharepoint_total_failures(stats) == 2
+    # All missing content reaches PARTIAL, including possible templates.
+    assert _bw.sharepoint_total_failures(stats) == 21
+
+
+def test_catalog_path_and_404_alone_never_prove_content_was_backed_up():
+    stats = {}
+    _bw.record_sp_rest_failure(stats, _CATALOG_URL, _http_error(404, _CATALOG_URL))
+    assert _bw.sharepoint_total_failures(stats) == 1

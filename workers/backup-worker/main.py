@@ -4188,24 +4188,10 @@ _SHAREPOINT_CATALOG_MARKER = "/_catalogs/"
 def is_ghosted_catalog_file(
     server_relative_url: Optional[str], exc: BaseException,
 ) -> bool:
-    """Is this download failure a ghosted catalog file rather than data loss?
+    """Classify a possible template-backed catalog file for diagnostics only.
 
-    ``GetFileByServerRelativeUrl(...)/$value`` returns 404 forever for files
-    provisioned from the site definition — they are listed in the gallery but
-    the bytes live on the front-end's disk, not in the content DB. Retrying
-    cannot help and no permission grant changes it.
-
-    Observed 2026-08-13 on SHAREPOINT_SITE "IT Projects": 19 distinct files,
-    all under ``/sites/projects/_catalogs/wp/``, 608 log lines in one day,
-    100% 404 — enough to settle the site PARTIAL on every run and bury any
-    real degradation in permanent noise.
-
-    Deliberately NARROW, because both halves guard against masking a real
-    fault: a 404 outside ``_catalogs/`` is a genuinely missing document and
-    must still fail the run, and a 403/500 on a catalog path is an error, not
-    a ghost. Anything that is not an HTTP status error is never a ghost.
-
-    Pure function; pinned by tests/workers/test_sharepoint_ghosted_catalog.py.
+    A catalog path and404cannot distinguish unavailable content from a
+    template-backed file. This classification never proves backup coverage.
     """
     response = getattr(exc, "response", None)
     if getattr(response, "status_code", None) != 404:
@@ -4217,13 +4203,10 @@ def record_sp_rest_failure(
     stats: Dict[str, Any], server_relative_url: Optional[str],
     exc: BaseException,
 ) -> str:
-    """Count one REST-pass download failure into the right bucket.
+    """Count missing required bytes, separating possible catalog templates.
 
-    Returns ``"ghosted"`` or ``"failed"``. Ghosts go to ``rest_ghosted``,
-    which :func:`sharepoint_total_failures` deliberately does not sum, so
-    they never reach ``files_failed`` and never flip the snapshot PARTIAL.
-    They are still counted rather than dropped: an operator asking "why is
-    this site 19 items short of the gallery listing" deserves an answer.
+    Both buckets count toward incomplete coverage; neither advances a drive
+    delta cursor because this is the independent REST list traversal.
     """
     if is_ghosted_catalog_file(server_relative_url, exc):
         stats["rest_ghosted"] = int(stats.get("rest_ghosted", 0) or 0) + 1
@@ -4278,19 +4261,11 @@ def partition_loss_degraded_reason(
 
 
 def sharepoint_total_failures(stats: Dict[str, Any]) -> int:
-    """Every SharePoint per-item failure in a run, for HONEST REPORTING.
-
-    Feeds ``files_failed`` so the snapshot still settles PARTIAL and the
-    operator still sees the true count. Never use this to gate a cursor —
-    see :func:`sharepoint_cursor_blocking_failures`.
-
-    ``rest_ghosted`` is deliberately absent: a ghosted catalog file has no
-    bytes to back up on the server either, so counting it would report a
-    permanent, unactionable PARTIAL. See :func:`is_ghosted_catalog_file`.
-    """
+    """Count required content and enumeration gaps without hiding catalog404s."""
     return (
         int(stats.get("drive_fail", 0) or 0)
         + int(stats.get("rest_fail", 0) or 0)
+        + int(stats.get("rest_ghosted", 0) or 0)
         + int(stats.get("enum_fail", 0) or 0)
         + int(stats.get("rest_enum_fail", 0) or 0)
     )
@@ -29508,15 +29483,13 @@ class BackupWorker:
                         stats["rest_fail"] += 1
                 except Exception as exc:
                     content_hash = None
-                    # Ghosted catalog files (Web Part Gallery et al) 404 on
-                    # /$value forever by design — they must not settle the
-                    # site PARTIAL on every run. Everything else still does.
+                    # Record possible template-backed files separately; missing
+                    # required bytes still leave incomplete coverage.
                     if record_sp_rest_failure(stats, srv_rel, exc) == "ghosted":
                         print(f"[{self.worker_id}]   [SP_LIST_GHOSTED] "
                               f"{site_label}/{display}/{name}: no content "
-                              f"stream (provisioned from the site "
-                              f"definition) — metadata captured, not counted "
-                              f"as a failure")
+                              f"stream — metadata captured; required "
+                              f"content remains unavailable")
                     else:
                         print(f"[{self.worker_id}]   [SP_LIST_STREAM FAIL] "
                               f"{site_label}/{display}/{name}: "
