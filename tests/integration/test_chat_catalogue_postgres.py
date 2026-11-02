@@ -798,6 +798,9 @@ async def test_single_child_staging_fetches_only_its_parent_from_inventory(store
     parents[1] = parent_for(child, parent=parents[1])
     for start in range(0, len(parents), 100):
         await store.stage(lease, parents[start:start+100])
+    # Fresh fixture tables have no planner statistics until explicitly analyzed.
+    async with store.engine.begin() as connection:
+        await connection.execute(text("ANALYZE chat_item_versions, chat_inventory_items"))
     selected = []
     def record(conn, cursor, statement, parameters, context, executemany):
         if statement.startswith("SELECT chat_item_versions.graph_id,"):
@@ -820,7 +823,8 @@ async def test_single_child_staging_fetches_only_its_parent_from_inventory(store
             filtered = 0
             while nodes:
                 node = nodes.pop()
-                filtered += node.get("Rows Removed by Filter", 0)
+                filtered += (node.get("Rows Removed by Filter", 0)
+                             + node.get("Rows Removed by Join Filter", 0)) * node.get("Actual Loops", 1)
                 nodes.extend(node.get("Plans", []))
             assert filtered < 20, f"unrelated parent records inspected: {filtered}"
 
