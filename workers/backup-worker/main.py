@@ -4480,9 +4480,20 @@ class BackupWorker:
                 recovery_s=float(os.getenv("COPY_WORK_RECOVERY_SECONDS", "10")),
             )
             await self._copy_work_runner.start()
+        from shared.provider_work import guards_enabled as provider_guards
+        self._provider_work_runner = None
+        if provider_guards():
+            from shared.provider_runtime import ProviderWorkRunner
+            self._provider_work_runner = ProviderWorkRunner(async_session_factory,
+                self.resume_provider_work, self._settle_provider_parent,
+                concurrency=int(os.getenv('PROVIDER_EXECUTION_CAPACITY', '8')),
+                owner_id=getattr(getattr(self, '_heartbeat', None), 'worker_uuid', None))
+            await self._provider_work_runner.start()
         try:
             await self._consume_backup_queues()
         finally:
+            if self._provider_work_runner is not None:
+                await self._provider_work_runner.close()
             if self._copy_work_runner is not None:
                 await self._copy_work_runner.close()
 
@@ -4909,6 +4920,98 @@ class BackupWorker:
             )
         except Exception as audit_err:
             print(f"[{self.worker_id}] [AuditLogger] lifecycle emit failed: {audit_err}")
+
+    async def _enqueue_provider_message(self, message):
+        """Persist intake before acknowledging; polling survives broker loss."""
+        from shared import provider_work
+        from shared.models import ProviderWork
+        partition_id = uuid.UUID(str(message['partitionId'])) if message.get('partitionId') else None
+        if partition_id:
+            async with async_session_factory.begin() as session:
+                part = await session.get(SnapshotPartition, partition_id)
+                if part is None or part.status in ('COMPLETED', 'FAILED'):
+                    return True
+                snap = await session.get(Snapshot, part.snapshot_id)
+                job = await session.get(Job, part.job_id)
+                if job is None or job.status in (JobStatus.CANCELLED, JobStatus.CANCELLING):
+                    return True
+                await provider_work.ensure_work(session, snapshot_id=snap.id,
+                    snapshot_token=snap.lease_token, job_token=job.lease_token,
+                    partition_id=part.id, partition_token=part.lease_token,
+                    continuation={'message': dict(message)})
+        else:
+            ids = message.get('resourceIds') or ([message['resourceId']] if message.get('resourceId') else [])
+            if not ids or not message.get('jobId'):
+                return False
+            job_id = uuid.UUID(str(message['jobId']))
+            for resource_id in ids:
+                async with async_session_factory() as session:
+                    job = await session.get(Job, job_id)
+                    resource = await session.get(Resource, uuid.UUID(str(resource_id)))
+                    if job is None or resource is None or job.status in (JobStatus.CANCELLED, JobStatus.CANCELLING):
+                        continue
+                    pending = await session.scalar(select(ProviderWork.id).where(
+                        ProviderWork.job_id == job_id, ProviderWork.resource_id == resource.id,
+                        ProviderWork.partition_id.is_(None)))
+                    if pending:
+                        continue
+                    original_job_token = job.lease_token
+                    session.expunge(resource)
+                leaf_message = {key: value for key, value in message.items() if key != 'resourceIds'}
+                leaf_message.update(resourceId=str(resource_id), _job_lease_token=original_job_token)
+                snapshot = await self.create_snapshot(resource, leaf_message, job_id)
+                if snapshot.status != SnapshotStatus.IN_PROGRESS:
+                    continue
+                async with async_session_factory.begin() as session:
+                    job = await session.get(Job, job_id, with_for_update=True)
+                    if job.status in (JobStatus.QUEUED, JobStatus.PENDING):
+                        job.status = JobStatus.RUNNING
+                    await provider_work.ensure_work(session, snapshot_id=snapshot.id,
+                        snapshot_token=snapshot.lease_token, job_token=original_job_token,
+                        continuation={'message': leaf_message})
+                lease_unregister('snapshots', snapshot.id)
+        runner = getattr(self, '_provider_work_runner', None)
+        if runner:
+            runner.wake()
+        return True
+
+    async def resume_provider_work(self, claim):
+        """Re-enter the existing handler with its already acquired parent fence."""
+        from shared.provider_work import _owned
+        async with async_session_factory() as session:
+            row, job, snapshot, partition = await _owned(session, claim)
+            message = dict((row.continuation or {}).get('message') or {})
+            message.update(jobId=str(job.id), resourceId=str(snapshot.resource_id),
+                tenantId=str(job.tenant_id), priority=job.priority,
+                _job_lease_token=claim.job_token)
+            if row.sla_policy_id:
+                message['slaPolicyId'] = str(row.sla_policy_id)
+        return await self.process_backup_message(message)
+
+    async def _settle_provider_parent(self, work_id):
+        from shared import provider_work
+        from shared.models import ProviderWork
+        async with async_session_factory() as session:
+            row = await session.get(ProviderWork, work_id)
+            if row is None or not row.parent_settle_pending:
+                return False
+            snapshot = await session.get(Snapshot, row.snapshot_id)
+            job = await session.get(Job, row.job_id)
+        with provider_work.settling_parent():
+            if row.partition_id or (snapshot.extra_data or {}).get('partitioned'):
+                await self._finalize_partitioned_snapshot(snapshot.id, job_id=job.id)
+            async with async_session_factory() as session:
+                current = await session.get(Snapshot, snapshot.id)
+                if current.status not in (SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL, SnapshotStatus.FAILED):
+                    return False
+                if job.batch_resource_ids:
+                    await self._finalize_bulk_parent_if_complete(session, job.id)
+                else:
+                    await self.update_job_status(session, job.id,
+                        JobStatus.FAILED if current.status == SnapshotStatus.FAILED else JobStatus.COMPLETED,
+                        {'item_count': current.item_count, 'bytes_total': current.bytes_total})
+            async with async_session_factory.begin() as session:
+                return await provider_work.finish_parent_settlement(session, work_id)
 
     async def resume_copy_workflow(self, workflow_id):
         """Settle persisted capture after required copy tasks, without re-enumeration."""
@@ -5768,6 +5871,10 @@ class BackupWorker:
         # without duplicating consumer plumbing. Partition envelopes
         # carry `messageType="BACKUP_ONEDRIVE_PARTITION"` and have no
         # resourceIds / resourceId — they identify work via partitionId.
+        from shared.provider_work import enabled as provider_enabled, current_claim
+        if provider_enabled() and current_claim() is None:
+            if await self._enqueue_provider_message(message):
+                return {'provider_waiting': True}
         if message.get("messageType") == "BACKUP_ONEDRIVE_PARTITION":
             await self._process_onedrive_partition_message(message)
             return
@@ -6068,6 +6175,10 @@ class BackupWorker:
                     f"started={fresh_inprogress[1]}); the previous attempt "
                     f"died, so this delivery IS the retry."
                 )
+                fresh_inprogress = None
+            from shared.provider_work import current_claim
+            provider_claim = current_claim()
+            if provider_claim is not None and provider_claim.job_id == job_id:
                 fresh_inprogress = None
             if fresh_inprogress is not None:
                 ip_id, ip_started = fresh_inprogress[0], fresh_inprogress[1]
@@ -6980,7 +7091,8 @@ class BackupWorker:
                 partition_id=partition_id, policy_id=policy.id if policy is not None else None,
                 exclude_message=predicate, scope_filter_hash=filter_hash, check_cancelled=cancel_check,
                 concurrency=max(1, int(os.getenv("USER_CHATS_PARALLEL_CHATS", "4"))),
-                snapshot_lease_token=getattr(snapshot, "lease_token", None), partition_lease_token=token)
+                snapshot_lease_token=getattr(snapshot, "lease_token", None), partition_lease_token=token,
+                job_lease_token=(message or {}).get("_job_lease_token"))
             if result is None or result.get("resumed_terminal"):
                 return result
 
@@ -16088,6 +16200,16 @@ class BackupWorker:
         2026-05-16: 18 CHATS partitions across 5 users marked FAILED
         this way mid-drain.
         """
+        from shared.provider_work import current_claim, _owned
+        provider_claim = current_claim()
+        if provider_claim is not None:
+            if provider_claim.partition_id != partition_id:
+                raise ChatCatalogueWorkLeaseMoved('provider partition claim differs')
+            async with async_session_factory() as provider_session:
+                _, _, _, part = await _owned(provider_session, provider_claim)
+                claim = {prop.key: getattr(part, prop.key) for prop in part.__mapper__.column_attrs}
+            _bind_partition_lease(partition_id, claim)
+            return claim
         stale_min = int(settings.ONEDRIVE_PARTITION_STALE_SWEEP_MIN)
         worker_region = os.getenv("WORKER_REGION", "default")
         # heartbeat.worker_uuid is the lease-tracking UUID; the legacy
@@ -19019,7 +19141,8 @@ class BackupWorker:
             "resourceId": str(resource_id),
             "tenantId": str(tenant_id),
             "type": "INCREMENTAL",
-            "priority": 3,
+            "priority": message.get("priority", 5),
+            "_job_lease_token": message.get("_job_lease_token"),
             "partitionFilter": {"chatIds": shard_chat_ids},
             "partitionId": str(partition_id),
             "partitionIndex": partition_index,
@@ -21312,7 +21435,8 @@ class BackupWorker:
         )
 
         async def _bounded(rid: uuid.UUID) -> None:
-            async with sem:
+            from shared.provider_runtime import execution_budget
+            async with sem, execution_budget().permit():
                 try:
                     await self._retry_one_onedrive_file(
                         retry_id=rid, max_attempts=max_attempts,
@@ -30022,6 +30146,65 @@ class BackupWorker:
             print(f"[{self.worker_id}] [REAPER] skipped: {type(exc).__name__}: {exc}")
             return 0
 
+    async def _complete_archive_snapshot(self, snapshot, result):
+        """Receipt gate and terminal publication share one fenced transaction."""
+        from shared.archive_capture import ArchiveConflict, archive_final_gate
+        from shared.copy_workflow import has_pending_copy, verify_copy_resume
+        from shared.db_retry import run_with_db_retry
+        snapshot_id = snapshot.id
+        expected_snapshot = result.get('archive_snapshot_token')
+        expected_job = result.get('archive_job_token')
+        generation = result.get('archive_capture_generation')
+        async def publish():
+            async with async_session_factory() as db:
+                hint = await db.get(Snapshot, snapshot_id)
+                if hint is None:
+                    return None
+                job = await db.get(Job, hint.job_id, with_for_update=True, populate_existing=True)
+                live = await db.get(Snapshot, snapshot_id, with_for_update=True, populate_existing=True)
+                if (live.lease_token != expected_snapshot or job is None or job.lease_token != expected_job
+                    or job.status in (JobStatus.CANCELLED, JobStatus.CANCELLING)):
+                    raise ArchiveConflict('archive finalization parent generation changed')
+                if live.status != SnapshotStatus.IN_PROGRESS:
+                    marker = (live.extra_data or {}).get('archive_terminal_receipt')
+                    if marker != [expected_snapshot, expected_job, generation]:
+                        raise ArchiveConflict('archive finalization parent generation changed')
+                    db.expunge(live)
+                    return live
+                if not await verify_copy_resume(db) or await has_pending_copy(db, snapshot_id=snapshot_id):
+                    return None
+                summary = await archive_final_gate(db, live, generation=generation)
+                if (live.extra_data or {}).get('partitioned'):
+                    return None
+                live.item_count = int(summary['files_succeeded'])
+                live.new_item_count = int(summary.get('new_item_count', result.get('new_item_count', 0)))
+                live.bytes_total = int(summary.get('bytes_total', result.get('bytes_total', 0)))
+                live.bytes_added = int(summary.get('bytes_added', result.get('bytes_added', 0)))
+                live.status = SnapshotStatus.PARTIAL if summary['files_failed'] else SnapshotStatus.COMPLETED
+                if (live.extra_data or {}).get(SNAPSHOT_DEGRADED_REASON_KEY):
+                    live.status = SnapshotStatus.PARTIAL
+                live.completed_at = datetime.utcnow()
+                if live.started_at:
+                    live.duration_secs = int((live.completed_at - live.started_at).total_seconds())
+                live.extra_data = {**(live.extra_data or {}),
+                    'archive_terminal_receipt': [expected_snapshot, expected_job, generation]}
+                if summary['files_failed']:
+                    live.extra_data = {**live.extra_data, 'failure_reason': 'archive coverage or content receipts incomplete'}
+                await db.commit()
+                db.expunge(live)
+                return live
+        try:
+            live = await run_with_db_retry(publish, attempts=8, max_delay=15,
+                label='archive-terminal:' + str(snapshot_id)[:8])
+            if live is None:
+                return False
+            for key in ('status', 'item_count', 'new_item_count', 'bytes_total', 'bytes_added',
+                        'completed_at', 'duration_secs', 'delta_tokens_json', 'extra_data'):
+                setattr(snapshot, key, getattr(live, key))
+            return True
+        finally:
+            lease_unregister('snapshots', snapshot_id)
+
     async def complete_snapshot(self, session: AsyncSession, snapshot: Snapshot, result: Dict):
         """Mark snapshot as completed with result data.
 
@@ -30069,20 +30252,7 @@ class BackupWorker:
         # The persisted marker wins over detached handler state or rollout flags.
         archive_metadata = await session.scalar(select(Snapshot.extra_data).where(Snapshot.id == snapshot.id))
         if (archive_metadata or {}).get("archive_capture"):
-            archive_live = await session.get(Snapshot, snapshot.id)
-            from shared.archive_capture import ArchiveConflict, archive_final_gate
-            archive_job = await session.get(Job, archive_live.job_id, with_for_update=True, populate_existing=True)
-            archive_live = await session.get(Snapshot, snapshot.id, with_for_update=True, populate_existing=True)
-            if (archive_live.status != SnapshotStatus.IN_PROGRESS
-                    or archive_live.lease_token != result.get("archive_snapshot_token")
-                    or archive_job is None or archive_job.lease_token != result.get("archive_job_token")
-                    or archive_job.status in (JobStatus.CANCELLED, JobStatus.CANCELLING)):
-                raise ArchiveConflict("archive finalization parent generation changed")
-            archive_summary = await archive_final_gate(session, archive_live,
-                generation=result.get("archive_capture_generation"))
-            result.update(item_count=archive_summary["files_succeeded"], files_failed=archive_summary["files_failed"])
-            snapshot.extra_data = dict(archive_live.extra_data or {})
-            snapshot.delta_tokens_json = dict(archive_live.delta_tokens_json or {})
+            return await self._complete_archive_snapshot(snapshot, result)
         extra = snapshot.extra_data or {}
         if extra.get("partitioned") is True:
             # Last-finisher owns this snapshot's terminal state.
@@ -31214,6 +31384,15 @@ class BackupWorker:
         walk everything promote their own row via `_mark_snapshot_full`;
         see that method for why guessing FULL here loses data.
         """
+        from shared.provider_work import current_claim, _owned
+        provider_claim = current_claim()
+        if provider_claim is not None:
+            async with async_session_factory() as provider_session:
+                _, _, owned_snapshot, _ = await _owned(provider_session, provider_claim)
+                if owned_snapshot.resource_id != resource.id or owned_snapshot.job_id != job_id:
+                    raise ChatCatalogueWorkLeaseMoved('provider resume target differs from original claim')
+                provider_session.expunge(owned_snapshot)
+                return owned_snapshot
         from sqlalchemy.exc import IntegrityError as _IntegrityError
         async with async_session_factory() as session:
             # Serialize SELECT+INSERT against the same (job, resource)

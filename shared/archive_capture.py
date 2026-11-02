@@ -156,7 +156,7 @@ class ArchiveCapture:
         key = digest(base, '', 'root')
         existing = await db.get(Folder, (self.fence.snapshot_id, self.generation, key))
         if existing:
-            return
+            return existing.gap_kind != 'location_cap'
         count = await db.scalar(select(func.count()).select_from(Folder).where(Folder.snapshot_id == self.fence.snapshot_id,
             Folder.capture_generation == self.generation, Folder.phase == 'root', Folder.state != 'excluded'))
         over = count >= self.max_locations
@@ -164,6 +164,7 @@ class ArchiveCapture:
             phase='root', base_url=base, folder_id='', next_url=base,
             state='unresolved' if over else 'pending', gap_kind='location_cap' if over else None))
         await db.flush()
+        return not over
 
     async def add_location(self, base):
         async with self.factory.begin() as db:
@@ -216,7 +217,9 @@ class ArchiveCapture:
                     digest('page', scope['scope_key'], scope['scope_generation'], nxt)))
                 if nxt == request_url or cycle:
                     raise ArchivePageError('archive continuation cycle')
-            await self._location(db, base)
+            if not await self._location(db, base):
+                row.state, row.gap_kind = 'unresolved', 'location_cap'
+                return
             ordinal = row.page_ordinal + 1
             inserted_count = 0
             if row.phase == 'items':
@@ -249,7 +252,8 @@ class ArchiveCapture:
                     if not isinstance(child, dict) or not isinstance(child.get('id'), str) or not child['id']:
                         raise ArchivePageError('archive folder identity missing')
                     route = folder_base(child, base)
-                    await self._location(db, route)
+                    if not await self._location(db, route):
+                        continue
                     path = row.display_path + '/' + str(child.get('displayName') or child['id'])
                     declared = child.get('childFolderCount')
                     for phase in ('items', 'children'):
@@ -371,6 +375,10 @@ class ArchiveCapture:
                 ORDER BY (s.created_at > NOW()-make_interval(days=>:days)) DESC,s.item_count DESC NULLS LAST,s.created_at DESC LIMIT 1'''),
                 {'rid': self.fence.resource_id, 'sid': self.fence.snapshot_id, 'days': days})).first()
             chosen = (result[0], int(result[1] or 0)) if result else (None, 0)
+            if chosen[0]:
+                retained = await db.scalar(select(func.count(func.distinct(SnapshotItem.external_id))).where(
+                    SnapshotItem.snapshot_id == chosen[0], SnapshotItem.item_type == 'ARCHIVE_ITEM'))
+                chosen = (chosen[0], max(chosen[1], int(retained or 0)))
             context.update(prior_snapshot_id=str(chosen[0]) if chosen[0] else None, baseline_count=chosen[1])
             snap.extra_data = {**snap.extra_data, 'archive_capture': context}
             return chosen
@@ -431,8 +439,8 @@ class ArchiveCapture:
                 if prior is None:
                     await db.execute(insert(SnapshotItem.__table__).values(row))
                     prior = await db.get(SnapshotItem, row['id'])
-                expected = (ck, row['content_hash'], row['content_size'], row['blob_path'], row['backend_id'], row.get('encryption_key_id'))
-                actual = ((prior.extra_data or {}).get('changeKey'), prior.content_hash, prior.content_size, prior.blob_path, prior.backend_id, prior.encryption_key_id)
+                expected = (ck, row['content_hash'], row['content_size'], row['blob_path'], row['backend_id'], row.get('encryption_key_id'), row.get('backup_version'))
+                actual = ((prior.extra_data or {}).get('changeKey'), prior.content_hash, prior.content_size, prior.blob_path, prior.backend_id, prior.encryption_key_id, prior.backup_version)
                 if expected != actual:
                     for o in observations:
                         o.state, o.gap_kind = 'failed', 'receipt_conflict'
@@ -447,12 +455,12 @@ class ArchiveCapture:
 
     async def missing_samples(self, prior, limit=60):
         async with self.factory() as db:
-            return list((await db.scalars(text('''SELECT p.external_id FROM snapshot_items p
+            return list((await db.scalars(text('''SELECT external_id FROM (SELECT p.external_id, p.folder_path, row_number() OVER (PARTITION BY p.folder_path ORDER BY p.external_id) AS ordinal FROM snapshot_items p
                 WHERE p.snapshot_id=:prior AND p.item_type='ARCHIVE_ITEM' AND NOT EXISTS (
                     SELECT 1 FROM archive_item_work i JOIN archive_folder_work f ON f.snapshot_id=i.snapshot_id AND f.capture_generation=i.capture_generation
                     AND f.scope_key=i.scope_key AND f.scope_generation=i.scope_generation
                     WHERE i.snapshot_id=:sid AND i.capture_generation=:gen AND i.external_id=p.external_id AND f.state<>'excluded')
-                ORDER BY p.external_id LIMIT :limit'''), self.params(prior=prior, limit=min(limit, 60)))).all())
+                 ) candidates ORDER BY ordinal, folder_path, external_id LIMIT :limit'''), self.params(prior=prior, limit=min(limit, 60)))).all())
 
     async def summary(self, db=None):
         if db is None:
@@ -512,13 +520,15 @@ class ArchiveCapture:
         source = {p.external_id: p for p in (await db.scalars(select(SnapshotItem).where(
             SnapshotItem.snapshot_id == prior_id, SnapshotItem.item_type == 'ARCHIVE_ITEM',
             SnapshotItem.external_id.in_(pending_ids)))).all()}
+        attachment_receipts = await self._attachment_receipts(db, prior_id, pending_ids, normalize_version=collection is not None)
         for item in pending:
             row = source.get(item.external_id)
             if row is None:
                 raise ArchiveConflict('archive predecessor content disappeared')
             item.receipt = {'kind': 'copy', 'change_key': item.change_key, 'hash': row.content_hash, 'size': row.content_size,
                 'blob_path': row.blob_path, 'backend_id': str(row.backend_id),
-                'encryption_key_id': row.encryption_key_id, 'backup_version': row.backup_version}
+                'encryption_key_id': row.encryption_key_id, 'backup_version': (row.backup_version or 1) if collection is not None else row.backup_version,
+                'attachments': attachment_receipts[item.external_id]}
         if collection is not None:
             from shared.copy_work import CopyRequest, enqueue
             try:
@@ -542,8 +552,43 @@ class ArchiveCapture:
         await db.flush()
         await self.resolve_copies(db)
 
+    async def _attachment_receipts(self, db, snapshot_id, ids, *, normalize_version=False):
+        evidence = {iid: [hashlib.sha256(), 0] for iid in ids}
+        rows = await db.stream(select(SnapshotItem.parent_external_id, SnapshotItem.external_id,
+            SnapshotItem.content_hash, SnapshotItem.blob_path, SnapshotItem.content_size,
+            SnapshotItem.backend_id, SnapshotItem.encryption_key_id, SnapshotItem.backup_version)
+            .where(SnapshotItem.snapshot_id == snapshot_id, SnapshotItem.item_type == 'ARCHIVE_ATTACHMENT',
+                SnapshotItem.parent_external_id.in_(ids)).order_by(SnapshotItem.parent_external_id,
+                SnapshotItem.external_id).execution_options(yield_per=128))
+        async for row in rows:
+            parent, *values = row
+            if normalize_version:
+                values[-1] = values[-1] or 1
+            evidence[parent][0].update(json.dumps(values, default=str, separators=(',', ':')).encode() + b'\n')
+            evidence[parent][1] += 1
+        return {iid: {'sha256': value[0].hexdigest(), 'count': value[1]} for iid, value in evidence.items()}
+
     async def resolve_copies(self, db):
         """A queued intent is not a receipt; validate completed tasks and bytes."""
+        after = ''
+        while True:
+            pending = (await db.scalars(select(Item).where(Item.snapshot_id == self.fence.snapshot_id,
+                Item.capture_generation == self.generation, Item.state == 'copy_pending', Item.external_id > after)
+                .order_by(Item.external_id, Item.scope_key).limit(128))).all()
+            if not pending:
+                break
+            after = pending[-1].external_id
+            ready = []
+            for item in pending:
+                task = await db.get(CopyWorkTask, item.copy_task_id) if item.copy_task_id else None
+                if task is None or task.state == 'COMPLETED':
+                    ready.append(item)
+            if ready:
+                actual = await self._attachment_receipts(db, self.fence.snapshot_id, [item.external_id for item in ready])
+                for item in ready:
+                    if (item.receipt or {}).get('attachments') != actual[item.external_id]:
+                        item.state, item.gap_kind = 'failed', 'attachment_receipt_conflict'
+            await db.flush()
         await db.execute(text('''UPDATE archive_item_work i SET state='stored',receipt_item_id=s.id
             FROM snapshot_items s WHERE i.snapshot_id=:sid AND i.capture_generation=:gen AND i.state='copy_pending'
             AND (i.copy_task_id IS NULL OR EXISTS (SELECT 1 FROM copy_work_tasks t WHERE t.id=i.copy_task_id AND t.state='COMPLETED'))

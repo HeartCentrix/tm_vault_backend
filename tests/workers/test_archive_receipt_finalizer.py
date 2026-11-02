@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
 from datetime import datetime
+from contextlib import asynccontextmanager
 import pytest
 import importlib.util
 from pathlib import Path
@@ -22,7 +23,6 @@ async def test_complete_snapshot_uses_persisted_receipt_gate(monkeypatch, worker
     worker = worker_module.BackupWorker.__new__(worker_module.BackupWorker)
     worker.worker_id = 'archive-finalizer-test'
     worker.flush_version_rows = AsyncMock(return_value=0)
-    worker._write_snapshot_terminal = AsyncMock(return_value=False)
     marker = {'version': 1, 'generation': str(uuid4())}
     snapshot = SimpleNamespace(id=uuid4(), job_id=uuid4(), resource_id=uuid4(),
         lease_token=4, status=worker_module.SnapshotStatus.IN_PROGRESS,
@@ -33,7 +33,11 @@ async def test_complete_snapshot_uses_persisted_receipt_gate(monkeypatch, worker
     job = SimpleNamespace(lease_token=2, status=worker_module.JobStatus.RUNNING)
     async def get(model, id, **kwargs):
         return job if model is worker_module.Job else live
-    session = SimpleNamespace(get=get, scalar=AsyncMock(return_value=live.extra_data))
+    session = SimpleNamespace(get=get, scalar=AsyncMock(return_value=live.extra_data), commit=AsyncMock(), expunge=lambda row: None)
+    @asynccontextmanager
+    async def factory():
+        yield session
+    monkeypatch.setattr(worker_module, 'async_session_factory', factory)
     async def gate(db, current, **kwargs):
         assert current.extra_data['archive_capture'] == marker
         current.delta_tokens_json = {'files_failed': missing}
@@ -43,7 +47,7 @@ async def test_complete_snapshot_uses_persisted_receipt_gate(monkeypatch, worker
     monkeypatch.setattr(worker_module, '_coerce_snapshot_terminal_on_cancel', terminal)
     result = {'item_count': 999, 'new_item_count': 0, 'bytes_added': 0, 'files_failed': 0,
         'archive_snapshot_token': 4, 'archive_job_token': 2}
-    assert await worker.complete_snapshot(session, snapshot, result) is False
+    assert await worker.complete_snapshot(session, snapshot, result) is True
     assert snapshot.item_count == 1 - missing
     assert snapshot.status == (worker_module.SnapshotStatus.PARTIAL if missing else worker_module.SnapshotStatus.COMPLETED)
 
@@ -57,6 +61,11 @@ async def test_stale_archive_result_cannot_promote_terminal_snapshot(monkeypatch
         status=worker_module.SnapshotStatus.PARTIAL, extra_data={'archive_capture': {'version': 1}})
     job = SimpleNamespace(lease_token=2, status=worker_module.JobStatus.RUNNING)
     async def get(model, id, **kwargs): return job if model is worker_module.Job else snap
+    session = SimpleNamespace(get=get, scalar=AsyncMock(return_value=snap.extra_data))
+    @asynccontextmanager
+    async def factory():
+        yield session
+    monkeypatch.setattr(worker_module, 'async_session_factory', factory)
     with pytest.raises(archive_capture.ArchiveConflict, match='generation'):
-        await worker.complete_snapshot(SimpleNamespace(get=get, scalar=AsyncMock(return_value=snap.extra_data)), snap,
+        await worker.complete_snapshot(session, snap,
             {'archive_snapshot_token': 4, 'archive_job_token': 2})

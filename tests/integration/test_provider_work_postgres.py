@@ -195,3 +195,45 @@ async def test_chat_siblings_suspend_without_partial_and_completed_receipts_surv
         assert all(row.state == 'COMPLETED' for row in (await db.scalars(select(models.ProviderWorkUnit))).all())
 
 from test_chat_catalogue_entry_postgres import source_adapter
+
+async def test_worker_intake_is_durable_and_resume_does_not_reclaim_snapshot(store, monkeypatch, worker_module):
+    from shared.provider_runtime import ProviderWorkRunner
+    from unittest.mock import AsyncMock
+    scope = await store.new_scope()
+    async with store.factory() as db:
+        snapshot = await db.get(models.Snapshot, scope.snapshot_id)
+    monkeypatch.setenv('PROVIDER_WORK_ENABLED', 'true')
+    monkeypatch.setattr(worker_module, 'async_session_factory', store.factory)
+    worker = worker_module.BackupWorker.__new__(worker_module.BackupWorker)
+    worker.worker_id = 'provider-intake'
+    worker._heartbeat = None
+    observed = []
+    async def execute(job_id, message, resource_id):
+        current = work.current_claim()
+        async with store.factory() as db:
+            resource = await db.get(models.Resource, scope.resource_id)
+        resumed = await worker.create_snapshot(resource, message, job_id)
+        observed.append((current, resumed.lease_token, message['priority']))
+        async with store.factory.begin() as db:
+            live = await db.get(models.Snapshot, resumed.id)
+            live.status = models.SnapshotStatus.COMPLETED
+        return {'completed': True}
+    worker._process_single_backup = execute
+    first = await worker.process_backup_message({'jobId': str(snapshot.job_id), 'resourceId': str(scope.resource_id)})
+    assert first['provider_waiting'] and observed == []
+    worker._settle_provider_parent = AsyncMock()
+    runner = ProviderWorkRunner(store.factory, worker.resume_provider_work, worker._settle_provider_parent)
+    await runner.run_once()
+    assert len(observed) == 1
+    current, token, priority = observed[0]
+    assert current.snapshot_token == token == 1 and priority == 5
+    async with store.factory() as db:
+        assert (await db.get(models.ProviderWork, current.work_id)).state == 'COMPLETED'
+
+# Keep the expensive worker import behind its existing test fixture.
+import importlib.util
+from pathlib import Path
+_worker_spec = importlib.util.spec_from_file_location('provider_worker_fixture', Path(__file__).parents[1] / 'workers/test_durable_copy_worker_handoff.py')
+_worker_fixture = importlib.util.module_from_spec(_worker_spec)
+_worker_spec.loader.exec_module(_worker_fixture)
+worker_module = _worker_fixture.worker_module
