@@ -219,7 +219,7 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
         snapshot_lease_token=None, partition_lease_token=None, job_lease_token=None):
     """Return None only for an eligible disabled legacy path; never downgrade."""
     from shared.provider_runtime import (unit_scope, checkpoint_unit, check_provider_turn,
-        ProviderTurnDeferred, current_execution)
+        ProviderTurnDeferred, current_execution, other_provider_work_waiting, yield_provider_turn)
     from shared.chat_capture import capture_chat_inventory
     from shared.chat_capture_graph import pinned_chat_source, effective_capture_scope_hash
     if type(concurrency) is not int or concurrency < 1:
@@ -301,9 +301,12 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                         state='COMPLETED' if result.outcome == 'complete' else 'FAILED')
                     return result
             remaining = iter(keys)
+            yield_requested, processed = False, 0
             async def worker():
-                nonlocal completed
+                nonlocal completed, yield_requested, processed
                 for cid in remaining:
+                    if yield_requested:
+                        return
                     await cancel_check()
                     try:
                         result = await capture(cid)
@@ -335,18 +338,23 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                         completed += 1
                     else:
                         errors.append(result.failure_reason or "chat capture has incomplete coverage")
+                    processed += 1
+                    if cid not in published and await other_provider_work_waiting():
+                        yield_requested = True
             workers = [asyncio.create_task(worker()) for _ in range(min(concurrency, len(keys)))]
             try:
-                outcomes = await asyncio.gather(*workers, return_exceptions=True)
-                # The first deferred request stops new admissions. Siblings close
-                # and suspend their own unpublished capture before parent fencing.
-                for outcome in outcomes:
-                    if isinstance(outcome, BaseException):
-                        raise outcome
+                await asyncio.gather(*workers)
+            except ProviderTurnDeferred:
+                # Provider pause is cooperative. Ownership loss and explicit
+                # cancellation still interrupt siblings through finally below.
+                await asyncio.gather(*workers, return_exceptions=True)
+                raise
             finally:
                 for task in workers:
                     task.cancel()
                 await asyncio.gather(*workers, return_exceptions=True)
+            if yield_requested and processed < len(keys):
+                yield_provider_turn()
             final_chats = set(await _chat_list(source))
             if (allowed is None and final_chats != set(chats)) or (allowed is not None and allowed - final_chats):
                 errors.append("chat visibility changed during resource capture")

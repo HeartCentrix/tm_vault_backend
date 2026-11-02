@@ -61,6 +61,9 @@ EXPECTED_CHAIN = [
     ('0012', '0011'),
     ('0013', '0012'),
     ('0014', '0013'),
+    ('0015', '0014'),
+    ('0016', '0015'),
+    ('0017', '0016'),
 ]
 
 # Substring that must appear in the module docstring of each pending revision,
@@ -74,6 +77,9 @@ PENDING_SUBJECTS = {
     "0012": "Durable database-copy",
     "0013": "Captured chat names",
     "0014": "protected-size retained references",
+    "0015": "Version observation proofs",
+    "0016": "Persist archive folder coverage",
+    "0017": "Durable provider continuation",
 }
 
 

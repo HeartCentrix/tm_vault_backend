@@ -30,7 +30,7 @@ def test_copy_progress_aggregates_only_final_visible_page(monkeypatch, redesign)
     jobs = [str(uuid.uuid4()) for _ in range(4)]
     items = [{'id': job, 'jobIds': [job], 'operation': 'BACKUP', 'status': 'Done',
               'start_time': f'2026-11-0{4-index}T00:00:00'} for index, job in enumerate(jobs)]
-    calls = []
+    calls, provider_calls = [], []
 
     async def batches(**params):
         assert params['tenantId'] == tenant
@@ -53,6 +53,13 @@ def test_copy_progress_aggregates_only_final_visible_page(monkeypatch, redesign)
                          'committed_rows': 7, 'committed_bytes': 70,
                          'policies': [{'sla_policy_id': 'private-id'}]}}
 
+    async def providers(session, *, job_ids):
+        provider_calls.append(job_ids)
+        return {jobs[1]: {'state': 'WAITING', 'pending_leaves': 2, 'completed_units': 7,
+                         'next_eligible_at': '2026-11-04T12:00:00+00:00', 'oldest_queue_age_s': 50}}
+
+    monkeypatch.setattr('shared.provider_work.guards_enabled', lambda: True)
+    monkeypatch.setattr('shared.provider_observability.provider_work_summaries', providers)
     monkeypatch.setattr(audit.settings, 'BATCH_ROW_REDESIGN_ENABLED', redesign)
     monkeypatch.setattr(audit, '_list_activities_batch', batches)
     monkeypatch.setattr(audit, '_list_activities_batch_v2', v2)
@@ -64,13 +71,16 @@ def test_copy_progress_aggregates_only_final_visible_page(monkeypatch, redesign)
         'tenantId': tenant, 'page': 2, 'size': 1,
     })
     assert response.status_code == 200
-    assert calls == [[jobs[1]]]
+    assert calls == provider_calls == [[jobs[1]]]
     assert response.json()['total'] == 4
     assert response.json()['has_more'] is True
     item = response.json()['items'][0]
     assert item['status'] == 'Done'
     assert item['copy_work']['state'] == 'QUEUED'
     assert item['copy_work']['committed_rows'] == 7
+    assert item['provider_work']['state'] == 'WAITING'
+    assert item['provider_work']['pending_leaves'] == 2
+    assert item['provider_work']['completed_units'] == 7
     assert 'private-id' not in response.text
 
 

@@ -27,6 +27,10 @@ class ArchivePageError(ValueError):
     pass
 
 
+class ArchiveLocationCap(ArchivePageError):
+    stage = 'location_cap'
+
+
 def digest(*parts):
     return hashlib.sha256(json.dumps(parts, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
@@ -219,7 +223,7 @@ class ArchiveCapture:
                     raise ArchivePageError('archive continuation cycle')
             if not await self._location(db, base):
                 row.state, row.gap_kind = 'unresolved', 'location_cap'
-                return
+                return False
             ordinal = row.page_ordinal + 1
             inserted_count = 0
             if row.phase == 'items':
@@ -424,6 +428,7 @@ class ArchiveCapture:
             for row in rows:
                 if (row['snapshot_id'], row['tenant_id']) != (self.fence.snapshot_id, self.fence.tenant_id):
                     raise ArchiveConflict('archive receipt target identity differs')
+                row = {'backup_version': 1, **row}
                 iid, ck = row['external_id'], row['metadata'].get('changeKey')
                 observations = list((await db.scalars(select(Item).join(Folder,
                     (Folder.snapshot_id == Item.snapshot_id) & (Folder.capture_generation == Item.capture_generation)
@@ -550,7 +555,7 @@ class ArchiveCapture:
                   OR (src.item_type='ARCHIVE_ATTACHMENT' AND src.parent_external_id=ANY(:ids)))
                 ON CONFLICT (snapshot_id,external_id,item_type) DO NOTHING'''), {'sid': self.fence.snapshot_id, 'prior': prior_id, 'ids': pending_ids})
         await db.flush()
-        await self.resolve_copies(db)
+        await self.resolve_copies(db, ids=pending_ids)
 
     async def _attachment_receipts(self, db, snapshot_id, ids, *, normalize_version=False):
         evidence = {iid: [hashlib.sha256(), 0] for iid in ids}
@@ -568,26 +573,25 @@ class ArchiveCapture:
             evidence[parent][1] += 1
         return {iid: {'sha256': value[0].hexdigest(), 'count': value[1]} for iid, value in evidence.items()}
 
-    async def resolve_copies(self, db):
+    async def resolve_copies(self, db, *, ids=None):
         """A queued intent is not a receipt; validate completed tasks and bytes."""
         after = ''
         while True:
-            pending = (await db.scalars(select(Item).where(Item.snapshot_id == self.fence.snapshot_id,
-                Item.capture_generation == self.generation, Item.state == 'copy_pending', Item.external_id > after)
-                .order_by(Item.external_id, Item.scope_key).limit(128))).all()
-            if not pending:
+            query = select(Item).outerjoin(CopyWorkTask, CopyWorkTask.id == Item.copy_task_id).where(
+                Item.snapshot_id == self.fence.snapshot_id, Item.capture_generation == self.generation,
+                Item.state.in_(('copy_pending', 'stored')), Item.receipt['kind'].as_string() == 'copy',
+                Item.external_id > after,
+                (Item.copy_task_id.is_(None) | (CopyWorkTask.state == 'COMPLETED')))
+            if ids is not None:
+                query = query.where(Item.external_id.in_(ids))
+            ready = (await db.scalars(query.order_by(Item.external_id, Item.scope_key).limit(128))).all()
+            if not ready:
                 break
-            after = pending[-1].external_id
-            ready = []
-            for item in pending:
-                task = await db.get(CopyWorkTask, item.copy_task_id) if item.copy_task_id else None
-                if task is None or task.state == 'COMPLETED':
-                    ready.append(item)
-            if ready:
-                actual = await self._attachment_receipts(db, self.fence.snapshot_id, [item.external_id for item in ready])
-                for item in ready:
-                    if (item.receipt or {}).get('attachments') != actual[item.external_id]:
-                        item.state, item.gap_kind = 'failed', 'attachment_receipt_conflict'
+            after = ready[-1].external_id
+            actual = await self._attachment_receipts(db, self.fence.snapshot_id, [item.external_id for item in ready])
+            for item in ready:
+                if (item.receipt or {}).get('attachments') != actual[item.external_id]:
+                    item.state, item.gap_kind = 'failed', 'attachment_receipt_conflict'
             await db.flush()
         await db.execute(text('''UPDATE archive_item_work i SET state='stored',receipt_item_id=s.id
             FROM snapshot_items s WHERE i.snapshot_id=:sid AND i.capture_generation=:gen AND i.state='copy_pending'
@@ -597,7 +601,8 @@ class ArchiveCapture:
             AND s.content_hash=i.receipt->>'hash' AND s.blob_path=i.receipt->>'blob_path'
             AND s.content_size=(i.receipt->>'size')::bigint AND s.backend_id::text=i.receipt->>'backend_id'
             AND s.encryption_key_id IS NOT DISTINCT FROM i.receipt->>'encryption_key_id'
-            AND s.backup_version IS NOT DISTINCT FROM (i.receipt->>'backup_version')::integer'''), self.params())
+            AND s.backup_version IS NOT DISTINCT FROM (i.receipt->>'backup_version')::integer
+            AND (CAST(:ids AS text[]) IS NULL OR i.external_id=ANY(CAST(:ids AS text[])))'''), self.params(ids=ids))
 
     async def has_copies(self):
         async with self.factory() as db:

@@ -138,33 +138,40 @@ class AzureBlobStore:
         async def _stage(block_id: str, data: bytes):
             await shard.stage_block(container, path, block_id, data)
 
-        async for chunk in byte_stream:
-            if not chunk:
-                continue
-            hasher.update(chunk)
-            total_written += len(chunk)
-            buf.extend(chunk)
-            while len(buf) >= chunk_size:
+        try:
+            async for chunk in byte_stream:
+                if not chunk:
+                    continue
+                hasher.update(chunk)
+                total_written += len(chunk)
+                buf.extend(chunk)
+                while len(buf) >= chunk_size:
+                    blk_index += 1
+                    # Azure block IDs must be same-length base64 strings.
+                    bid = _b64.b64encode(
+                        f"{blk_index:08d}-{_uuid.uuid4().hex[:8]}".encode(),
+                    ).decode()
+                    block_ids.append(bid)
+                    await _stage(bid, bytes(buf[:chunk_size]))
+                    del buf[:chunk_size]
+
+            if buf or not block_ids:
                 blk_index += 1
-                # Azure block IDs must be same-length base64 strings.
                 bid = _b64.b64encode(
                     f"{blk_index:08d}-{_uuid.uuid4().hex[:8]}".encode(),
                 ).decode()
                 block_ids.append(bid)
-                await _stage(bid, bytes(buf[:chunk_size]))
-                del buf[:chunk_size]
+                await _stage(bid, bytes(buf))
 
-        if buf or not block_ids:
-            blk_index += 1
-            bid = _b64.b64encode(
-                f"{blk_index:08d}-{_uuid.uuid4().hex[:8]}".encode(),
-            ).decode()
-            block_ids.append(bid)
-            await _stage(bid, bytes(buf))
-
-        await shard.commit_block_list_manual(
-            container, path, block_ids, metadata=metadata,
-        )
+            await shard.commit_block_list_manual(
+                container, path, block_ids, metadata=metadata,
+            )
+        finally:
+            # Never commit an interrupted block list or delete a previous valid
+            # blob. Azure expires this attempt's uncommitted block IDs.
+            close = getattr(byte_stream, 'aclose', None)
+            if close is not None:
+                await close()
         props = await shard.get_blob_properties(container, path)
         return BlobInfo(
             backend_id=self.backend_id, container=container, path=path,

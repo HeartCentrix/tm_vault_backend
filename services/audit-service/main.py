@@ -1338,12 +1338,29 @@ async def _attach_activity_copy_work(payload, *, session=None):
     job_ids = list(dict.fromkeys(job_id for _, ids in rows for job_id in ids))
     if not job_ids:
         return payload
+    from shared.provider_work import guards_enabled as provider_guards
+    from shared.provider_observability import provider_work_summaries
+    async def collect(db):
+        copies = await copy_work_summaries(db, job_ids=job_ids)
+        providers = await provider_work_summaries(db, job_ids=job_ids) if provider_guards() else {}
+        return copies, providers
     if session is None:
         async with async_session_factory() as db:
-            summaries = await copy_work_summaries(db, job_ids=job_ids)
+            summaries, provider_summaries = await collect(db)
     else:
-        summaries = await copy_work_summaries(session, job_ids=job_ids)
+        summaries, provider_summaries = await collect(session)
     for item, ids in rows:
+        provider_parts = [provider_summaries[job_id] for job_id in ids if job_id in provider_summaries]
+        if provider_parts:
+            states = {part['state'] for part in provider_parts}
+            summary = {name: sum(part.get(name) or 0 for part in provider_parts) for name in (
+                'pending_leaves', 'pending_units', 'completed_units', 'failed_units',
+                'reserved_provider_attempts', 'retry_wait_s')}
+            summary['state'] = next((state for state in ('RUNNING','WAITING','SETTLING','INCOMPLETE') if state in states), 'COMPLETE')
+            due = [part['next_eligible_at'] for part in provider_parts if part.get('next_eligible_at')]
+            summary['next_eligible_at'] = min(due) if due else None
+            summary['oldest_queue_age_s'] = max(part['oldest_queue_age_s'] for part in provider_parts)
+            item['provider_work'] = summary
         parts = [summaries[job_id] for job_id in ids if job_id in summaries]
         if not parts:
             continue

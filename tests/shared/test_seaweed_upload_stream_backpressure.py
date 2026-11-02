@@ -162,3 +162,43 @@ def test_upload_stream_part_failure_releases_slot_and_aborts():
         assert fake.aborted
 
     asyncio.run(scenario())
+
+import pytest
+
+@pytest.mark.parametrize('outcome', ['defer', 'cancel'])
+async def test_control_flow_closes_source_joins_parts_and_aborts_before_return(outcome):
+    from shared.provider_runtime import ProviderTurnDeferred
+    from shared.provider_admission import ProviderDeferred, ProviderRequestContext
+    gate, started = asyncio.Event(), asyncio.Event()
+    fake = _FakeS3(gate)
+    active, closed = 0, False
+    async def upload_part(**kwargs):
+        nonlocal active
+        active += 1
+        started.set()
+        try:
+            await gate.wait()
+            return {'ETag': 'part'}
+        finally:
+            active -= 1
+    fake.upload_part = upload_part
+    error = ProviderTurnDeferred(ProviderDeferred(ProviderRequestContext('tenant', 'app', 'graph'), 300))
+    async def stream():
+        nonlocal closed
+        try:
+            yield b'x' * _CHUNK
+            await started.wait()
+            if outcome == 'defer':
+                raise error
+            await gate.wait()
+        finally:
+            closed = True
+    task = asyncio.create_task(_make_store(fake).upload_stream('c', 'p', stream(), 2 * _CHUNK,
+        chunk_size=_CHUNK, max_parallel_parts=2))
+    await started.wait()
+    if outcome == 'cancel':
+        task.cancel()
+    with pytest.raises(ProviderTurnDeferred if outcome == 'defer' else asyncio.CancelledError):
+        await task
+    assert closed and active == 0
+    assert fake.aborted and fake.completed_parts is None

@@ -275,6 +275,7 @@ class SeaweedStore:
                 "upload_stream: encryption ON but no tenant_id for %s/%s — storing PLAINTEXT",
                 container, path,
             )
+        source_stream = byte_stream
         byte_stream, _stream_encrypted = await _crypto_runtime.maybe_encrypt_stream(
             _hash_plaintext(byte_stream), eff_tenant,
         )
@@ -342,7 +343,7 @@ class SeaweedStore:
                 # cancel the multipart cleanly before re-raising.
                 results = await asyncio.gather(*inflight, return_exceptions=True)
                 for r in results:
-                    if isinstance(r, Exception):
+                    if isinstance(r, BaseException):
                         raise r
                     parts.append(r)
                 parts.sort(key=lambda p: p["PartNumber"])
@@ -352,7 +353,11 @@ class SeaweedStore:
                     UploadId=upload_id,
                     MultipartUpload={"Parts": parts},
                 )
-            except Exception:
+            except BaseException:
+                for task in inflight:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*inflight, return_exceptions=True)
                 # Defensive: abort the multipart so parts uploaded
                 # so far are garbage-collected by SeaweedFS / S3.
                 try:
@@ -362,6 +367,11 @@ class SeaweedStore:
                 except Exception:
                     pass
                 raise
+            finally:
+                for stream in (byte_stream, source_stream):
+                    close = getattr(stream, 'aclose', None)
+                    if close is not None:
+                        await close()
 
             head = await s3.head_object(Bucket=bucket, Key=key)
 

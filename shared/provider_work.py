@@ -9,7 +9,7 @@ import json
 import math
 import os
 from uuid import UUID, uuid4
-from sqlalchemy import exists, func, select, update
+from sqlalchemy import delete, exists, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import aliased
 from shared.models import (Job, Snapshot, SnapshotPartition, Resource, SlaPolicy,
@@ -141,7 +141,9 @@ async def ensure_work(session, *, snapshot_id, snapshot_token, job_token, partit
     weight = max(1, min(8, 6 - int(job.priority or 5))) if weight is None else weight
     if type(weight) is not int or weight <= 0:
         raise ValueError('provider policy needs a positive weight')
-    policy_id = _uuid(policy_id or resource.sla_policy_id)
+    message = (continuation or {}).get('message') or {}
+    effective_policy = message.get('slaPolicyId') or message.get('sla_policy_id') or (message.get('spec') or {}).get('sla_policy_id')
+    policy_id = _uuid(policy_id or effective_policy or resource.sla_policy_id)
     if policy_id:
         policy = await session.get(SlaPolicy, policy_id)
         if policy is None or policy.tenant_id != resource.tenant_id:
@@ -229,12 +231,41 @@ async def claim_due_work(session, *, owner_id, lease_seconds=120):
         if row.state not in ACTIVE or (row.lease_expires_at and row.lease_expires_at > now and row.state != 'WAITING'):
             continue
         leaf = partition or snapshot
+        if (leaf.lease_token != row.parent_lease_token or (partition is None and
+            (snapshot.lease_token != row.snapshot_lease_token or job.lease_token != row.job_lease_token))):
+            row.state, row.last_reason, row.parent_settle_pending = 'FAILED', 'parent_generation_changed', False
+            row.generation += 1
+            row.lease_owner_id = row.lease_expires_at = None
+            continue
         # A copy continuation owns its distinct drain until its receipts settle.
         from shared.models import CopyWorkflow
         copy = await session.scalar(select(CopyWorkflow).where(CopyWorkflow.target_snapshot_id == snapshot.id,
             CopyWorkflow.partition_id.is_not_distinct_from(row.partition_id), CopyWorkflow.state.in_(ACTIVE)).with_for_update())
         if copy is not None and copy.state != 'DRAINING':
             continue
+        from shared.models import ChatCaptureAttempt, ChatInventoryItem, SnapshotChatInventory, SnapshotItem
+        # Expired provider ownership fences the capture even while its longer
+        # local keeper lease remains live. Only exact unpublished links move.
+        while True:
+            old_attempts = (await session.scalars(select(ChatCaptureAttempt).where(
+                ChatCaptureAttempt.snapshot_id == snapshot.id,
+                ChatCaptureAttempt.partition_id.is_not_distinct_from(row.partition_id),
+                (ChatCaptureAttempt.partition_lease_token if partition else ChatCaptureAttempt.snapshot_lease_token) == leaf.lease_token,
+                ChatCaptureAttempt.state.in_(('CREATED','ENUMERATING','CONTENT_PENDING','VERIFYING','READY')),
+                ~exists(select(SnapshotChatInventory.chat_id).where(
+                    SnapshotChatInventory.snapshot_id == snapshot.id,
+                    SnapshotChatInventory.chat_id == ChatCaptureAttempt.chat_id)))
+                .order_by(ChatCaptureAttempt.id).limit(128).with_for_update())).all()
+            if not old_attempts:
+                break
+            for attempt in old_attempts:
+                matching = exists(select(ChatInventoryItem.logical_key).where(
+                    ChatInventoryItem.inventory_id == attempt.staged_inventory_id,
+                    ChatInventoryItem.logical_key == SnapshotItem.external_id,
+                    ChatInventoryItem.version_id == SnapshotItem.chat_version_id))
+                await session.execute(delete(SnapshotItem).where(SnapshotItem.snapshot_id == snapshot.id, matching))
+                attempt.state, attempt.failure_reason = 'SUPERSEDED', 'provider_owner_expired'
+            await session.flush()
         leaf.lease_token += 1
         leaf.lease_owner_id, leaf.lease_expires_at = _uuid(owner_id), now + timedelta(seconds=lease_seconds)
         if partition:
@@ -254,7 +285,7 @@ async def claim_due_work(session, *, owner_id, lease_seconds=120):
 
 
 async def renew_work(session, claim, *, lease_seconds=120):
-    row, _, snapshot, partition = await _owned(session, claim)
+    row, _, snapshot, partition = await _owned(session, claim, allow_terminal=True)
     expiry = await session.scalar(select(func.clock_timestamp())) + timedelta(seconds=lease_seconds)
     row.lease_expires_at = (partition or snapshot).lease_expires_at = expiry
     return claim
@@ -302,6 +333,11 @@ async def suspend_current_work(session, claim, *, next_eligible_at, reason, cont
     leaf = partition or snapshot
     job.result = {**(job.result or {}), 'provider_phase': 'WAITING', 'provider_next_eligible_at': next_eligible_at.isoformat()}
     snapshot.extra_data = {**(snapshot.extra_data or {}), 'provider_phase': 'WAITING', 'provider_next_eligible_at': next_eligible_at.isoformat()}
+    now = await session.scalar(select(func.clock_timestamp()))
+    await session.execute(update(ProviderWorkUnit).where(ProviderWorkUnit.work_id == row.id,
+        ProviderWorkUnit.state.in_(('PENDING', 'RUNNING'))).values(
+            state='PENDING', next_eligible_at=next_eligible_at,
+            waited_s=ProviderWorkUnit.waited_s + max(0, (next_eligible_at - now).total_seconds())))
     row.state, row.next_eligible_at = 'WAITING', next_eligible_at
     row.suspension_generation = claim.generation
     row.last_reason = str(reason)[:80]
@@ -318,6 +354,8 @@ async def suspend_current_work(session, claim, *, next_eligible_at, reason, cont
 
 
 async def finish_work(session, claim, *, state='COMPLETED'):
+    from shared.provider_runtime import check_provider_turn
+    check_provider_turn()
     row, _, _, _ = await _owned(session, claim, allow_terminal=True)
     if state not in ('COMPLETED', 'PARTIAL', 'FAILED'):
         raise ValueError('invalid provider completion')
@@ -335,10 +373,12 @@ async def finish_parent_settlement(session, work_id):
     hint = await session.get(ProviderWork, _uuid(work_id))
     if hint is None:
         return False
-    await _parents(session, hint.snapshot_id, hint.partition_id)
+    _, snapshot, _ = await _parents(session, hint.snapshot_id, hint.partition_id)
     row = await session.scalar(select(ProviderWork).where(ProviderWork.id == hint.id).with_for_update())
     if row.state not in TERMINAL:
         raise ProviderWorkConflict('provider work has not finished')
+    if snapshot.status.value not in ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELLED'):
+        return False
     row.parent_settle_pending = False
     return True
 

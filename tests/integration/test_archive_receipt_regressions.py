@@ -160,3 +160,94 @@ async def test_review_missing_location_probes_lose_folder_diversity(store, monke
     old_samples = await archive._default_load_prior_paths(str(prior.fence.snapshot_id))
     assert len(samples) == 60 and 'z-other-location' in samples
     assert old_samples['B'] == ['z-other-location'] and len(old_samples['A']) == 3
+
+async def test_ordinary_export_row_uses_database_default_backup_version(store):
+    ledger = await capture(store)
+    await observed_item(ledger)
+    row = content_row(store, ledger)
+    row.pop('backup_version')
+    assert len(await ledger.commit_rows([row])) == 1
+    assert (await ledger.summary())['files_failed'] == 0
+
+async def test_capped_response_context_stops_graph_before_following_next_link(store):
+    from types import SimpleNamespace
+    from test_archive_runner_postgres import archive
+    ledger = await capture(store)
+    ledger.max_locations = 1
+    aux = BASE.replace('Primary', 'BeyondCap')
+    calls = []
+    class Graph:
+        async def _get(self, url, params, *, on_activity, on_page):
+            calls.append(url)
+            await on_page({'value': [], '@odata.context': aux.split('/admin/')[0] + '/$metadata#admin/' + aux.split('/admin/')[1],
+                '@odata.nextLink': aux + '?page=2'}, url)
+            calls.append(aux + '?page=2')
+    await archive._DurableArchiveWalker(Graph(), ledger, SimpleNamespace(ARCHIVE_FOLDER_CONCURRENCY=1), lambda: None).run()
+    assert calls == [BASE]
+    assert (await ledger.summary())['folders_failed'] >= 1
+
+async def test_attachment_changed_after_inline_copy_is_detected_by_final_gate(store):
+    prior = await capture(store)
+    await observed_item(prior)
+    await prior.commit_rows([content_row(store, prior)])
+    async with store.factory.begin() as db:
+        snap = await db.get(models.Snapshot, prior.fence.snapshot_id)
+        snap.status = models.SnapshotStatus.COMPLETED
+        db.add(models.SnapshotItem(id=uuid4(), snapshot_id=snap.id, tenant_id=store.tenant,
+            external_id='attachment', parent_external_id='i', item_type='ARCHIVE_ATTACHMENT', name='file',
+            content_hash='expected', blob_path='bytes', backend_id=store.backend, content_size=4))
+    current = await capture(store)
+    await observed_item(current)
+    await current.classify(prior.fence.snapshot_id)
+    async with store.factory.begin() as db:
+        await db.execute(update(models.SnapshotItem).where(models.SnapshotItem.snapshot_id == current.fence.snapshot_id,
+            models.SnapshotItem.item_type == 'ARCHIVE_ATTACHMENT').values(content_hash='changed'))
+        snap = await db.get(models.Snapshot, current.fence.snapshot_id)
+        assert (await archive_final_gate(db, snap, generation=current.generation))['files_failed'] == 1
+
+async def test_archive_finalizer_preserves_required_copy_failure(store, monkeypatch, worker_module):
+    ledger = await capture(store)
+    root = await ledger.claim_scope()
+    await ledger.page(root, {'value': []}, BASE)
+    async with store.factory.begin() as db:
+        snap = await db.get(models.Snapshot, ledger.fence.snapshot_id)
+        snap.extra_data = {**snap.extra_data, 'copy_required_failed': True}
+    monkeypatch.setattr(worker_module, 'async_session_factory', store.factory)
+    worker = worker_module.BackupWorker.__new__(worker_module.BackupWorker)
+    worker.worker_id = 'provider-archive-finalizer'
+    assert await worker._complete_archive_snapshot(snap, {'archive_snapshot_token': 0, 'archive_job_token': 0,
+        'archive_capture_generation': str(ledger.generation)})
+    assert snap.status == models.SnapshotStatus.PARTIAL
+
+async def test_pending_carry_resolution_does_not_rescan_prior_batches(store, monkeypatch):
+    from shared import copy_workflow
+    from shared.copy_executor import prepare_manifest, copy_manifest_batch
+    from sqlalchemy import event
+    monkeypatch.setenv('COPY_WORK_ENABLED', 'true')
+    monkeypatch.setattr(copy_workflow, 'async_session_factory', store.factory)
+    prior = await capture(store)
+    async with store.factory.begin() as db:
+        snap = await db.get(models.Snapshot, prior.fence.snapshot_id)
+        snap.status = models.SnapshotStatus.COMPLETED
+        for n in range(512):
+            row = content_row(store, prior, iid=f'i{n:04}')
+            row['extra_data'] = row.pop('metadata')
+            db.add(models.SnapshotItem(**row))
+    current = await capture(store)
+    root = await current.claim_scope()
+    await current.page(root, {'value': [{'id': 'f', 'childFolderCount': 0}]}, BASE)
+    items = await current.claim_scope()
+    await current.page(items, {'value': [{'id': f'i{n:04}', 'changeKey': 'a'} for n in range(512)]}, items['next_url'])
+    page_queries = []
+    def observe(conn, cursor, statement, parameters, context, executemany):
+        if 'FROM archive_item_work' in statement and 'ORDER BY archive_item_work.external_id' in statement and 'LIMIT' in statement:
+            page_queries.append(statement)
+    event.listen(store.engine.sync_engine, 'before_cursor_execute', observe)
+    try:
+        with copy_workflow.copy_collection(current.fence.snapshot_id, expected_snapshot_token=0, expected_job_token=0) as collection:
+            await current.classify(prior.fence.snapshot_id, copy_collection=collection)
+    finally:
+        event.remove(store.engine.sync_engine, 'before_cursor_execute', observe)
+    # Four128-ID batches each perform at most one ready-copy query while SQL
+    # copies are DRAINING. A scan of the whole growing backlog used fourteen.
+    assert len(page_queries) <= 4

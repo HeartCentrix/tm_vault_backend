@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 import logging
 import os
 from uuid import uuid4
-from sqlalchemy import select
+from sqlalchemy import and_, exists, func, or_, select
 from shared import provider_work as work
 from shared.models import ProviderWork, ProviderWorkUnit, Snapshot, SnapshotPartition
 from shared.provider_admission import ProviderDeferred
@@ -84,6 +84,9 @@ class ProviderExecution:
     deferred: ProviderDeferred | None = None
     attempt_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     planning_unit: object = None
+    lease_lost: bool = False
+    owner_task: object = field(default_factory=asyncio.current_task)
+    provider_tasks: set = field(default_factory=set)
 
     def defer(self, error):
         if self.deferred is None or error.next_eligible_at > self.deferred.next_eligible_at:
@@ -125,6 +128,10 @@ def defer_provider(error):
 @asynccontextmanager
 async def provider_request_scope():
     check_provider_turn()
+    execution, task = current_execution(), asyncio.current_task()
+    if execution and task is not execution.owner_task and task not in execution.provider_tasks:
+        execution.provider_tasks.add(task)
+        task.add_done_callback(execution.provider_tasks.discard)
     try:
         yield
     except ProviderDeferred as error:
@@ -191,14 +198,40 @@ async def checkpoint_unit(*, receipt_id=None, state='COMPLETED', reconciliations
         unit.reconciliations = row.reconciliations
 
 
+async def other_provider_work_waiting():
+    execution = current_execution()
+    if execution is None:
+        return False
+    async with execution.factory() as session:
+        return bool(await session.scalar(select(exists(select(ProviderWork.id).where(
+            ProviderWork.id != execution.claim.work_id, ProviderWork.state == 'WAITING',
+            ProviderWork.next_eligible_at <= func.clock_timestamp())))))
+
+
+def yield_provider_turn():
+    defer_provider(ProviderDeferred(None, 0, stage='fair_checkpoint'))
+
+
+async def _join_provider_tasks(execution):
+    while True:
+        tasks = [task for task in execution.provider_tasks if not task.done()]
+        if not tasks:
+            return
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 class ProviderWorkRunner:
     def __init__(self, factory, resume_callback, settle_callback, *, concurrency=8, poll_s=1,
-                 owner_id=None, budget=None):
+                 owner_id=None, budget=None, renew_s=30):
         self.factory, self.resume_callback, self.settle_callback = factory, resume_callback, settle_callback
         self.concurrency, self.poll_s = max(1, concurrency), poll_s
+        self.renew_s = max(.01, renew_s)
         self.owner_id, self.budget = owner_id or uuid4(), budget or execution_budget()
         self._tasks, self._closing = set(), False
         self._wake = asyncio.Event()
+        self._settlement_cursor = None
 
     def wake(self):
         self._wake.set()
@@ -217,16 +250,17 @@ class ProviderWorkRunner:
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
 
-    async def _renew(self, claim, owner_task):
+    async def _renew(self, execution, owner_task):
         try:
             while True:
-                await asyncio.sleep(30)
+                await asyncio.sleep(self.renew_s)
                 async with self.budget.permit(control=True):
                     async with self.factory.begin() as session:
-                        await work.renew_work(session, claim)
+                        await work.renew_work(session, execution.claim)
         except asyncio.CancelledError:
             raise
         except Exception:
+            execution.lease_lost = True
             owner_task.cancel()
 
     async def run_once(self):
@@ -237,11 +271,12 @@ class ProviderWorkRunner:
                 return None
             execution = ProviderExecution(self.factory, claim)
             token = _EXECUTION.set(execution)
-            renewer = asyncio.create_task(self._renew(claim, asyncio.current_task()))
+            renewer = asyncio.create_task(self._renew(execution, asyncio.current_task()))
             try:
                 with work.work_scope(claim):
                     async with unit_scope('planning', 'planning'):
                         result = await self.resume_callback(claim)
+                        check_provider_turn()
                         async with self.factory() as session:
                             handed = await session.get(ProviderWork, claim.work_id)
                             if handed.state in work.TERMINAL and handed.last_reason == 'copy_handoff':
@@ -249,21 +284,28 @@ class ProviderWorkRunner:
                         await checkpoint_unit()
                     async with self.factory.begin() as session:
                         await work.finish_work(session, claim)
+                renewer.cancel()
+                await asyncio.gather(renewer, return_exceptions=True)
                 await self.settle_callback(claim.work_id)
                 return result
             except (ProviderDeferred, ProviderTurnDeferred) as deferred:
                 error = deferred.error if isinstance(deferred, ProviderTurnDeferred) else deferred
+                execution.defer(error)
+                await _join_provider_tasks(execution)
                 async with self.factory.begin() as session:
                     await work.suspend_current_work(session, claim, next_eligible_at=error.next_eligible_at,
                         reason=getattr(error, 'stage', 'provider_wait'))
                 return {'provider_waiting': True, 'provider_work_id': str(claim.work_id)}
             except asyncio.CancelledError:
+                await _join_provider_tasks(execution)
                 # Only an owned nonterminal leaf can be released; user cancellation
                 # wins under the same parent locks. A hard crash is lease-recovered.
                 with suppress(work.ProviderWorkConflict):
                     async with self.factory.begin() as session:
                         await work.suspend_current_work(session, claim,
                             next_eligible_at=datetime.now(timezone.utc), reason='worker_interrupted')
+                if execution.lease_lost and not self._closing:
+                    return {'provider_lease_lost': True}
                 raise
             finally:
                 renewer.cancel()
@@ -288,9 +330,14 @@ class ProviderWorkRunner:
             try:
                 async with self.budget.permit(control=True):
                     async with self.factory() as session:
-                        ids = list((await session.scalars(select(ProviderWork.id).where(
-                            ProviderWork.parent_settle_pending).order_by(ProviderWork.created_at, ProviderWork.id).limit(32))).all())
-                    for work_id in ids:
+                        query = select(ProviderWork.id, ProviderWork.created_at).where(ProviderWork.parent_settle_pending)
+                        if self._settlement_cursor is not None:
+                            created, key = self._settlement_cursor
+                            query = query.where(or_(ProviderWork.created_at > created,
+                                and_(ProviderWork.created_at == created, ProviderWork.id > key)))
+                        rows = (await session.execute(query.order_by(ProviderWork.created_at, ProviderWork.id).limit(32))).all()
+                        self._settlement_cursor = (rows[-1].created_at, rows[-1].id) if rows else None
+                    for work_id, _ in rows:
                         await self.settle_callback(work_id)
             except asyncio.CancelledError:
                 raise

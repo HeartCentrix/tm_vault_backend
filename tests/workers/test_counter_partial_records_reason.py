@@ -156,6 +156,9 @@ class _FakeSnapshot:
 
 
 class _FakeSession:
+    async def scalar(self, statement):
+        return None
+
     async def get(self, _model, _pk, **_kwargs):
         return None
 

@@ -1707,9 +1707,15 @@ class _DurableArchiveWalker:
                     continue
                 try:
                     async def sink(page, request_url):
-                        await self.ledger.page(scope, page, request_url)
+                        accepted = await self.ledger.page(scope, page, request_url)
+                        if accepted is False:
+                            from shared.archive_capture import ArchiveLocationCap
+                            raise ArchiveLocationCap('archive location cap reached')
                         self.on_progress()
                         changed.set()
+                        from shared.provider_runtime import other_provider_work_waiting, yield_provider_turn
+                        if await other_provider_work_waiting():
+                            yield_provider_turn()
                     params = None
                     if scope['page_ordinal'] == 0:
                         params = {'$top': str(getattr(self.settings, 'ARCHIVE_ITEM_PAGE_SIZE', 1000)
