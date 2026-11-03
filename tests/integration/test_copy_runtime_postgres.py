@@ -291,3 +291,20 @@ async def test_terminal_leaf_does_not_hide_explicit_parent_cancellation(store):
     async with store.factory() as db:
         assert (await db.get(models.CopyWorkflow,workflow_id)).state=='CANCELLED'
     await runner.close()
+
+
+@pytest.mark.parametrize('provider_state,expected', [('COMPLETED', True), ('WAITING', False)])
+async def test_orphan_recovery_is_not_blocked_by_completed_provider_receipts(store, monkeypatch, provider_state, expected):
+    from shared import provider_work
+    target, _, workflow_id = await unsealed(store)
+    monkeypatch.setattr(provider_work, 'guards_enabled', lambda: True)
+    async with store.factory.begin() as db:
+        snapshot = await db.get(models.Snapshot, target.snapshot_id)
+        receipt = await provider_work.ensure_work(db, snapshot_id=snapshot.id,
+            snapshot_token=snapshot.lease_token, job_token=0, continuation={})
+        row = await db.get(models.ProviderWork, receipt.work_id)
+        row.state, row.parent_settle_pending = provider_state, True
+        snapshot.status = models.SnapshotStatus.PARTIAL
+    runner = api().CopyWorkRunner(store.factory, completer(store, []))
+    assert (workflow_id in await runner._orphan_candidates()) is expected
+    await runner.close()
