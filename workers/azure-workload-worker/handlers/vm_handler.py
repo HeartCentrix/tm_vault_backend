@@ -1239,6 +1239,10 @@ class VmBackupHandler:
                     str(snapshot.id),
                     vol_id,
                     None,  # no max_entries cap in production
+                    # DB inserts must hop back to THIS loop — asyncpg
+                    # connections are loop-bound and the shared pool
+                    # lives here.
+                    loop=asyncio.get_running_loop(),
                 )
                 self._log(
                     f"File index OK disk={disk_name} dirs={stats.directories} "

@@ -1,18 +1,21 @@
 """Shared database models"""
 import uuid
 from datetime import datetime, timezone
-from typing import Tuple
+from typing import Optional, Tuple
 from sqlalchemy import (
     Column, String, DateTime, Boolean, Integer, BigInteger,
     Text, ForeignKey, Enum as SAEnum, JSON, ARRAY, func, LargeBinary,
-    Index, text as sql_text,
+    Index, UniqueConstraint, Float, text as sql_text,
 )
 from sqlalchemy.ext.mutable import MutableDict
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, synonym
 from sqlalchemy.dialects.postgresql import UUID
 import enum
 
 from shared.database import Base
+
+
+SNAPSHOT_ID_FOREIGN_KEY = "snapshots.id"
 
 
 def utcnow():
@@ -474,7 +477,7 @@ class Job(Base):
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), index=True)
     resource_id = Column(UUID(as_uuid=True), ForeignKey("resources.id"))
     batch_resource_ids = Column(ARRAY(UUID(as_uuid=True)), default=[])  # NEW: for mass backup
-    snapshot_id = Column(UUID(as_uuid=True), ForeignKey("snapshots.id"))
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey(SNAPSHOT_ID_FOREIGN_KEY))
     status = Column(SAEnum(JobStatus), default=JobStatus.QUEUED)
     priority = Column(Integer, default=5)
     attempts = Column(Integer, default=0)
@@ -564,7 +567,7 @@ class Snapshot(Base):
     # parent so a chain can never cross isolation boundaries.
     reuse_of_snapshot_id = Column(
         UUID(as_uuid=True),
-        ForeignKey("snapshots.id", ondelete="RESTRICT"),
+        ForeignKey(SNAPSHOT_ID_FOREIGN_KEY, ondelete="RESTRICT"),
         nullable=True,
     )
     # Denormalised: terminal ancestor in the chain. Lets the read-path
@@ -574,7 +577,7 @@ class Snapshot(Base):
     # together with reuse_of_snapshot_id.
     reuse_chain_root_id = Column(
         UUID(as_uuid=True),
-        ForeignKey("snapshots.id", ondelete="RESTRICT"),
+        ForeignKey(SNAPSHOT_ID_FOREIGN_KEY, ondelete="RESTRICT"),
         nullable=True,
     )
     # Reconciliation lease (2026-05-16 design).
@@ -621,7 +624,7 @@ class Snapshot(Base):
 class SnapshotItem(Base):
     __tablename__ = "snapshot_items"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    snapshot_id = Column(UUID(as_uuid=True), ForeignKey("snapshots.id"), nullable=False, index=True)
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey(SNAPSHOT_ID_FOREIGN_KEY), nullable=False, index=True)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), index=True)
     external_id = Column(String, nullable=False)
     parent_external_id = Column(String, index=True)
@@ -640,6 +643,8 @@ class SnapshotItem(Base):
     # Storage backend that holds this item's blob. Permanent — wins over
     # system_config.active_backend_id during passthrough restores.
     backend_id = Column(UUID(as_uuid=True), ForeignKey("storage_backends.id"), nullable=False)
+    chat_version_id = Column(UUID(as_uuid=True), ForeignKey("chat_item_versions.id", ondelete="RESTRICT",
+                             name="fk_snapshot_items_chat_version"), nullable=True, index=True)
     created_at = Column(DateTime, default=utcnow)
 
 
@@ -666,7 +671,7 @@ class SnapshotPartition(Base):
     __tablename__ = "snapshot_partitions"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     snapshot_id = Column(UUID(as_uuid=True),
-                         ForeignKey("snapshots.id", ondelete="CASCADE"),
+                         ForeignKey(SNAPSHOT_ID_FOREIGN_KEY, ondelete="CASCADE"),
                          nullable=False, index=True)
     tenant_id = Column(UUID(as_uuid=True), nullable=False)
     resource_id = Column(UUID(as_uuid=True), nullable=False)
@@ -685,7 +690,30 @@ class SnapshotPartition(Base):
     #   MAIL_FOLDERS     → {"folder_ids": [...]}
     #   SHAREPOINT_DRIVES→ {"drive_ids": [...]}
     payload = Column(JSON, nullable=True)
-    total_files = Column(Integer, nullable=False, default=0)
+    # Size of THIS shard's work-set — and the unit is NOT files except
+    # for ONEDRIVE_FILES. Every fanout helper writes the length of the
+    # id list it just bin-packed, which per partition_type means:
+    #     ONEDRIVE_FILES    → files          (the original, honest case)
+    #     MAIL_FOLDERS      → mail folders
+    #     CHATS             → chats
+    #     SHAREPOINT_DRIVES → document libraries (drives)
+    #     GROUPS_CHANNELS   → channels
+    #     ENTRA_CATEGORIES  → directory object categories
+    # while `files_uploaded` counts snapshot_items. The two are not
+    # comparable, which is why 140 of the 147 partitions enqueued in the
+    # 24h to 2026-08-11 read files_uploaded > total_files — e.g. the four
+    # SHAREPOINT "IT OPS NOTES" shards each carry 1 library and
+    # 1,270 / 1,271 / 1,273 / 11,142 items.
+    #
+    # Renamed to an honest attribute name against the SAME DB column
+    # (`total_files`) — no migration, and cheap because nothing reads it
+    # as a denominator: no UI, no API, and no completion / requeue /
+    # rollup predicate in either deploy lineage consults it (verified by
+    # grep, 2026-08-11). `total_files` is kept as a synonym so any
+    # reader outside this repo's search path still resolves, and so an
+    # ORM query on the old name cannot become a production AttributeError.
+    shard_unit_count = Column("total_files", Integer, nullable=False, default=0)
+    total_files = synonym("shard_unit_count")
     total_bytes_est = Column(BigInteger, nullable=False, default=0)
     # QUEUED | IN_PROGRESS | COMPLETED | FAILED
     status = Column(String, nullable=False, default="QUEUED")
@@ -1125,7 +1153,7 @@ class VmFileIndex(Base):
     hot query path driving the directory listing UI."""
     __tablename__ = "vm_file_index"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    snapshot_id = Column(UUID(as_uuid=True), ForeignKey("snapshots.id", ondelete="CASCADE"), nullable=False, index=True)
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey(SNAPSHOT_ID_FOREIGN_KEY, ondelete="CASCADE"), nullable=False, index=True)
     volume_item_id = Column(UUID(as_uuid=True), nullable=False, index=True)
     parent_path = Column(String, nullable=False, index=True)
     name = Column(String, nullable=False)
@@ -1391,7 +1419,7 @@ class OneDriveFileRetry(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
     resource_id = Column(UUID(as_uuid=True), ForeignKey("resources.id", ondelete="CASCADE"), nullable=False, index=True)
-    snapshot_id = Column(UUID(as_uuid=True), ForeignKey("snapshots.id", ondelete="CASCADE"), nullable=False, index=True)
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey(SNAPSHOT_ID_FOREIGN_KEY, ondelete="CASCADE"), nullable=False, index=True)
     file_external_id = Column(String(256), nullable=False)
     file_name = Column(Text, nullable=True)
     drive_id = Column(Text, nullable=True)
@@ -1411,6 +1439,98 @@ class OneDriveFileRetry(Base):
     # DDL in shared/database.py; mirrored here is not necessary.
 
 
+# ── Item-C detached-drain recovery (2026-08-11) ──────────────────────────
+# `hc_drain_status='PENDING'` is stamped by the USER_CHATS handler just
+# BEFORE it detaches the hostedContent finalizer, and exactly ONE write
+# clears it again: that finalizer's own fire-and-forget
+# `UPDATE snapshots SET hc_drain_status=...`. On 2026-08-11 02:20:50 that
+# UPDATE died — the same asyncpg ConnectionDoesNotExistError, from the
+# same pool saturation, that cost CHATS/4 of snapshot 6807df97 its
+# partition row — and the except arm around it only prints. Nothing in the
+# system re-derives the column, so the value is PENDING forever, which:
+#   * makes shared/retention_cleanup.py skip the snapshot in BOTH of its
+#     guards (`_is_snapshot_live` and the `_delete_snapshots` SELECT), so
+#     its blobs are never reclaimed — an unbounded storage leak; and
+#   * makes `snapshot_is_restore_ready` below refuse that recovery point
+#     forever. (Latent today: verified by grep 2026-08-11, no restore path
+#     calls that function yet — it bites the moment one does.)
+# One prod snapshot was found stuck this way during the 2026-08-11 review.
+#
+# The finalizer is an asyncio task inside the worker process, so it cannot
+# outlive that process: a PENDING older than this horizon is not "still in
+# flight", it is abandoned. The honest re-derivation is NOT "COMPLETE" —
+# whether every inline image landed is unknowable from the row, because
+# the finalizer records its evidence (degraded_reason, COMPLETED→PARTIAL)
+# in the very statement that failed. It is "FAILED", i.e. "this point may
+# be missing hostedContent, do not claim it is whole", which is precisely
+# what FAILED already means to every reader of the column — and which
+# unsticks retention.
+#
+# 6h is 12x the 30-min ONEDRIVE_PARTITION_STALE_SWEEP_MIN window this
+# codebase already treats as "a drain may legitimately take this long",
+# and 36x LEASE_TTL_S. Nothing here deletes or rewrites anything — the
+# horizon only decides which of two REASONS an already-blocked restore
+# reports, and what a (future) sweep should re-derive.
+HC_DRAIN_PENDING_STALE_AFTER_S = 6 * 3600
+
+
+def _as_naive_utc(ts):
+    """Snapshot timestamps are naive UTC (`utcnow()`), but a few rows are
+    read back tz-aware via DateTime(timezone=True) columns. Normalise so
+    a comparison can never raise offset-naive vs offset-aware."""
+    if ts is None:
+        return None
+    if getattr(ts, "tzinfo", None) is not None:
+        return ts.astimezone(timezone.utc).replace(tzinfo=None)
+    return ts
+
+
+def hc_drain_pending_is_stale(
+    snapshot: "Snapshot",
+    *,
+    now=None,
+    stale_after_s: int = HC_DRAIN_PENDING_STALE_AFTER_S,
+) -> bool:
+    """True when this snapshot's hc_drain_status=PENDING can no longer be
+    a drain in flight — the detached finalizer's status write was lost.
+
+    False for every other status, and False when the row carries no
+    timestamp to judge by: an unknown age is never treated as stale.
+    """
+    status = getattr(snapshot, "hc_drain_status", None) or "NOT_APPLICABLE"
+    if status != "PENDING":
+        return False
+    ref = _as_naive_utc(
+        getattr(snapshot, "completed_at", None)
+        or getattr(snapshot, "started_at", None)
+        or getattr(snapshot, "created_at", None)
+    )
+    if ref is None:
+        return False
+    now = _as_naive_utc(now) or utcnow()
+    return (now - ref).total_seconds() > stale_after_s
+
+
+def rederive_stale_hc_drain_status(
+    snapshot: "Snapshot",
+    *,
+    now=None,
+    stale_after_s: int = HC_DRAIN_PENDING_STALE_AFTER_S,
+) -> Optional[str]:
+    """The value a sweep should WRITE to `hc_drain_status`, or None to
+    leave the row alone.
+
+    Pure so it can be unit-tested and so the deciding logic lives in one
+    place no matter who runs the sweep (reconciler tick, retention
+    pre-pass, or an ops one-liner).
+    """
+    if hc_drain_pending_is_stale(
+        snapshot, now=now, stale_after_s=stale_after_s,
+    ):
+        return "FAILED"
+    return None
+
+
 def snapshot_is_restore_ready(snapshot: "Snapshot") -> Tuple[bool, str]:
     """Return (is_ready, reason). Restore paths should call this and
     refuse to proceed when is_ready is False.
@@ -1418,7 +1538,11 @@ def snapshot_is_restore_ready(snapshot: "Snapshot") -> Tuple[bool, str]:
     Currently checks Item-C's hc_drain_status:
       - NOT_APPLICABLE / COMPLETE → ready.
       - PENDING → background HC drain still in flight; reject with a
-        retryable error so callers can poll-and-retry.
+        retryable error so callers can poll-and-retry. Unless it is a
+        STALE pending (see HC_DRAIN_PENDING_STALE_AFTER_S), in which case
+        "retry later" is a lie — the finalizer that would have cleared it
+        died hours ago — and the reason must say so instead of pointing
+        the operator at a poll loop that never ends.
       - FAILED → at least one HC task raised; restore is unsafe because
         inline images may be missing. Caller should surface to the user.
     """
@@ -1426,6 +1550,15 @@ def snapshot_is_restore_ready(snapshot: "Snapshot") -> Tuple[bool, str]:
     if status in ("NOT_APPLICABLE", "COMPLETE"):
         return True, ""
     if status == "PENDING":
+        if hc_drain_pending_is_stale(snapshot):
+            return False, (
+                "hc_drain_status=PENDING is stale (older than "
+                f"{HC_DRAIN_PENDING_STALE_AFTER_S // 3600}h) — the detached "
+                "hostedContent finalizer's status write was lost, so this "
+                "point may be missing inline images. Re-run the backup; "
+                "the value must be re-derived to FAILED "
+                "(shared.models.rederive_stale_hc_drain_status)"
+            )
         return False, "hc_drain_status=PENDING — hostedContent drain still in flight; retry later"
     if status == "FAILED":
         return False, "hc_drain_status=FAILED — at least one hostedContent task raised; restore unsafe"
@@ -1463,3 +1596,483 @@ class EncryptionConfig(Base):
     verify_readback = Column(Boolean, nullable=False, default=True)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
     updated_by = Column(String, nullable=True)
+
+
+from sqlalchemy import CheckConstraint
+
+
+class AppSettings(Base):
+    """Global single-row application settings (daily discovery schedule).
+
+    Guarded to a single row via CHECK(id = 1); always read/written as id=1.
+    """
+    __tablename__ = "app_settings"
+    id = Column(Integer, primary_key=True)
+    discovery_time = Column(Text, nullable=False, server_default="02:00")
+    timezone = Column(Text, nullable=False, server_default="America/Phoenix")
+    # Automatic retry of failed backup jobs (Configuration tab, 2026-08-18):
+    # after a resource's backup run fails, the scheduler re-dispatches it up
+    # to job_retry_max times, waiting job_retry_delay_minutes after each
+    # failure. 0 retries disables the sweep.
+    job_retry_max = Column(Integer, nullable=False, server_default="3")
+    job_retry_delay_minutes = Column(Integer, nullable=False, server_default="5")
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    __table_args__ = (CheckConstraint("id = 1", name="ck_app_settings_singleton"),)
+
+
+class ChatCaptureAttempt(Base):
+    __tablename__ = "chat_capture_attempts"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # Preserve upload ownership after snapshot deletion; a null owner fences publication.
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey(SNAPSHOT_ID_FOREIGN_KEY, ondelete="SET NULL"), index=True)
+    resource_id = Column(UUID(as_uuid=True), ForeignKey("resources.id"), nullable=False)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
+    chat_id = Column(Text, nullable=False)
+    folder_path = Column(Text, nullable=False)
+    principal_id = Column(Text, nullable=False)
+    permission_scope_hash = Column(String(64), nullable=False)
+    authentication_context_sha256 = Column(String(64), nullable=False)
+    backend_id = Column(UUID(as_uuid=True), ForeignKey("storage_backends.id"), nullable=False)
+    partition_id = Column(UUID(as_uuid=True), nullable=True)
+    snapshot_lease_token = Column(BigInteger)
+    job_lease_token = Column(BigInteger)
+    partition_lease_token = Column(BigInteger)
+    generation = Column(BigInteger, nullable=False)
+    state = Column(String(24), nullable=False, default="CREATED")
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    staged_inventory_id = Column(UUID(as_uuid=True), ForeignKey("chat_inventories.id", use_alter=True,
+        name="fk_chat_attempt_staged_inventory", deferrable=True, initially="DEFERRED"), nullable=False)
+    evidence = Column(JSON, nullable=True)
+    evidence_history = Column(JSON, nullable=False, default=list)
+    failure_reason = Column(Text)
+    reused_inventory = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", "chat_id", "generation", name="uq_chat_attempt_generation"),
+        CheckConstraint("generation >= 0", name="ck_chat_attempt_generation"),
+        CheckConstraint("state IN ('CREATED','ENUMERATING','CONTENT_PENDING','VERIFYING','READY','PUBLISHED','PARTIAL','FAILED','SUPERSEDED')", name="ck_chat_attempt_state"),
+    )
+
+
+class ChatBlobObject(Base):
+    __tablename__ = "chat_blob_objects"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
+    backend_id = Column(UUID(as_uuid=True), ForeignKey("storage_backends.id"), nullable=False)
+    container = Column(Text, nullable=False)
+    path = Column(Text, nullable=False)
+    sha256 = Column(String(64), nullable=False)
+    size = Column(BigInteger, nullable=False)
+    encryption_key_id = Column(Text)
+    backup_version = Column(Integer)
+    state = Column(String(16), nullable=False, default="STAGING")
+    capture_attempt_id = Column(UUID(as_uuid=True), ForeignKey("chat_capture_attempts.id", ondelete="SET NULL"), index=True)
+    uploaded_bytes = Column(BigInteger, nullable=False, default=0)
+    upload_deadline = Column(DateTime(timezone=True))
+    quiescent_after = Column(DateTime(timezone=True))
+    deletion_task_id = Column(UUID(as_uuid=True))
+    deletion_requested_at = Column(DateTime(timezone=True))
+    deletion_attempts = Column(Integer, nullable=False, default=0)
+    deletion_error = Column(Text)
+    deleted_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    __table_args__ = (
+        UniqueConstraint("backend_id", "container", "path", name="uq_chat_blob_location"),
+        CheckConstraint("state IN ('STAGING','LIVE','DELETING','DELETED')", name="ck_chat_blob_state"),
+        CheckConstraint("size >= 0 AND uploaded_bytes >= 0 AND deletion_attempts >= 0", name="ck_chat_blob_counts"),
+    )
+
+
+class ChatItemVersion(Base):
+    __tablename__ = "chat_item_versions"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
+    chat_id = Column(Text, nullable=False)
+    logical_key = Column(String(64), nullable=False)
+    item_type = Column(Text, nullable=False)
+    graph_id = Column(Text, nullable=False)
+    parent_graph_id = Column(Text)
+    payload_sha256 = Column(String(64), nullable=False)
+    version_sha256 = Column(String(64), nullable=False)
+    payload = Column(JSON, nullable=False)
+    content = Column(JSON)
+    object_id = Column(UUID(as_uuid=True), ForeignKey("chat_blob_objects.id", ondelete="RESTRICT"), index=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "chat_id", "logical_key", "version_sha256", name="uq_chat_item_version"),
+        Index("ix_chat_item_versions_parent_lookup", "tenant_id", "chat_id", func.md5(graph_id), "item_type"),
+        CheckConstraint("item_type NOT IN ('CHAT_ATTACHMENT','CHAT_HOSTED_CONTENT') OR parent_graph_id IS NOT NULL", name="ck_chat_version_parent"),
+    )
+
+
+class ChatInventory(Base):
+    __tablename__ = "chat_inventories"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    capture_attempt_id = Column(UUID(as_uuid=True), ForeignKey("chat_capture_attempts.id"), nullable=False, unique=True)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
+    chat_id = Column(Text, nullable=False)
+    authentication_context_sha256 = Column(String(64), nullable=False)
+    observation_hash_version = Column(Integer, nullable=False, default=1, server_default="1")
+    state = Column(String(16), nullable=False, default="STAGING")
+    membership_sha256 = Column(String(64))
+    representation_sha256 = Column(String(64))
+    item_count = Column(BigInteger, nullable=False, default=0)
+    logical_bytes = Column(BigInteger, nullable=False, default=0)
+    evidence = Column(JSON)
+    failure_reason = Column(Text)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    __table_args__ = (
+        CheckConstraint("observation_hash_version IN (1, 2)", name="ck_chat_inventory_observation_version"),
+        CheckConstraint("state IN ('STAGING','PARTIAL','COMPLETE')", name="ck_chat_inventory_state"),
+        CheckConstraint("item_count >= 0 AND logical_bytes >= 0", name="ck_chat_inventory_counts"),
+        CheckConstraint("state <> 'COMPLETE' OR (membership_sha256 IS NOT NULL AND representation_sha256 IS NOT NULL AND evidence IS NOT NULL)", name="ck_chat_inventory_complete_evidence"),
+        Index("uq_chat_complete_inventory", "tenant_id", "chat_id", "authentication_context_sha256", "membership_sha256", "representation_sha256",
+              unique=True, postgresql_where=sql_text("state = 'COMPLETE'")),
+    )
+
+
+class ChatInventoryItem(Base):
+    __tablename__ = "chat_inventory_items"
+    inventory_id = Column(UUID(as_uuid=True), ForeignKey("chat_inventories.id", ondelete="CASCADE"), primary_key=True)
+    logical_key = Column(String(64), primary_key=True)
+    version_id = Column(UUID(as_uuid=True), ForeignKey("chat_item_versions.id", ondelete="RESTRICT"), nullable=False, index=True)
+
+
+class SnapshotChatInventory(Base):
+    __tablename__ = "snapshot_chat_inventories"
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey(SNAPSHOT_ID_FOREIGN_KEY, ondelete="CASCADE"), primary_key=True)
+    chat_id = Column(Text, primary_key=True)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
+    inventory_id = Column(UUID(as_uuid=True), ForeignKey("chat_inventories.id", ondelete="RESTRICT"), nullable=False, index=True)
+    capture_attempt_id = Column(UUID(as_uuid=True), ForeignKey("chat_capture_attempts.id"), nullable=False)
+    coverage_status = Column(String(16), nullable=False)
+    started_at = Column(DateTime(timezone=True), nullable=False)
+    finished_at = Column(DateTime(timezone=True), nullable=False)
+    failure_reason = Column(Text)
+    uploaded_bytes = Column(BigInteger, nullable=False, default=0)
+    __table_args__ = (CheckConstraint("coverage_status IN ('PARTIAL','COMPLETE')", name="ck_snapshot_chat_coverage"),)
+
+
+class ChatPresentationPlan(Base):
+    __tablename__ = "chat_presentation_plans"
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey(SNAPSHOT_ID_FOREIGN_KEY, ondelete="CASCADE"), primary_key=True)
+    state = Column(String(16), nullable=False, default="PENDING")
+    task_id = Column(UUID(as_uuid=True))
+    expected_count = Column(BigInteger, nullable=False, default=0)
+    published_count = Column(BigInteger, nullable=False, default=0)
+    __table_args__ = (CheckConstraint("state IN ('PENDING','PUBLISHING','PUBLISHED','ABORTED')", name="ck_chat_presentation_plan_state"),)
+
+
+class ChatPresentationDraft(Base):
+    __tablename__ = "chat_presentation_drafts"
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey(SNAPSHOT_ID_FOREIGN_KEY, ondelete="CASCADE"), primary_key=True)
+    workflow_id = Column(UUID(as_uuid=True), ForeignKey("copy_workflows.id", ondelete="CASCADE"), primary_key=True)
+    capture_attempt = Column(BigInteger, primary_key=True)
+    chat_id = Column(Text, primary_key=True)
+    folder_path = Column(Text, nullable=False)
+    quality = Column(Integer, nullable=False)
+    provenance = Column(String(64), nullable=False)
+    conflicted = Column(Boolean, nullable=False, default=False)
+    accepted_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    __table_args__ = (CheckConstraint("quality BETWEEN 0 AND 3", name="ck_chat_presentation_draft_quality"),)
+
+
+class SnapshotChatPresentation(Base):
+    __tablename__ = "snapshot_chat_presentations"
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey(SNAPSHOT_ID_FOREIGN_KEY, ondelete="CASCADE"), primary_key=True)
+    chat_id = Column(Text, primary_key=True)
+    folder_path = Column(Text, nullable=False)
+    quality = Column(Integer, nullable=False)
+    provenance = Column(String(64), nullable=False)
+    conflicted = Column(Boolean, nullable=False, default=False)
+    policy_version = Column(Integer, nullable=False, default=1)
+
+
+class ChatCataloguePin(Base):
+    __tablename__ = "chat_catalogue_pins"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    inventory_id = Column(UUID(as_uuid=True), ForeignKey("chat_inventories.id", ondelete="RESTRICT"), index=True)
+    object_id = Column(UUID(as_uuid=True), ForeignKey("chat_blob_objects.id", ondelete="RESTRICT"), index=True)
+    owner_kind = Column(String(32), nullable=False)
+    owner_id = Column(UUID(as_uuid=True), nullable=False)
+    generation = Column(BigInteger, nullable=False)
+    expires_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    __table_args__ = (
+        CheckConstraint("(inventory_id IS NULL) <> (object_id IS NULL)", name="ck_chat_pin_target"),
+        CheckConstraint("generation >= 0", name="ck_chat_pin_generation"),
+    )
+
+
+class CopyWorkflow(Base):
+    """Durable ownership of a leaf's required database-copy continuation."""
+    __tablename__ = 'copy_workflows'
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey('tenants.id', ondelete='CASCADE'), nullable=False)
+    resource_id = Column(UUID(as_uuid=True), ForeignKey('resources.id', ondelete='CASCADE'), nullable=False)
+    job_id = Column(UUID(as_uuid=True), ForeignKey('jobs.id', ondelete='CASCADE'), nullable=False)
+    target_snapshot_id = Column(UUID(as_uuid=True), ForeignKey('snapshots.id', ondelete='CASCADE'), nullable=False)
+    partition_id = Column(UUID(as_uuid=True), ForeignKey('snapshot_partitions.id', ondelete='CASCADE'))
+    leaf_key = Column(String(80), nullable=False, unique=True)
+    state = Column(String(16), nullable=False, default='DRAINING')
+    capture_attempt = Column(BigInteger, nullable=False, default=0, server_default='0')
+    generation = Column(BigInteger, nullable=False, default=0)
+    parent_lease_token = Column(BigInteger, nullable=False, default=0)
+    snapshot_lease_token = Column(BigInteger, nullable=False, default=0)
+    job_lease_token = Column(BigInteger, nullable=False, default=0)
+    continuation = Column(JSON, nullable=False, default=dict)
+    lease_owner_id = Column(UUID(as_uuid=True))
+    lease_expires_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    completed_at = Column(DateTime(timezone=True))
+    parent_settle_pending = Column(Boolean, nullable=False, default=False, server_default='false')
+    __table_args__ = (
+        Index('ix_copy_workflow_snapshot_state', 'target_snapshot_id', 'state'),
+        Index('ix_copy_workflow_partition_state', 'partition_id', 'state'),
+        Index('ix_copy_workflow_job_state', 'job_id', 'state'),
+        Index('ix_copy_workflow_recovery', 'state', 'created_at', 'id'),
+        Index('ix_copy_workflow_parent_settle', 'parent_settle_pending', 'created_at', 'id'),
+        CheckConstraint("state IN ('DRAINING','WAITING','RESUMING','COMPLETED','PARTIAL','FAILED','CANCELLED')", name='ck_copy_workflow_state'),
+    )
+
+
+class CopyWorkQueue(Base):
+    """Shared fair service clocks at tenant, policy and resource levels."""
+    __tablename__ = 'copy_work_queues'
+    key = Column(String(64), primary_key=True)
+    scope = Column(String(12), nullable=False)
+    parent_key = Column(String(64))
+    tenant_id = Column(UUID(as_uuid=True), nullable=False)
+    sla_policy_id = Column(UUID(as_uuid=True))
+    resource_id = Column(UUID(as_uuid=True))
+    lane = Column(String(8), nullable=False)
+    weight = Column(Integer, nullable=False, default=1)
+    virtual_finish = Column(Float, nullable=False, default=0)
+    __table_args__ = (
+        Index('ix_copy_queue_parent_finish', 'parent_key', 'virtual_finish', 'key'),
+        CheckConstraint('weight BETWEEN 1 AND 8', name='ck_copy_queue_weight'),
+        CheckConstraint("scope IN ('TENANT','POLICY','RESOURCE') AND lane IN ('micro','giant')", name='ck_copy_queue_scope_lane'),
+    )
+
+
+class CopyWorkTask(Base):
+    __tablename__ = 'copy_work_tasks'
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workflow_id = Column(UUID(as_uuid=True), ForeignKey('copy_workflows.id', ondelete='CASCADE'), nullable=False)
+    tenant_id = Column(UUID(as_uuid=True), nullable=False)
+    resource_id = Column(UUID(as_uuid=True), nullable=False)
+    sla_policy_id = Column(UUID(as_uuid=True))
+    queue_key = Column(String(64), ForeignKey('copy_work_queues.key'), nullable=False)
+    resource_queue_key = Column(String(64), ForeignKey('copy_work_queues.key'), nullable=False)
+    tenant_queue_key = Column(String(64), ForeignKey('copy_work_queues.key'), nullable=False)
+    idempotency_key = Column(String(64), nullable=False, unique=True)
+    kind = Column(String(32), nullable=False)
+    capture_attempt = Column(BigInteger, nullable=False, default=0, server_default='0')
+    lane = Column(String(8), nullable=False)
+    params = Column(JSON, nullable=False, default=dict)
+    state = Column(String(16), nullable=False, default='READY')
+    generation = Column(BigInteger, nullable=False, default=0)
+    prepared = Column(Boolean, nullable=False, default=False)
+    checkpoint = Column(BigInteger, nullable=False, default=0)
+    row_count = Column(BigInteger, nullable=False, default=0)
+    bytes_count = Column(BigInteger, nullable=False, default=0)
+    execution_s = Column(Float, nullable=False, default=0, server_default='0')
+    lease_owner_id = Column(UUID(as_uuid=True))
+    lease_expires_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    ready_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    queue_entered_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    cumulative_wait_s = Column(Float, nullable=False, default=0)
+    wait_max_s = Column(Float, nullable=False, default=0)
+    attempts = Column(Integer, nullable=False, default=0)
+    error = Column(JSON)
+    __table_args__ = (
+        Index('ix_copy_task_ready', 'state', 'ready_at', 'resource_queue_key'),
+        Index('ix_copy_task_workflow_state', 'workflow_id', 'state'),
+        Index('ix_copy_task_expired', 'state', 'lease_expires_at'),
+        CheckConstraint("state IN ('READY','RUNNING','COMPLETED','FAILED','CANCELLED')", name='ck_copy_task_state'),
+        CheckConstraint("lane IN ('micro','giant') AND checkpoint >= 0 AND generation >= 0 AND row_count >= 0 AND bytes_count >= 0", name='ck_copy_task_counts'),
+    )
+
+
+class CopyWorkItem(Base):
+    """Frozen selected payloads; source FK is a retention pin, not a cursor."""
+    __tablename__ = 'copy_work_items'
+    task_id = Column(UUID(as_uuid=True), ForeignKey('copy_work_tasks.id', ondelete='CASCADE'), primary_key=True)
+    ordinal = Column(BigInteger, primary_key=True)
+    payload = Column(JSON, nullable=False)
+    source_snapshot_id = Column(UUID(as_uuid=True), ForeignKey('snapshots.id', ondelete='RESTRICT'), index=True)
+    phase = Column(Integer, nullable=False, default=0)
+
+
+class CopyWorkControl(Base):
+    """One short transactional claim mutex and coordinated protocol settings."""
+    __tablename__ = 'copy_work_control'
+    id = Column(String(16), primary_key=True, default='global')
+    enabled = Column(Boolean, nullable=False, default=False)
+    epoch = Column(BigInteger, nullable=False, default=0)
+    micro_capacity = Column(Integer, nullable=False, default=3)
+    giant_capacity = Column(Integer, nullable=False, default=3)
+    total_capacity = Column(Integer, nullable=False, default=6)
+    tenant_capacity = Column(Integer, nullable=False, default=2)
+    virtual_clock = Column(Float, nullable=False, default=0)
+    __table_args__ = (CheckConstraint('micro_capacity > 0 AND giant_capacity > 0 AND total_capacity > 0 AND tenant_capacity > 0', name='ck_copy_control_capacity'),)
+
+
+class CopyWorkInput(Base):
+    """Large selector lists are durable bounded rows, not broker/task payloads."""
+    __tablename__ = 'copy_work_inputs'
+    task_id = Column(UUID(as_uuid=True), ForeignKey('copy_work_tasks.id', ondelete='CASCADE'), primary_key=True)
+    input_key = Column(String(32), primary_key=True)
+    ordinal = Column(BigInteger, primary_key=True)
+    payload = Column(JSON, nullable=False)
+
+
+class ArchiveFolderWork(Base):
+    """Durable qualified folder scopes and page receipts for one capture."""
+    __tablename__ = 'archive_folder_work'
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey('snapshots.id', ondelete='CASCADE'), primary_key=True)
+    capture_generation = Column(UUID(as_uuid=True), primary_key=True)
+    scope_key = Column(String(64), primary_key=True)
+    phase = Column(String(16), nullable=False)
+    base_url = Column(Text, nullable=False)
+    folder_id = Column(Text, nullable=False, default='')
+    parent_scope_key = Column(String(64))
+    parent_generation = Column(Integer)
+    display_path = Column(Text, nullable=False, default='')
+    state = Column(String(16), nullable=False, default='pending')
+    scope_generation = Column(Integer, nullable=False, default=1)
+    next_url = Column(Text)
+    page_ordinal = Column(Integer, nullable=False, default=0)
+    observed_count = Column(BigInteger, nullable=False, default=0)
+    declared_count = Column(BigInteger)
+    terminal_page = Column(Boolean, nullable=False, default=False)
+    logical_attempts = Column(Integer, nullable=False, default=0)
+    restart_count = Column(Integer, nullable=False, default=0)
+    error_count = Column(Integer, nullable=False, default=0)
+    gap_kind = Column(String(64))
+    evidence = Column(JSON, nullable=False, default=dict)
+    not_before = Column(DateTime(timezone=True))
+    __table_args__ = (
+        Index('ix_archive_folder_due', 'snapshot_id', 'capture_generation', 'state', 'not_before', 'scope_key'),
+        Index('ix_archive_folder_parent', 'snapshot_id', 'capture_generation', 'parent_scope_key'),
+    )
+
+
+class ArchiveItemWork(Base):
+    """Small observations and exact content receipts; never exported bodies."""
+    __tablename__ = 'archive_item_work'
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey('snapshots.id', ondelete='CASCADE'), primary_key=True)
+    capture_generation = Column(UUID(as_uuid=True), primary_key=True)
+    scope_key = Column(String(64), primary_key=True)
+    scope_generation = Column(Integer, primary_key=True)
+    external_id = Column(Text, primary_key=True)
+    location = Column(Text, nullable=False)
+    folder_id = Column(Text, nullable=False)
+    change_key = Column(Text)
+    item_type = Column(Text)
+    size = Column(BigInteger)
+    display_path = Column(Text, nullable=False, default='')
+    page_ordinal = Column(Integer, nullable=False)
+    state = Column(String(16), nullable=False, default='discovered')
+    gap_kind = Column(String(64))
+    copy_task_id = Column(UUID(as_uuid=True), ForeignKey('copy_work_tasks.id', ondelete='SET NULL'))
+    receipt_item_id = Column(UUID(as_uuid=True), ForeignKey('snapshot_items.id', ondelete='SET NULL'))
+    receipt = Column(JSON, nullable=False, default=dict)
+    __table_args__ = (
+        Index('ix_archive_item_identity', 'snapshot_id', 'capture_generation', 'external_id'),
+        Index('ix_archive_item_pending', 'snapshot_id', 'capture_generation', 'state', 'external_id'),
+    )
+
+
+class ProviderWorkQueue(Base):
+    """Positive service clocks, separate from database-copy lanes."""
+    __tablename__ = 'provider_work_queues'
+    key = Column(String(64), primary_key=True)
+    scope = Column(String(12), nullable=False)
+    parent_key = Column(String(64))
+    tenant_id = Column(UUID(as_uuid=True), nullable=False)
+    weight = Column(Integer, nullable=False, default=1)
+    virtual_finish = Column(Float, nullable=False, default=0)
+    __table_args__ = (
+        Index('ix_provider_queue_finish', 'parent_key', 'virtual_finish', 'key'),
+        CheckConstraint('weight > 0', name='ck_provider_queue_weight'),
+    )
+
+
+class ProviderWorkControl(Base):
+    __tablename__ = 'provider_work_control'
+    id = Column(String(16), primary_key=True, default='global')
+    enabled = Column(Boolean, nullable=False, default=False)
+    epoch = Column(BigInteger, nullable=False, default=1)
+    total_capacity = Column(Integer, nullable=False, default=8)
+    tenant_capacity = Column(Integer, nullable=False, default=4)
+    control_reserve = Column(Integer, nullable=False, default=2)
+    virtual_clock = Column(Float, nullable=False, default=0)
+    __table_args__ = (CheckConstraint('total_capacity > 0 AND tenant_capacity > 0 AND control_reserve > 0', name='ck_provider_capacity'),)
+
+
+class ProviderWork(Base):
+    __tablename__ = 'provider_work'
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    leaf_key = Column(String(80), unique=True, nullable=False)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey('tenants.id', ondelete='CASCADE'), nullable=False)
+    resource_id = Column(UUID(as_uuid=True), ForeignKey('resources.id', ondelete='CASCADE'), nullable=False)
+    job_id = Column(UUID(as_uuid=True), ForeignKey('jobs.id', ondelete='CASCADE'), nullable=False)
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey('snapshots.id', ondelete='CASCADE'), nullable=False)
+    partition_id = Column(UUID(as_uuid=True), ForeignKey('snapshot_partitions.id', ondelete='CASCADE'))
+    sla_policy_id = Column(UUID(as_uuid=True))
+    weight = Column(Integer, nullable=False)
+    tenant_queue_key = Column(String(64), ForeignKey('provider_work_queues.key'), nullable=False)
+    policy_queue_key = Column(String(64), ForeignKey('provider_work_queues.key'), nullable=False)
+    resource_queue_key = Column(String(64), ForeignKey('provider_work_queues.key'), nullable=False)
+    state = Column(String(16), nullable=False, default='WAITING')
+    protocol_version = Column(Integer, nullable=False, default=1)
+    generation = Column(BigInteger, nullable=False, default=0)
+    parent_lease_token = Column(BigInteger, nullable=False)
+    snapshot_lease_token = Column(BigInteger, nullable=False)
+    job_lease_token = Column(BigInteger, nullable=False)
+    lease_owner_id = Column(UUID(as_uuid=True))
+    lease_expires_at = Column(DateTime(timezone=True))
+    next_eligible_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    queue_entered_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    completed_at = Column(DateTime(timezone=True))
+    continuation = Column(JSON, nullable=False, default=dict)
+    parent_settle_pending = Column(Boolean, nullable=False, default=False)
+    suspension_generation = Column(BigInteger)
+    last_reason = Column(String(80))
+    __table_args__ = (
+        Index('ix_provider_work_due', 'state', 'next_eligible_at', 'resource_queue_key', 'id'),
+        Index('ix_provider_work_expired', 'state', 'lease_expires_at'),
+        Index('ix_provider_work_snapshot', 'snapshot_id', 'state'),
+        Index('ix_provider_work_partition', 'partition_id', 'state'),
+        Index('ix_provider_work_job', 'job_id', 'state'),
+        Index('ix_provider_parent_settle', 'parent_settle_pending', 'created_at', 'id'),
+        CheckConstraint("state IN ('DRAINING','WAITING','RESUMING','COMPLETED','PARTIAL','FAILED','CANCELLED')", name='ck_provider_state'),
+        CheckConstraint('weight > 0 AND generation >= 0 AND protocol_version = 1', name='ck_provider_protocol'),
+    )
+
+
+class ProviderWorkUnit(Base):
+    __tablename__ = 'provider_work_units'
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    work_id = Column(UUID(as_uuid=True), ForeignKey('provider_work.id', ondelete='CASCADE'), nullable=False)
+    unit_key = Column(String(128), nullable=False)
+    kind = Column(String(32), nullable=False)
+    source_version = Column(String(128))
+    state = Column(String(16), nullable=False, default='PENDING')
+    checkpoint = Column(JSON, nullable=False, default=dict)
+    receipt_id = Column(String(128))
+    attempts = Column(BigInteger, nullable=False, default=0)
+    waited_s = Column(Float, nullable=False, default=0)
+    reconciliations = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    deadline_at = Column(DateTime(timezone=True), nullable=False)
+    next_eligible_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    error = Column(JSON)
+    __table_args__ = (
+        UniqueConstraint('work_id', 'unit_key', name='uq_provider_unit_key'),
+        Index('ix_provider_unit_due', 'work_id', 'state', 'next_eligible_at', 'id'),
+        CheckConstraint("state IN ('PENDING','RUNNING','COMPLETED','FAILED','CANCELLED') AND attempts >= 0 AND waited_s >= 0 AND reconciliations >= 0", name='ck_provider_unit_state'),
+    )

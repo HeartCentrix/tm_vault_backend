@@ -53,6 +53,8 @@ class _FakeSession:
         s = str(stmt).lower()
         if "sla_policies" in s:
             return _Result(self._policies)
+        if "from resources" in s:
+            return _Result([r.id for r in self._resources] if "limit" in s else self._resources)
         if "snapshots" in s:
             return _Result(self._snaps)
         return _Result([])
@@ -92,7 +94,7 @@ def _scenario():
     )
     recent = _snap(0)          # within 1-day window -> kept
     old1 = _snap(10)           # outside -> delete
-    old2 = _snap(20)           # outside -> delete
+    old2 = _snap(20)           # oldest baseline anchor -> kept
     return tid, pol, res, recent, old1, old2
 
 
@@ -101,16 +103,18 @@ async def test_emits_audit_and_deletes_when_permitted(monkeypatch):
     tid, pol, res, recent, old1, old2 = _scenario()
     sess = _FakeSession([pol], [res], [recent, old1, old2])
     recorded = {}
-    async def _fake_delete(session, ids):
+    async def _fake_delete(session, ids, *, audit_events=None):
         recorded["ids"] = set(ids)
+        for sid in ids:
+            session.add(audit_events[sid])
         return len(ids)
     monkeypatch.setattr(rc, "_delete_snapshots", _fake_delete)
     monkeypatch.setattr(rc.settings, "RETENTION_DELETE_ENABLED", True)
 
     await rc.enforce_retention_for_tenant(sess, tid)
 
-    assert recorded["ids"] == {old1.id, old2.id}                      # deletes the right ones
-    assert {e.snapshot_id for e in sess.added} == {old1.id, old2.id}  # one audit per doomed
+    assert recorded["ids"] == {old1.id}                      # deletes the right ones
+    assert {e.snapshot_id for e in sess.added} == {old1.id}  # one audit per doomed
     assert all(e.action == "RETENTION_SNAPSHOT_DELETED" for e in sess.added)
     assert recent.id not in recorded["ids"]                          # restorable kept
 
@@ -130,4 +134,4 @@ async def test_dryrun_emits_no_audit_and_no_delete(monkeypatch):
 
     assert sess.added == []            # NO audit rows written in dry-run
     assert called["n"] == 0            # _delete_snapshots never called
-    assert stats.get("would_delete", 0) == 2   # but it still reports what it WOULD delete
+    assert stats.get("would_delete", 0) == 1   # but it still reports what it WOULD delete

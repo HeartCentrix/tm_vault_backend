@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import uuid
 from typing import Optional
 
@@ -190,6 +191,33 @@ async def ensure_storage_bootstrap(engine: AsyncEngine) -> None:
             conn, BOOTSTRAP_LOCK_KEY, LOCK_DEADLINE_S,
         )
 
+        # Bound how long any bootstrap DDL will wait for a table lock.
+        # The DROP/CREATE TRIGGER on snapshot_items needs ACCESS EXCLUSIVE;
+        # without a cap it can queue behind a long UPDATE and, per PG
+        # lock-queue fairness, block every live INSERT behind it (prod
+        # froze ~5 min on 2026-07-30). On timeout the per-statement
+        # SAVEPOINT below swallows the failure and we continue — the
+        # triggers are idempotent and already present from a prior boot.
+        # Validate against a strict Postgres-duration pattern so a malformed
+        # env value (e.g. "3 seconds", "abc") can't raise here and abort
+        # startup on every boot of all 4 services — fall back to '3s'.
+        #
+        # SET LOCAL is TRANSACTION-scoped, so it is released again right
+        # after the DDL loop below. Only the DDL loop is SAVEPOINT-wrapped;
+        # the seed UPSERTs and the invariant check are bare, so leaving the
+        # timeout in force for them would turn a row-lock conflict (a
+        # concurrent bootstrap or storage_toggle_worker holding the
+        # azure-primary row — reachable because _try_acquire_bootstrap_lock
+        # gives up after STORAGE_BOOTSTRAP_LOCK_DEADLINE_S and proceeds
+        # unserialized) from "wait briefly, then succeed" into a raise that
+        # aborts the whole bootstrap and silently skips the operator-facing
+        # endpoint/config upsert. Those statements take row locks only —
+        # they cannot cause the ACCESS EXCLUSIVE pile-up this guard exists
+        # for — so they keep the server default.
+        _raw_lt = os.getenv("STORAGE_BOOTSTRAP_LOCK_TIMEOUT", "3s").strip()
+        _lock_timeout = _raw_lt if re.fullmatch(r"\d+(us|ms|s|min|h|d)?", _raw_lt) else "3s"
+        await conn.execute(text(f"SET LOCAL lock_timeout = '{_lock_timeout}'"))
+
         # Wrap each DDL in its own SAVEPOINT so a stmt-level failure (the
         # CREATE FUNCTION pg_proc_proname_args_nsp_index race we're
         # guarding against, plus any IF NOT EXISTS edge cases) doesn't
@@ -215,6 +243,13 @@ async def ensure_storage_bootstrap(engine: AsyncEngine) -> None:
                     "[storage-bootstrap] trigger stmt failed: %s (%s...)",
                     exc, stmt[:60],
                 )
+
+        # DDL done — hand the rest of the transaction back to the server
+        # default so the un-SAVEPOINTed seed/invariant statements below
+        # keep their pre-guard "wait for the row lock, then succeed"
+        # behaviour. DEFAULT (not a literal) so an operator-configured
+        # server/role setting is honoured, and it stays transaction-local.
+        await conn.execute(text("SET LOCAL lock_timeout = DEFAULT"))
 
         azure_id = str(uuid.uuid4())
         # Upsert on re-seed so operator-driven .env changes (e.g.

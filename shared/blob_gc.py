@@ -17,6 +17,11 @@ from __future__ import annotations
 from typing import Iterable, List, Optional, Set, Tuple
 
 
+def is_catalogue_blob_path(path: str) -> bool:
+    """Catalogue generations have one exclusive collector, across all snapshots."""
+    return isinstance(path, str) and path.startswith("chat-catalogue/v1/")
+
+
 def blobs_safe_to_delete(
     candidate_blob_paths: Optional[Iterable[str]],
     still_referenced_blob_paths: Optional[Iterable[str]],
@@ -29,7 +34,7 @@ def blobs_safe_to_delete(
     ``None`` inputs so callers don't have to pre-normalise query results.
     """
     referenced = set(still_referenced_blob_paths or ())
-    return {p for p in (candidate_blob_paths or ()) if p and p not in referenced}
+    return {p for p in (candidate_blob_paths or ()) if p and p not in referenced and not is_catalogue_blob_path(p)}
 
 
 def container_candidates(

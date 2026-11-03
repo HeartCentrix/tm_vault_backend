@@ -1,0 +1,20 @@
+# 06-netpol-ingress-stack.yaml
+# itops enforces a namespace default-deny-all (ingress+egress). Catch-all policies
+# already allow: DNS egress, apiserver egress, ingress-nginx -> pods, prometheus scrape.
+# What's missing is intra-stack pod->pod traffic: frontend->gateway, gateway->services,
+# services->services, services->redis/rabbitmq. This policy allows any tmvault pod to
+# RECEIVE from any tmvault pod. (Egress for tmvault pods is opened by
+# tmvault-egress-postgres' allow-all rule; kubelet health probes are CNI-exempt.)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tmvault-ingress-stack
+  namespace: itops
+spec:
+  podSelector:
+    matchLabels: { stack: tmvault }
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { stack: tmvault }

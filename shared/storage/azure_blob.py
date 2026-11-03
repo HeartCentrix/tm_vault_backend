@@ -113,7 +113,16 @@ class AzureBlobStore:
             last_modified=props["last_modified"] if props else datetime.utcnow(),
         )
 
-    async def upload_stream(
+    async def upload_stream(self, container, path, byte_stream, total_size, metadata=None,
+                            chunk_size=8*1024*1024, max_parallel_parts=4):
+        from shared.provider_runtime import storage_buffer_budget
+        if chunk_size <= 0:
+            raise ValueError('block buffer must be positive')
+        async with storage_buffer_budget(chunk_size*4):
+            return await self._upload_stream(container, path, byte_stream, total_size,
+                metadata=metadata, chunk_size=chunk_size, max_parallel_parts=max_parallel_parts)
+
+    async def _upload_stream(
         self, container, path,
         byte_stream, total_size: int,
         metadata=None,
@@ -138,33 +147,40 @@ class AzureBlobStore:
         async def _stage(block_id: str, data: bytes):
             await shard.stage_block(container, path, block_id, data)
 
-        async for chunk in byte_stream:
-            if not chunk:
-                continue
-            hasher.update(chunk)
-            total_written += len(chunk)
-            buf.extend(chunk)
-            while len(buf) >= chunk_size:
+        try:
+            async for chunk in byte_stream:
+                if not chunk:
+                    continue
+                hasher.update(chunk)
+                total_written += len(chunk)
+                buf.extend(chunk)
+                while len(buf) >= chunk_size:
+                    blk_index += 1
+                    # Azure block IDs must be same-length base64 strings.
+                    bid = _b64.b64encode(
+                        f"{blk_index:08d}-{_uuid.uuid4().hex[:8]}".encode(),
+                    ).decode()
+                    block_ids.append(bid)
+                    await _stage(bid, bytes(buf[:chunk_size]))
+                    del buf[:chunk_size]
+
+            if buf or not block_ids:
                 blk_index += 1
-                # Azure block IDs must be same-length base64 strings.
                 bid = _b64.b64encode(
                     f"{blk_index:08d}-{_uuid.uuid4().hex[:8]}".encode(),
                 ).decode()
                 block_ids.append(bid)
-                await _stage(bid, bytes(buf[:chunk_size]))
-                del buf[:chunk_size]
+                await _stage(bid, bytes(buf))
 
-        if buf or not block_ids:
-            blk_index += 1
-            bid = _b64.b64encode(
-                f"{blk_index:08d}-{_uuid.uuid4().hex[:8]}".encode(),
-            ).decode()
-            block_ids.append(bid)
-            await _stage(bid, bytes(buf))
-
-        await shard.commit_block_list_manual(
-            container, path, block_ids, metadata=metadata,
-        )
+            await shard.commit_block_list_manual(
+                container, path, block_ids, metadata=metadata,
+            )
+        finally:
+            # Never commit an interrupted block list or delete a previous valid
+            # blob. Azure expires this attempt's uncommitted block IDs.
+            close = getattr(byte_stream, 'aclose', None)
+            if close is not None:
+                await close()
         props = await shard.get_blob_properties(container, path)
         return BlobInfo(
             backend_id=self.backend_id, container=container, path=path,
@@ -259,7 +275,18 @@ class AzureBlobStore:
         )
 
     async def delete(self, container, path) -> None:
-        await self._default_shard().delete_blob(container, path)
+        from shared.blob_gc import is_catalogue_blob_path
+        if not is_catalogue_blob_path(path):
+            await self._default_shard().delete_blob(container, path)
+            return
+        # The legacy shard helper swallows every error; catalogue retirement
+        # needs a provider acknowledgement before recording a tombstone.
+        from azure.core.exceptions import ResourceNotFoundError
+        client = self._default_shard().get_async_client().get_blob_client(container=container, blob=path)
+        try:
+            await client.delete_blob()
+        except ResourceNotFoundError:
+            pass
 
     async def presigned_url(self, container, path, valid_hours=6, *, allow_encrypted=False) -> str:
         # allow_encrypted is a no-op for Azure (its uploads never TMVE-encrypt).

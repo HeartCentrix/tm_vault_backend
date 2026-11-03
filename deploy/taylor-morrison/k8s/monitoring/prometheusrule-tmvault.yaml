@@ -1,0 +1,315 @@
+# prometheusrule-tmvault.yaml — alerting rules for the TM Vault stack.
+# NOT applied by any script; see README.md in this folder.
+#
+# Selected by Prometheus through `release: kube-prometheus-stack` (ruleNamespaceSelector: {}).
+# Routing (Alertmanager, verified 2026-10-14): severity=critical -> itops on-call email
+# AND an ITO Jira ticket; severity=warning -> ITO Jira ticket only. No other severities
+# are routed, so every rule here is one of those two.
+#
+# Every expression uses only series that were observed on the cluster on 2026-10-14:
+#   up / tmvault_* / sla_* / rabbitmq_* ... from the PodMonitors in podmonitor-tmvault.yaml
+#   container_memory_working_set_bytes ...... kubelet cAdvisor (kube-prometheus-stack default)
+#   kube_* ................................. kube-state-metrics (kube-prometheus-stack default)
+#   probe_success .......................... the Probe in probe-tmvault-ingress.yaml
+# `job` values are pod `app` labels (PodMonitors set jobLabel: app) or the Probe's jobName.
+# Container names in the memory rules are the container names in 40-services.yaml /
+# 50-workers.yaml (kube-state-metrics does not export the stack=tmvault pod label, so the
+# rules cannot select on it).
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: tmvault-alerts
+  namespace: itops
+  labels:
+    release: kube-prometheus-stack
+    stack: tmvault
+spec:
+  groups:
+    - name: tmvault-availability
+      rules:
+        - alert: TMVaultWorkerDown
+          expr: absent(up{namespace="itops", job="backup-worker"} == 1)
+          for: 10m
+          labels: { severity: critical, service: tmvault, team: it-ops }
+          annotations:
+            summary: No backup-worker pod is scrapeable — backup capacity is gone
+            description: >-
+              Prometheus has had no healthy backup-worker target for 10 minutes. Either every
+              backup-worker pod is down (check `kubectl -n itops get pods -l app=backup-worker`)
+              or the scrape path from the monitoring namespace is blocked (NetworkPolicy
+              tmvault-ingress-prometheus-scrape must exist). Scheduled backups are not running.
+            runbook_url: https://github.com/taylormorrison/tm_vault_backend/blob/main/deploy/taylor-morrison/RUNBOOK.md#worker-scheduler-or-target-down
+        - alert: TMVaultHeavyWorkerDown
+          expr: absent(up{namespace="itops", job="backup-worker-heavy"} == 1)
+          for: 10m
+          labels: { severity: critical, service: tmvault, team: it-ops }
+          annotations:
+            summary: No backup-worker-heavy pod is scrapeable — heavy-queue backups are stalled
+            description: >-
+              Prometheus has had no healthy backup-worker-heavy target for 10 minutes. The
+              backup.heavy queue has no consumer, so large mailboxes/sites stop being backed
+              up. Check `kubectl -n itops get pods -l app=backup-worker-heavy`.
+            runbook_url: https://github.com/taylormorrison/tm_vault_backend/blob/main/deploy/taylor-morrison/RUNBOOK.md#worker-scheduler-or-target-down
+        - alert: TMVaultSchedulerDown
+          expr: absent(up{namespace="itops", job="backup-scheduler"} == 1)
+          for: 10m
+          labels: { severity: critical, service: tmvault, team: it-ops }
+          annotations:
+            summary: backup-scheduler is not scrapeable — no new backup waves are being dispatched
+            description: >-
+              The single backup-scheduler pod has not been scraped successfully for 10 minutes.
+              Without it no backup jobs are enqueued and SLA/lifecycle reconcile stops. Check
+              `kubectl -n itops get pods -l app=backup-scheduler` and its logs.
+            runbook_url: https://github.com/taylormorrison/tm_vault_backend/blob/main/deploy/taylor-morrison/RUNBOOK.md#worker-scheduler-or-target-down
+        - alert: TMVaultRabbitmqDown
+          expr: absent(up{namespace="itops", job="tmvault-rabbitmq"} == 1)
+          for: 5m
+          labels: { severity: critical, service: tmvault, team: it-ops }
+          annotations:
+            summary: tmvault-rabbitmq is not scrapeable — the whole job pipeline is stopped
+            description: >-
+              The RabbitMQ broker has had no healthy scrape for 5 minutes. Every worker and the
+              scheduler publish/consume through it, so nothing moves while it is down. Check
+              `kubectl -n itops get pods -l app=tmvault-rabbitmq` and the data PVC.
+            runbook_url: https://github.com/taylormorrison/tm_vault_backend/blob/main/deploy/taylor-morrison/RUNBOOK.md#rabbitmq-queues-and-broker
+        - alert: TMVaultRedisDown
+          expr: kube_deployment_status_replicas_available{namespace="itops", deployment="tmvault-redis"} == 0
+          for: 5m
+          labels: { severity: critical, service: tmvault, team: it-ops }
+          annotations:
+            summary: tmvault-redis has no available replica
+            description: >-
+              kube-state-metrics reports 0 available replicas for Deployment itops/tmvault-redis
+              for 5 minutes. Redis has no exporter, so this is the only Redis signal: check
+              `kubectl -n itops get pods -l app=tmvault-redis` and the pod logs.
+            runbook_url: https://github.com/taylormorrison/tm_vault_backend/blob/main/deploy/taylor-morrison/RUNBOOK.md#redis-down
+        - alert: TMVaultTargetDown
+          expr: |
+            up{namespace="itops", job=~"restore-worker|discovery-worker|chat-export-worker|azure-workload-worker|auth-service|tenant-service|resource-service|job-service|snapshot-service|dashboard-service|alert-service|delta-token|audit-service"} == 0
+          for: 15m
+          labels: { severity: warning, service: tmvault, team: it-ops }
+          annotations:
+            summary: TM Vault pod {{ $labels.pod }} ({{ $labels.job }}) is not scrapeable
+            description: >-
+              Prometheus has failed to scrape {{ $labels.pod }} on {{ $labels.instance }} for
+              15 minutes. For a single-replica role (restore-worker, discovery-worker, the API
+              services) this means the role is down or wedged. Check the pod and its logs.
+            runbook_url: https://github.com/taylormorrison/tm_vault_backend/blob/main/deploy/taylor-morrison/RUNBOOK.md#worker-scheduler-or-target-down
+
+    - name: tmvault-backup-health
+      rules:
+        - alert: TMVaultFailedSnapshotsSpike
+          expr: |
+            sum by (type) (increase(tmvault_snapshots_total{namespace="itops", status="FAILED"}[1h])) > 10
+          for: 15m
+          labels: { severity: warning, service: tmvault, team: it-ops }
+          annotations:
+            summary: "{{ $value | humanize }} {{ $labels.type }} snapshots FAILED in the last hour"
+            description: >-
+              More than 10 snapshots of type {{ $labels.type }} reached terminal status FAILED
+              in the last hour (tmvault_snapshots_total, emitted by the backup workers on
+              completion). Look at the failed rows in tm.snapshots and the backup-worker logs for
+              the dominant error before the failure ratio alert escalates.
+            runbook_url: https://github.com/taylormorrison/tm_vault_backend/blob/main/deploy/taylor-morrison/RUNBOOK.md#snapshot-failures
+        - alert: TMVaultSnapshotFailureRatioHigh
+          expr: |
+            (
+              sum(increase(tmvault_snapshots_total{namespace="itops", status="FAILED"}[1h]))
+                /
+              sum(increase(tmvault_snapshots_total{namespace="itops"}[1h]))
+            ) > 0.25
+            and
+            sum(increase(tmvault_snapshots_total{namespace="itops"}[1h])) > 20
+          for: 15m
+          labels: { severity: critical, service: tmvault, team: it-ops }
+          annotations:
+            summary: "{{ $value | humanizePercentage }} of snapshots in the last hour FAILED"
+            description: >-
+              More than a quarter of all terminal snapshots in the last hour ended FAILED (with at
+              least 20 snapshots finished, so this is not noise from a quiet hour). Something
+              systemic is wrong: Graph auth/throttling, storage backend, or the database. Treat as
+              a backup outage until the cause is known.
+            runbook_url: https://github.com/taylormorrison/tm_vault_backend/blob/main/deploy/taylor-morrison/RUNBOOK.md#snapshot-failures
+        - alert: TMVaultNoSnapshotsCompleted
+          expr: |
+            sum(increase(tmvault_snapshots_total{namespace="itops", status=~"COMPLETED|PARTIAL"}[12h])) == 0
+          # 3h, not 1h: after a full worker roll every pod's counter is born non-zero, so
+          # increase() reads 0 until the next completion lands (observed 2026-10-14 23:41Z).
+          for: 3h
+          labels: { severity: warning, service: tmvault, team: it-ops }
+          annotations:
+            summary: No snapshot has completed in the last 12 hours
+            description: >-
+              The backup workers are up (the counter is being scraped) but have not recorded a
+              single COMPLETED or PARTIAL snapshot in 12 hours. Either nothing is being scheduled
+              (scheduler stuck, policies paused) or every job is failing/stalling. Compare with
+              TMVaultSchedulerDown and the RabbitMQ queue alerts.
+            runbook_url: https://github.com/taylormorrison/tm_vault_backend/blob/main/deploy/taylor-morrison/RUNBOOK.md#snapshot-failures
+        - alert: TMVaultSlaAuditPublishFailing
+          expr: |
+            sum(increase(sla_audit_publish_failed_total{namespace="itops"}[1h])) > 0
+          for: 15m
+          labels: { severity: warning, service: tmvault, team: it-ops }
+          annotations:
+            summary: backup-scheduler failed to publish SLA audit events in the last hour
+            description: >-
+              sla_audit_publish_failed_total increased on backup-scheduler. SLA/lifecycle
+              reconcile actions are happening without a matching audit-trail record, which is a
+              silent compliance gap. Check audit-service health and the INTERNAL_API_KEY plumbing
+              (tests/deploy/test_manifest_internal_api_key.py explains the two halves).
+            runbook_url: https://github.com/taylormorrison/tm_vault_backend/blob/main/deploy/taylor-morrison/RUNBOOK.md#sla-audit-publish-failing
+        # Graph 429 ratio — DISABLED until the counters are wired. shared/core_metrics.py defines
+        # tmvault_graph_api_calls_total / tmvault_graph_throttles_total but no production code
+        # path increments them (only the unused time_graph_call() helper); the series have no
+        # samples, so this rule could never fire. Wire time_graph_call()/inc_graph_throttle()
+        # around the Graph client, confirm samples, then uncomment. Thresholds follow the 429
+        # table in RUNBOOK.md "Monitor 429 rate (the canary)": > 15% = throttle is dominant.
+        # - alert: TMVaultGraphThrottleRateHigh
+        #   expr: |
+        #     (
+        #       sum(rate(tmvault_graph_throttles_total{namespace="itops"}[30m]))
+        #         /
+        #       sum(rate(tmvault_graph_api_calls_total{namespace="itops"}[30m]))
+        #     ) > 0.15
+        #   for: 30m
+        #   labels: { severity: warning, service: tmvault, team: it-ops }
+        #   annotations:
+        #     summary: "{{ $value | humanizePercentage }} of Graph calls are being throttled (429)"
+        #     runbook_url: https://github.com/taylormorrison/tm_vault_backend/blob/main/deploy/taylor-morrison/RUNBOOK.md#monitor-429-rate-the-canary
+
+    - name: tmvault-resources
+      rules:
+        - alert: TMVaultWorkerMemoryHigh
+          expr: |
+            max by (namespace, pod, container) (
+              container_memory_working_set_bytes{namespace="itops", container=~"backup-worker|restore-worker|discovery-worker|chat-export-worker|azure-workload-worker|backup-scheduler|job-service|snapshot-service|dashboard-service|alert-service|auth-service|tenant-service|resource-service|delta-token|progress-tracker|audit-service|report-service|search-service|graph-proxy|api-gateway"}
+            )
+              /
+            max by (namespace, pod, container) (
+              kube_pod_container_resource_limits{namespace="itops", resource="memory", container=~"backup-worker|restore-worker|discovery-worker|chat-export-worker|azure-workload-worker|backup-scheduler|job-service|snapshot-service|dashboard-service|alert-service|auth-service|tenant-service|resource-service|delta-token|progress-tracker|audit-service|report-service|search-service|graph-proxy|api-gateway"}
+            )
+              > 0.85
+          for: 15m
+          labels: { severity: warning, service: tmvault, team: it-ops }
+          annotations:
+            summary: "{{ $labels.pod }}/{{ $labels.container }} is at {{ $value | humanizePercentage }} of its memory limit"
+            description: >-
+              Working-set memory of container {{ $labels.container }} in pod {{ $labels.pod }} has
+              been above 85% of its limit (40-services.yaml / 50-workers.yaml) for 15 minutes.
+              Backup workers grow with the mailbox/site they are walking; an OOMKill loses the
+              in-flight job. Check `kubectl -n itops top pod {{ $labels.pod }}` and recent OOMKills.
+            runbook_url: https://github.com/taylormorrison/tm_vault_backend/blob/main/deploy/taylor-morrison/RUNBOOK.md#worker-memory
+        - alert: TMVaultWorkerMemoryCritical
+          expr: |
+            max by (namespace, pod, container) (
+              container_memory_working_set_bytes{namespace="itops", container=~"backup-worker|restore-worker|discovery-worker|chat-export-worker|azure-workload-worker|backup-scheduler|job-service|snapshot-service|dashboard-service|alert-service|auth-service|tenant-service|resource-service|delta-token|progress-tracker|audit-service|report-service|search-service|graph-proxy|api-gateway"}
+            )
+              /
+            max by (namespace, pod, container) (
+              kube_pod_container_resource_limits{namespace="itops", resource="memory", container=~"backup-worker|restore-worker|discovery-worker|chat-export-worker|azure-workload-worker|backup-scheduler|job-service|snapshot-service|dashboard-service|alert-service|auth-service|tenant-service|resource-service|delta-token|progress-tracker|audit-service|report-service|search-service|graph-proxy|api-gateway"}
+            )
+              > 0.95
+          for: 5m
+          labels: { severity: critical, service: tmvault, team: it-ops }
+          annotations:
+            summary: "{{ $labels.pod }}/{{ $labels.container }} is at {{ $value | humanizePercentage }} of its memory limit — OOMKill imminent"
+            description: >-
+              Working-set memory of container {{ $labels.container }} in pod {{ $labels.pod }} has
+              been above 95% of its limit for 5 minutes. The kernel will OOMKill it next; for a
+              backup worker that aborts the running job and marks the snapshot FAILED/PARTIAL.
+            runbook_url: https://github.com/taylormorrison/tm_vault_backend/blob/main/deploy/taylor-morrison/RUNBOOK.md#worker-memory
+        - alert: TMVaultContainerOOMKilled
+          expr: |
+            max by (namespace, pod, container) (
+              increase(kube_pod_container_status_restarts_total{namespace="itops", container=~"backup-worker|restore-worker|discovery-worker|chat-export-worker|azure-workload-worker|backup-scheduler|job-service|snapshot-service|dashboard-service|alert-service|auth-service|tenant-service|resource-service|delta-token|progress-tracker|audit-service|report-service|search-service|graph-proxy|api-gateway"}[1h])
+            ) > 0
+              and on (namespace, pod, container)
+            max by (namespace, pod, container) (
+              kube_pod_container_status_last_terminated_reason{namespace="itops", reason="OOMKilled"}
+            ) == 1
+          labels: { severity: warning, service: tmvault, team: it-ops }
+          annotations:
+            summary: "{{ $labels.pod }}/{{ $labels.container }} was OOMKilled in the last hour"
+            description: >-
+              Container {{ $labels.container }} in pod {{ $labels.pod }} restarted in the last hour
+              and its last termination reason is OOMKilled. The job it was running was lost (a
+              backup job is re-queued only after its lease expires). Raise the memory limit in
+              50-workers.yaml / 40-services.yaml or split the workload.
+            runbook_url: https://github.com/taylormorrison/tm_vault_backend/blob/main/deploy/taylor-morrison/RUNBOOK.md#worker-memory
+
+    - name: tmvault-queues
+      rules:
+        - alert: TMVaultQueueBacklog
+          expr: |
+            max by (queue) (rabbitmq_detailed_queue_messages_ready{namespace="itops", queue!~".*\\.dlq|dlq\\..*"}) > 1000
+          for: 30m
+          labels: { severity: warning, service: tmvault, team: it-ops }
+          annotations:
+            summary: "RabbitMQ queue {{ $labels.queue }} has {{ $value | humanize }} ready messages for 30m"
+            description: >-
+              Queue {{ $labels.queue }} has held more than 1000 ready (unconsumed) messages for 30
+              minutes. Consumers are not keeping up or are not consuming at all (see
+              TMVaultQueueNoConsumers). Compare the queue name to the worker that owns it
+              (backup.* -> backup-worker/-heavy, restore.* -> restore-worker, discovery.* ->
+              discovery-worker, azure.* -> azure-workload-worker). The 1000 threshold is a first
+              guess — tune after a week of data.
+            runbook_url: https://github.com/taylormorrison/tm_vault_backend/blob/main/deploy/taylor-morrison/RUNBOOK.md#rabbitmq-queues-and-broker
+        - alert: TMVaultQueueNoConsumers
+          expr: |
+            max by (queue) (rabbitmq_detailed_queue_messages_ready{namespace="itops", queue=~"(backup|restore|discovery|azure)\\..*", queue!~".*\\.dlq"}) > 0
+              and on (queue)
+            max by (queue) (rabbitmq_detailed_queue_consumers{namespace="itops"}) == 0
+          for: 15m
+          labels: { severity: warning, service: tmvault, team: it-ops }
+          annotations:
+            summary: "RabbitMQ queue {{ $labels.queue }} has messages waiting but zero consumers"
+            description: >-
+              Work queue {{ $labels.queue }} has had ready messages and no consumer for 15 minutes.
+              The worker Deployment that consumes it is down, wedged before subscribing, or gave up
+              its channel (the 2026-10-13 router-gate incident looked exactly like this). Restart
+              the owning worker and confirm `rabbitmqctl list_queues name consumers`.
+            runbook_url: https://github.com/taylormorrison/tm_vault_backend/blob/main/deploy/taylor-morrison/RUNBOOK.md#rabbitmq-queues-and-broker
+        - alert: TMVaultDeadLetterQueueParked
+          expr: |
+            max by (queue) (rabbitmq_detailed_queue_messages{namespace="itops", queue=~".*\\.dlq|dlq\\..*"}) > 0
+          for: 30m
+          labels: { severity: warning, service: tmvault, team: it-ops }
+          annotations:
+            summary: "Dead-letter queue {{ $labels.queue }} holds {{ $value | humanize }} messages"
+            description: >-
+              Messages have sat in dead-letter queue {{ $labels.queue }} for 30 minutes. Each one is
+              a job that exhausted its retries (or was rejected) and will NOT be retried on its
+              own; the affected resource silently misses its backup/restore until someone
+              inspects and re-queues or discards it.
+            runbook_url: https://github.com/taylormorrison/tm_vault_backend/blob/main/deploy/taylor-morrison/RUNBOOK.md#rabbitmq-queues-and-broker
+        - alert: TMVaultRabbitmqResourceAlarm
+          expr: |
+            max by (pod) (rabbitmq_alarms_memory_used_watermark{namespace="itops"}) > 0
+              or max by (pod) (rabbitmq_alarms_free_disk_space_watermark{namespace="itops"}) > 0
+              or max by (pod) (rabbitmq_alarms_file_descriptor_limit{namespace="itops"}) > 0
+          for: 2m
+          labels: { severity: critical, service: tmvault, team: it-ops }
+          annotations:
+            summary: RabbitMQ {{ $labels.pod }} has a resource alarm (memory, disk or file descriptors)
+            description: >-
+              The broker raised a memory-watermark, free-disk-watermark or file-descriptor alarm.
+              While any alarm is active RabbitMQ BLOCKS publishers, so the scheduler and workers
+              hang on publish and the whole pipeline stalls. Check `rabbitmqctl status` (alarms
+              section), the /var/lib/rabbitmq PVC and the pod's memory limit.
+            runbook_url: https://github.com/taylormorrison/tm_vault_backend/blob/main/deploy/taylor-morrison/RUNBOOK.md#rabbitmq-queues-and-broker
+
+    - name: tmvault-ingress
+      rules:
+        - alert: TMVaultIngressProbeFailing
+          expr: max_over_time(probe_success{job="tmvault-ingress"}[5m]) == 0
+          for: 5m
+          labels: { severity: critical, service: tmvault, team: it-ops }
+          annotations:
+            summary: https://tmvault.taylormorrison.com/ is not answering 2xx from inside the cluster
+            description: >-
+              The blackbox probe (module http_2xx_tls, from the monitoring namespace through the
+              ingress VIP) has failed for 10 minutes straight. Users cannot reach the TM Vault UI.
+              Check the tmvault-frontend pods, the itops/tmvault Ingress and ingress-nginx; if the
+              cluster-wide metallb-vip-ingress-https probe is failing too, the problem is the VIP,
+              not TM Vault.
+            runbook_url: https://github.com/taylormorrison/tm_vault_backend/blob/main/deploy/taylor-morrison/RUNBOOK.md#ingress-probe-failing

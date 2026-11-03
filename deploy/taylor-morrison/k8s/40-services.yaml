@@ -1,0 +1,1165 @@
+---
+# ROLLOUT ORDER for the 2026-07-31 authorization fix — auth-service LAST.
+#   1. alert-service   2. job-service   3. auth-service
+# auth-service is what populates the JWT `tenantIds` claim. Its consumers
+# (alert-service, job-service) fail closed while the claim is empty, so
+# shipping them first cannot open anything; shipping auth-service first makes
+# the claim live against the OLD alert-service, which has no admin guard on
+# DELETE /api/v1/access-groups/{id} — a destructive window. job-service
+# re-derives entitlement from the database when the claim is absent
+# (services/job-service/export_authz.py: entitled_tenants), so it is correct
+# either side of the auth-service rollout.
+#
+# INTERNAL_API_KEY — APPLY THE SECRET FIRST, BEFORE ANY OF THE THREE.
+# Services enumerate individual secretKeyRef entries (workers use
+# envFrom/secretRef and inherit the whole Secret automatically), so a key that
+# is not enumerated here can never reach a service pod no matter what is in
+# Secret tmvault-secrets. audit-service VALIDATES this key on
+# POST /api/v1/audit/log; job-service, snapshot-service and backup-scheduler
+# EMIT with it. Half-configuring it silently 401s the emitters (httpx does not
+# raise on 4xx and those call sites swallow), so it is plumbed uniformly to
+# every service exactly like JWT_SECRET/ENCRYPTION_KEY.
+#   1. kubectl -n itops patch secret tmvault-secrets --type merge \
+#        -p "{\"stringData\":{\"INTERNAL_API_KEY\":\"$(openssl rand -hex 32)\"}}"
+#   2. kubectl -n itops apply -f 40-services.yaml
+# In that order: the ref is NOT optional, so applying this file against a
+# Secret without the key leaves every service pod in
+# CreateContainerConfigError. That is deliberate — it fails loudly instead of
+# leaving the audit gate inert. The SAME value must be used in both lineages'
+# manifests; there is one Secret and one audit-service.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: auth-service, namespace: itops, labels: { app: auth-service, stack: tmvault } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: auth-service } }
+  template:
+    metadata: { labels: { app: auth-service, stack: tmvault } }
+    spec:
+      imagePullSecrets: [ { name: harbor-creds } ]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: auth-service
+          image: harbor.taylormorrison.com/library/tmvault-auth-service@sha256:a60e20eefbcb571d684708797b36f29f8248fa3561ad089607af1b0f693dd2b1
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+          ports: [ { containerPort: 8001 } ]
+          envFrom:
+            - configMapRef: { name: tmvault-config }
+          env:
+            - { name: PORT, value: "8001" }
+            - name: DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: DB_PASSWORD } }
+            - name: JWT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: JWT_SECRET } }
+            - name: ENCRYPTION_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ENCRYPTION_KEY } }
+            - name: INTERNAL_API_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: INTERNAL_API_KEY } }
+            - name: REDIS_PASSWORD
+              # optional: the code passes password=REDIS_PASSWORD or None, so a
+              # missing key means no-auth mode — only the redis container itself
+              # hard-requires the secret (fail-loud there is deliberate).
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: REDIS_PASSWORD, optional: true } }
+            - name: RABBITMQ_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: RABBITMQ_PASSWORD } }
+            - name: ONPREM_S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_ACCESS_KEY } }
+            - name: ONPREM_S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_SECRET_KEY } }
+            - name: SPA_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_ID } }
+            - name: SPA_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_SECRET } }
+            - name: SPA_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_TENANT_ID } }
+            - name: APP_1_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_ID } }
+            - name: APP_1_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_SECRET } }
+            - name: APP_1_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_TENANT_ID } }
+          readinessProbe:
+            httpGet: { path: /health, port: 8001 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          livenessProbe:
+            httpGet: { path: /health, port: 8001 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: auth-service, namespace: itops, labels: { app: auth-service, stack: tmvault } }
+spec:
+  selector: { app: auth-service }
+  ports: [ { port: 8001, targetPort: 8001 } ]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: tenant-service, namespace: itops, labels: { app: tenant-service, stack: tmvault } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: tenant-service } }
+  template:
+    metadata: { labels: { app: tenant-service, stack: tmvault } }
+    spec:
+      imagePullSecrets: [ { name: harbor-creds } ]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: tenant-service
+          image: harbor.taylormorrison.com/library/tmvault-tenant-service@sha256:d5665438c826aa18593699386fdae8d5e094bfe678c1d452417ebdc0d461239a
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+          ports: [ { containerPort: 8002 } ]
+          envFrom:
+            - configMapRef: { name: tmvault-config }
+          env:
+            - { name: PORT, value: "8002" }
+            - name: DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: DB_PASSWORD } }
+            - name: JWT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: JWT_SECRET } }
+            - name: ENCRYPTION_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ENCRYPTION_KEY } }
+            - name: INTERNAL_API_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: INTERNAL_API_KEY } }
+            - name: RABBITMQ_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: RABBITMQ_PASSWORD } }
+            - name: ONPREM_S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_ACCESS_KEY } }
+            - name: ONPREM_S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_SECRET_KEY } }
+            - name: SPA_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_ID } }
+            - name: SPA_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_SECRET } }
+            - name: SPA_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_TENANT_ID } }
+            - name: APP_1_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_ID } }
+            - name: APP_1_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_SECRET } }
+            - name: APP_1_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_TENANT_ID } }
+          readinessProbe:
+            httpGet: { path: /health, port: 8002 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          livenessProbe:
+            httpGet: { path: /health, port: 8002 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: tenant-service, namespace: itops, labels: { app: tenant-service, stack: tmvault } }
+spec:
+  selector: { app: tenant-service }
+  ports: [ { port: 8002, targetPort: 8002 } ]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: resource-service, namespace: itops, labels: { app: resource-service, stack: tmvault } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: resource-service } }
+  template:
+    metadata: { labels: { app: resource-service, stack: tmvault } }
+    spec:
+      imagePullSecrets: [ { name: harbor-creds } ]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: resource-service
+          image: harbor.taylormorrison.com/library/tmvault-resource-service@sha256:b260c82380299fb909110b6113f8a12dcd88e300c2c6871114f31fa03fa744e1
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+          ports: [ { containerPort: 8003 } ]
+          envFrom:
+            - configMapRef: { name: tmvault-config }
+          env:
+            - { name: PORT, value: "8003" }
+            - name: DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: DB_PASSWORD } }
+            - name: JWT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: JWT_SECRET } }
+            - name: ENCRYPTION_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ENCRYPTION_KEY } }
+            - name: INTERNAL_API_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: INTERNAL_API_KEY } }
+            - name: RABBITMQ_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: RABBITMQ_PASSWORD } }
+            - name: ONPREM_S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_ACCESS_KEY } }
+            - name: ONPREM_S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_SECRET_KEY } }
+            - name: SPA_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_ID } }
+            - name: SPA_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_SECRET } }
+            - name: SPA_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_TENANT_ID } }
+            - name: APP_1_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_ID } }
+            - name: APP_1_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_SECRET } }
+            - name: APP_1_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_TENANT_ID } }
+          readinessProbe:
+            httpGet: { path: /health, port: 8003 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          livenessProbe:
+            httpGet: { path: /health, port: 8003 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: resource-service, namespace: itops, labels: { app: resource-service, stack: tmvault } }
+spec:
+  selector: { app: resource-service }
+  ports: [ { port: 8003, targetPort: 8003 } ]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: job-service, namespace: itops, labels: { app: job-service, stack: tmvault } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: job-service } }
+  template:
+    metadata: { labels: { app: job-service, stack: tmvault } }
+    spec:
+      imagePullSecrets: [ { name: harbor-creds } ]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: job-service
+          image: harbor.taylormorrison.com/library/tmvault-job-service@sha256:cc39d8efb05beeb8f8b697272967a23a40000dd6e2e8ed676f2006d73eefee08
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+          ports: [ { containerPort: 8004 } ]
+          envFrom:
+            - configMapRef: { name: tmvault-config }
+          env:
+            - { name: PORT, value: "8004" }
+            - name: DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: DB_PASSWORD } }
+            - name: JWT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: JWT_SECRET } }
+            - name: ENCRYPTION_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ENCRYPTION_KEY } }
+            - name: INTERNAL_API_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: INTERNAL_API_KEY } }
+            - name: REDIS_PASSWORD
+              # optional: the code passes password=REDIS_PASSWORD or None, so a
+              # missing key means no-auth mode — only the redis container itself
+              # hard-requires the secret (fail-loud there is deliberate).
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: REDIS_PASSWORD, optional: true } }
+            - name: RABBITMQ_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: RABBITMQ_PASSWORD } }
+            - name: ONPREM_S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_ACCESS_KEY } }
+            - name: ONPREM_S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_SECRET_KEY } }
+            - name: SPA_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_ID } }
+            - name: SPA_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_SECRET } }
+            - name: SPA_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_TENANT_ID } }
+            - name: APP_1_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_ID } }
+            - name: APP_1_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_SECRET } }
+            - name: APP_1_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_TENANT_ID } }
+          readinessProbe:
+            httpGet: { path: /health, port: 8004 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          livenessProbe:
+            httpGet: { path: /health, port: 8004 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: job-service, namespace: itops, labels: { app: job-service, stack: tmvault } }
+spec:
+  selector: { app: job-service }
+  ports: [ { port: 8004, targetPort: 8004 } ]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: snapshot-service, namespace: itops, labels: { app: snapshot-service, stack: tmvault } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: snapshot-service } }
+  template:
+    metadata: { labels: { app: snapshot-service, stack: tmvault } }
+    spec:
+      imagePullSecrets: [ { name: harbor-creds } ]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: snapshot-service
+          image: harbor.taylormorrison.com/library/tmvault-snapshot-service@sha256:d1c028a2ce30479e1e73477cc1d83b418919cb205f26da3ca9299eb5a863ba52
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+          ports: [ { containerPort: 8005 } ]
+          envFrom:
+            - configMapRef: { name: tmvault-config }
+          env:
+            - { name: PORT, value: "8005" }
+            - name: DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: DB_PASSWORD } }
+            - name: JWT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: JWT_SECRET } }
+            - name: ENCRYPTION_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ENCRYPTION_KEY } }
+            - name: INTERNAL_API_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: INTERNAL_API_KEY } }
+            - name: RABBITMQ_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: RABBITMQ_PASSWORD } }
+            - name: ONPREM_S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_ACCESS_KEY } }
+            - name: ONPREM_S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_SECRET_KEY } }
+            - name: SPA_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_ID } }
+            - name: SPA_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_SECRET } }
+            - name: SPA_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_TENANT_ID } }
+            - name: APP_1_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_ID } }
+            - name: APP_1_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_SECRET } }
+            - name: APP_1_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_TENANT_ID } }
+          readinessProbe:
+            httpGet: { path: /health, port: 8005 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+          # failureThreshold 40: the lifespan folder-path backfill runs
+          # unbounded UPDATEs over snapshot_items before /health serves;
+          # at 54GB+ table size it exceeded the default 2-min liveness
+          # budget and the kubelet killed the pod mid-backfill forever
+          # (2026-07-20). Applied live then; persisted here so a re-apply
+          # doesn't revert it. Durable fix = move backfill off the
+          # serving path, then this can tighten again.
+          livenessProbe:
+            httpGet: { path: /health, port: 8005 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 40
+          resources:
+            requests: { cpu: "50m", memory: "256Mi" }
+            # 3Gi: applied live 2026-07-20 when 1.5Gi OOMed on the
+            # unbounded /mail materialization; persisted so re-apply
+            # doesn't revert. The 2026-07-21 SQL-side pagination fix
+            # (_paged_latest_items) removes that failure mode — the
+            # limit is deliberate headroom for the remaining aggregate
+            # endpoints and can come down once they prove stable.
+            limits: { cpu: "500m", memory: "3Gi" }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: snapshot-service, namespace: itops, labels: { app: snapshot-service, stack: tmvault } }
+spec:
+  selector: { app: snapshot-service }
+  ports: [ { port: 8005, targetPort: 8005 } ]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: dashboard-service, namespace: itops, labels: { app: dashboard-service, stack: tmvault } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: dashboard-service } }
+  template:
+    metadata: { labels: { app: dashboard-service, stack: tmvault } }
+    spec:
+      imagePullSecrets: [ { name: harbor-creds } ]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: dashboard-service
+          image: harbor.taylormorrison.com/library/tmvault-dashboard-service@sha256:5064be7fe97fd7dae9f433246a518071a57cb93d97171a9588c337cc97ef6b18
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+          ports: [ { containerPort: 8006 } ]
+          envFrom:
+            - configMapRef: { name: tmvault-config }
+          env:
+            - { name: PORT, value: "8006" }
+            - { name: DB_RO_HOST, value: "postgres-ha-ro.databases.svc.cluster.local" }  # 2026-10-15: protected-bytes rollups read on the replica
+            - { name: PROTECTED_PREWARM_ENABLED, value: "true" }
+            - { name: PROTECTED_PREWARM_INTERVAL_S, value: "300" }
+            - name: DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: DB_PASSWORD } }
+            - name: JWT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: JWT_SECRET } }
+            - name: ENCRYPTION_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ENCRYPTION_KEY } }
+            - name: INTERNAL_API_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: INTERNAL_API_KEY } }
+            - name: RABBITMQ_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: RABBITMQ_PASSWORD } }
+            - name: ONPREM_S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_ACCESS_KEY } }
+            - name: ONPREM_S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_SECRET_KEY } }
+            - name: SPA_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_ID } }
+            - name: SPA_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_SECRET } }
+            - name: SPA_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_TENANT_ID } }
+            - name: APP_1_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_ID } }
+            - name: APP_1_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_SECRET } }
+            - name: APP_1_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_TENANT_ID } }
+          readinessProbe:
+            httpGet: { path: /health, port: 8006 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          livenessProbe:
+            httpGet: { path: /health, port: 8006 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: dashboard-service, namespace: itops, labels: { app: dashboard-service, stack: tmvault } }
+spec:
+  selector: { app: dashboard-service }
+  ports: [ { port: 8006, targetPort: 8006 } ]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: alert-service, namespace: itops, labels: { app: alert-service, stack: tmvault } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: alert-service } }
+  template:
+    metadata: { labels: { app: alert-service, stack: tmvault } }
+    spec:
+      imagePullSecrets: [ { name: harbor-creds } ]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: alert-service
+          image: harbor.taylormorrison.com/library/tmvault-alert-service@sha256:ea4b4b2c7b04ccb1796e69320b1ff77fb98e72093c03893bfd20e964260b01a9
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+          ports: [ { containerPort: 8007 } ]
+          envFrom:
+            - configMapRef: { name: tmvault-config }
+          env:
+            - { name: PORT, value: "8007" }
+            - name: DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: DB_PASSWORD } }
+            - name: JWT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: JWT_SECRET } }
+            - name: ENCRYPTION_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ENCRYPTION_KEY } }
+            - name: INTERNAL_API_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: INTERNAL_API_KEY } }
+            - name: RABBITMQ_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: RABBITMQ_PASSWORD } }
+            - name: ONPREM_S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_ACCESS_KEY } }
+            - name: ONPREM_S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_SECRET_KEY } }
+            - name: SPA_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_ID } }
+            - name: SPA_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_SECRET } }
+            - name: SPA_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_TENANT_ID } }
+            - name: APP_1_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_ID } }
+            - name: APP_1_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_SECRET } }
+            - name: APP_1_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_TENANT_ID } }
+          readinessProbe:
+            httpGet: { path: /health, port: 8007 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          livenessProbe:
+            httpGet: { path: /health, port: 8007 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: alert-service, namespace: itops, labels: { app: alert-service, stack: tmvault } }
+spec:
+  selector: { app: alert-service }
+  ports: [ { port: 8007, targetPort: 8007 } ]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: backup-scheduler, namespace: itops, labels: { app: backup-scheduler, stack: tmvault } }
+spec:
+  replicas: 1
+  # The scheduler holds process-local per-policy locks and a drain tick;
+  # two pods during a RollingUpdate would race the cap.
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: backup-scheduler } }
+  template:
+    metadata: { labels: { app: backup-scheduler, stack: tmvault } }
+    spec:
+      imagePullSecrets: [ { name: harbor-creds } ]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: backup-scheduler
+          image: harbor.taylormorrison.com/library/tmvault-backup-scheduler@sha256:46f4776f6674070d655e8e2a1c5fbb4e5bc7d4155d1a1473e96e145eec12eef4
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+          ports: [ { containerPort: 8008 } ]
+          envFrom:
+            - configMapRef: { name: tmvault-config }
+          env:
+            - { name: PORT, value: "8008" }
+            - name: DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: DB_PASSWORD } }
+            - name: JWT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: JWT_SECRET } }
+            - name: ENCRYPTION_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ENCRYPTION_KEY } }
+            - name: INTERNAL_API_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: INTERNAL_API_KEY } }
+            - name: RABBITMQ_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: RABBITMQ_PASSWORD } }
+            - name: ONPREM_S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_ACCESS_KEY } }
+            - name: ONPREM_S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_SECRET_KEY } }
+            - name: SPA_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_ID } }
+            - name: SPA_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_SECRET } }
+            - name: SPA_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_TENANT_ID } }
+            - name: APP_1_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_ID } }
+            - name: APP_1_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_SECRET } }
+            - name: APP_1_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_TENANT_ID } }
+          readinessProbe:
+            httpGet: { path: /health, port: 8008 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          livenessProbe:
+            httpGet: { path: /health, port: 8008 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: backup-scheduler, namespace: itops, labels: { app: backup-scheduler, stack: tmvault } }
+spec:
+  selector: { app: backup-scheduler }
+  ports: [ { port: 8008, targetPort: 8008 } ]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: graph-proxy, namespace: itops, labels: { app: graph-proxy, stack: tmvault } }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: graph-proxy } }
+  template:
+    metadata: { labels: { app: graph-proxy, stack: tmvault } }
+    spec:
+      imagePullSecrets: [ { name: harbor-creds } ]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: graph-proxy
+          image: harbor.taylormorrison.com/library/tmvault-graph-proxy@sha256:c6d49380e39e57ecf881ad5b6e748328d68407cad91289a4bdf9c63bc8925de5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+          ports: [ { containerPort: 8009 } ]
+          envFrom:
+            - configMapRef: { name: tmvault-config }
+          env:
+            - { name: PORT, value: "8009" }
+            - name: DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: DB_PASSWORD } }
+            - name: JWT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: JWT_SECRET } }
+            - name: ENCRYPTION_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ENCRYPTION_KEY } }
+            - name: INTERNAL_API_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: INTERNAL_API_KEY } }
+            - name: REDIS_PASSWORD
+              # optional: the code passes password=REDIS_PASSWORD or None, so a
+              # missing key means no-auth mode — only the redis container itself
+              # hard-requires the secret (fail-loud there is deliberate).
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: REDIS_PASSWORD, optional: true } }
+            - name: RABBITMQ_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: RABBITMQ_PASSWORD } }
+            - name: ONPREM_S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_ACCESS_KEY } }
+            - name: ONPREM_S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_SECRET_KEY } }
+            - name: SPA_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_ID } }
+            - name: SPA_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_SECRET } }
+            - name: SPA_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_TENANT_ID } }
+            - name: APP_1_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_ID } }
+            - name: APP_1_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_SECRET } }
+            - name: APP_1_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_TENANT_ID } }
+          readinessProbe:
+            httpGet: { path: /health, port: 8009 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          livenessProbe:
+            httpGet: { path: /health, port: 8009 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: graph-proxy, namespace: itops, labels: { app: graph-proxy, stack: tmvault } }
+spec:
+  selector: { app: graph-proxy }
+  ports: [ { port: 8009, targetPort: 8009 } ]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: delta-token, namespace: itops, labels: { app: delta-token, stack: tmvault } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: delta-token } }
+  template:
+    metadata: { labels: { app: delta-token, stack: tmvault } }
+    spec:
+      imagePullSecrets: [ { name: harbor-creds } ]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: delta-token
+          image: harbor.taylormorrison.com/library/tmvault-delta-token@sha256:5c810353100f4afa21758d4393109c5428b2873120fc19544758f13bf4a83bf3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+          ports: [ { containerPort: 8010 } ]
+          envFrom:
+            - configMapRef: { name: tmvault-config }
+          env:
+            - { name: PORT, value: "8010" }
+            - name: DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: DB_PASSWORD } }
+            - name: JWT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: JWT_SECRET } }
+            - name: ENCRYPTION_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ENCRYPTION_KEY } }
+            - name: INTERNAL_API_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: INTERNAL_API_KEY } }
+            - name: REDIS_PASSWORD
+              # optional: the code passes password=REDIS_PASSWORD or None, so a
+              # missing key means no-auth mode — only the redis container itself
+              # hard-requires the secret (fail-loud there is deliberate).
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: REDIS_PASSWORD, optional: true } }
+            - name: RABBITMQ_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: RABBITMQ_PASSWORD } }
+            - name: ONPREM_S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_ACCESS_KEY } }
+            - name: ONPREM_S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_SECRET_KEY } }
+            - name: SPA_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_ID } }
+            - name: SPA_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_SECRET } }
+            - name: SPA_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_TENANT_ID } }
+            - name: APP_1_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_ID } }
+            - name: APP_1_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_SECRET } }
+            - name: APP_1_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_TENANT_ID } }
+          readinessProbe:
+            httpGet: { path: /health, port: 8010 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          livenessProbe:
+            httpGet: { path: /health, port: 8010 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: delta-token, namespace: itops, labels: { app: delta-token, stack: tmvault } }
+spec:
+  selector: { app: delta-token }
+  ports: [ { port: 8010, targetPort: 8010 } ]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: progress-tracker, namespace: itops, labels: { app: progress-tracker, stack: tmvault } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: progress-tracker } }
+  template:
+    metadata: { labels: { app: progress-tracker, stack: tmvault } }
+    spec:
+      imagePullSecrets: [ { name: harbor-creds } ]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: progress-tracker
+          image: harbor.taylormorrison.com/library/tmvault-progress-tracker@sha256:338c5cec51007e75230184949d2311480eb6913b9328824fa48e34e985e7862c
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+          ports: [ { containerPort: 8011 } ]
+          envFrom:
+            - configMapRef: { name: tmvault-config }
+          env:
+            - { name: PORT, value: "8011" }
+            - name: DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: DB_PASSWORD } }
+            - name: JWT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: JWT_SECRET } }
+            - name: ENCRYPTION_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ENCRYPTION_KEY } }
+            - name: INTERNAL_API_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: INTERNAL_API_KEY } }
+            - name: RABBITMQ_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: RABBITMQ_PASSWORD } }
+            - name: ONPREM_S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_ACCESS_KEY } }
+            - name: ONPREM_S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_SECRET_KEY } }
+            - name: SPA_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_ID } }
+            - name: SPA_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_SECRET } }
+            - name: SPA_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_TENANT_ID } }
+            - name: APP_1_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_ID } }
+            - name: APP_1_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_SECRET } }
+            - name: APP_1_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_TENANT_ID } }
+          readinessProbe:
+            httpGet: { path: /health, port: 8011 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          livenessProbe:
+            httpGet: { path: /health, port: 8011 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: progress-tracker, namespace: itops, labels: { app: progress-tracker, stack: tmvault } }
+spec:
+  selector: { app: progress-tracker }
+  ports: [ { port: 8011, targetPort: 8011 } ]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: audit-service, namespace: itops, labels: { app: audit-service, stack: tmvault } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: audit-service } }
+  template:
+    metadata: { labels: { app: audit-service, stack: tmvault } }
+    spec:
+      imagePullSecrets: [ { name: harbor-creds } ]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: audit-service
+          image: harbor.taylormorrison.com/library/tmvault-audit-service@sha256:b1088397a642a8dfd8e8c19cd34efc4975b5a07b6faebcd707f6e516ed9d785f
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+          ports: [ { containerPort: 8012 } ]
+          envFrom:
+            - configMapRef: { name: tmvault-config }
+          env:
+            - { name: PORT, value: "8012" }
+            - name: DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: DB_PASSWORD } }
+            - name: JWT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: JWT_SECRET } }
+            - name: ENCRYPTION_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ENCRYPTION_KEY } }
+            - name: INTERNAL_API_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: INTERNAL_API_KEY } }
+            - name: RABBITMQ_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: RABBITMQ_PASSWORD } }
+            - name: ONPREM_S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_ACCESS_KEY } }
+            - name: ONPREM_S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_SECRET_KEY } }
+            - name: SPA_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_ID } }
+            - name: SPA_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_SECRET } }
+            - name: SPA_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_TENANT_ID } }
+            - name: APP_1_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_ID } }
+            - name: APP_1_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_SECRET } }
+            - name: APP_1_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_TENANT_ID } }
+          readinessProbe:
+            httpGet: { path: /health, port: 8012 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          livenessProbe:
+            httpGet: { path: /health, port: 8012 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: audit-service, namespace: itops, labels: { app: audit-service, stack: tmvault } }
+spec:
+  selector: { app: audit-service }
+  ports: [ { port: 8012, targetPort: 8012 } ]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: search-service, namespace: itops, labels: { app: search-service, stack: tmvault } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: search-service } }
+  template:
+    metadata: { labels: { app: search-service, stack: tmvault } }
+    spec:
+      imagePullSecrets: [ { name: harbor-creds } ]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: search-service
+          image: harbor.taylormorrison.com/library/tmvault-search-service@sha256:17de052153d47d7210ad29f49d7ac3918c2a0624de16cba226ce976308155885
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+          ports: [ { containerPort: 8013 } ]
+          envFrom:
+            - configMapRef: { name: tmvault-config }
+          env:
+            - { name: PORT, value: "8013" }
+            - name: DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: DB_PASSWORD } }
+            - name: JWT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: JWT_SECRET } }
+            - name: ENCRYPTION_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ENCRYPTION_KEY } }
+            - name: INTERNAL_API_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: INTERNAL_API_KEY } }
+            - name: RABBITMQ_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: RABBITMQ_PASSWORD } }
+            - name: ONPREM_S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_ACCESS_KEY } }
+            - name: ONPREM_S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_SECRET_KEY } }
+            - name: SPA_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_ID } }
+            - name: SPA_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_SECRET } }
+            - name: SPA_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_TENANT_ID } }
+            - name: APP_1_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_ID } }
+            - name: APP_1_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_SECRET } }
+            - name: APP_1_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_TENANT_ID } }
+          readinessProbe:
+            httpGet: { path: /health, port: 8013 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          livenessProbe:
+            httpGet: { path: /health, port: 8013 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: search-service, namespace: itops, labels: { app: search-service, stack: tmvault } }
+spec:
+  selector: { app: search-service }
+  ports: [ { port: 8013, targetPort: 8013 } ]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: report-service, namespace: itops, labels: { app: report-service, stack: tmvault } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: report-service } }
+  template:
+    metadata: { labels: { app: report-service, stack: tmvault } }
+    spec:
+      imagePullSecrets: [ { name: harbor-creds } ]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: report-service
+          image: harbor.taylormorrison.com/library/tmvault-report-service@sha256:e600846efd9aeb764624ca8414223292939ec58dec316bef33f84d34bfa0818a
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+          ports: [ { containerPort: 8014 } ]
+          envFrom:
+            - configMapRef: { name: tmvault-config }
+          env:
+            - { name: PORT, value: "8014" }
+            - name: DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: DB_PASSWORD } }
+            - name: JWT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: JWT_SECRET } }
+            - name: ENCRYPTION_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ENCRYPTION_KEY } }
+            - name: INTERNAL_API_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: INTERNAL_API_KEY } }
+            - name: RABBITMQ_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: RABBITMQ_PASSWORD } }
+            - name: ONPREM_S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_ACCESS_KEY } }
+            - name: ONPREM_S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_SECRET_KEY } }
+            - name: SPA_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_ID } }
+            - name: SPA_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_SECRET } }
+            - name: SPA_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_TENANT_ID } }
+            - name: APP_1_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_ID } }
+            - name: APP_1_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_SECRET } }
+            - name: APP_1_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_TENANT_ID } }
+          readinessProbe:
+            httpGet: { path: /health, port: 8014 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          livenessProbe:
+            httpGet: { path: /health, port: 8014 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: report-service, namespace: itops, labels: { app: report-service, stack: tmvault } }
+spec:
+  selector: { app: report-service }
+  ports: [ { port: 8014, targetPort: 8014 } ]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: api-gateway, namespace: itops, labels: { app: api-gateway, stack: tmvault } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: api-gateway } }
+  template:
+    metadata: { labels: { app: api-gateway, stack: tmvault } }
+    spec:
+      imagePullSecrets: [ { name: harbor-creds } ]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: api-gateway
+          image: harbor.taylormorrison.com/library/tmvault-api-gateway@sha256:82bef682d07c6f63a76229ebf9e3dd4778c45b431021f45f9a57972770a6b503
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+          ports: [ { containerPort: 8000 } ]
+          envFrom:
+            - configMapRef: { name: tmvault-config }
+          env:
+            - { name: PORT, value: "8000" }
+            - name: DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: DB_PASSWORD } }
+            - name: JWT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: JWT_SECRET } }
+            - name: ENCRYPTION_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ENCRYPTION_KEY } }
+            - name: INTERNAL_API_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: INTERNAL_API_KEY } }
+            - name: RABBITMQ_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: RABBITMQ_PASSWORD } }
+            - name: ONPREM_S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_ACCESS_KEY } }
+            - name: ONPREM_S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_SECRET_KEY } }
+            - name: SPA_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_ID } }
+            - name: SPA_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_CLIENT_SECRET } }
+            - name: SPA_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SPA_TENANT_ID } }
+            - name: APP_1_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_ID } }
+            - name: APP_1_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_SECRET } }
+            - name: APP_1_TENANT_ID
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_TENANT_ID } }
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          livenessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: api-gateway, namespace: itops, labels: { app: api-gateway, stack: tmvault } }
+spec:
+  selector: { app: api-gateway }
+  ports: [ { port: 8000, targetPort: 8000 } ]

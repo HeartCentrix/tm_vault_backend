@@ -22,6 +22,7 @@ from typing import Optional
 from sqlalchemy import text
 
 from shared.database import async_session_factory
+from shared.copy_workflow import pending_copy_sql
 
 
 async def reclaim_for_replica(
@@ -63,10 +64,10 @@ async def reclaim_for_replica(
         if not old_ids:
             return 0
 
-        for table, in_prog in (
-            ("snapshots", "IN_PROGRESS"),
-            ("snapshot_partitions", "IN_PROGRESS"),
-            ("jobs", "RUNNING"),
+        for table, in_prog, copy_scope in (
+            ("snapshots", "IN_PROGRESS", "snapshot_expr"),
+            ("snapshot_partitions", "IN_PROGRESS", "partition_expr"),
+            ("jobs", "RUNNING", "job_expr"),
         ):
             res = await session.execute(
                 text(
@@ -77,6 +78,7 @@ async def reclaim_for_replica(
                            lease_token      = lease_token + 1
                      WHERE lease_owner_id = ANY(cast(:ids AS uuid[]))
                        AND status::text = :sts
+                       AND {pending_copy_sql(**{copy_scope: f'{table}.id'})}
                     """
                 ),
                 {"ids": old_ids, "sts": in_prog},

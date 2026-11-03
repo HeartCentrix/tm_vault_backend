@@ -12,14 +12,19 @@ import uuid
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, Depends, HTTPException, Query
-from sqlalchemy import select, and_, func, or_, text
+from sqlalchemy import select, and_, cast, exists, func, or_, text, Text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from shared.database import async_session_factory, init_db, close_db
-from shared.models import SnapshotItem, Snapshot, Resource, Tenant
+from shared.models import ChatItemVersion, SnapshotItem, Snapshot, Resource, Tenant
+from shared.chat_catalogue import materialize_chat_items
 
+from shared.audit_middleware import AuditMiddleware  # Ops/Data Check 3: mutation-audit backstop
 app = FastAPI(title="Full-Text Search Service", version="1.0.0")
+app.add_middleware(AuditMiddleware, service_name="search-service")
+from shared.auth_enforcement import AuthMiddleware, is_admin, verified_user  # Ops/Data Check 17: verified principal required
+app.add_middleware(AuthMiddleware, service_name="search-service", enforce_tenant_scope=True)
 
 
 # Dependency - must be before route decorators
@@ -30,46 +35,23 @@ async def get_db():
 
 @app.on_event("startup")
 async def startup():
-    """Initialize database and search index"""
+    """Initialize database"""
     from shared import core_metrics
     core_metrics.init()
     await init_db()
-    # Create GIN index on metadata for faster JSONB search
-    await create_search_index()
+    # NO search DDL here. The former create_search_index() ran a plain
+    # (non-CONCURRENT) CREATE INDEX + ALTER TABLE ... ADD COLUMN IF NOT EXISTS
+    # (ACCESS EXCLUSIVE even as a no-op) + CREATE INDEX on snapshot_items in
+    # ONE transaction at every pod start, and the liveness probe SIGKILLed it
+    # mid-DDL. idx_snapshot_items_metadata_gin, the search_vector column and
+    # idx_snapshot_items_search_vector already exist in prod. Any future
+    # search index MUST ship as an alembic migration using
+    # CREATE INDEX CONCURRENTLY — never from a service startup hook.
 
 
 @app.on_event("shutdown")
 async def shutdown():
     await close_db()
-
-
-async def create_search_index():
-    """Create PostgreSQL full-text search index on snapshot_items"""
-    async with async_session_factory() as session:
-        try:
-            # Create GIN index on metadata JSONB for faster search
-            await session.execute(text("""
-                CREATE INDEX IF NOT EXISTS idx_snapshot_items_metadata_gin
-                ON snapshot_items USING gin ((metadata::jsonb) jsonb_path_ops)
-            """))
-
-            # Create text search vector column if it doesn't exist
-            await session.execute(text("""
-                ALTER TABLE snapshot_items
-                ADD COLUMN IF NOT EXISTS search_vector tsvector
-            """))
-
-            # Create GIN index on search vector
-            await session.execute(text("""
-                CREATE INDEX IF NOT EXISTS idx_snapshot_items_search_vector
-                ON snapshot_items USING gin (search_vector)
-            """))
-
-            await session.commit()
-            print("[SEARCH] Search indexes created successfully")
-        except Exception as e:
-            print(f"[SEARCH] Failed to create search indexes: {e}")
-            await session.rollback()
 
 
 @app.get("/health")
@@ -88,6 +70,7 @@ async def search_snapshots(
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
+    user: dict = Depends(verified_user),
 ):
     """
     Full-text search across all backup snapshot items.
@@ -106,10 +89,7 @@ async def search_snapshots(
     - dateFrom/dateTo: Filter by backup date range (ISO 8601)
     """
     # Build search conditions
-    filters = []
-
-    if tenantId:
-        filters.append(SnapshotItem.tenant_id == uuid.UUID(tenantId))
+    filters = [SnapshotItem.tenant_id.in_(_suggestion_tenant_scope(user, tenantId))]
 
     if itemType:
         filters.append(SnapshotItem.item_type == itemType.upper())
@@ -142,6 +122,7 @@ async def search_snapshots(
         .join(Snapshot, SnapshotItem.snapshot_id == Snapshot.id)
         .join(Resource, Snapshot.resource_id == Resource.id)
         .join(Tenant, Resource.tenant_id == Tenant.id)
+        .where(SnapshotItem.tenant_id == Tenant.id)
     )
 
     if filters:
@@ -166,8 +147,9 @@ async def search_snapshots(
     rows = result.all()
 
     # Format results
+    hydrated = await materialize_chat_items(db, [row[0] for row in rows]) if rows else []
     items = []
-    for snapshot_item, snapshot, resource, tenant in rows:
+    for snapshot_item, (_, snapshot, resource, tenant) in zip(hydrated, rows):
         items.append(format_search_result(snapshot_item, snapshot, resource, tenant, q))
 
     return {
@@ -187,16 +169,52 @@ async def search_snapshots(
     }
 
 
+def _suggestion_tenant_scope(user: dict, tenant_id: Optional[str]) -> List[uuid.UUID]:
+    """Tenant UUIDs the suggestions query may touch — never empty.
+
+    Same principal/tenant mechanism as /api/v1/search: the verified principal
+    (AuthMiddleware, enforce_tenant_scope=True) carries the caller's entitled
+    `tenant_ids`; a caller-supplied `tenantId` is honoured only if entitled.
+    Admin / internal principals carry no tenant claims, so they must name one
+    — the query is never run without a tenant_id predicate.
+    """
+    privileged = is_admin(user) or user.get("_principal") == "internal"
+    entitled: List[uuid.UUID] = []
+    for raw in user.get("tenant_ids") or []:
+        try:
+            entitled.append(uuid.UUID(str(raw)))
+        except (TypeError, ValueError):
+            continue
+    if tenant_id:
+        try:
+            requested = uuid.UUID(tenant_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid tenantId")
+        if not privileged and requested not in entitled:
+            raise HTTPException(status_code=403, detail="Not entitled to the requested tenant")
+        return [requested]
+    if entitled:
+        return entitled
+    if privileged:
+        raise HTTPException(status_code=400, detail="tenantId is required")
+    raise HTTPException(status_code=403, detail="No tenant access")
+
+
 @app.get("/api/v1/search/suggestions")
 async def search_suggestions(
     q: str = Query(..., min_length=2),
     limit: int = Query(10, ge=1, le=50),
+    tenantId: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
+    user: dict = Depends(verified_user),
 ):
-    """Get search suggestions from indexed content"""
-    # Search for similar terms in metadata
+    """Get search suggestions from indexed content (tenant-scoped)"""
+    # An unscoped `name ILIKE '%q%'` per keystroke plans a full seq scan of
+    # snapshot_items (the hottest table). Always constrain to tenant_id.
+    tenant_scope = _suggestion_tenant_scope(user, tenantId)
     stmt = (
         select(SnapshotItem.name, SnapshotItem.item_type, func.count().label('count'))
+        .where(SnapshotItem.tenant_id.in_(tenant_scope))
         .where(SnapshotItem.name.ilike(f"%{q}%"))
         .group_by(SnapshotItem.name, SnapshotItem.item_type)
         .order_by(func.count().desc())
@@ -220,15 +238,30 @@ async def search_suggestions(
 @app.post("/api/v1/search/reindex")
 async def reindex_snapshots(
     snapshot_ids: List[str] = None,
+    limit: int = Query(1000, ge=1, le=10000),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Reindex snapshot items for full-text search.
     Can be used to update search index after backup completion.
+
+    Snapshot-scoped and bounded: `snapshot_ids` are snapshots.id values (the
+    old code matched them against snapshot_items.id, so it never indexed a
+    snapshot's items — and with no ids it selected the whole table). At most
+    `limit` items are indexed per call.
     """
-    stmt = select(SnapshotItem)
-    if snapshot_ids:
-        stmt = stmt.where(SnapshotItem.id.in_([uuid.UUID(sid) for sid in snapshot_ids]))
+    if not snapshot_ids:
+        raise HTTPException(status_code=400, detail="snapshot_ids is required")
+    try:
+        snapshot_uuids = [uuid.UUID(sid) for sid in snapshot_ids]
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid snapshot id")
+
+    stmt = (
+        select(SnapshotItem)
+        .where(SnapshotItem.snapshot_id.in_(snapshot_uuids))
+        .limit(limit)
+    )
 
     result = await db.execute(stmt)
     items = result.scalars().all()
@@ -238,12 +271,20 @@ async def reindex_snapshots(
         await index_snapshot_item(item, db)
         indexed_count += 1
 
-    return {"indexed": indexed_count}
+    # The per-item search_vector UPDATEs ran on the request session; without
+    # an explicit commit they are rolled back when get_db() closes it.
+    await db.commit()
+
+    return {"indexed": indexed_count, "limit": limit}
 
 
 async def index_snapshot_item(item: SnapshotItem, db: AsyncSession):
     """Index a single snapshot item for full-text search"""
     try:
+        # Captured versions are authoritative; the mutable shared cache only
+        # hydrates legacy links. Materialization also rejects broken format-1 links.
+        if item.chat_version_id is not None or item.item_type == "TEAMS_CHAT_MESSAGE":
+            item, = await materialize_chat_items(db, [item])
         # SnapshotItem ORM aliases the JSON column to `extra_data` (the DB
         # column is named ``metadata``); use the attribute the ORM exposes.
         metadata = getattr(item, "extra_data", None) or {}
@@ -254,7 +295,7 @@ async def index_snapshot_item(item: SnapshotItem, db: AsyncSession):
         # the 2026-05-13 Level 2 refactor; the body / sender / payload
         # live in chat_thread_messages. Hydrate them so search continues
         # to index chat content.
-        if item.item_type in ("TEAMS_CHAT_MESSAGE",) and not raw_data:
+        if item.item_type == "TEAMS_CHAT_MESSAGE" and item.chat_version_id is None and not raw_data:
             try:
                 row = (await db.execute(text(
                     "SELECT ctm.body_content, ctm.from_display_name, "
@@ -381,14 +422,18 @@ def build_text_search_filters(search_terms: List[str]) -> list:
         # Search in name
         name_filter = SnapshotItem.name.ilike(f"%{term}%")
 
-        # Search in metadata JSONB
-        # PostgreSQL JSONB containment operator
-        metadata_filter = text(
-            "snapshot_items.metadata::text ILIKE :term"
-        ).bindparams(term=f"%{term}%")
+        metadata_filter = cast(SnapshotItem.extra_data, Text).ilike(f"%{term}%")
 
-        # Combine with OR (match name OR metadata)
-        filters.append(or_(name_filter, metadata_filter))
+        # Filter against the captured payload before count/pagination without
+        # copying heavy historical bodies into each thin snapshot link.
+        captured_filter = exists(select(ChatItemVersion.id).where(
+            ChatItemVersion.id == SnapshotItem.chat_version_id,
+            ChatItemVersion.tenant_id == SnapshotItem.tenant_id,
+            ChatItemVersion.chat_id == SnapshotItem.extra_data["chat_id"].as_string(),
+            ChatItemVersion.item_type == SnapshotItem.item_type,
+            cast(ChatItemVersion.payload, Text).ilike(f"%{term}%"),
+        ))
+        filters.append(or_(name_filter, metadata_filter, captured_filter))
 
     # All terms must match (AND)
     return filters
@@ -402,8 +447,10 @@ def format_search_result(
     query: str,
 ) -> Dict[str, Any]:
     """Format a search result for API response"""
-    metadata = item.metadata or {}
-    raw_data = metadata.get("raw", {})
+    # SnapshotItem maps the DB column ``metadata`` to ``extra_data``;
+    # ``item.metadata`` is the declarative Base's MetaData object.
+    metadata = item.extra_data or {}
+    raw_data = metadata.get("raw", {}) if isinstance(metadata, dict) else {}
 
     # Build preview/snippet
     preview = build_preview(item, raw_data, query)

@@ -200,14 +200,16 @@ class PostgresBackupHandler:
             snapshot.blob_path = f"{server_name}/{primary_db}/{snapshot.id.hex[:12]}/"
 
             # Per-database blob locations so the restore handler can
-            # look up the right schema dump and data folder for whichever
+            # look up the right schema tree and data folder for whichever
             # source DB the user picks. Without these the restorer falls
             # back to "primary_db" and can't restore any other DB the
-            # snapshot covers.
-            schema_blobs = {
-                db: r["schema"].get("blob_path", "")
+            # snapshot covers. schema_prefixes points at the FOLDER of
+            # per-object schema files (the old schema_blobs key held a
+            # single file and made restores rebuild one table).
+            schema_prefixes = {
+                db: r["schema"].get("prefix", "")
                 for db, r in per_db_results.items()
-                if r["schema"].get("blob_path")
+                if r["schema"].get("prefix")
             }
             data_prefixes = {
                 db: f"{server_name}/{db}/{snapshot.id.hex[:12]}/"
@@ -224,7 +226,7 @@ class PostgresBackupHandler:
                 "databases_count": len(per_db_results),
                 "databases": list(per_db_results.keys()),
                 "config_blob": config_result.get("blob_path", ""),
-                "schema_blobs": schema_blobs,
+                "schema_prefixes": schema_prefixes,
                 "data_prefixes": data_prefixes,
                 "server_name": server_name,
                 "database_name": primary_db,
@@ -715,7 +717,11 @@ class PostgresBackupHandler:
         return {
             "files": files,
             "size_bytes": total_bytes,
-            "blob_path": files[0]["blob_path"] if files else "",
+            # Folder prefix of the whole schema tree — restore replays
+            # every file under it. Never expose a single file here:
+            # storing files[0] as "the schema" made FULL restores
+            # rebuild exactly one table.
+            "prefix": f"{snap_dir}/" if files else "",
         }
 
     async def _capture_configuration(self, server_name: str, sub_id: str,

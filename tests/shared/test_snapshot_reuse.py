@@ -60,10 +60,12 @@ class _StubSession:
 
 
 def _run(coro):
-    # A fresh loop per call — get_event_loop() raises "no current event loop"
-    # once any prior pytest-asyncio test in the run closes the default loop
-    # (this file's failures were purely that ordering artifact, not logic).
-    return asyncio.new_event_loop().run_until_complete(coro)
+    # asyncio.run, not get_event_loop().run_until_complete: get_event_loop()
+    # raises "There is no current event loop" as soon as ANY earlier test in
+    # the session has called asyncio.run (which closes and unsets the loop) —
+    # so every test in this file failed whenever it ran after
+    # tests/shared/test_retention_*.py, and passed in isolation.
+    return asyncio.run(coro)
 
 
 def test_full_snapshot_resolves_to_itself():

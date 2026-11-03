@@ -1,0 +1,35 @@
+# probe-tmvault-ingress.yaml — synthetic HTTPS check of the TM Vault UI through the ingress.
+# NOT applied by any script; see README.md in this folder.
+#
+# Selected by Prometheus through `release: kube-prometheus-stack` (probeNamespaceSelector: {}).
+# The cluster has no Probe CRs yet; its blackbox checks are ServiceMonitors with static
+# params (monitoring/blackbox-exporter-...-metallb-vip-ingress-https). This Probe uses the
+# same exporter (monitoring/blackbox-exporter-prometheus-blackbox-exporter:9115) and the
+# `http_2xx_tls` module from its ConfigMap: GET, follow redirects, expect 2xx, skip TLS
+# verification — required because tmvault.taylormorrison.com serves the internal wildcard
+# cert (secret wildcard-tls), which the exporter's trust store rejects. In-cluster the host
+# resolves to the ingress VIP 192.168.207.41, the same VIP the existing probe already
+# reaches, so no NetworkPolicy change is needed for this file.
+# `/` is served by tmvault-frontend (its own readinessProbe path), so a 2xx proves
+# DNS -> VIP -> ingress-nginx -> frontend pod end to end.
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: tmvault-ingress
+  namespace: itops
+  labels: { release: kube-prometheus-stack, stack: tmvault }
+spec:
+  jobName: tmvault-ingress
+  interval: 30s
+  scrapeTimeout: 10s
+  module: http_2xx_tls
+  prober:
+    url: blackbox-exporter-prometheus-blackbox-exporter.monitoring.svc:9115
+    scheme: http
+    path: /probe
+  targets:
+    staticConfig:
+      static:
+        - https://tmvault.taylormorrison.com/
+      labels:
+        stack: tmvault

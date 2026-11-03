@@ -10,18 +10,51 @@ Responsibilities:
 - Request metrics and monitoring
 """
 import asyncio
+import json
+import math
+from types import SimpleNamespace
+import secrets
 import time
 import uuid
 from datetime import datetime
 from typing import Dict, List, Any, Optional
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel
 import httpx
 from redis.asyncio import Redis
 
 from shared.config import settings
 
+from shared.audit_middleware import AuditMiddleware  # Ops/Data Check 3: mutation-audit backstop
 app = FastAPI(title="Graph Proxy Service", version="2.0.0")
+app.add_middleware(AuditMiddleware, service_name="graph-proxy", extra_excludes=("/graph",))  # /graph is an outbound MS-Graph passthrough, not a TM Vault data mutation — auditing it floods audit_events
+
+
+def require_internal_api_key(
+    x_internal_api_key: Optional[str] = Header(default=None, alias="X-Internal-Api-Key"),
+) -> None:
+    """Reject any request that doesn't carry the internal-services shared secret.
+
+    The /graph routes forward arbitrary Microsoft Graph calls with the backup
+    app's client-credentials token — unauthenticated, any pod (or kubectl exec)
+    in the namespace could act as the app against every tenant. Same gate as
+    services/delta-token: fail closed (503) when the secret isn't configured so
+    a misconfigured deploy can't silently expose the routes.
+    """
+    expected = settings.INTERNAL_API_KEY
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="INTERNAL_API_KEY not configured",
+        )
+    if not x_internal_api_key or not secrets.compare_digest(
+        x_internal_api_key, expected
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing internal API key",
+        )
+
 
 # Redis for token caching
 redis_client: Optional[Redis] = None
@@ -141,6 +174,10 @@ async def startup():
                 host=settings.REDIS_HOST,
                 port=settings.REDIS_PORT,
                 db=settings.REDIS_DB,
+                # `or None` is load-bearing (ITO-10192): password="" would
+                # send AUTH against a no-auth server and error, so pods
+                # without the env var keep working unchanged.
+                password=settings.REDIS_PASSWORD or None,
                 decode_responses=True
             )
             await redis_client.ping()
@@ -171,7 +208,7 @@ async def health_check():
     }
 
 
-@app.post("/graph/batch")
+@app.post("/graph/batch", dependencies=[Depends(require_internal_api_key)])
 async def execute_batch_request(batch_request: GraphBatchRequest, tenant_id: str):
     """
     Execute batch request to Graph API
@@ -186,56 +223,16 @@ async def execute_batch_request(batch_request: GraphBatchRequest, tenant_id: str
             detail="Batch request cannot contain more than 20 requests"
         )
     
-    # Check throttle state
-    if not throttle_manager.can_execute(tenant_id):
-        raise HTTPException(
-            status_code=429,
-            detail="Throttle limit exceeded. Try again later."
-        )
-    
-    # Get access token
-    access_token = await get_graph_token(tenant_id)
-    
-    # Execute batch request
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.post(
-            "https://graph.microsoft.com/v1.0/$batch",
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json",
-            },
-            json={"requests": batch_request.requests}
-        )
-    
-    # Handle response
-    if response.status_code == 429:
-        # Throttled - extract retry-after header
-        retry_after = int(response.headers.get("Retry-After", "60"))
-        throttle_manager.record_throttle(tenant_id, retry_after)
-        
-        raise HTTPException(
-            status_code=429,
-            detail=f"Graph API throttled. Retry after {retry_after} seconds.",
-            headers={"Retry-After": str(retry_after)}
-        )
-    
-    if response.status_code == 200:
-        throttle_manager.record_success(tenant_id)
-        return response.json()
-    
-    raise HTTPException(
-        status_code=response.status_code,
-        detail=f"Graph API error: {response.text}"
-    )
+    return await _proxy_data("POST", "$batch", tenant_id, {"requests": batch_request.requests})
 
 
-@app.get("/graph/{path:path}")
+@app.get("/graph/{path:path}", dependencies=[Depends(require_internal_api_key)])
 async def proxy_get_request(path: str, tenant_id: str, request: Request):
     """Proxy GET request to Graph API with throttling"""
     return await proxy_request("GET", path, tenant_id, dict(request.query_params))
 
 
-@app.post("/graph/{path:path}")
+@app.post("/graph/{path:path}", dependencies=[Depends(require_internal_api_key)])
 async def proxy_post_request(path: str, tenant_id: str, request: Request):
     """Proxy POST request to Graph API with throttling"""
     body = await request.json() if request.method == "POST" else None
@@ -243,59 +240,71 @@ async def proxy_post_request(path: str, tenant_id: str, request: Request):
 
 
 async def proxy_request(method: str, path: str, tenant_id: str, body: Optional[Dict] = None):
-    """Generic Graph API proxy with throttling"""
-    # Check throttle
+    """One transmission; an upstream retry decision belongs to its caller."""
+    return await _proxy_data(method, path, tenant_id, body)
+
+
+def _proxy_http(raw, token):
+    from shared.graph_rate_limiter import graph_rate_limiter
+    if not graph_rate_limiter.scoped_enabled:
+        return raw
+    context = getattr(token, "provider_owner", None)
+    if context is None:
+        raise HTTPException(status_code=503, detail="Provider credential context unavailable")
+    from shared.provider_http import AdmittedHttpClient
+    return AdmittedHttpClient(raw, context)
+
+
+async def _proxy_data(method, path, tenant_id, body):
+    from shared.graph_rate_limiter import graph_rate_limiter
+    from shared.graph_ratelimit import parse_retry_after
+    from shared.provider_admission import ProviderDeferred
+    from shared.provider_read import ProviderReadError
     if not throttle_manager.can_execute(tenant_id):
-        raise HTTPException(status_code=429, detail="Throttle limit exceeded")
-    
-    # Get token
-    access_token = await get_graph_token(tenant_id)
-    
-    # Build Graph API URL
-    graph_url = f"https://graph.microsoft.com/v1.0/{path}"
-    
-    # Execute request with retry logic
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.request(
-            method=method,
-            url=graph_url,
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json",
-            },
-            json=body if method == "POST" else None
-        )
-    
-    # Handle throttling
-    if response.status_code == 429:
-        retry_after = int(response.headers.get("Retry-After", "60"))
-        throttle_manager.record_throttle(tenant_id, retry_after)
-        
-        # Wait and retry once
-        await asyncio.sleep(retry_after)
-        
-        if not throttle_manager.can_execute(tenant_id):
-            raise HTTPException(status_code=429, detail="Still throttled after retry")
-        
-        response = await client.request(
-            method=method,
-            url=graph_url,
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json",
-            },
-            json=body if method == "POST" else None
-        )
-    
-    throttle_manager.record_success(tenant_id)
-    
-    if response.status_code in [200, 201]:
-        return response.json()
-    
-    raise HTTPException(
-        status_code=response.status_code,
-        detail=f"Graph API error: {response.text}"
-    )
+        state = throttle_manager.tenant_states.get(tenant_id)
+        delay = max(1, math.ceil((state.backoff_until if state else time.time()) - time.time()))
+        raise HTTPException(status_code=429, detail="Provider request waiting", headers={"Retry-After": str(delay)})
+    released = False
+    try:
+        token = await get_graph_token(tenant_id)
+        if not graph_rate_limiter.scoped_enabled:
+            await graph_rate_limiter.acquire(reason="graph_proxy")
+        async with httpx.AsyncClient(timeout=60.0) as raw:
+            client = _proxy_http(raw, token)
+            response = await client.request(method, f"https://graph.microsoft.com/v1.0/{path}",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                params={k: v for k, v in (body or {}).items() if k != 'tenant_id'} if method == 'GET' else None,
+                json=body if method != 'GET' else None)
+        if response.status_code in (429, 503):
+            delay = max(1, math.ceil(parse_retry_after(response.headers.get("Retry-After")) or 60))
+            throttle_manager.record_throttle(tenant_id, delay)
+            released = True
+            raise HTTPException(status_code=response.status_code, detail="Microsoft data service requested a retry",
+                headers={"Retry-After": str(delay)})
+        if response.status_code == 204:
+            return Response(status_code=204)
+        if response.is_success:
+            try:
+                return response.json()
+            except ValueError:
+                raise HTTPException(status_code=502, detail="Invalid Microsoft data response") from None
+        raise HTTPException(status_code=response.status_code, detail="Microsoft data request failed")
+    except ProviderDeferred as error:
+        unavailable = error.stage in ('coordinator_unavailable', 'coordinator_unconfigured')
+        raise HTTPException(status_code=503 if unavailable else 429, detail="Provider request temporarily unavailable",
+            headers={"Retry-After": str(max(1, math.ceil(error.retry_after)))}) from None
+    except (httpx.TransportError, ProviderReadError):
+        raise HTTPException(status_code=503, detail="Microsoft data service temporarily unavailable") from None
+    finally:
+        if not released:
+            throttle_manager.record_success(tenant_id)
+
+
+class _GraphProxyToken(str):
+    def __new__(cls, token, app_id, tenant_id):
+        value = super().__new__(cls, token)
+        value.provider_owner = SimpleNamespace(client_id=app_id, tenant_id=tenant_id)
+        return value
 
 
 async def get_graph_token(tenant_id: str) -> str:
@@ -308,32 +317,50 @@ async def get_graph_token(tenant_id: str) -> str:
     3. If expired/missing, acquire new token from Microsoft
     4. Cache token in Redis with 5-minute buffer before expiry
     """
-    cache_key = f"graph_token:{tenant_id}"
+    cache_key = f"graph_token:v2:{tenant_id}"
     
-    # Check Redis cache
+    from shared.multi_app_manager import multi_app_manager
+    # Cache the effective credential owner with the token; internal tenant IDs
+    # and directory IDs are distinct and must never be guessed from a URL.
     if redis_client:
         cached = await redis_client.get(cache_key)
         if cached:
-            return cached
-    
-    # Acquire new token
-    token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
-    
+            try:
+                record = json.loads(cached)
+                app = multi_app_manager.get_app_by_client_id(record['app'])
+                if app and app.tenant_id == record['tenant'] and isinstance(record['token'], str):
+                    return _GraphProxyToken(record['token'], app.client_id, app.tenant_id)
+            except (ValueError, TypeError, KeyError):
+                pass
+
+    # Acquire new token. Credentials come from the shared multi-app pool
+    # (APP_<N>_CLIENT_ID/SECRET/TENANT_ID env family) — the old
+    # `settings.AZURE_AD_CLIENT_ID` attribute never existed, so every
+    # passthrough request 500'd since this service shipped. The token is
+    # minted against the APP's directory tenant (mirrors the workers:
+    # callers pass the INTERNAL tenants.id uuid, whose DB
+    # external_tenant_id is NULL in this deployment, so it is only used
+    # for cache keying and throttle bucketing — never as the AAD
+    # authority).
+    from shared.multi_app_manager import multi_app_manager
+    app_reg = multi_app_manager.get_next_app()
+    token_url = f"https://login.microsoftonline.com/{app_reg.tenant_id}/oauth2/v2.0/token"
+
     async with httpx.AsyncClient() as client:
         response = await client.post(
             token_url,
             data={
                 "grant_type": "client_credentials",
-                "client_id": settings.AZURE_AD_CLIENT_ID,
-                "client_secret": settings.AZURE_AD_CLIENT_SECRET,
+                "client_id": app_reg.client_id,
+                "client_secret": app_reg.client_secret,
                 "scope": "https://graph.microsoft.com/.default",
             }
         )
         
         if response.status_code != 200:
             raise HTTPException(
-                status_code=401,
-                detail=f"Failed to acquire Graph token: {response.text}"
+                status_code=503,
+                detail="Microsoft application authentication unavailable"
             )
         
         token_data = response.json()
@@ -342,10 +369,11 @@ async def get_graph_token(tenant_id: str) -> str:
         
         # Cache in Redis (with 5-minute buffer)
         if redis_client:
-            cache_ttl = max(300, expires_in - 300)  # At least 5 minutes
-            await redis_client.setex(cache_key, cache_ttl, access_token)
+            cache_ttl = max(1, expires_in - 300)  # At least 5 minutes
+            await redis_client.setex(cache_key, cache_ttl, json.dumps({"token": access_token,
+                "app": app_reg.client_id, "tenant": app_reg.tenant_id}))
     
-    return access_token
+    return _GraphProxyToken(access_token, app_reg.client_id, app_reg.tenant_id)
 
 
 @app.get("/throttle/stats/{tenant_id}")

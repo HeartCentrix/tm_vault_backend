@@ -1,0 +1,239 @@
+# podmonitor-tmvault.yaml — Prometheus scrape targets for the TM Vault stack.
+# NOT applied by any script; see README.md in this folder for the apply order.
+#
+# kube-prometheus-stack's Prometheus (namespace monitoring) selects PodMonitors in ANY
+# namespace that carry `release: kube-prometheus-stack` (podMonitorNamespaceSelector: {}),
+# so these live next to the pods in itops, like the landdev-backend ServiceMonitor does.
+#
+# Why `relabelings` instead of `port:` / `portNumber:`:
+#   No TM Vault Deployment declares its metrics port as a containerPort (50-workers.yaml
+#   declares none at all, 40-services.yaml only the HTTP port). Kubernetes pod SD emits
+#   one target per DECLARED container port (plus one port-free target for a container
+#   with none), and prometheus-operator implements port/portNumber as a `keep` on
+#   __meta_kubernetes_pod_container_port_name/_number — so either form selects ZERO
+#   targets here. Each endpoint therefore rewrites __address__ to <podIP>:<exporter port>.
+#
+# Exporter ports (verified live on 2026-10-14 by curling /metrics inside every pod):
+#   9103  shared/core_metrics.py  $CORE_METRICS_PORT default — tmvault_* (workers + API services)
+#   9101  shared/sla_metrics.py   $SLA_METRICS_PORT default  — sla_* (backup-scheduler; same registry also on 9103)
+#   9100  shared/pst_metrics.py   $PST_METRICS_PORT default  — pst_export_* (restore-worker; same registry also on 9103)
+#   9102  workers/chat-export-worker/main.py start_http_server(9102) — process_* only
+#  15692  rabbitmq_prometheus plugin (enabled in the tmvault-rabbitmq image): /metrics + /metrics/detailed
+#   progress-tracker, report-service, api-gateway, tmvault-frontend and tmvault-redis serve nothing.
+# Every pod is scraped on exactly ONE port, so no registry is ingested twice.
+#
+# `jobLabel: app` makes the Prometheus `job` label equal the pod's `app` label
+# (backup-worker, backup-scheduler, tmvault-rabbitmq, ...); prometheusrule-tmvault.yaml keys on it.
+#
+# PREREQUISITE: itops is default-deny ingress and the catch-all allow-prometheus-scrape
+# policy only opens 9090/9100/8080/8443 from monitoring. Apply
+# netpol-tmvault-prometheus-scrape.yaml with this file, or every target except
+# restore-worker:9100 reports up == 0 and the *Down alerts fire.
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: tmvault-backup-worker
+  namespace: itops
+  labels: { release: kube-prometheus-stack, stack: tmvault }
+spec:
+  jobLabel: app
+  podTargetLabels: [app, stack]
+  namespaceSelector: { matchNames: [itops] }
+  selector:
+    matchLabels: { stack: tmvault }
+    matchExpressions:
+      - { key: app, operator: In, values: [backup-worker, backup-worker-heavy] }
+  podMetricsEndpoints:
+    - path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_ip]
+          regex: "(.+)"
+          replacement: "${1}:9103"
+          targetLabel: __address__
+        - targetLabel: endpoint
+          replacement: core-metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: tmvault-backup-scheduler
+  namespace: itops
+  labels: { release: kube-prometheus-stack, stack: tmvault }
+spec:
+  jobLabel: app
+  podTargetLabels: [app, stack]
+  namespaceSelector: { matchNames: [itops] }
+  selector:
+    matchLabels: { stack: tmvault, app: backup-scheduler }
+  podMetricsEndpoints:
+    - path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_ip]
+          regex: "(.+)"
+          replacement: "${1}:9101"
+          targetLabel: __address__
+        - targetLabel: endpoint
+          replacement: sla-metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: tmvault-restore-worker
+  namespace: itops
+  labels: { release: kube-prometheus-stack, stack: tmvault }
+spec:
+  jobLabel: app
+  podTargetLabels: [app, stack]
+  namespaceSelector: { matchNames: [itops] }
+  selector:
+    matchLabels: { stack: tmvault, app: restore-worker }
+  podMetricsEndpoints:
+    - path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_ip]
+          regex: "(.+)"
+          replacement: "${1}:9100"
+          targetLabel: __address__
+        - targetLabel: endpoint
+          replacement: pst-metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: tmvault-chat-export-worker
+  namespace: itops
+  labels: { release: kube-prometheus-stack, stack: tmvault }
+spec:
+  jobLabel: app
+  podTargetLabels: [app, stack]
+  namespaceSelector: { matchNames: [itops] }
+  selector:
+    matchLabels: { stack: tmvault, app: chat-export-worker }
+  podMetricsEndpoints:
+    - path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_ip]
+          regex: "(.+)"
+          replacement: "${1}:9102"
+          targetLabel: __address__
+        - targetLabel: endpoint
+          replacement: process-metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: tmvault-aux-workers
+  namespace: itops
+  labels: { release: kube-prometheus-stack, stack: tmvault }
+spec:
+  jobLabel: app
+  podTargetLabels: [app, stack]
+  namespaceSelector: { matchNames: [itops] }
+  selector:
+    matchLabels: { stack: tmvault }
+    matchExpressions:
+      - { key: app, operator: In, values: [discovery-worker, azure-workload-worker] }
+  podMetricsEndpoints:
+    - path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_ip]
+          regex: "(.+)"
+          replacement: "${1}:9103"
+          targetLabel: __address__
+        - targetLabel: endpoint
+          replacement: core-metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: tmvault-api-services
+  namespace: itops
+  labels: { release: kube-prometheus-stack, stack: tmvault }
+spec:
+  jobLabel: app
+  podTargetLabels: [app, stack]
+  namespaceSelector: { matchNames: [itops] }
+  selector:
+    matchLabels: { stack: tmvault }
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - auth-service
+          - tenant-service
+          - resource-service
+          - job-service
+          - snapshot-service
+          - dashboard-service
+          - alert-service
+          - delta-token
+          - audit-service
+  podMetricsEndpoints:
+    - path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_ip]
+          regex: "(.+)"
+          replacement: "${1}:9103"
+          targetLabel: __address__
+        - targetLabel: endpoint
+          replacement: core-metrics
+---
+# RabbitMQ: the pod declares 5672 and 15672, so SD emits two targets per endpoint. Keep the
+# 15672 one and point it at the rabbitmq_prometheus listener (15692) so each endpoint scrapes
+# the broker exactly once. /metrics is the aggregated feed (node alarms, totals);
+# /metrics/detailed?family=queue_coarse_metrics&family=queue_metrics adds per-queue
+# rabbitmq_detailed_queue_* gauges (messages_ready, consumers, ...) for the queue alerts.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: tmvault-rabbitmq
+  namespace: itops
+  labels: { release: kube-prometheus-stack, stack: tmvault }
+spec:
+  jobLabel: app
+  podTargetLabels: [app, stack]
+  namespaceSelector: { matchNames: [itops] }
+  selector:
+    matchLabels: { stack: tmvault, app: tmvault-rabbitmq }
+  podMetricsEndpoints:
+    - path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      relabelings:
+        - action: keep
+          sourceLabels: [__meta_kubernetes_pod_container_port_number]
+          regex: "15672"
+        - sourceLabels: [__meta_kubernetes_pod_ip]
+          regex: "(.+)"
+          replacement: "${1}:15692"
+          targetLabel: __address__
+        - targetLabel: endpoint
+          replacement: prometheus
+    - path: /metrics/detailed
+      params:
+        family: [queue_coarse_metrics, queue_metrics]
+      interval: 30s
+      scrapeTimeout: 10s
+      relabelings:
+        - action: keep
+          sourceLabels: [__meta_kubernetes_pod_container_port_number]
+          regex: "15672"
+        - sourceLabels: [__meta_kubernetes_pod_ip]
+          regex: "(.+)"
+          replacement: "${1}:15692"
+          targetLabel: __address__
+        - targetLabel: endpoint
+          replacement: prometheus-detailed

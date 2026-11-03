@@ -69,6 +69,11 @@ def test_removed_tombstone_is_not_bare():
     assert is_bare({"id": "AAMk123", "@removed": {"reason": "deleted"}}) is False
 
 
+def test_all_supported_tombstones_skip_rehydration():
+    assert is_bare({"id": "AAMk123", "@removed": None}) is False
+    assert is_bare({"id": "AAMk123", "deleted": {"state": "deleted"}}) is False
+
+
 def test_no_id_is_not_bare():
     assert is_bare({"@odata.etag": "W/\"abc\""}) is False
 

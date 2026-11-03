@@ -32,6 +32,16 @@ class MessageBus:
             print("[MESSAGE_BUS] RabbitMQ disabled by config", flush=True)
             return
 
+        # Idempotency guard: `connect()` is a singleton-level call invoked
+        # from several APScheduler jobs on every interval tick (e.g.
+        # _reconcile_stuck_queued_jobs, _sweep_tier2_gaps). aio_pika keeps
+        # abandoned `connect_robust` connections alive, so overwriting
+        # self.connection on each tick leaked one connection per tick
+        # (the scheduler pod accumulated ~150 open connections). When a live
+        # connection already exists, reuse it instead of opening another.
+        if self.connection is not None and not self.connection.is_closed:
+            return
+
         attempt = 0
         while True:
             attempt += 1
@@ -252,13 +262,31 @@ class MessageBus:
         queue = await self.channel.get_queue(queue_name)
         async with queue.iterator() as queue_iter:
             async for message in queue_iter:
-                async with message.process():
-                    try:
+                # The exception must escape `message.process()` — catching it
+                # inside made the context manager exit cleanly and ACK a
+                # message whose handler had raised, so audit events were
+                # silently destroyed on any handler error.
+                #
+                # requeue=True + reject_on_redelivered=True gives bounded
+                # redelivery: first failure is requeued, and if it fails
+                # again the redelivery is rejected without requeue, which
+                # the queue's x-dead-letter-exchange (see _declare_queue)
+                # routes to <queue>.dlq. Two attempts, then the message is
+                # parked for an operator — never a hot-loop, never a drop.
+                try:
+                    async with message.process(
+                        requeue=True, reject_on_redelivered=True,
+                    ):
                         body = json.loads(message.body.decode())
                         await callback(body)
-                    except Exception as e:
-                        # In production: send to DLQ
-                        print(f"Error processing message: {e}")
+                except Exception as e:
+                    # Caught OUT here so one bad message doesn't tear down
+                    # the consumer; process() has already nacked/DLQ'd it.
+                    print(
+                        f"Error processing message from {queue_name} "
+                        f"(requeued or dead-lettered): {e}",
+                        flush=True,
+                    )
 
 
 # Global message bus instance

@@ -1,0 +1,60 @@
+# 60-frontend.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: tmvault-frontend, namespace: itops, labels: { app: tmvault-frontend, stack: tmvault } }
+spec:
+  replicas: 1   # pilot: single replica (HA deferred to prod)
+  selector: { matchLabels: { app: tmvault-frontend } }
+  template:
+    metadata: { labels: { app: tmvault-frontend, stack: tmvault } }
+    spec:
+      imagePullSecrets: [ { name: harbor-creds } ]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        fsGroup: 101
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: frontend
+          image: harbor.taylormorrison.com/library/tmvault-frontend@sha256:a5c884f3b7ccc32f96588a8ba5c3c47d823183197e784ebb83f2258b001c876f
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+          ports: [ { containerPort: 8080 } ]
+          readinessProbe:
+            httpGet: { path: /, port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests: { cpu: "25m", memory: "64Mi" }
+            limits: { cpu: "200m", memory: "256Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: tmvault-frontend, namespace: itops, labels: { app: tmvault-frontend, stack: tmvault } }
+spec:
+  selector: { app: tmvault-frontend }
+  ports: [ { port: 80, targetPort: 8080 } ]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tmvault
+  namespace: itops
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [ tmvault.taylormorrison.com ]
+      secretName: wildcard-tls
+  rules:
+    - host: tmvault.taylormorrison.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: tmvault-frontend, port: { number: 80 } } }

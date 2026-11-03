@@ -13,6 +13,7 @@ import httpx
 import smtplib
 import asyncio
 import csv
+from shared.csv_safe import SafeCsvWriter  # Check 17: CSV formula-injection
 import io
 import os
 from email.mime.multipart import MIMEMultipart
@@ -35,9 +36,19 @@ from shared.models import (
 )
 from shared.config import settings
 from shared.security import get_current_user_from_token
+from shared.auth_enforcement import require_principal  # user JWT OR X-Internal-Api-Key
 from shared.storage_rollup import exclude_tier2_storage_dupes_clause
 
+from shared.audit_middleware import AuditMiddleware  # Ops/Data Check 3: mutation-audit backstop
 app = FastAPI(title="Report Service", version="1.0.0")
+app.add_middleware(AuditMiddleware, service_name="report-service")
+
+# resources.last_backup_status values that mean "a restore point was
+# produced". The backup-worker now records PARTIAL truthfully (it used to
+# write COMPLETED for every finalize); a PARTIAL run still protected the
+# resource, so coverage keeps counting it, while FAILED and CANCELLED
+# (cancel_job) do not.
+PROTECTED_LAST_BACKUP_STATUSES = ("COMPLETED", "PARTIAL")
 
 # SMTP config from environment
 SMTP_ENABLED = os.getenv("NOTIFICATION_EMAIL_ENABLED", "false").lower() in ("true", "1", "yes")
@@ -739,7 +750,10 @@ class GenerateReportResponse(BaseModel):
 
 
 @app.post("/api/v1/reports/send-test")
-async def send_test_email(to: Optional[str] = Query(None)):
+async def send_test_email(
+    to: Optional[str] = Query(None),
+    current_user: dict = Depends(get_current_user_from_token),
+):
     """Send a small test email using the current SMTP config. Defaults to the
     recipient list on the first report config; accept a `?to=addr` override
     for one-off checks. Returns the envelope/header used and the actual send
@@ -791,7 +805,12 @@ async def send_test_email(to: Optional[str] = Query(None)):
 
 
 @app.post("/api/v1/reports/generate", response_model=GenerateReportResponse)
-async def generate_report(request: GenerateReportRequest):
+async def generate_report(
+    request: GenerateReportRequest,
+    # A user JWT (operator via the gateway) OR the internal key: backup-scheduler
+    # fires the DAILY / WEEKLY runs machine-to-machine with no user session.
+    _principal: dict = Depends(require_principal),
+):
     """Generate and send a report (called by scheduler on schedule)"""
     print(f"[REPORT] Generating {request.report_type} report...")
 
@@ -874,7 +893,7 @@ async def generate_report(request: GenerateReportRequest):
                         Resource.status == ResourceStatus.ACTIVE,
                         Resource.type.in_(types),
                         Resource.last_backup_at >= period_start,
-                        Resource.last_backup_status == "COMPLETED",
+                        Resource.last_backup_status.in_(PROTECTED_LAST_BACKUP_STATUSES),
                     )
                 )
             )
@@ -961,7 +980,7 @@ async def generate_report(request: GenerateReportRequest):
             )
             detail_rows = detail_result.all()
             buf = io.StringIO()
-            writer = csv.writer(buf)
+            writer = SafeCsvWriter(csv.writer(buf))
             writer.writerow(["Resource Name", "Backup Time", "Size (bytes)"])
             for row in detail_rows:
                 writer.writerow([row[0], row[1].isoformat() if row[1] else "", row[2] or 0])

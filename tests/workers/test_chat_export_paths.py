@@ -74,13 +74,14 @@ def _load_named_nodes(rel_path: str, names: set[str]):
 
 
 _packager_ns = _load_named_nodes(
-    "packager/thread_packager.py", {"_safe_name"},
+    "packager/thread_packager.py", {"_safe_name", "_unique_in_dir"},
 )
 _normalizer_ns = _load_named_nodes(
     "render/normalizer.py",
     {"_REACTION_GLYPH", "_reaction_glyph", "_plaintext_to_html"},
 )
 _safe_name = _packager_ns._safe_name
+_unique_in_dir = _packager_ns._unique_in_dir
 _reaction_glyph = _normalizer_ns._reaction_glyph
 _plaintext_to_html = _normalizer_ns._plaintext_to_html
 
@@ -114,6 +115,43 @@ def test_safe_name_truncates_long_input():
     MAX_PATH on Windows extractors."""
     long_in = "x" * 500
     assert len(_safe_name(long_in)) == 120
+
+
+# ── attachment name uniquification ─────────────────────────────────────
+
+
+def test_unique_in_dir_dedupes_same_name():
+    """Two attachments named 'contract.pdf' shared in different messages
+    of one thread land in the SAME directory in single_thread layout.
+    Pre-fix they became two ZIP entries at the identical path; extraction
+    kept only one and both HTML chips linked to the survivor — wrong-data
+    delivery. Pinned: the second gets a ' (2)' suffix before the ext."""
+    used: set = set()
+    assert _unique_in_dir("contract.pdf", used) == "contract.pdf"
+    assert _unique_in_dir("contract.pdf", used) == "contract (2).pdf"
+    assert _unique_in_dir("contract.pdf", used) == "contract (3).pdf"
+
+
+def test_unique_in_dir_is_case_insensitive():
+    """Windows/macOS extraction is case-insensitive, so 'Contract.pdf'
+    and 'contract.pdf' would still overwrite each other on disk even
+    though ZIP allows both entries."""
+    used: set = set()
+    assert _unique_in_dir("Contract.pdf", used) == "Contract.pdf"
+    assert _unique_in_dir("contract.pdf", used) == "contract (2).pdf"
+
+
+def test_unique_in_dir_handles_extensionless_names():
+    used: set = set()
+    assert _unique_in_dir("README", used) == "README"
+    assert _unique_in_dir("README", used) == "README (2)"
+
+
+def test_unique_in_dir_scopes_per_directory():
+    """Same filename in DIFFERENT directories (per_message layout puts
+    each message's attachments in its own dir) must not be renamed."""
+    assert _unique_in_dir("contract.pdf", set()) == "contract.pdf"
+    assert _unique_in_dir("contract.pdf", set()) == "contract.pdf"
 
 
 # ── inline image local_path coordination ───────────────────────────────

@@ -9,9 +9,10 @@ import hashlib
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 from typing import Dict, Any, List, Optional, Set, Tuple
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aio_pika
 import httpx
@@ -19,6 +20,8 @@ from aio_pika import IncomingMessage
 from sqlalchemy import bindparam, select, text
 from sqlalchemy.dialects.postgresql import JSONB
 
+from shared.app_settings import get_app_settings
+from shared.audit import internal_audit_headers
 from shared.config import settings
 from shared.database import async_session_factory, init_db
 from shared.power_bi_client import PowerBIClient
@@ -36,6 +39,34 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger("discovery-worker")
+
+_DEFAULT_DISCOVERY_TIME = "02:00"
+_DEFAULT_DISCOVERY_TZ = "America/Phoenix"
+
+# A RUNNING discovery run older than this is presumed crashed (worker died
+# before it could mark the run FAILED) and no longer blocks a new run for the
+# tenant.
+_RUNNING_RUN_STALE_HOURS = 6
+
+# _ORPHAN_STAGING_ABANDON_HOURS lives next to its consumer
+# (_is_purgeable_staging_run) further down; it is deliberately LONGER than
+# _RUNNING_RUN_STALE_HOURS above.
+
+
+def _seconds_until(discovery_time: str, tz_name: str, now: Optional[datetime] = None) -> float:
+    """Return seconds until the next occurrence of *discovery_time* (HH:MM) in *tz_name*.
+
+    *now* defaults to the current wall-clock time in *tz_name* and is exposed
+    as a parameter so unit tests can supply a fixed instant.
+    """
+    tz = ZoneInfo(tz_name)
+    if now is None:
+        now = datetime.now(tz)
+    hh, mm = map(int, discovery_time.split(":"))
+    target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return max(1.0, (target - now).total_seconds())
 
 
 async def _emit_discovery_audit(
@@ -63,6 +94,7 @@ async def _emit_discovery_audit(
         async with httpx.AsyncClient(timeout=5.0) as client:
             await client.post(
                 f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json=payload,
+                headers=internal_audit_headers(),
             )
     except Exception as exc:
         logger.warning("[audit] failed to emit %s for tenant %s: %s", action, tenant_id, exc)
@@ -97,12 +129,13 @@ TYPE_MAP: Dict[str, ResourceType] = {
 }
 
 DISCOVERY_SCOPE_DEFINITIONS: Dict[str, Dict[str, Any]] = {
-    "users": {"method": "discover_users", "resource_types": {ResourceType.ENTRA_USER}},
+    "users": {"method": "discover_users", "paged_method": "discover_users_paged", "resource_types": {ResourceType.ENTRA_USER}},
     # discover_groups emits a mix of ENTRA_GROUP (DLs / security groups) and
     # M365_GROUP (Unified groups) — list both so stale-marking covers them.
     "groups": {"method": "discover_groups", "resource_types": {ResourceType.ENTRA_GROUP, ResourceType.M365_GROUP}},
     "mailboxes": {
         "method": "discover_mailboxes",
+        "paged_method": "discover_mailboxes_paged",
         # Tier 1 only emits SHARED + ROOM mailboxes — user MAILBOX rows are
         # Tier 2 children of an ENTRA_USER (USER_MAIL). Pass the explicit
         # `kinds` filter so the scope-based discovery path matches
@@ -199,6 +232,16 @@ STAGE_INSERT_STMT = text(
         :azure_region,
         :discovered_at
     )
+    ON CONFLICT (run_id, tenant_id, resource_type, external_id) DO UPDATE SET
+        display_name = EXCLUDED.display_name,
+        email = EXCLUDED.email,
+        metadata = EXCLUDED.metadata,
+        resource_status = EXCLUDED.resource_status,
+        resource_hash = EXCLUDED.resource_hash,
+        azure_subscription_id = EXCLUDED.azure_subscription_id,
+        azure_resource_group = EXCLUDED.azure_resource_group,
+        azure_region = EXCLUDED.azure_region,
+        discovered_at = EXCLUDED.discovered_at
     """
 ).bindparams(bindparam("metadata", type_=JSONB))
 
@@ -210,6 +253,17 @@ CASE
 END
 """
 
+# resources.metadata is CO-OWNED: discovery writes stable identity / Graph
+# keys, the backup-worker persists incremental state into the same column
+# (onedrive_delta_link[_pending], mail_delta_token, mail folder deltas,
+# calendar_delta_tokens, channel_delta_tokens, chat cursors, …). Assigning
+# s.metadata wholesale wiped those cursors on every run, forcing full
+# re-walks. Merge instead — discovery keys win, every other key survives
+# (same semantics as shared/tier2_discovery.py's {**existing, **new}).
+METADATA_MERGE_EXPR = (
+    "(COALESCE(r.metadata::jsonb, '{}'::jsonb) || COALESCE(s.metadata::jsonb, '{}'::jsonb))"
+)
+
 MERGE_UPDATED_COUNT_STMT = text(
     f"""
     WITH updated AS (
@@ -217,7 +271,7 @@ MERGE_UPDATED_COUNT_STMT = text(
         SET
             display_name = s.display_name,
             email = s.email,
-            metadata = s.metadata::json,
+            metadata = {METADATA_MERGE_EXPR}::json,
             resource_hash = s.resource_hash,
             azure_subscription_id = s.azure_subscription_id,
             azure_resource_group = s.azure_resource_group,
@@ -233,7 +287,7 @@ MERGE_UPDATED_COUNT_STMT = text(
           AND (
               r.display_name IS DISTINCT FROM s.display_name
               OR r.email IS DISTINCT FROM s.email
-              OR r.metadata::jsonb IS DISTINCT FROM s.metadata
+              OR r.metadata::jsonb IS DISTINCT FROM {METADATA_MERGE_EXPR}
               OR r.resource_hash IS DISTINCT FROM s.resource_hash
               OR r.azure_subscription_id IS DISTINCT FROM s.azure_subscription_id
               OR r.azure_resource_group IS DISTINCT FROM s.azure_resource_group
@@ -325,6 +379,49 @@ STALE_MARK_COUNT_STMT = text(
     """
 ).bindparams(bindparam("resource_types", expanding=True))
 
+ORPHAN_STAGING_CANDIDATES_STMT = text(
+    """
+    SELECT DISTINCT s.run_id, dr.status, dr.started_at
+    FROM resource_discovery_staging AS s
+    LEFT JOIN discovery_runs AS dr ON dr.id = s.run_id
+    WHERE s.tenant_id = :tenant_id
+      AND s.run_id <> :keep_run_id
+    """
+)
+
+PURGE_ORPHAN_STAGING_STMT = text(
+    "DELETE FROM resource_discovery_staging "
+    "WHERE tenant_id = :tenant_id AND run_id IN :run_ids"
+).bindparams(bindparam("run_ids", expanding=True))
+
+# A run still flagged RUNNING after this long is presumed dead: a hard crash
+# (OOM / pod kill) never reaches _mark_discovery_failed, so its row never
+# leaves RUNNING and its staging rows would otherwise be unreclaimable.
+# Deliberately LONGER than _RUNNING_RUN_STALE_HOURS (the single-flight
+# window): deleting the staging of a slow-but-live run blinds its finalize
+# (the 2026-07 archive-pilot wedge), whereas leaving a dead run's rows behind
+# is harmless — every read of the table is scoped to a single run_id.
+_ORPHAN_STAGING_ABANDON_HOURS = 24
+
+
+def _is_purgeable_staging_run(
+    status: Optional[str],
+    started_at: Optional[datetime],
+    now: datetime,
+) -> bool:
+    """Whether a prior run's staged rows can be deleted without harming it."""
+    if status is None:
+        # No discovery_runs row: nobody can ever finalize these rows.
+        return True
+    if status != "RUNNING":
+        return True
+    if started_at is None:
+        return False
+    if started_at.tzinfo is None:
+        # discovery_runs.started_at is `timestamp without time zone`, UTC.
+        started_at = started_at.replace(tzinfo=timezone.utc)
+    return (now - started_at) >= timedelta(hours=_ORPHAN_STAGING_ABANDON_HOURS)
+
 
 async def decrypt_tenant_secret(tenant: Tenant) -> str:
     """Decrypt the tenant's Graph client secret from the DB."""
@@ -391,11 +488,15 @@ def _prepare_staging_rows(tenant_id: UUID, resources: List[Dict[str, Any]]) -> L
         display_name = resource.get("display_name") or "Unknown"
         email = resource.get("email")
         metadata = resource.get("metadata") or {}
-        resource_status = (
-            ResourceStatus.DISCOVERED.value
-            if resource.get("_account_enabled", True)
-            else ResourceStatus.INACCESSIBLE.value
-        )
+        # Existence in the Graph listing is the only gate discovery applies.
+        # accountEnabled=false used to stage INACCESSIBLE, which removed the
+        # row from every scheduler dispatch path — but room/shared mailboxes
+        # are account-disabled by design and leavers' mailboxes by definition,
+        # and Graph app-only reads on them succeed. "No longer exists" is
+        # still signalled by the stale-mark (absent from a successful scan)
+        # and by the worker's resource-level 404/423 marking. The flag stays
+        # in metadata["account_enabled"] for display.
+        resource_status = ResourceStatus.DISCOVERED.value
         prepared.append(
             {
                 "tenant_id": tenant_id,
@@ -427,6 +528,18 @@ AZURE_DISCOVERY_RESOURCE_TYPES: Set[ResourceType] = {
     ResourceType.AZURE_SQL_DB,
     ResourceType.AZURE_POSTGRESQL,
     ResourceType.AZURE_POSTGRESQL_SINGLE,
+}
+
+# An ARM family whose enumeration hit any error (403 on one subscription's
+# provider, 404 on a server deleted mid-walk, a single 429) was not provably
+# enumerated, so its resource type leaves the stale-mark set — the same
+# per-scope degradation _discover_and_stage_scopes applies to M365 scopes.
+# Whatever WAS collected is still staged.
+AZURE_FAMILY_RESOURCE_TYPES: Dict[str, ResourceType] = {
+    "vms": ResourceType.AZURE_VM,
+    "sql_dbs": ResourceType.AZURE_SQL_DB,
+    "postgres_flexible": ResourceType.AZURE_POSTGRESQL,
+    "postgres_single": ResourceType.AZURE_POSTGRESQL_SINGLE,
 }
 
 
@@ -467,15 +580,22 @@ def _prepare_azure_staging_rows(tenant_id: UUID, discovered: Dict[str, Any]) -> 
         )
 
     for sql_db in discovered.get("sql_dbs", []):
+        db_name = sql_db.get("database_name", "")
         metadata = {
             "server_name": sql_db.get("server_name", ""),
             "server_fqdn": sql_db.get("server_fqdn", ""),
             "server_id": sql_db.get("server_id", ""),
             "database_id": sql_db.get("database_id", ""),
+            "database_name": db_name,
             "subscription_id": sql_db.get("subscription_id", ""),
         }
-        external_id = sql_db.get("database_name", "")
-        display_name = f"{sql_db.get('server_name', '')}/{external_id}"
+        # Key by the ARM database id — a bare database name collides across
+        # servers ('appdb' on server A and server B) and _dedupe_resources
+        # silently dropped one of them from inventory, so it was never backed
+        # up. The connectable database name travels in metadata for the
+        # backup handler.
+        external_id = sql_db.get("database_id") or f"{sql_db.get('server_name', '')}/{db_name}"
+        display_name = f"{sql_db.get('server_name', '')}/{db_name}"
         prepared.append(
             {
                 "tenant_id": tenant_id,
@@ -515,7 +635,16 @@ def _prepare_azure_staging_rows(tenant_id: UUID, discovered: Dict[str, Any]) -> 
             "subscription_id": pg.get("subscription_id", ""),
             "type": pg.get("type", ""),
         }
-        external_id = pg.get("name", pg.get("id", ""))
+        server_arm_id = pg.get("id", "")
+        # One resource row per DATABASE: key by ARM server id + database name.
+        # The bare server name gave every database of a flexible server the
+        # same external_id, so _dedupe_resources kept only the first — the
+        # remaining databases were silently absent from inventory.
+        if resource_type is ResourceType.AZURE_POSTGRESQL:
+            external_id = f"{server_arm_id or pg.get('name', '')}/databases/{db_name}"
+        else:
+            # Single Server rows are one-per-server; the ARM id is unique.
+            external_id = server_arm_id or pg.get("name", "")
         display_name = f"{pg.get('name', 'Unknown')}/{db_name}"
         prepared.append(
             {
@@ -541,7 +670,17 @@ def _prepare_azure_staging_rows(tenant_id: UUID, discovered: Dict[str, Any]) -> 
             }
         )
 
-    return _dedupe_resources(prepared), set(AZURE_DISCOVERY_RESOURCE_TYPES)
+    successful_types = set(AZURE_DISCOVERY_RESOURCE_TYPES)
+    for family in discovered.get("degraded_families") or []:
+        degraded_type = AZURE_FAMILY_RESOURCE_TYPES.get(family)
+        if degraded_type is not None:
+            successful_types.discard(degraded_type)
+        else:
+            # Unknown family name: can't prove which type is safe, so none are.
+            successful_types.clear()
+            break
+
+    return _dedupe_resources(prepared), successful_types
 
 
 async def _mark_discovery_failed(
@@ -565,39 +704,88 @@ async def _mark_discovery_failed(
         await db.commit()
 
 
-async def _persist_discovery_rows(
+async def _stage_rows(
+    db,
+    run_id: UUID,
+    tenant_id: UUID,
+    rows: List[Dict[str, Any]],
+) -> int:
+    """Chunk-INSERT rows into resource_discovery_staging and return the count staged.
+
+    Each row dict should contain the staging columns (without run_id); this
+    function prepends run_id to every row before executing STAGE_INSERT_STMT.
+    Returns 0 immediately when rows is empty.
+    """
+    if not rows:
+        return 0
+    staged_count = len(rows)
+    processed = 0
+    progress_every = max(settings.DISCOVERY_PROGRESS_LOG_EVERY, 1)
+    for chunk in _chunked(rows, settings.DISCOVERY_STAGE_CHUNK_SIZE):
+        payload = [{"run_id": run_id, **row} for row in chunk]
+        await db.execute(STAGE_INSERT_STMT, payload)
+        processed += len(chunk)
+        if processed % progress_every == 0 or processed == staged_count:
+            logger.info(
+                "Discovery staging progress for tenant %s run %s: %d/%d rows staged.",
+                tenant_id,
+                run_id,
+                processed,
+                staged_count,
+            )
+    return staged_count
+
+
+async def _finalize_discovery(
     db,
     tenant: Tenant,
     run: DiscoveryRun,
     tenant_id: UUID,
-    staged_rows: List[Dict[str, Any]],
     successful_scope_types: Optional[Set[ResourceType]],
     *,
     fetched_count: int,
 ) -> Tuple[int, int, int, int]:
-    staged_count = len(staged_rows)
-    if staged_rows:
-        processed = 0
-        progress_every = max(settings.DISCOVERY_PROGRESS_LOG_EVERY, 1)
-        for chunk in _chunked(staged_rows, settings.DISCOVERY_STAGE_CHUNK_SIZE):
-            payload = [{"run_id": run.id, **row} for row in chunk]
-            await db.execute(STAGE_INSERT_STMT, payload)
-            processed += len(chunk)
-            if processed % progress_every == 0 or processed == staged_count:
-                logger.info(
-                    "Discovery staging progress for tenant %s run %s: %d/%d rows staged.",
-                    tenant_id,
-                    run.id,
-                    processed,
-                    staged_count,
-                )
+    """Run MERGE, stale-mark, finalize the DiscoveryRun + Tenant, delete staging, and auto-protect.
+
+    Computes staged_count by querying the staging table (rows are already inserted
+    by the time this is called).  Returns (staged_count, inserted_count,
+    updated_count, stale_marked_count).
+    """
+    staged_count = int(
+        (
+            await db.execute(
+                text("SELECT COUNT(*) FROM resource_discovery_staging WHERE run_id = :run_id"),
+                {"run_id": run.id},
+            )
+        ).scalar()
+        or 0
+    )
 
     updated_count = int((await db.execute(MERGE_UPDATED_COUNT_STMT, {"run_id": run.id})).scalar() or 0)
     inserted_count = int((await db.execute(MERGE_INSERTED_COUNT_STMT, {"run_id": run.id})).scalar() or 0)
     unchanged_count = max(staged_count - updated_count - inserted_count, 0)
 
     stale_marked_count = 0
-    if successful_scope_types:
+    stale_mark_note: Optional[str] = None
+    if successful_scope_types and staged_count == 0:
+        # An empty staging table is never authoritative evidence that the
+        # inventory vanished — it is exactly what a blinded run looks like
+        # (concurrent purge, throttled/unauthorized API, empty error body).
+        # Skip stale-marking rather than mass-flip the tenant INACCESSIBLE,
+        # which silently stops every scheduled backup (the archive-pilot
+        # wedge). A later run that actually stages rows stale-marks for real.
+        stale_mark_note = (
+            "stale-mark skipped: 0 rows staged despite successful scopes — "
+            "enumeration not authoritative"
+        )
+        logger.error(
+            "Discovery run %s for tenant %s staged 0 rows but reported successful scopes %s; %s",
+            run.id,
+            tenant_id,
+            sorted(resource_type.value for resource_type in successful_scope_types),
+            stale_mark_note,
+        )
+    elif successful_scope_types:
         stale_marked_count = int(
             (
                 await db.execute(
@@ -621,7 +809,8 @@ async def _persist_discovery_rows(
     run.unchanged_count = unchanged_count
     run.stale_marked_count = stale_marked_count
     run.finished_at = now
-    run.error_message = None
+    # Breadcrumb: a COMPLETED run that skipped stale-marking records why.
+    run.error_message = stale_mark_note
 
     tenant.status = TenantStatus.ACTIVE
     tenant.last_discovery_at = now
@@ -643,6 +832,20 @@ async def _persist_discovery_rows(
     return staged_count, inserted_count, updated_count, stale_marked_count
 
 
+async def _persist_discovery_rows(
+    db,
+    tenant: Tenant,
+    run: DiscoveryRun,
+    tenant_id: UUID,
+    staged_rows: List[Dict[str, Any]],
+    successful_scope_types: Optional[Set[ResourceType]],
+    *,
+    fetched_count: int,
+) -> Tuple[int, int, int, int]:
+    await _stage_rows(db, run.id, tenant_id, staged_rows)
+    return await _finalize_discovery(db, tenant, run, tenant_id, successful_scope_types, fetched_count=fetched_count)
+
+
 async def _apply_auto_protect_groups(db, tenant_id: UUID) -> int:
     """Evaluate auto-protect resource groups for this tenant and assign policies.
 
@@ -653,7 +856,8 @@ async def _apply_auto_protect_groups(db, tenant_id: UUID) -> int:
       3. For each resource, find matching groups (sorted by priority ASC — lower
          number = higher precedence, matches afi convention)
       4. Take the first matching group's first attached policy — assign it to the resource
-      5. Commit
+      5. Caller commits (this runs inside the finalize transaction; committing
+         here would kill the server-side cursor feeding the stream)
 
     Returns the count of resources auto-assigned."""
     from shared.models import ResourceGroup, GroupPolicyAssignment, Resource as _Res, SlaPolicy
@@ -710,8 +914,12 @@ async def _apply_auto_protect_groups(db, tenant_id: UUID) -> int:
 
     # 2. Resources in this tenant without a policy. Stream + chunked
     #    bulk UPDATE so a 25k-resource tenant doesn't materialize the
-    #    full unpolicied set into memory and doesn't hold a single huge
-    #    transaction across the whole sweep.
+    #    full unpolicied set into memory. NOTE: nothing in here commits —
+    #    the stream is an asyncpg server-side cursor and a commit ends the
+    #    transaction that owns it, so the next fetch raises and auto-protect
+    #    silently truncated at the first ~1000 resources (and prematurely
+    #    committed the caller's finalize transaction, releasing its advisory
+    #    lock mid-finalize). The caller owns the commit.
     from sqlalchemy import update as sa_update
 
     CHUNK = 1000
@@ -739,26 +947,29 @@ async def _apply_auto_protect_groups(db, tenant_id: UUID) -> int:
             )
             n += len(rids)
         pending = {}
-        if n:
-            await db.commit()
         return n
 
-    async for resource in res_stream.scalars():
-        matched = find_matching_groups(resource, eligible_groups)
-        if not matched:
-            continue
-        top_group = matched[0]
-        policies_for_group = group_to_policies.get(top_group.id) or []
-        if not policies_for_group:
-            continue
-        pol_id = policies_for_group[0]
-        pending.setdefault(pol_id, []).append(resource.id)
-        # Flush when any single bucket reaches CHUNK — keeps the bulk
-        # UPDATE statement's parameter count predictable.
-        if len(pending[pol_id]) >= CHUNK:
-            assigned += await _flush()
+    try:
+        async for resource in res_stream.scalars():
+            matched = find_matching_groups(resource, eligible_groups)
+            if not matched:
+                continue
+            top_group = matched[0]
+            policies_for_group = group_to_policies.get(top_group.id) or []
+            if not policies_for_group:
+                continue
+            pol_id = policies_for_group[0]
+            pending.setdefault(pol_id, []).append(resource.id)
+            # Flush when any single bucket reaches CHUNK — keeps the bulk
+            # UPDATE statement's parameter count predictable.
+            if len(pending[pol_id]) >= CHUNK:
+                assigned += await _flush()
 
-    assigned += await _flush()
+        assigned += await _flush()
+    finally:
+        # Close the server-side cursor even when matching raises — an open
+        # cursor left on the session would poison the caller's commit.
+        await res_stream.close()
 
     if assigned:
         logger.info("[auto-protect] Assigned policies to %d newly-discovered resource(s) for tenant %s",
@@ -766,15 +977,81 @@ async def _apply_auto_protect_groups(db, tenant_id: UUID) -> int:
     return assigned
 
 
-async def _discover_resources_for_scope(
+async def _purge_orphan_staging(db, tenant_id: UUID, keep_run_id: UUID) -> None:
+    """Drop staging rows left behind by crashed/FAILED prior runs for this tenant
+    so a redelivered job starts clean. Keeps the current run's rows — and the
+    rows of any OTHER run that is still in progress.
+
+    Periodic, onboarding and manual discovery all share the discovery.m365
+    queue, so two runs for one tenant overlap routinely, and no lock is held
+    during the staging phase (the advisory lock is only taken at finalize).
+    Deleting a live run's staged rows makes it finalize against a partial —
+    often empty — staging set and stale-mark real resources INACCESSIBLE en
+    masse (the 2026-07 archive-pilot wedge), so liveness is resolved first and
+    the DELETE is scoped to dead runs only. A RUNNING run older than
+    _ORPHAN_STAGING_ABANDON_HOURS is treated as crashed and purged.
+    """
+    candidates = (
+        await db.execute(
+            ORPHAN_STAGING_CANDIDATES_STMT,
+            {"tenant_id": tenant_id, "keep_run_id": keep_run_id},
+        )
+    ).all()
+    now = datetime.now(timezone.utc)
+    dead_run_ids = [
+        row[0] for row in candidates
+        if _is_purgeable_staging_run(row[1], row[2], now)
+    ]
+    live_count = len(candidates) - len(dead_run_ids)
+    if live_count:
+        logger.info(
+            "Leaving staging rows of %d in-progress discovery run(s) intact for tenant %s",
+            live_count,
+            tenant_id,
+        )
+    if not dead_run_ids:
+        return
+    await db.execute(
+        PURGE_ORPHAN_STAGING_STMT,
+        {"tenant_id": tenant_id, "run_ids": dead_run_ids},
+    )
+
+
+async def _discover_and_stage_scopes(
     graph: GraphClient,
     discovery_scope: Optional[List[str]],
-) -> Tuple[List[Dict[str, Any]], Optional[Set[ResourceType]]]:
-    if not discovery_scope:
-        return _dedupe_resources(await graph.discover_all()), set(FULL_DISCOVERY_RESOURCE_TYPES)
+    run_id: UUID,
+    tenant_id: UUID,
+) -> Tuple[int, Optional[Set[ResourceType]], int]:
+    """Discover resources scope-by-scope, staging each batch immediately.
 
+    Each scope opens its OWN AsyncSession so concurrent coroutines never
+    share a session — making DISCOVERY_SCOPE_MAX_CONCURRENCY > 1 safe.
+
+    Returns (fetched_count, successful_scope_types, attempted_scope_count).
+    attempted_scope_count is 0 for the full-discovery (no-scope) path, where
+    all scopes always succeed and a separate signal is not needed.
+    """
+    # ── Full discovery (no scope specified) ─────────────────────────────────
+    # Fan out through the same streaming loop as scoped discovery so no
+    # single coroutine accumulates the entire tenant's resource list in
+    # memory before staging.  The set of scopes mirrors discover_all() exactly
+    # (users / groups / mailboxes / sharepoint / teams / power_platform) —
+    # planner, todo, conditional_access, and bitlocker are intentionally
+    # excluded here just as they were excluded from discover_all().
+    if not discovery_scope:
+        discovery_scope = [
+            "users",
+            "groups",
+            "mailboxes",
+            "sharepoint",
+            "teams",
+            "power_platform",
+        ]
+
+    # ── Canonicalise the requested scopes ────────────────────────────────────
     canonical_scopes: List[str] = []
-    seen_scopes = set()
+    seen_scopes: set = set()
     for raw_scope in discovery_scope:
         if not raw_scope:
             continue
@@ -789,31 +1066,63 @@ async def _discover_resources_for_scope(
 
     if not canonical_scopes:
         logger.warning("No valid discovery scopes supplied; skipping scoped discovery run.")
-        return [], set()
+        return 0, set(), 0
 
-    async def _safe_discover(scope_name: str) -> Tuple[str, List[Dict[str, Any]], bool]:
-        spec = DISCOVERY_SCOPE_DEFINITIONS[scope_name]
-        method = getattr(graph, spec["method"])
-        kwargs = spec.get("method_kwargs") or {}
-        try:
-            result = await method(**kwargs)
-            logger.info("Scoped discovery '%s' returned %d resource(s)", scope_name, len(result))
-            return scope_name, result, False
-        except Exception as exc:
-            logger.warning("Scoped discovery '%s' failed: %s", scope_name, exc)
-            return scope_name, [], True
-
-    results = await asyncio.gather(*[_safe_discover(scope) for scope in canonical_scopes])
-
-    resources: List[Dict[str, Any]] = []
+    # ── Stream each scope into staging, one at a time (semaphore-bounded) ───
+    # Each _process_scope coroutine opens its OWN session so concurrent
+    # coroutines never share a session (AsyncSession is not concurrency-safe).
+    sem = asyncio.Semaphore(max(settings.DISCOVERY_SCOPE_MAX_CONCURRENCY, 1))
+    fetched_count = 0
     successful_types: Set[ResourceType] = set()
-    for scope_name, result, failed in results:
-        if failed:
-            continue
-        resources.extend(result)
-        successful_types.update(DISCOVERY_SCOPE_DEFINITIONS[scope_name]["resource_types"])
 
-    return _dedupe_resources(resources), successful_types
+    async def _process_scope(scope_name: str) -> None:
+        nonlocal fetched_count
+        spec = DISCOVERY_SCOPE_DEFINITIONS[scope_name]
+        kwargs = spec.get("method_kwargs") or {}
+
+        async with sem:
+            try:
+                # Paged method hook (Task 4 forward compatibility)
+                paged_method_name = spec.get("paged_method")
+                if paged_method_name and hasattr(graph, paged_method_name):
+                    paged_method = getattr(graph, paged_method_name)
+                    batch_fetched = 0
+                    async with async_session_factory() as scope_db:
+                        async for batch in paged_method(**kwargs):
+                            rows = _prepare_staging_rows(tenant_id, batch)
+                            await _stage_rows(scope_db, run_id, tenant_id, rows)
+                            await scope_db.commit()
+                            batch_fetched += len(batch)
+                    logger.info(
+                        "Scoped discovery '%s' (paged) returned %d resource(s)",
+                        scope_name, batch_fetched,
+                    )
+                    fetched_count += batch_fetched
+                    successful_types.update(spec["resource_types"])
+                else:
+                    # Standard list-returning method
+                    method = getattr(graph, spec["method"])
+                    result = await method(**kwargs)
+                    logger.info(
+                        "Scoped discovery '%s' returned %d resource(s)",
+                        scope_name, len(result),
+                    )
+                    rows = _prepare_staging_rows(tenant_id, result)
+                    scope_count = len(result)
+                    del result  # free memory before staging
+                    async with async_session_factory() as scope_db:
+                        await _stage_rows(scope_db, run_id, tenant_id, rows)
+                        await scope_db.commit()
+                    fetched_count += scope_count
+                    successful_types.update(spec["resource_types"])
+            except Exception as exc:
+                logger.warning("Scoped discovery '%s' failed: %s", scope_name, exc)
+                # Do NOT add to successful_types — matches _safe_discover behaviour
+
+    # Run scopes; with default concurrency=1 this is effectively sequential.
+    await asyncio.gather(*[_process_scope(scope) for scope in canonical_scopes])
+
+    return fetched_count, successful_types, len(canonical_scopes)
 
 
 async def discover_tenant(tenant_id: UUID, discovery_scope: Optional[List[str]] = None) -> int:
@@ -842,6 +1151,41 @@ async def discover_tenant(tenant_id: UUID, discovery_scope: Optional[List[str]] 
                 return 0
 
             power_bi_refresh_token = PowerBIClient.get_refresh_token_from_tenant(tenant)
+
+            # Single-flight per tenant: the 02:00 sweep and the queue consumer
+            # can otherwise discover the same tenant concurrently, and the
+            # second run's staging purge would erase the first run's rows —
+            # its finalize then saw an empty staging table and stale-marked
+            # the whole tenant INACCESSIBLE (the archive-pilot wedge). The
+            # advisory lock serializes this check-and-create (released at
+            # commit); a RUNNING row older than the staleness window is
+            # presumed crashed and does not block re-discovery.
+            await db.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_id)"),
+                {"lock_id": _tenant_lock_id(tenant_id)},
+            )
+            stale_cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
+                hours=_RUNNING_RUN_STALE_HOURS
+            )
+            concurrent_run_id = (
+                await db.execute(
+                    select(DiscoveryRun.id)
+                    .where(
+                        DiscoveryRun.tenant_id == tenant_id,
+                        DiscoveryRun.status == "RUNNING",
+                        DiscoveryRun.started_at > stale_cutoff,
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if concurrent_run_id is not None:
+                logger.warning(
+                    "Discovery already RUNNING for tenant %s (run %s) — skipping this trigger.",
+                    tenant_id,
+                    concurrent_run_id,
+                )
+                return 0
+
             run_id = uuid.uuid4()
             tenant.status = TenantStatus.DISCOVERING
             db.add(
@@ -872,15 +1216,36 @@ async def discover_tenant(tenant_id: UUID, discovery_scope: Optional[List[str]] 
             ext_tenant_id,
             power_bi_refresh_token=power_bi_refresh_token,
         )
-        resources, successful_scope_types = await _discover_resources_for_scope(graph, discovery_scope)
-        staged_rows = _prepare_staging_rows(tenant_id, resources)
-        logger.info(
-            "Discovered %d raw resources for tenant %s; %d prepared for persistence.",
-            len(resources),
-            tenant_display_name,
-            len(staged_rows),
+
+        # ── Purge stale staging rows from any crashed prior run ───────────
+        async with async_session_factory() as db:
+            await _purge_orphan_staging(db, tenant_id, keep_run_id=run_id)
+            await db.commit()
+
+        # ── Stream each scope into staging, committing per scope ──────────
+        fetched_count, successful_scope_types, attempted_scope_count = (
+            await _discover_and_stage_scopes(graph, discovery_scope, run_id, tenant_id)
         )
 
+        # If every attempted scope errored, do NOT finalize as COMPLETED —
+        # raise so the existing except handler marks the run FAILED.
+        # A genuine tenant with 0 resources but successful scopes still ends
+        # COMPLETED because successful_scope_types will be non-empty.
+        # The full-discovery path returns attempted_scope_count == 0 and
+        # always populates successful_scope_types on success, so this guard
+        # only fires for the scoped path.
+        if attempted_scope_count > 0 and not successful_scope_types:
+            raise RuntimeError(
+                f"All discovery scopes failed for tenant {tenant_id}"
+            )
+
+        logger.info(
+            "Discovered %d resource(s) for tenant %s; now finalizing.",
+            fetched_count,
+            tenant_display_name,
+        )
+
+        # ── Finalize: advisory lock, MERGE, stale-mark, commit ───────────
         async with async_session_factory() as db:
             await db.execute(
                 text("SELECT pg_advisory_xact_lock(:lock_id)"),
@@ -899,14 +1264,13 @@ async def discover_tenant(tenant_id: UUID, discovery_scope: Optional[List[str]] 
             ):
                 await PowerBIClient.persist_refresh_token(db, tenant, graph.power_bi_refresh_token)
 
-            staged_count, inserted_count, updated_count, stale_marked_count = await _persist_discovery_rows(
+            staged_count, inserted_count, updated_count, stale_marked_count = await _finalize_discovery(
                 db,
                 tenant,
                 run,
                 tenant_id,
-                staged_rows,
                 successful_scope_types,
-                fetched_count=len(resources),
+                fetched_count=fetched_count,
             )
             unchanged_count = run.unchanged_count
             await db.commit()
@@ -1042,6 +1406,37 @@ async def discover_azure_tenant(tenant_id: UUID) -> int:
 
             previous_status = tenant.status
             tenant_display_name = tenant.display_name
+
+            # Single-flight per tenant — same guard as discover_tenant: a
+            # concurrent run mid-flight must not be doubled up on (its
+            # finalize stale-marks against its own staging). Stale RUNNING
+            # rows (crashed worker) don't block.
+            await db.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_id)"),
+                {"lock_id": _tenant_lock_id(tenant_id)},
+            )
+            stale_cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
+                hours=_RUNNING_RUN_STALE_HOURS
+            )
+            concurrent_run_id = (
+                await db.execute(
+                    select(DiscoveryRun.id)
+                    .where(
+                        DiscoveryRun.tenant_id == tenant_id,
+                        DiscoveryRun.status == "RUNNING",
+                        DiscoveryRun.started_at > stale_cutoff,
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if concurrent_run_id is not None:
+                logger.warning(
+                    "Discovery already RUNNING for tenant %s (run %s) — skipping this Azure trigger.",
+                    tenant_id,
+                    concurrent_run_id,
+                )
+                return 0
+
             run_id = uuid.uuid4()
             tenant.status = TenantStatus.DISCOVERING
             db.add(
@@ -1072,6 +1467,17 @@ async def discover_azure_tenant(tenant_id: UUID) -> int:
             tenant_display_name,
         )
         staged_rows, successful_scope_types = _prepare_azure_staging_rows(tenant_id, discovered)
+        degraded_families = list(discovered.get("degraded_families") or [])
+        if degraded_families:
+            # Counted, not swallowed: the run keeps its partial inventory but
+            # these families are excluded from stale-marking.
+            logger.error(
+                "Azure discovery for tenant %s could not fully enumerate %s (%s); "
+                "staging partial inventory and skipping stale-mark for those types.",
+                tenant_id,
+                degraded_families,
+                "; ".join((discovered.get("errors") or [])[:5]),
+            )
 
         async with async_session_factory() as db:
             await db.execute(
@@ -1094,6 +1500,13 @@ async def discover_azure_tenant(tenant_id: UUID) -> int:
                 fetched_count=len(staged_rows),
             )
             unchanged_count = run.unchanged_count
+            if degraded_families:
+                # Durable breadcrumb on the run row — a COMPLETED Azure run
+                # that only saw part of ARM must say so.
+                note = "azure enumeration degraded: " + ", ".join(degraded_families)
+                run.error_message = (
+                    f"{run.error_message}; {note}" if run.error_message else note
+                )
             await db.commit()
 
         logger.info(
@@ -1114,6 +1527,7 @@ async def discover_azure_tenant(tenant_id: UUID) -> int:
                 "updated": updated_count,
                 "unchanged": unchanged_count,
                 "staleMarked": stale_marked_count,
+                **({"degradedFamilies": degraded_families} if degraded_families else {}),
             },
         )
         return staged_count
@@ -1390,6 +1804,7 @@ async def _consume_tier2_discovery():
                             payload["batchId"] = forward_batch_id
                             r = await _c.post(
                                 f"{settings.JOB_SERVICE_URL}/api/v1/backups/trigger-bulk",
+                                headers=internal_audit_headers(),  # Check 17: authenticate service-to-service call
                                 json=payload,
                             )
                             if r.status_code >= 300:
@@ -1453,7 +1868,7 @@ async def main():
     from shared.graph_rate_limiter import graph_rate_limiter
     core_metrics.init()
     await graph_rate_limiter.maybe_init_redis()
-    await startup_router()
+    await startup_router(required=True)
     logger.info("=== Discovery Worker Starting ===")
     logger.info("DB: %s@%s:%s/%s", settings.DB_USERNAME, settings.DB_HOST, settings.DB_PORT, settings.DB_NAME)
     logger.info("Microsoft Client ID: %s", settings.MICROSOFT_CLIENT_ID or settings.AZURE_AD_CLIENT_ID or "NOT SET")
@@ -1473,12 +1888,64 @@ async def main():
     # Per-user Tier-2 content discovery consumer
     tier2_consumer_task = asyncio.create_task(_consume_tier2_discovery())
 
-    # Also run periodic M365 discovery as fallback (every 24 hours)
+    # Periodic M365 discovery: runs once daily at the configured local time.
     async def periodic_discovery():
         while True:
-            await asyncio.sleep(24 * 60 * 60)
-            logger.info("=== Running scheduled periodic M365 discovery ===")
-            await run_all_discoveries()
+            try:
+                # Re-read settings every cycle so a changed time/timezone takes
+                # effect on the next scheduled run without a restart.
+                discovery_time = _DEFAULT_DISCOVERY_TIME
+                tz_name = _DEFAULT_DISCOVERY_TZ
+                try:
+                    async with async_session_factory() as db:
+                        s = await get_app_settings(db)
+                    raw_time = s.get("discovery_time") or _DEFAULT_DISCOVERY_TIME
+                    raw_tz = s.get("timezone") or _DEFAULT_DISCOVERY_TZ
+                    # Validate — fall back to defaults on bad values.
+                    from zoneinfo import ZoneInfoNotFoundError
+                    try:
+                        ZoneInfo(raw_tz)
+                        tz_name = raw_tz
+                    except (ZoneInfoNotFoundError, KeyError, ValueError):
+                        logger.warning(
+                            "periodic_discovery: invalid timezone %r — using default %s",
+                            raw_tz, _DEFAULT_DISCOVERY_TZ,
+                        )
+                    import re as _re
+                    if _re.match(r"^([01]\d|2[0-3]):[0-5]\d$", raw_time or ""):
+                        discovery_time = raw_time
+                    else:
+                        logger.warning(
+                            "periodic_discovery: invalid discovery_time %r — using default %s",
+                            raw_time, _DEFAULT_DISCOVERY_TIME,
+                        )
+                except Exception as settings_exc:
+                    logger.warning(
+                        "periodic_discovery: could not read app settings (%s) — using defaults",
+                        settings_exc,
+                    )
+
+                sleep_s = _seconds_until(discovery_time, tz_name)
+                tz = ZoneInfo(tz_name)
+                now = datetime.now(tz)
+                hh, mm = map(int, discovery_time.split(":"))
+                target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                if target <= now:
+                    target += timedelta(days=1)
+                logger.info(
+                    "Next periodic discovery scheduled for %s (%s) — sleeping %.0f min",
+                    target.isoformat(), tz_name, sleep_s / 60,
+                )
+                await asyncio.sleep(sleep_s)
+                logger.info("=== Running scheduled periodic M365 discovery ===")
+                await run_all_discoveries()
+            except asyncio.CancelledError:
+                raise
+            except Exception as loop_exc:
+                logger.exception(
+                    "periodic_discovery: unexpected error — retrying in 300s: %s", loop_exc
+                )
+                await asyncio.sleep(300)
 
     periodic_task = asyncio.create_task(periodic_discovery())
 

@@ -1,0 +1,97 @@
+# 10-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tmvault-config
+  namespace: itops
+data:
+  # --- database ---
+  DB_HOST: "tmvault-pooler-rw.databases.svc.cluster.local"
+  # ITO-9652 final review: LISTEN backends (StorageRouter storage-toggle
+  # notifications) must bypass the pgbouncer transaction pooler — LISTEN
+  # requires a session-scoped backend connection, which transaction pooling
+  # cannot provide (the pooler swaps backends between transactions and would
+  # silently drop the channel). shared/storage/startup.py::_build_dsn prefers
+  # this over DB_HOST when set.
+  DB_DIRECT_HOST: "postgres-ha-rw.databases.svc.cluster.local"
+  DB_MAX_OVERFLOW: "40"
+  DB_NAME: "tmvault_prod"
+  DB_PGBOUNCER: "true"
+  DB_PORT: "5432"
+  DB_POOL_SIZE: "40"
+  # Ceiling on carry-forward slot queueing (2026-08-24 pooler-disturbance
+  # fix): on_wait ticks stall guards while queued, so without a ceiling a
+  # wedged bucket-holder would keep waiters alive+invisible forever. 4h =
+  # comfortably above the longest legitimate giant copy (~1.6h) plus queue.
+  CARRY_FORWARD_WAIT_MAX_S: "14400"
+  # Archive stall guard (2026-08-25): the giant carry-forward INSERT..SELECT
+  # emits zero progress ticks for its whole ~48-min (and growing) copy — at
+  # the 5400 default that is only 1.9x headroom before a HEALTHY copy gets
+  # stall-killed FAILED. 9000 = 2.5-3x over both untracked quiet phases
+  # (retry ladder ~3600s, copy ~2880s). Orthogonal to the queue-phase
+  # ceiling above (queueing ticks progress via on_wait) — BUT coupled to
+  # its budget: a wedged slot-HOLDER now occupies its bucket up to 9000s
+  # before the stall guard kills it, so two back-to-back wedged holders
+  # (18000s > 14400s) can exhaust a queued waiter's CARRY_FORWARD_WAIT_MAX_S
+  # where 5400 could not. Accepted: wedged holders need the storms this
+  # branch remediates, and a false-positive kill of a healthy 96-min copy
+  # is the worse trade.
+  ARCHIVE_STALL_ABORT_S: "9000"
+  # Pin schema explicitly: shared.config defaults to "public" but alembic/env.py
+  # defaults to "tm_vault" — leaving it unset splits app tables (public) from
+  # alembic_version (tm_vault). Pinning keeps init_db, runtime, and alembic aligned.
+  DB_SCHEMA: "public"
+  DB_USERNAME: "tmvault"
+  # --- messaging / cache ---
+  RABBITMQ_ENABLED: "true"
+  RABBITMQ_HOST: "tmvault-rabbitmq.itops.svc.cluster.local"
+  RABBITMQ_PORT: "5672"
+  RABBITMQ_USERNAME: "tmvault"
+  REDIS_ENABLED: "true"
+  REDIS_HOST: "tmvault-redis.itops.svc.cluster.local"
+  REDIS_PORT: "6379"
+  # --- gateway upstreams ---
+  AUTH_SERVICE_URL: "http://auth-service:8001"
+  TENANT_SERVICE_URL: "http://tenant-service:8002"
+  RESOURCE_SERVICE_URL: "http://resource-service:8003"
+  JOB_SERVICE_URL: "http://job-service:8004"
+  SNAPSHOT_SERVICE_URL: "http://snapshot-service:8005"
+  DASHBOARD_SERVICE_URL: "http://dashboard-service:8006"
+  ALERT_SERVICE_URL: "http://alert-service:8007"
+  REPORT_SERVICE_URL: "http://report-service:8014"
+  AUDIT_SERVICE_URL: "http://audit-service:8012"
+  CORS_ORIGINS: "https://tmvault.taylormorrison.com"
+  # Drives the OAuth redirect_uri ({FRONTEND_URL}/auth/callback) and Secure-cookie
+  # flag. MUST match the SPA app's registered redirect URI in Entra.
+  FRONTEND_URL: "https://tmvault.taylormorrison.com"
+  # --- storage: Wasabi via S3-compat backend ---
+  # NOTE: endpoint region + bucket are PLACEHOLDERS pending Jason's Wasabi details.
+  ACTIVE_STORAGE_BACKEND: "seaweedfs"
+  # Must match a backend NAME the bootstrap actually seeds. The S3-compatible
+  # (Wasabi) backend is seeded as "seaweedfs-local"; "wasabi-primary" does not
+  # exist, which leaves system_config.active_backend_id NULL -> invariant fails.
+  STORAGE_DEFAULT_BACKEND: "seaweedfs-local"
+  ONPREM_S3_ENDPOINT: "https://s3.us-west-2.wasabisys.com"
+  ONPREM_S3_PUBLIC_ENDPOINT: "https://s3.us-west-2.wasabisys.com"
+  ONPREM_S3_REGION: "us-west-2"
+  ONPREM_S3_BUCKETS: "tm-vault"
+  ONPREM_S3_VERIFY_TLS: "true"
+  # --- Graph throttle: 6-app pool since ITO-9718 (2026-07-15) ---
+  GRAPH_APP_PACE_REQS_PER_SEC: "5.0"
+  GRAPH_APP_MAX: "30"  # slot scan ceiling, NOT pool size — sparse slots skipped; pool = populated APP_N_* secrets
+  BACKUP_CONCURRENCY: "20"
+  # BACKUP_HEAVY_THRESHOLD_BYTES removed 2026-07-14 (ITO-9652): it was
+  # never consumed by code — heavy routing is type-based (routing_fence).
+  WORKLOAD_CONCURRENCY: "4"
+  ONEDRIVE_BACKUP_FILE_CONCURRENCY: "8"
+  # --- ITO-9777 Online Archive pilot (jrue-only via code-default allowlist) ---
+  # Final-review sizing: exportItems batches can reach ~4GB in flight each
+  # (20 items x 150MB x 4/3 base64) — cap concurrency and widen the per-batch
+  # timeout for the 22.3GB pilot archive. Code defaults are 8/120.
+  ARCHIVE_EXPORT_CONCURRENCY: "4"  # 2→4 2026-07-30: observed items avg 20-200KB (not GB-scale); 4 = Graph per-mailbox concurrency cap; 2 gave ~163 items/min export
+  ARCHIVE_IMPORT_TIMEOUT_S: "600"
+  # 90→75 2026-08-18 (Jason): the MS autoexpanded-archive listing regression
+  # caps reachable coverage at ~76.8% (856k/1.11M); 75 accepts honest
+  # PARTIALs holding everything reachable + new mail while the MS case
+  # runs. Revert to 90 (or drop the key) when MS fixes their side.
+  ARCHIVE_MIN_COVERAGE_PCT: "75"

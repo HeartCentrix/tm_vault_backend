@@ -62,6 +62,9 @@ class ArchiveRestoreEngine:
     ):
         self.gc = graph_client
         self.download_blob = download_blob
+        if post_json is post_json_no_auth:
+            from functools import partial
+            post_json = partial(post_json_no_auth, graph_client=graph_client)
         self.post_json = post_json
         self.worker_id = worker_id
         self.refresh_margin_s = refresh_margin_s

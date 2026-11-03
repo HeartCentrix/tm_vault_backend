@@ -1,8 +1,8 @@
 """Admin storage API: status, toggle, events, SSE stream, abort.
 
-Mounted into api-gateway/main.py via include_router. Role-gating removed
-— any authenticated user (valid JWT) can read status / submit toggles /
-stream phase events. The SSE endpoint also accepts the JWT via a
+Mounted into api-gateway/main.py via include_router. Reads (status/backends/
+events/stream) require any authenticated user; the state-changing toggle/abort
+routes require an ADMIN role (Ops/Data Check 17). The SSE endpoint also accepts the JWT via a
 `?token=<jwt>` query param since browsers' EventSource() API cannot set
 custom Authorization headers.
 """
@@ -27,6 +27,7 @@ from shared.schemas import (
     ToggleStatusOut,
 )
 from shared.security import _get_user_from_token
+from shared.storage.labels import describe_backend
 
 log = logging.getLogger(__name__)
 
@@ -43,9 +44,8 @@ async def _require_user_from_header_or_query(request: Request) -> dict:
     directly on the gateway (not behind proxy_request), so the
     cookie→Bearer translation in main.py:proxy_request never runs for
     these routes — without this fallback, the SPA's cookie-only fetch()
-    calls would 401. Role checks are intentionally omitted — any
-    authenticated user is allowed to read storage status and submit
-    toggles."""
+    calls would 401. This dep authenticates only; toggle/abort additionally
+    require admin via _require_admin_from_header_or_query."""
     auth = request.headers.get("authorization") or ""
     token: str | None = None
     if auth.lower().startswith("bearer "):
@@ -57,6 +57,18 @@ async def _require_user_from_header_or_query(request: Request) -> dict:
     if not token:
         raise HTTPException(status_code=401, detail="missing bearer token")
     return _get_user_from_token(token)
+
+
+async def _require_admin_from_header_or_query(request: Request) -> dict:
+    """Ops/Data Check 17: flipping the platform storage backend drains jobs,
+    promotes the replica DB and puts the whole fleet read-only during the
+    transition — it must NOT be reachable by every authenticated employee.
+    Require an admin role on the state-changing toggle/abort routes."""
+    user = await _require_user_from_header_or_query(request)
+    from shared.auth_enforcement import ADMIN_ROLES
+    if not any(r in ADMIN_ROLES for r in (user.get("roles") or [])):
+        raise HTTPException(status_code=403, detail="Administrator role required")
+    return user
 
 
 def _dsn() -> str:
@@ -139,10 +151,18 @@ async def status(user: dict = Depends(_require_user_from_header_or_query)):
         await db.close()
     if not sc:
         raise HTTPException(500, detail="system_config singleton missing")
+    # 2026-08-11 QA-11: serve the display label from the server instead of
+    # letting each surface derive its own. The Storage page computed
+    # "Wasabi (S3)" from the endpoint in the browser while /health/deep
+    # printed the raw slot identifiers ("seaweedfs/seaweedfs-local") off the
+    # SAME row — two truthful readings that looked like a disagreement about
+    # where 3.5M items/day are being written. shared.storage.labels is now
+    # the one place that turns (kind, name, endpoint) into words.
     return {
         "active_backend": {
             "id": str(sc["b_id"]), "kind": sc["kind"], "name": sc["name"],
             "endpoint": sc["endpoint"], "is_enabled": sc["is_enabled"],
+            **describe_backend(sc["kind"], sc["name"], sc["endpoint"]),
         },
         "transition_state": sc["transition_state"],
         "last_toggle_at": sc["last_toggle_at"].isoformat() if sc["last_toggle_at"] else None,
@@ -161,13 +181,19 @@ async def list_backends(user: dict = Depends(_require_user_from_header_or_query)
         )
     finally:
         await db.close()
-    return [dict(r) for r in rows]
+    # Same server-side label as /status (QA-11) — the toggle button's text is
+    # built from this list, so it must not be able to disagree with the
+    # active-backend card it sits under.
+    return [
+        {**dict(r), **describe_backend(r["kind"], r["name"], r["endpoint"])}
+        for r in rows
+    ]
 
 
 @router.post("/toggle")
 async def submit_toggle(
     req: ToggleRequest, request: Request,
-    user: dict = Depends(_require_user_from_header_or_query),
+    user: dict = Depends(_require_admin_from_header_or_query),
 ):
     org_id = user.get("org_id")
     # Org name fetched via a separate query — in production, resolve from
@@ -195,6 +221,37 @@ async def submit_toggle(
         from_id = sc["active_backend_id"]
         if str(from_id) == str(req.target_backend_id):
             raise HTTPException(400, detail="target backend is already active")
+
+        # 2026-08-11 QA-10: fail closed on a target that the data plane
+        # cannot serve. shared/storage/router.py:132 only registers rows
+        # WHERE is_enabled = true, so promoting a disabled backend makes
+        # every subsequent write raise BackendNotFoundError. Today's prod is
+        # exactly that shape: the only alternate row is `azure-primary`,
+        # is_enabled=false, endpoint https://PLACEHOLDER.blob.core.windows.net/
+        # — and the UI offers it as the toggle target simply because its id
+        # differs from the active one. The toggle worker's preflight does
+        # catch it (router.get_store_by_id raises -> target_reachable=False),
+        # but only after this endpoint has written a storage_toggle_events
+        # row and queued a message: an audit trail of an operation that was
+        # never possible. Reject it here, with the reason spelled out.
+        target = await db.fetchrow(
+            "SELECT kind, name, endpoint, is_enabled "
+            "FROM storage_backends WHERE id=$1",
+            req.target_backend_id,
+        )
+        if target is None:
+            raise HTTPException(
+                404, detail=f"unknown target backend {req.target_backend_id}",
+            )
+        if not target["is_enabled"]:
+            raise HTTPException(
+                400,
+                detail=(
+                    f"target backend {target['name']} is disabled and is not "
+                    "registered with the storage router; enable and configure "
+                    "it before toggling"
+                ),
+            )
 
         event_id = uuid.uuid4()
         actor_id = user.get("id")
@@ -295,31 +352,96 @@ async def stream_event(
     return EventSourceResponse(generator())
 
 
+
+async def _release_transition_if_no_live_toggle(db, event_id) -> None:
+    """Free system_config.transition_state when no live toggle owns it.
+
+    While transition_state is not 'stable', router.get_active_store()
+    raises TransitionInProgressError for EVERY backup write and
+    submit_toggle 409s — so a transition left dirty by a dead worker is a
+    fleet-wide outage with no UI escape hatch.
+
+    Liveness is expressed as "NOT terminal" rather than a list of
+    in-flight statuses: the in-flight set has seven members (started,
+    drain_started, drain_completed, db_promoted, dns_flipped,
+    smoke_passed, workers_restarted) and enumerating it positively
+    already missed four, which would have let this release steal a
+    transition from a toggle that was mid-promote.
+    """
+    tag = await db.execute(
+        "UPDATE system_config SET transition_state='stable', updated_at=NOW() "
+        " WHERE id = 1 "
+        "   AND transition_state <> 'stable' "
+        "   AND NOT EXISTS ("
+        "         SELECT 1 FROM storage_toggle_events e "
+        "          WHERE e.id <> $1 "
+        "            AND e.status NOT IN ('completed','failed','aborted')"
+        "       )",
+        event_id,
+    )
+    if tag and tag != "UPDATE 0":
+        log.info(
+            "abort %s released a stuck transition_state -> stable "
+            "(backup writes were blocked)", event_id,
+        )
+
+
 @router.post("/toggle/{event_id}/abort")
 async def abort_toggle(
     event_id: uuid.UUID,
-    user: dict = Depends(_require_user_from_header_or_query),
+    user: dict = Depends(_require_admin_from_header_or_query),
 ):
     db = await _connect()
     try:
-        row = await db.fetchrow(
-            "SELECT status FROM storage_toggle_events WHERE id=$1", event_id,
+        # Atomic claim: only wins while the toggle worker hasn't committed
+        # 'drain_completed' (the worker's own status write is guarded on
+        # status <> 'aborted'), so whichever UPDATE commits first sticks —
+        # an abort can no longer be clobbered by the worker promoting on.
+        claimed = await db.fetchval(
+            "UPDATE storage_toggle_events SET status='aborted', completed_at=NOW() "
+            "WHERE id=$1 AND status IN ('started','drain_started') "
+            "RETURNING status",
+            event_id,
         )
-        if not row:
-            raise HTTPException(404)
-        if row["status"] not in ("started", "drain_started"):
+        if claimed is None:
+            row = await db.fetchrow(
+                "SELECT status FROM storage_toggle_events WHERE id=$1", event_id,
+            )
+            if not row:
+                raise HTTPException(404)
+            # Already-terminal events: abort is idempotent, and — crucially
+            # — must still free a stuck transition. The mid-drain pod-death
+            # path flips the event to 'aborted' from the worker's own
+            # preflight failure while transition_state stays 'draining', so
+            # 409ing here was the last door closing on the operator (every
+            # backup write failing, submit_toggle 409ing, recovery only via
+            # manual SQL).
+            if row["status"] in ("aborted", "failed", "completed"):
+                await _release_transition_if_no_live_toggle(db, event_id)
+                return {"status": row["status"]}
             raise HTTPException(
                 409, detail="cannot abort after drain has completed",
             )
-        await db.execute(
-            "UPDATE storage_toggle_events SET status='aborted', completed_at=NOW() "
-            "WHERE id=$1",
-            event_id,
-        )
-        await db.execute(
-            "UPDATE system_config SET transition_state='stable', updated_at=NOW() "
-            "WHERE id=1",
-        )
+        # Release the transition, but ONLY when no other toggle is live.
+        #
+        # An unconditional reset here was the original bug: it let
+        # submit_toggle's `!= 'stable'` guard admit a second concurrent
+        # toggle while the first worker was still promoting. Delegating
+        # it entirely to the worker was the opposite failure — if the
+        # worker pod died mid-drain (the message is un-acked for the full
+        # 900s drain window), the redelivery path stands down without
+        # clearing the state, and while transition_state is 'draining'
+        # router.get_active_store() raises TransitionInProgressError for
+        # EVERY backup write and submit_toggle 409s: the fleet is
+        # read-only with no operator escape hatch short of manual SQL.
+        #
+        # The claim above only wins from 'started'/'drain_started' — i.e.
+        # strictly before promotion — and the worker's own post-drain
+        # write is guarded on `status <> 'aborted'`, so a successful claim
+        # means no promotion can follow. The NOT EXISTS keeps this from
+        # stealing a transition owned by a DIFFERENT live toggle. The
+        # worker's redelivery path does the same thing idempotently.
+        await _release_transition_if_no_live_toggle(db, event_id)
     finally:
         await db.close()
     return {"status": "aborted"}

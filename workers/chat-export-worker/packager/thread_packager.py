@@ -24,8 +24,43 @@ def _safe_name(name: str, fallback: str = "item") -> str:
     return (s[:120] or fallback)
 
 
+def _hosted_archive_key(message_id: str, hosted: dict, *, thread_path: str) -> str:
+    """Graph hosted IDs are only unique within their parent message."""
+    key = hosted.get("archive_key")
+    if key is not None:
+        if not isinstance(key, str) or re.fullmatch(r"[0-9a-f]{64}", key) is None:
+            raise ValueError("invalid hosted-content archive key")
+        return key
+    # Legacy descriptors have no qualified key. Hash exact source IDs;
+    # sanitizing/concatenating them can collapse distinct Graph IDs.
+    from shared.chat_catalogue_identity import qualified_chat_item_key
+    return qualified_chat_item_key(thread_path, "CHAT_HOSTED_CONTENT", hosted["hc_id"], message_id)
+
+
+def _unique_in_dir(name: str, used: set[str]) -> str:
+    """Uniquify a sanitised filename within one ZIP directory.
+
+    Two attachments named 'contract.pdf' in the same thread used to become
+    two ZIP entries at the identical path — extractors keep only one, and
+    both messages' HTML chips then link to whichever file survived, silently
+    misrepresenting which document was attached to which message. Comparison
+    is case-insensitive because most extraction targets (Windows/macOS) are.
+    """
+    candidate = name
+    n = 2
+    while candidate.lower() in used:
+        stem, dot, ext = name.rpartition(".")
+        if dot and stem:
+            candidate = f"{stem} ({n}).{ext}"
+        else:
+            candidate = f"{name} ({n})"
+        n += 1
+    used.add(candidate.lower())
+    return candidate
+
+
 class AttachmentSource(Protocol):
-    async def open(self, blob_path: str) -> tuple[AsyncIterator[bytes], str, int]: ...
+    async def open(self, blob_path: str | dict) -> tuple[AsyncIterator[bytes], str, int]: ...
 
 
 @dataclass
@@ -55,7 +90,7 @@ class ThreadPackager:
             per_file.append({"path": path, "sha256": sha256(data).hexdigest(), "bytes": len(data)})
             total_bytes += len(data)
 
-        async def _add_stream(path: str, src_path: str) -> tuple[int, bool]:
+        async def _add_stream(path: str, src_path: str | dict) -> tuple[int, bool]:
             """Stream bytes from blob storage straight into a ZIP entry.
 
             Computes sha256 + total bytes on the fly so per_file stays
@@ -75,12 +110,20 @@ class ThreadPackager:
                         entry.write(chunk)
                         h.update(chunk)
                         total += len(chunk)
+                if isinstance(src_path, dict) and src_path.get("catalogue"):
+                    if total != src_path["size"] or h.hexdigest() != src_path["sha256"]:
+                        from shared.chat_catalogue import ChatCatalogueIntegrityError
+                        raise ChatCatalogueIntegrityError("captured attachment checksum differs during export")
                 per_file.append({
                     "path": path, "sha256": h.hexdigest(), "bytes": total,
                 })
                 total_bytes += total
                 return total, False
             except Exception as e:
+                if isinstance(src_path, dict) and src_path.get("catalogue"):
+                    # A new-format export cannot report success with substituted bytes.
+                    zf.close()
+                    raise
                 placeholder = (
                     f"[ATTACHMENT_MISSING]\nblob_path: {src_path}\nerror: {e!r}\n"
                     "This attachment was not available at export time.\n"
@@ -98,6 +141,7 @@ class ThreadPackager:
                 return len(placeholder), True
 
         inline_count = 0; attachment_count = 0
+        used_att_names: dict[str, set] = {}  # att_dir -> lowercased names taken
         for m in messages:
             att_dir = (f"{tsafe}-attachments" if self.layout == "single_thread"
                        else f"per-message/{tsafe}/{_safe_name(m.external_id)}/attachments")
@@ -111,9 +155,12 @@ class ThreadPackager:
                 # placeholder under it — the operator can tell from
                 # the file size (and from manifest.json) that it's
                 # not the real attachment.
-                clean_name = _safe_name(att["name"])
+                clean_name = _unique_in_dir(
+                    _safe_name(att["name"]),
+                    used_att_names.setdefault(att_dir, set()),
+                )
                 target = f"{att_dir}/{clean_name}"
-                written, missing = await _add_stream(target, att["blob_path"])
+                written, missing = await _add_stream(target, att if att.get("catalogue") else att["blob_path"])
                 if missing:
                     # Append a .MISSING marker file next to it so
                     # operators can spot the gap at a glance — the
@@ -137,11 +184,12 @@ class ThreadPackager:
             m.attachments = new_atts
             for hc in hosted_map.get(m.external_id, []):
                 ext = hc.get("ext", ".bin")
-                target = f"{att_dir}/inline/{hc['hc_id']}{ext}"
-                written, missing = await _add_stream(target, hc["blob_path"])
+                archive_key = _hosted_archive_key(m.external_id, hc, thread_path=self.thread_path)
+                target = f"{att_dir}/inline/{archive_key}{ext}"
+                written, missing = await _add_stream(target, hc if hc.get("catalogue") else hc["blob_path"])
                 if missing:
                     _add(
-                        f"{att_dir}/inline/{hc['hc_id']}.MISSING.txt",
+                        f"{att_dir}/inline/{archive_key}.MISSING.txt",
                         (
                             f"Inline image {hc['hc_id']} could not be retrieved.\n"
                             f"blob_path: {hc['blob_path']}\n"

@@ -1,0 +1,28 @@
+# netpol-tmvault-prometheus-scrape.yaml
+# itops enforces a namespace default-deny (ingress+egress). The cluster's catch-all
+# allow-prometheus-scrape policy admits the monitoring namespace on 9090/9100/8080/8443
+# only, and 06-netpol-ingress-stack.yaml admits only other tmvault pods — so the
+# exporter ports the PodMonitors in podmonitor-tmvault.yaml scrape (9101/9102/9103 and
+# RabbitMQ 15692) are unreachable from Prometheus without this policy. NetworkPolicies
+# are additive: this opens ONLY the listed TCP ports, ONLY from namespace monitoring,
+# ONLY to pods labelled stack=tmvault. Apply it together with the PodMonitors.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tmvault-ingress-prometheus-scrape
+  namespace: itops
+  labels: { stack: tmvault }
+spec:
+  podSelector:
+    matchLabels: { stack: tmvault }
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: monitoring }
+      ports:
+        - { protocol: TCP, port: 9100 }    # pst_metrics   (restore-worker)
+        - { protocol: TCP, port: 9101 }    # sla_metrics   (backup-scheduler)
+        - { protocol: TCP, port: 9102 }    # chat-export-worker process metrics
+        - { protocol: TCP, port: 9103 }    # core_metrics  (workers + API services)
+        - { protocol: TCP, port: 15692 }   # rabbitmq_prometheus

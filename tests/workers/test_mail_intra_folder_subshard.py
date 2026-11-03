@@ -124,7 +124,7 @@ def test_gate_incremental_small_jump_no_subshard():
                 jump_bytes=128 * MB) is False
 
 
-def test_gate_incremental_big_jump_subshards():
+def test_gate_incremental_big_jump_keeps_saved_delta():
     assert _dec(enabled=True, size_bytes=400 * MB, prev_size_bytes=200 * MB,
                 saved_token="https://delta", min_bytes=128 * MB,
-                jump_bytes=128 * MB) is True
+                jump_bytes=128 * MB) is False

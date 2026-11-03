@@ -74,7 +74,7 @@ class _StubSession:
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 # ─── reconciler.sweep_orphans ─────────────────────────────────────────
@@ -119,12 +119,37 @@ def test_sweep_finalizes_orphan_snapshots():
     from shared.reconciler import sweep_orphans
     snap_id = uuid.uuid4()
     session = _StubSession({
-        "UPDATE snapshots s\n                   SET status = CASE\n                           WHEN NOT EXISTS": [
-            _Row(id=snap_id, status="COMPLETED"),
+        # Substring unique to STEP B (the orphan-snapshot UPDATE): STEP D's
+        # integrity correction also starts "UPDATE snapshots s SET status =
+        # CASE", so key on STEP B's non-partitioned-orphan comment.
+        "-- Non-partitioned orphan": [
+            _Row(id=snap_id, status="FAILED"),
         ],
     })
     stats = _run(sweep_orphans(session))
     assert stats.snapshots_finalized == 1
+
+
+def test_step_b_orphan_without_partitions_derives_failed_not_completed():
+    """A non-partitioned IN_PROGRESS snapshot whose lease died (WHERE
+    precondition of STEP B) is a worker that died mid-run. Deriving
+    COMPLETED manufactured false successes — a crashed multi-hour
+    archive walk became a COMPLETED 0-item snapshot that read as a
+    successful empty backup and fed retention deletion."""
+    import inspect
+    import shared.reconciler as reconciler
+    src = inspect.getsource(reconciler)
+    import re
+    m = re.search(
+        r"WHEN NOT EXISTS \(\s*SELECT 1 FROM snapshot_partitions sp\s*"
+        r"WHERE sp\.snapshot_id = s\.id\s*\) THEN '(\w+)'::snapshotstatus",
+        src,
+    )
+    assert m, "STEP B's non-partitioned CASE branch not found"
+    assert m.group(1) == "FAILED", (
+        "non-partitioned orphans must derive FAILED — COMPLETED is a "
+        "false success for a run that died mid-walk"
+    )
 
 
 def test_sweep_finalizes_orphan_jobs():
@@ -174,14 +199,22 @@ def test_republish_routes_each_partition_type():
         {"id": "4", "snapshot_id": "s4", "partition_type": "SHAREPOINT_DRIVES",
          "partition_index": 0, "drive_id": None, "file_ids": None,
          "payload": {"drive_ids": ["sp"]}},
+        {"id": "5", "snapshot_id": "s5", "partition_type": "GROUPS_CHANNELS",
+         "partition_index": 0, "drive_id": None, "file_ids": None,
+         "payload": {"channel_ids": ["ch"], "team_id": "t"}},
+        {"id": "6", "snapshot_id": "s6", "partition_type": "ENTRA_CATEGORIES",
+         "partition_index": 0, "drive_id": None, "file_ids": None,
+         "payload": {"category_ids": ["USERS"], "directory_id": "d"}},
     ])
     n = _run(republish_partition_messages(stats, message_bus=bus))
-    assert n == 4
+    assert n == 6
     queues = [q for q, _ in bus.published]
     assert "backup.onedrive_partition" in queues
     assert "backup.chats_partition" in queues
     assert "backup.mail_partition" in queues
     assert "backup.sharepoint_partition" in queues
+    assert "backup.groups_partition" in queues
+    assert "backup.entra_partition" in queues
 
 
 def test_republish_skips_unknown_partition_type():

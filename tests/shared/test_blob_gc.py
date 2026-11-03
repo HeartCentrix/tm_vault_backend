@@ -73,3 +73,8 @@ def test_container_candidates_dedups_and_normalizes_underscores():
     assert "backup-mailbox-abcd1234" in cands
     # no duplicates
     assert len(cands) == len(set(cands))
+
+
+def test_catalogue_owned_generation_is_never_deleted_by_legacy_gc():
+    path = "chat-catalogue/v1/tenant/immutable-generation"
+    assert blobs_safe_to_delete([path, "legacy/path"], []) == {"legacy/path"}

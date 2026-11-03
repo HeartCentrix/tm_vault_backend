@@ -1,0 +1,261 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: backup-worker, namespace: itops, labels: { app: backup-worker, stack: tmvault } }
+spec:
+  replicas: 10
+  # maxSurge=0 keeps the pool under the itops memory ResourceQuota during a
+  # roll (no extra surge pod at 6Gi). Bumped to 6Gi 2026-06-18 — combined
+  # chat-heavy (CHAT-ATT) + onedrive-partition load OOMKilled the 3Gi pool.
+  strategy: { rollingUpdate: { maxSurge: 0, maxUnavailable: 1 } }
+  selector: { matchLabels: { app: backup-worker } }
+  template:
+    metadata: { labels: { app: backup-worker, stack: tmvault } }
+    spec:
+      imagePullSecrets: [ { name: harbor-creds } ]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: backup-worker
+          image: harbor.taylormorrison.com/library/tmvault-backup-worker@sha256:67952dba9a217c119b090455a84c717efc65bada5548528ee363fe9dc9cddf60
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+          envFrom: [ { configMapRef: { name: tmvault-config } }, { secretRef: { name: tmvault-secrets } } ]
+          env:
+            # Concurrent OneDrive backups per light-pool replica. Safe at 2
+            # now that the huge-file segment RAM pool is cgroup-bounded
+            # (worker-scoped ~1GiB shared across concurrent backups, not
+            # multiplied per-backup) and the limit is 3Gi. Was 1 during the
+            # OOM mitigation; raise further only with memory observation.
+            - { name: MAX_CONCURRENT_ONEDRIVE_BACKUPS_PER_WORKER, value: "2" }
+            - { name: BACKUP_CHATS_PARTITION_PREFETCH, value: "2" }  # 2026-10-15: prefetch == per-tenant cap (2) so pods stop hoarding claimed shards
+            - { name: BACKUP_MAIL_PARTITION_PREFETCH,  value: "2" }
+            # Cap concurrent per-shard chat drains. Default 32 OOM-killed the
+            # 6Gi pool under combined chat (CHAT-ATT hosted-content) load
+            # 2026-06-18 — orphaning partitions so snapshots never finalized.
+            # 16 bounds peak memory under 6Gi. Raise only with memory headroom.
+            - { name: USER_CHATS_PARALLEL_CHATS, value: "16" }
+            - { name: DB_PASSWORD,         valueFrom: { secretKeyRef: { name: tmvault-secrets, key: DB_PASSWORD } } }
+            - { name: JWT_SECRET,          valueFrom: { secretKeyRef: { name: tmvault-secrets, key: JWT_SECRET } } }
+            - { name: ENCRYPTION_KEY,      valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ENCRYPTION_KEY } } }
+            - { name: RABBITMQ_PASSWORD,   valueFrom: { secretKeyRef: { name: tmvault-secrets, key: RABBITMQ_PASSWORD } } }
+            - { name: ONPREM_S3_ACCESS_KEY,valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_ACCESS_KEY } } }
+            - { name: ONPREM_S3_SECRET_KEY,valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_SECRET_KEY } } }
+            - { name: APP_1_CLIENT_ID,     valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_ID } } }
+            - { name: APP_1_CLIENT_SECRET, valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_SECRET } } }
+            - { name: APP_1_TENANT_ID,     valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_TENANT_ID } } }
+          resources:
+            requests: { cpu: "250m", memory: "1Gi" }
+            limits: { cpu: "2", memory: "8Gi" }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: restore-worker, namespace: itops, labels: { app: restore-worker, stack: tmvault } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: restore-worker } }
+  template:
+    metadata: { labels: { app: restore-worker, stack: tmvault } }
+    spec:
+      imagePullSecrets: [ { name: harbor-creds } ]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: restore-worker
+          image: harbor.taylormorrison.com/library/tmvault-restore-worker@sha256:7e9de88b8da2b2c40dad1bfb08579119a0ef6a6193c2ce8fd5a108cb0293a45e
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+          envFrom: [ { configMapRef: { name: tmvault-config } }, { secretRef: { name: tmvault-secrets } } ]
+          env:
+            - { name: DB_PASSWORD,         valueFrom: { secretKeyRef: { name: tmvault-secrets, key: DB_PASSWORD } } }
+            - { name: JWT_SECRET,          valueFrom: { secretKeyRef: { name: tmvault-secrets, key: JWT_SECRET } } }
+            - { name: ENCRYPTION_KEY,      valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ENCRYPTION_KEY } } }
+            - { name: RABBITMQ_PASSWORD,   valueFrom: { secretKeyRef: { name: tmvault-secrets, key: RABBITMQ_PASSWORD } } }
+            - { name: ONPREM_S3_ACCESS_KEY,valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_ACCESS_KEY } } }
+            - { name: ONPREM_S3_SECRET_KEY,valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_SECRET_KEY } } }
+            - { name: APP_1_CLIENT_ID,     valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_ID } } }
+            - { name: APP_1_CLIENT_SECRET, valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_SECRET } } }
+            - { name: APP_1_TENANT_ID,     valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_TENANT_ID } } }
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits: { cpu: "1", memory: "1Gi" }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: discovery-worker, namespace: itops, labels: { app: discovery-worker, stack: tmvault } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: discovery-worker } }
+  template:
+    metadata: { labels: { app: discovery-worker, stack: tmvault } }
+    spec:
+      imagePullSecrets: [ { name: harbor-creds } ]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: discovery-worker
+          image: harbor.taylormorrison.com/library/tmvault-discovery-worker@sha256:29c3829a309f9b2c25bef09f72ed393087ad7fbfeaed101fec5b7000a17c47fd
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+          envFrom: [ { configMapRef: { name: tmvault-config } }, { secretRef: { name: tmvault-secrets } } ]
+          env:
+            - { name: DB_PASSWORD,         valueFrom: { secretKeyRef: { name: tmvault-secrets, key: DB_PASSWORD } } }
+            - { name: JWT_SECRET,          valueFrom: { secretKeyRef: { name: tmvault-secrets, key: JWT_SECRET } } }
+            - { name: ENCRYPTION_KEY,      valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ENCRYPTION_KEY } } }
+            - { name: RABBITMQ_PASSWORD,   valueFrom: { secretKeyRef: { name: tmvault-secrets, key: RABBITMQ_PASSWORD } } }
+            - { name: ONPREM_S3_ACCESS_KEY,valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_ACCESS_KEY } } }
+            - { name: ONPREM_S3_SECRET_KEY,valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_SECRET_KEY } } }
+            - { name: APP_1_CLIENT_ID,     valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_ID } } }
+            - { name: APP_1_CLIENT_SECRET, valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_SECRET } } }
+            - { name: APP_1_TENANT_ID,     valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_TENANT_ID } } }
+            # SharePoint REST rejects client-secret app-only tokens —
+            # site discovery needs a cert-signed assertion (PEM bundle:
+            # private key + cert; public .cer uploaded to the AAD app).
+            - { name: SHAREPOINT_CERT_PEM_B64, valueFrom: { secretKeyRef: { name: tmvault-secrets, key: SHAREPOINT_CERT_PEM_B64 } } }
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits: { cpu: "1", memory: "2Gi" }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: chat-export-worker, namespace: itops, labels: { app: chat-export-worker, stack: tmvault } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: chat-export-worker } }
+  template:
+    metadata: { labels: { app: chat-export-worker, stack: tmvault } }
+    spec:
+      imagePullSecrets: [ { name: harbor-creds } ]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: chat-export-worker
+          image: harbor.taylormorrison.com/library/tmvault-chat-export-worker@sha256:c27ced030e5628a89ec7aa6caf46560053023dee6320452104e84830bb317be6
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+          envFrom: [ { configMapRef: { name: tmvault-config } }, { secretRef: { name: tmvault-secrets } } ]
+          env:
+            - { name: DB_PASSWORD,         valueFrom: { secretKeyRef: { name: tmvault-secrets, key: DB_PASSWORD } } }
+            - { name: JWT_SECRET,          valueFrom: { secretKeyRef: { name: tmvault-secrets, key: JWT_SECRET } } }
+            - { name: ENCRYPTION_KEY,      valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ENCRYPTION_KEY } } }
+            - { name: RABBITMQ_PASSWORD,   valueFrom: { secretKeyRef: { name: tmvault-secrets, key: RABBITMQ_PASSWORD } } }
+            - { name: ONPREM_S3_ACCESS_KEY,valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_ACCESS_KEY } } }
+            - { name: ONPREM_S3_SECRET_KEY,valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_SECRET_KEY } } }
+            - { name: APP_1_CLIENT_ID,     valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_ID } } }
+            - { name: APP_1_CLIENT_SECRET, valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_SECRET } } }
+            - { name: APP_1_TENANT_ID,     valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_TENANT_ID } } }
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits: { cpu: "1", memory: "1Gi" }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: azure-workload-worker, namespace: itops, labels: { app: azure-workload-worker, stack: tmvault } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: azure-workload-worker } }
+  template:
+    metadata: { labels: { app: azure-workload-worker, stack: tmvault } }
+    spec:
+      imagePullSecrets: [ { name: harbor-creds } ]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: azure-workload-worker
+          image: harbor.taylormorrison.com/library/tmvault-azure-workload-worker@sha256:5e3e626bdf731a69bbcc702fce748883f5ef7e32f5b9d62b9e35b4d3839f2833
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+          envFrom: [ { configMapRef: { name: tmvault-config } }, { secretRef: { name: tmvault-secrets } } ]
+          env:
+            - { name: DB_PASSWORD,         valueFrom: { secretKeyRef: { name: tmvault-secrets, key: DB_PASSWORD } } }
+            - { name: JWT_SECRET,          valueFrom: { secretKeyRef: { name: tmvault-secrets, key: JWT_SECRET } } }
+            - { name: ENCRYPTION_KEY,      valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ENCRYPTION_KEY } } }
+            - { name: RABBITMQ_PASSWORD,   valueFrom: { secretKeyRef: { name: tmvault-secrets, key: RABBITMQ_PASSWORD } } }
+            - { name: ONPREM_S3_ACCESS_KEY,valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_ACCESS_KEY } } }
+            - { name: ONPREM_S3_SECRET_KEY,valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_SECRET_KEY } } }
+            - { name: APP_1_CLIENT_ID,     valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_ID } } }
+            - { name: APP_1_CLIENT_SECRET, valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_SECRET } } }
+            - { name: APP_1_TENANT_ID,     valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_TENANT_ID } } }
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits: { cpu: "1", memory: "1Gi" }
+---
+# Heavy backup pool — dedicated consumer of backup.heavy (oversized
+# OneDrive / SharePoint / chat drives). Same image as backup-worker;
+# BACKUP_WORKER_QUEUE=backup.heavy auto-flips it to DEDICATED_ONLY so it
+# never steals urgent/normal lanes from the light pool. One monster drive
+# at a time (MAX_CONCURRENT_ONEDRIVE_BACKUPS_PER_WORKER=1). Without this
+# deployment, backup.heavy has zero consumers and large drives never run.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: backup-worker-heavy, namespace: itops, labels: { app: backup-worker-heavy, stack: tmvault } }
+spec:
+  replicas: 10
+  # maxSurge=0 keeps a roll under the itops memory ResourceQuota (no surge pod).
+  strategy: { rollingUpdate: { maxSurge: 0, maxUnavailable: 1 } }
+  selector: { matchLabels: { app: backup-worker-heavy } }
+  template:
+    metadata: { labels: { app: backup-worker-heavy, stack: tmvault } }
+    spec:
+      imagePullSecrets: [ { name: harbor-creds } ]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: backup-worker
+          image: harbor.taylormorrison.com/library/tmvault-backup-worker@sha256:67952dba9a217c119b090455a84c717efc65bada5548528ee363fe9dc9cddf60
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+          envFrom: [ { configMapRef: { name: tmvault-config } }, { secretRef: { name: tmvault-secrets } } ]
+          env:
+            - { name: BACKUP_WORKER_QUEUE, value: "backup.heavy" }
+            - { name: MAX_CONCURRENT_ONEDRIVE_BACKUPS_PER_WORKER, value: "1" }
+            - { name: BACKUP_CHATS_PARTITION_PREFETCH, value: "2" }  # 2026-10-15: prefetch == per-tenant cap (2) so pods stop hoarding claimed shards
+            - { name: BACKUP_MAIL_PARTITION_PREFETCH,  value: "2" }
+            - { name: DB_PASSWORD,         valueFrom: { secretKeyRef: { name: tmvault-secrets, key: DB_PASSWORD } } }
+            - { name: JWT_SECRET,          valueFrom: { secretKeyRef: { name: tmvault-secrets, key: JWT_SECRET } } }
+            - { name: ENCRYPTION_KEY,      valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ENCRYPTION_KEY } } }
+            - { name: RABBITMQ_PASSWORD,   valueFrom: { secretKeyRef: { name: tmvault-secrets, key: RABBITMQ_PASSWORD } } }
+            - { name: ONPREM_S3_ACCESS_KEY,valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_ACCESS_KEY } } }
+            - { name: ONPREM_S3_SECRET_KEY,valueFrom: { secretKeyRef: { name: tmvault-secrets, key: ONPREM_S3_SECRET_KEY } } }
+            - { name: APP_1_CLIENT_ID,     valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_ID } } }
+            - { name: APP_1_CLIENT_SECRET, valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_CLIENT_SECRET } } }
+            - { name: APP_1_TENANT_ID,     valueFrom: { secretKeyRef: { name: tmvault-secrets, key: APP_1_TENANT_ID } } }
+          resources:
+            requests: { cpu: "500m", memory: "2Gi" }
+            limits: { cpu: "4", memory: "16Gi" }

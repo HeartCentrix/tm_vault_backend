@@ -1,0 +1,84 @@
+# 21-redis.yaml
+# Uses the official redis already mirrored in Harbor.
+# Auth: requirepass from tmvault-secrets/REDIS_PASSWORD (ITO-10192, 2026-08-25).
+# FLIP ORDERING (cannot be hitless): clients configured with a password error
+# against a no-auth server, so: (1) ship consumer images with password=...or
+# None, (2) patch the secret, (3) apply THIS file, (4) IMMEDIATELY roll
+# auth-service/graph-proxy/delta-token/job-service (40-services.yaml env),
+# (5) restart chat-export-worker + azure-workload-worker in a Gold-safe window.
+# Kyverno: harbor image + runAsNonRoot (redis user uid 999).
+#
+# DURABLE (2026-10-14). shared/security.py keeps the refresh-token revocation
+# denylist here (jwt_revoked:<jti>, TTL up to JWT_REFRESH_EXPIRATION_DAYS=7d).
+# With `--save "" --appendonly no` and no volume, every pod restart emptied it
+# and every refresh token rotated or logged out in the previous week became
+# replayable again. So:
+#   - AOF on, fsync every second, on a 1Gi rook-ceph-block PVC mounted at /data
+#     (the image's WORKDIR = redis `dir`). Hard crash loses at most ~1s of
+#     revocations. fsGroup 999 makes the fresh RBD volume writable by uid 999.
+#   - `--save ""` stays: AOF is the durability path. RDB snapshots would only add
+#     fork/copy-on-write spikes inside the 512Mi limit, and Redis 7 AOF rewrites
+#     already compact into an RDB-preamble base file.
+#   - `--maxmemory-policy noeviction` stated explicitly (it is the default): a
+#     denylist must error on OOM, never evict; security.py fails closed on errors.
+#   - strategy Recreate: the claim is RWO. A RollingUpdate surges a second pod
+#     that cannot attach the RBD image while the old pod holds it on another node.
+#   - resources explicit instead of the itops LimitRange default (1 CPU / 1Gi).
+#   - The FIRST apply still starts from an empty PVC (one last denylist wipe);
+#     apply it in a window where that is acceptable, as for any restart today.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: tmvault-redis-data, namespace: itops, labels: { app: tmvault-redis, stack: tmvault } }
+spec:
+  accessModes: [ ReadWriteOnce ]
+  storageClassName: rook-ceph-block
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: tmvault-redis, namespace: itops, labels: { app: tmvault-redis, stack: tmvault } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: tmvault-redis } }
+  strategy: { type: Recreate }
+  template:
+    metadata: { labels: { app: tmvault-redis, stack: tmvault } }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: redis
+          image: harbor.taylormorrison.com/library/redis@sha256:b1addbe72465a718643cff9e60a58e6df1841e29d6d7d60c9a85d8d72f08d1a7
+          # $(VAR) expansion in args requires the env var on this container.
+          args: ["--save", "", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction", "--requirepass", "$(REDIS_PASSWORD)"]
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: REDIS_PASSWORD } }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+          ports: [ { containerPort: 6379 } ]
+          volumeMounts: [ { name: data, mountPath: /data } ]
+          readinessProbe:
+            # plain `redis-cli ping` returns NOAUTH once requirepass is on
+            exec: { command: ["sh", "-c", "redis-cli --no-auth-warning -a \"$REDIS_PASSWORD\" ping"] }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: tmvault-redis-data }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: tmvault-redis, namespace: itops, labels: { app: tmvault-redis, stack: tmvault } }
+spec:
+  selector: { app: tmvault-redis }
+  ports: [ { port: 6379, targetPort: 6379 } ]

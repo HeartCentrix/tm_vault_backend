@@ -23,6 +23,8 @@ from shared.models import Job, Resource, Snapshot, JobStatus
 from shared.config import settings
 
 app = FastAPI(title="Progress Tracking Service", version="1.0.0")
+from shared.auth_enforcement import AuthMiddleware  # Ops/Data Check 17
+app.add_middleware(AuthMiddleware, service_name="progress-tracker", enforce_tenant_scope=True)
 
 # In-memory progress tracker (also persisted to DB)
 # Key: resource_id, Value: progress dict

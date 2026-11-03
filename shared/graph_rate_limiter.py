@@ -1,77 +1,26 @@
-"""Process-global token-bucket rate limiter for Microsoft Graph calls.
+"""Configured Graph admission with optional cross-process Redis coordination.
 
-Sits *above* the per-app throttle in :mod:`shared.multi_app_manager`.
-
-Why this exists
----------------
-Microsoft enforces several limits on Graph API traffic, layered:
-
-1. **Per-app** — each application registration has its own quota
-   (managed inside ``multi_app_manager``).
-2. **Per-tenant** — across all apps belonging to a tenant. As of
-   Mar 2026 the documented cap is roughly **150,000 requests per
-   10-minute sliding window** (~250 req/s). All 12 of our app
-   registrations share this pool. Per-app rotation does NOT lift it.
-3. **Per-mailbox** — at most 4 concurrent calls per mailbox per app.
-
-This module enforces (2). With single-tenant TMvault, the limiter is
-one process-global (or Redis-coordinated, when ``REDIS_URL`` is set)
-token bucket whose refill rate matches the Microsoft-side per-tenant
-budget. Callers ``await rate_limiter.acquire()`` before each Graph
-HTTP call; the call blocks until a token is available.
-
-Design choices
---------------
-- **Token bucket, not leaky bucket.** Bursts are allowed up to the
-  configured bucket capacity so that short spikes from coordinator
-  fan-out don't get punished — sustained rate still cannot exceed
-  the refill.
-- **Process-local fast path.** When ``REDIS_URL`` is unset (typical
-  for tests + local dev) the limiter is per-process. With multiple
-  workers in prod, each worker holds its own share — divide the
-  per-tenant budget across worker replicas via
-  ``GRAPH_GLOBAL_RPS / replica_count`` env on deploy.
-- **Redis-coordinated mode.** When ``REDIS_URL`` is set, tokens are
-  drawn from a Redis-hosted bucket using a tiny Lua script so that
-  N replicas share a single budget. Failure-open: if Redis is down
-  the limiter degrades to process-local (logs warning).
-- **Single-tenant simplification.** Today there is exactly one tenant.
-  The bucket key is ``graph:bucket:global`` so the same limiter
-  works unchanged when we go multi-tenant — the key just becomes
-  ``graph:bucket:{tenant_id}`` and ``acquire(tenant_id=...)`` is
-  routed accordingly.
-- **No-op when prometheus_client missing** — calls
-  ``core_metrics.inc_graph_rate_limit_wait`` only when the metric
-  is registered, so the limiter has no hard dep on observability.
-
-Configuration (env)
--------------------
-- ``GRAPH_GLOBAL_RPS`` (default 200) — sustained rate, requests/sec.
-  Microsoft's documented cap is ~250 r/s per tenant; default leaves
-  headroom for retries on top.
-- ``GRAPH_GLOBAL_BURST`` (default 400) — max bucket capacity. Short
-  bursts up to this size are allowed before the limiter kicks in.
-- ``GRAPH_RATE_LIMITER_ENABLED`` (default ``true``) — kill switch.
-
-Usage
------
-::
-
-    from shared.graph_rate_limiter import graph_rate_limiter
-
-    async def call_graph(client, url):
-        await graph_rate_limiter.acquire()
-        return await client.get(url)
+Limits are deployment policy, not a universal Microsoft quota. Local mode is
+appropriate only when its independently configured process allowance is safe.
+Configured Redis admission fails closed during coordinator outages.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
+from contextlib import asynccontextmanager
 from typing import Optional
 
+from shared.provider_read import ProviderReadError
+
 logger = logging.getLogger(__name__)
+
+def _validate_cost(cost, capacity):
+    if not math.isfinite(cost) or cost <= 0 or cost > capacity:
+        raise ValueError("admission cost must be positive, finite and no larger than capacity")
 
 
 class _LocalTokenBucket:
@@ -83,6 +32,8 @@ class _LocalTokenBucket:
     """
 
     def __init__(self, rate: float, capacity: float) -> None:
+        if not math.isfinite(rate) or rate <= 0 or not math.isfinite(capacity) or capacity <= 0:
+            raise ValueError("admission rate and capacity must be positive and finite")
         self.rate = float(rate)
         self.capacity = float(capacity)
         self._tokens = float(capacity)
@@ -90,6 +41,7 @@ class _LocalTokenBucket:
         self._lock = asyncio.Lock()
 
     async def acquire(self, n: float = 1.0) -> float:
+        _validate_cost(n, self.capacity)
         waited = 0.0
         # Sleep MUST be outside the lock or we serialise every Graph
         # caller in the worker — one task sleeping would block every
@@ -117,15 +69,15 @@ class _LocalTokenBucket:
 class _RedisTokenBucket:
     """Redis-coordinated token bucket for cross-replica sharing.
 
-    Uses a small Lua script that atomically refills + draws tokens,
-    keyed by ``key``. Failures fall back to a process-local bucket
-    so a Redis outage doesn't cascade into the backup pipeline.
+    Uses a server-clock Lua grant. Denied callers must redraw after sleeping;
+    no future capacity is reserved, so cancellation leaves no reservation.
     """
 
     # Atomic refill+take. Returns wait-seconds (0 if immediate) and
     # new token count.
     _LUA = """
-    local now = tonumber(ARGV[1])
+    local clock = redis.call('TIME')
+    local now = tonumber(clock[1]) + tonumber(clock[2]) / 1000000
     local rate = tonumber(ARGV[2])
     local cap = tonumber(ARGV[3])
     local n = tonumber(ARGV[4])
@@ -136,7 +88,6 @@ class _RedisTokenBucket:
     local wait = 0
     if tokens < n then
       wait = (n - tokens) / rate
-      tokens = 0
     else
       tokens = tokens - n
     end
@@ -154,24 +105,26 @@ class _RedisTokenBucket:
         self._fallback = fallback
 
     async def acquire(self, n: float = 1.0) -> float:
-        if self._script is None:
+        _validate_cost(n, self.capacity)
+        waited = 0.0
+        while True:
             try:
-                self._script = self._redis.register_script(self._LUA)
+                if self._script is None:
+                    self._script = self._redis.register_script(self._LUA)
+                wait_s, _tokens = await self._script(
+                    keys=[self._key],
+                    args=["0", str(self.rate), str(self.capacity), str(n)],
+                )
+                wait = float(wait_s)
+                if not math.isfinite(wait) or wait < 0:
+                    raise ValueError("invalid coordinator delay")
             except Exception as exc:
-                logger.warning("[graph_rate_limiter] Redis register_script failed (%s) — falling back to local", exc)
-                return await self._fallback.acquire(n)
-        try:
-            wait_s, _tokens = await self._script(
-                keys=[self._key],
-                args=[str(time.time()), str(self.rate), str(self.capacity), str(n)],
-            )
-            wait = float(wait_s)
-            if wait > 0:
-                await asyncio.sleep(wait)
-            return wait
-        except Exception as exc:
-            logger.warning("[graph_rate_limiter] Redis bucket draw failed (%s) — falling back to local", exc)
-            return await self._fallback.acquire(n)
+                logger.warning("Graph admission coordinator unavailable: %s", type(exc).__name__)
+                raise ProviderReadError("coordinator_unavailable", retry_after=5) from None
+            if wait == 0:
+                return waited
+            await asyncio.sleep(wait)
+            waited += wait
 
 
 class GraphRateLimiter:
@@ -186,8 +139,54 @@ class GraphRateLimiter:
         self._rate = rate
         self._burst = burst
 
+    @property
+    def scoped_enabled(self):
+        return os.environ.get("PROVIDER_SCOPED_ADMISSION_ENABLED", "false").lower() == "true"
+
+    async def _scoped_coordinator(self, context):
+        from shared.provider_admission import AdmissionLimits, ProviderDeferred, ScopedProviderAdmission
+        existing = getattr(self, "_scoped", None)
+        if existing is not None:
+            return existing
+        try:
+            await self.maybe_init_redis()
+        except ProviderReadError:
+            raise ProviderDeferred(context, 5, stage="coordinator_unavailable") from None
+        if not isinstance(self._bucket, _RedisTokenBucket):
+            raise ProviderDeferred(context, 5, stage="coordinator_unconfigured")
+        self._scoped = ScopedProviderAdmission(self._bucket._redis,
+            limits=AdmissionLimits(rate=self._rate, burst=self._burst,
+                global_concurrency=int(os.environ.get("PROVIDER_GLOBAL_CONCURRENCY", "16")),
+                tenant_concurrency=int(os.environ.get("PROVIDER_TENANT_CONCURRENCY", "8")),
+                resource_concurrency=int(os.environ.get("PROVIDER_RESOURCE_CONCURRENCY", "4"))),
+            namespace=os.environ.get("PROVIDER_ADMISSION_NAMESPACE", "tmvault"))
+        return self._scoped
+
+    @asynccontextmanager
+    async def admit(self, context, *, cost=1, wait_budget=1):
+        if not self.scoped_enabled:
+            yield
+            return
+        coordinator = await self._scoped_coordinator(context)
+        async with coordinator.admit(context, cost=cost, wait_budget=wait_budget):
+            yield
+
+    @asynccontextmanager
+    async def admit_many(self, requirements, *, wait_budget=1):
+        if not self.scoped_enabled:
+            yield
+            return
+        coordinator = await self._scoped_coordinator(requirements[0][0])
+        async with coordinator.admit_many(requirements, wait_budget=wait_budget):
+            yield
+
+    async def cooldown(self, context, seconds):
+        if self.scoped_enabled:
+            coordinator = await self._scoped_coordinator(context)
+            return await coordinator.cooldown(context, seconds)
+
     async def maybe_init_redis(self) -> None:
-        """Promote to Redis-backed bucket if ``REDIS_URL`` is configured.
+        """Promote using the explicit URL or enabled shared Redis settings.
 
         Safe to call multiple times; subsequent calls are no-ops.
         Designed to be invoked from each worker entry point AFTER
@@ -197,22 +196,29 @@ class GraphRateLimiter:
             return
         url = os.environ.get("REDIS_URL")
         if not url:
-            return
+            from shared.config import settings
+            if not settings.REDIS_ENABLED:
+                return
+            url = settings.REDIS_URL_FULL
         try:
             from redis.asyncio import Redis
-        except ImportError:
-            logger.info("[graph_rate_limiter] redis package missing — staying local")
-            return
-        try:
-            client = Redis.from_url(url, decode_responses=True)
+            client = Redis.from_url(url, decode_responses=True,
+                                    socket_connect_timeout=2, socket_timeout=2)
+            self._bucket = _RedisTokenBucket(
+                client, "graph:bucket:global", self._rate, self._burst, fallback=self._local,
+            )
             await client.ping()
         except Exception as exc:
-            logger.warning("[graph_rate_limiter] Redis ping failed (%s) — staying local", exc)
-            return
-        self._bucket = _RedisTokenBucket(
-            client, "graph:bucket:global", self._rate, self._burst, fallback=self._local,
+            logger.warning("Graph admission coordinator unavailable: %s", type(exc).__name__)
+            raise ProviderReadError("coordinator_unavailable", retry_after=5) from None
+        # Log host:port only — REDIS_URL can carry the auth password in URL
+        # form, and worker pods now route shared.* INFO to stdout.
+        from urllib.parse import urlparse
+        _loc = urlparse(url)
+        logger.info(
+            "[graph_rate_limiter] Redis-coordinated bucket active at %s:%s",
+            _loc.hostname, _loc.port,
         )
-        logger.info("[graph_rate_limiter] Redis-coordinated bucket active at %s", url)
 
     async def acquire(self, n: float = 1.0, reason: str = "graph_call") -> float:
         """Block until ``n`` tokens are available. Returns wait-seconds.
@@ -221,6 +227,7 @@ class GraphRateLimiter:
         can tell which call sites are hot."""
         if not self._enabled:
             return 0.0
+        await self.maybe_init_redis()
         waited = await self._bucket.acquire(n)
         if waited > 0:
             try:

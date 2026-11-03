@@ -38,6 +38,11 @@ _HEAVY_BACKUP_TYPES = {
     "ONEDRIVE",
     "SHAREPOINT_SITE",
     "POWER_BI",
+    # Online Archive (USER_ARCHIVE, jrue-only pilot ITO-9777) — full-item
+    # export via exportItems is just as content-heavy as OneDrive; this
+    # map (not shared.routing_fence's queue-by-workload map, which is
+    # inert — nothing consults it) is the real production dispatch gate.
+    "USER_ARCHIVE",
 }
 
 
@@ -77,5 +82,8 @@ def pick_restore_queue(total_bytes: int) -> str:
     50 GB used to be too high a bar.
     """
     if total_bytes and total_bytes > _HEAVY_RESTORE_THRESHOLD:
-        return "restore.heavy"
+        # Same name the consumer subscribes to (restore_queue_plan) — a
+        # literal here left >20GiB restores on an unconsumed queue when
+        # HEAVY_EXPORT_QUEUE is overridden (ITO-10275 review).
+        return settings.HEAVY_EXPORT_QUEUE
     return "restore.normal"

@@ -25,7 +25,7 @@ RESOURCE_TYPE_TO_SLA_FLAG: dict[str, str] = {
     # Exchange in-place archive rides the SAME Exchange checkbox as primary mail
     # — it's part of the user's mailbox. (Master gate is ARCHIVE_BACKUP_ENABLED;
     # a dedicated policy toggle can come later if granular control is wanted.)
-    "USER_ARCHIVE": "backup_exchange",
+    "USER_ARCHIVE": "backup_exchange_archive",
     "USER_ONEDRIVE": "backup_onedrive",
     "USER_CONTACTS": "contacts",
     "USER_CALENDAR": "calendars",

@@ -223,6 +223,29 @@ def _safe_name(s: str) -> str:
     return sanitized[:64]
 
 
+_ARCNAME_BAD_SEG = {"", ".", ".."}
+_ARCNAME_RESERVED = '<>:"/\\|?*'
+
+
+def safe_arcname(raw_path: str) -> str:
+    """Confining ZIP arcname builder for attacker-controlled path components.
+
+    Drops empty / ``.`` / ``..`` segments and reserved (Windows-forbidden)
+    chars per component, strips trailing dots/spaces, and normalises
+    backslashes so no ``..`` traversal or absolute path can survive.
+    """
+    if not raw_path:
+        return ""
+    segments = []
+    for seg in raw_path.replace("\\", "/").split("/"):
+        if seg.strip() in _ARCNAME_BAD_SEG:
+            continue
+        cleaned = "".join("_" if c in _ARCNAME_RESERVED else c for c in seg).rstrip(". ")
+        if cleaned:
+            segments.append(cleaned)
+    return "/".join(segments)
+
+
 def _cleanup_dir(path: Path) -> None:
     """Best-effort recursive delete of ``path``.  Swallows errors; the
     PST workdir lives under ``/tmp`` and we don't want a stray cleanup
@@ -520,8 +543,16 @@ class PstExportOrchestrator:
         await rate_limit.__aenter__()
 
         # Resumability — load prior progress and skip done groups.
+        # completed_keys doubles as the LIVE skip-filter on the stream, so
+        # only groups whose stream was fully exhausted may ever enter it
+        # (see _flush_group). flush_counts tracks how many PST "parts" a
+        # group has already flushed — persisted so a crash-resume keeps
+        # numbering (and blob keys) unique instead of overwriting prior
+        # parts. Resume of a partially-flushed group re-exports the whole
+        # group: duplicates across parts, never silent loss.
         completed_keys: set = set()
         prior_blobs: list = []
+        flush_counts: dict = defaultdict(int)
         if self.checkpoint_loader is not None:
             try:
                 prior = await self.checkpoint_loader()
@@ -531,6 +562,14 @@ class PstExportOrchestrator:
                         for k in prior.get("completed_keys", [])
                     }
                     prior_blobs = list(prior.get("pst_blobs", []) or [])
+                    for _fp in prior.get("flushed_parts", []) or []:
+                        try:
+                            _fk, _fn = _fp
+                            flush_counts[
+                                tuple(_fk) if isinstance(_fk, list) else _fk
+                            ] = int(_fn)
+                        except Exception:
+                            continue
                     logger.info(
                         "[pst_export] resumed: %d groups done, %d PSTs uploaded",
                         len(completed_keys), len(prior_blobs),
@@ -562,10 +601,15 @@ class PstExportOrchestrator:
             "ARCHIVE_ITEM": MailPstWriter,
         }
 
-        async def _flush_group(group_key: tuple) -> None:
+        async def _flush_group(group_key: tuple, final: bool = False) -> None:
             """Write one group's accumulated items to a PST, upload to
             blob, delete the local file, update checkpoint. Memory and
-            disk are reclaimed in this single function."""
+            disk are reclaimed in this single function.
+
+            ``final`` marks the end-of-stream flush. Mid-stream flushes
+            (flush threshold / total-accumulated cap) emit a PST *part*
+            and leave the group open — more items for it are still
+            arriving on the stream."""
             print(
                 f"[pst_export.FLUSH_TOP] group_key={group_key} "
                 f"accumulated_size={len(accumulated.get(group_key, []))} "
@@ -607,11 +651,26 @@ class PstExportOrchestrator:
                         flush=True,
                     )
 
+            # Every flush of the same group is its own PST part. A group
+            # larger than the flush threshold flushes multiple times and
+            # each part needs a distinct filename — the blob key and the
+            # final ZIP member name are both derived from it, so reusing
+            # the name would overwrite the earlier part.
+            flush_counts[group_key] += 1
+            part_no = flush_counts[group_key]
+            pst_filename = meta["pst_filename"]
+            if part_no > 1:
+                stem = (
+                    pst_filename[:-4]
+                    if pst_filename.endswith(".pst") else pst_filename
+                )
+                pst_filename = f"{stem}-part{part_no:03d}.pst"
+
             group = PstGroup(
                 key=group_key,
                 item_type=item_type,
                 items=items_to_write,
-                pst_filename=meta["pst_filename"],
+                pst_filename=pst_filename,
             )
 
             import time as _time
@@ -657,6 +716,7 @@ class PstExportOrchestrator:
                 # Upload each produced PST to blob immediately, then
                 # delete the local file. This bounds /tmp regardless of
                 # total mailbox size.
+                uploads_ok = True
                 for pst_path in write_result.pst_paths:
                     if not pst_path.exists():
                         continue
@@ -682,6 +742,7 @@ class PstExportOrchestrator:
                                 "item_type": item_type,
                             })
                         else:
+                            uploads_ok = False
                             logger.error(
                                 "PST upload failed for %s: %s",
                                 pst_path.name, upload_res.get("error"),
@@ -701,7 +762,16 @@ class PstExportOrchestrator:
                         except Exception:
                             pass
 
-                completed_keys.add(group_key)
+                # completed_keys doubles as the live skip-filter at the top
+                # of the stream loop. A group may only enter it once its
+                # stream is exhausted (final flush) AND its PSTs are durably
+                # uploaded — marking it on a mid-stream threshold flush
+                # silently dropped every remaining item of the group (a
+                # 10k-item Inbox truncated to its first 1000 with status
+                # 'done'). Failed uploads also stay un-completed so a crash
+                # resume retries them instead of skipping the group.
+                if final and uploads_ok:
+                    completed_keys.add(group_key)
                 _elapsed = _time.monotonic() - t0
                 logger.info(
                     "[pst_export] group %s flushed: items=%d psts=%d in %.2fs",
@@ -722,6 +792,9 @@ class PstExportOrchestrator:
                         await self.checkpoint_saver({
                             "completed_keys": [list(k) for k in completed_keys],
                             "pst_blobs": pst_blob_paths,
+                            "flushed_parts": [
+                                [list(k), n] for k, n in flush_counts.items()
+                            ],
                         })
                     except Exception as exc:
                         logger.warning("checkpoint save failed: %s", exc)
@@ -846,7 +919,10 @@ class PstExportOrchestrator:
                         else "sharepoint" if item.item_type.startswith("SHAREPOINT")
                         else "files"
                     )
-                    arcname = f"{workload_dir}/{folder.lstrip('/')}/{name}".replace("//", "/")
+                    arcname = safe_arcname(f"{workload_dir}/{folder}/{name}")
+                    assert ".." not in arcname.split("/") and not arcname.startswith("/"), (
+                        f"unsafe arcname: {arcname!r}"
+                    )
                     raw_members.append((arcname, container, blob_path))
                     raw_count += 1
                     items_seen += 1
@@ -904,9 +980,10 @@ class PstExportOrchestrator:
                 pct = min(80, 5 + int(items_seen ** 0.5 / 10))
                 await self._safe_progress(pct)
 
-        # Flush remaining accumulated groups.
+        # Flush remaining accumulated groups. The stream is exhausted, so
+        # these flushes are final — groups become resumable-complete here.
         for group_key in list(accumulated.keys()):
-            await _flush_group(group_key)
+            await _flush_group(group_key, final=True)
 
         await self._safe_progress(85)
 
@@ -1241,7 +1318,11 @@ class PstExportOrchestrator:
             with _zipfile.ZipFile(str(zip_path), "w", _zipfile.ZIP_STORED) as zf:
                 for pst_path in all_pst_paths:
                     if pst_path.exists():
-                        zf.write(str(pst_path), arcname=pst_path.name)
+                        _arc = safe_arcname(pst_path.name)
+                        assert _arc and ".." not in _arc.split("/") and not _arc.startswith("/"), (
+                            f"unsafe arcname: {_arc!r}"
+                        )
+                        zf.write(str(pst_path), arcname=_arc)
                         total_size += pst_path.stat().st_size
                         pst_file_names.append(pst_path.name)
 

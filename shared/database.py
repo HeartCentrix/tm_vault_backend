@@ -3,8 +3,12 @@
 import asyncio
 import logging
 import os
+import random
+from contextlib import asynccontextmanager
+from inspect import isawaitable
 from time import monotonic
 from typing import AsyncGenerator
+from weakref import WeakKeyDictionary, WeakValueDictionary
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -58,6 +62,10 @@ REQUIRED_TABLES = (
     # both expect the table to exist before issuing their INSERT /
     # SELECT FOR UPDATE SKIP LOCKED.
     "onedrive_file_retries",
+    "chat_capture_attempts", "chat_blob_objects", "chat_item_versions",
+    "chat_inventories", "chat_inventory_items", "snapshot_chat_inventories",
+    "chat_catalogue_pins",
+    "chat_presentation_plans", "chat_presentation_drafts", "snapshot_chat_presentations",
 )
 
 REQUIRED_COLUMNS = {
@@ -70,7 +78,7 @@ REQUIRED_COLUMNS = {
         "retention_mode",
     ),
     "resources": ("resource_hash",),
-    "snapshot_items": ("parent_external_id", "backend_id"),
+    "snapshot_items": ("parent_external_id", "backend_id", "chat_version_id"),
     "snapshots": ("backend_id",),
     "jobs": ("retry_reason", "pre_toggle_job_id"),
     "resource_discovery_staging": (
@@ -78,31 +86,68 @@ REQUIRED_COLUMNS = {
         "azure_resource_group",
         "azure_region",
     ),
+    "chat_capture_attempts": ("generation", "state", "expires_at", "staged_inventory_id", "evidence", "folder_path", "snapshot_lease_token", "job_lease_token", "partition_lease_token"),
+    "chat_blob_objects": ("state", "sha256", "capture_attempt_id", "deletion_task_id"),
+    "chat_item_versions": ("logical_key", "version_sha256", "payload", "content", "object_id"),
+    "chat_inventories": ("state", "membership_sha256", "representation_sha256", "evidence"),
+    "chat_inventory_items": ("inventory_id", "logical_key", "version_id"),
+    "snapshot_chat_inventories": ("inventory_id", "coverage_status", "capture_attempt_id", "uploaded_bytes"),
+    "chat_catalogue_pins": ("inventory_id", "object_id", "generation", "expires_at"),
 }
 
 logger = logging.getLogger(__name__)
 
 
-engine = create_async_engine(
-    settings.DATABASE_URL,
-    echo=False,
-    pool_pre_ping=True,
-    pool_use_lifo=settings.DB_POOL_USE_LIFO,
-    pool_size=settings.DB_POOL_SIZE,
-    max_overflow=settings.DB_MAX_OVERFLOW,
-    pool_timeout=settings.DB_POOL_TIMEOUT,
-    pool_recycle=settings.DB_POOL_RECYCLE,
-    # statement_cache_size=0 prevents asyncpg's prepared-statement cache from
-    # outliving a schema change. Without this, a tenant-wipe / DROP SCHEMA
-    # leaves dashboard_service holding cached statement plans with stale
-    # enum OIDs, producing `cache lookup failed for type 119228`. The cache
-    # is a 5-15% throughput win on hot paths; correctness matters more during
-    # demos/dev. Heavy-load prod can override by setting STATEMENT_CACHE_SIZE>0.
-    connect_args={
-        "server_settings": {"search_path": SEARCH_PATH},
-        "statement_cache_size": int(os.getenv("STATEMENT_CACHE_SIZE", "0")),
-    },
-)
+def _engine_kwargs() -> dict:
+    kw = dict(
+        echo=False,
+        pool_pre_ping=True,
+        pool_use_lifo=settings.DB_POOL_USE_LIFO,
+        pool_size=settings.DB_POOL_SIZE,
+        max_overflow=settings.DB_MAX_OVERFLOW,
+        pool_timeout=settings.DB_POOL_TIMEOUT,
+        pool_recycle=settings.DB_POOL_RECYCLE,
+        # statement_cache_size=0 prevents asyncpg's prepared-statement cache from
+        # outliving a schema change. Without this, a tenant-wipe / DROP SCHEMA
+        # leaves dashboard_service holding cached statement plans with stale
+        # enum OIDs, producing `cache lookup failed for type 119228`. The cache
+        # is a 5-15% throughput win on hot paths; correctness matters more during
+        # demos/dev. Heavy-load prod can override by setting STATEMENT_CACHE_SIZE>0.
+        connect_args={
+            "server_settings": {"search_path": SEARCH_PATH},
+            "statement_cache_size": int(os.getenv("STATEMENT_CACHE_SIZE", "0")),
+        },
+    )
+    if settings.DB_PGBOUNCER:
+        # ITO-9652: transaction-mode CNPG Pooler swaps the backend
+        # connection between transactions, so both asyncpg's client-side
+        # statement cache and its prepared-statement cache must be off —
+        # a cached plan can otherwise be reused against a backend that
+        # never prepared it (DuplicatePreparedStatementError /
+        # InvalidSQLStatementName).
+        kw["connect_args"]["statement_cache_size"] = 0
+        kw["connect_args"]["prepared_statement_cache_size"] = 0
+    return kw
+
+
+if settings.DB_PGBOUNCER and settings.DB_SCHEMA != "public":
+    # ITO-9652 final review: pgbouncer transaction-mode pooling swaps the
+    # backend connection between transactions/statements, so a session-level
+    # `SET search_path` (what asyncpg's connect_args["server_settings"] sends
+    # as a startup parameter) is not guaranteed to apply to the backend that
+    # actually executes a later statement. In practice DB_SCHEMA gets
+    # silently ignored and queries resolve against "public" only. This does
+    # not raise — flipping DB_PGBOUNCER/DB_SCHEMA is a live-fleet config knob
+    # and bricking engine creation over it would be worse than the bug.
+    logger.error(
+        "DB_PGBOUNCER is true and DB_SCHEMA=%r (!= 'public'): search_path is "
+        "ignored by pgbouncer transaction-mode pooling — queries will not "
+        "reliably see schema %r. Either set DB_SCHEMA=public or take this "
+        "service off the pooler (point DB_HOST at postgres-ha-rw directly).",
+        settings.DB_SCHEMA, settings.DB_SCHEMA,
+    )
+
+engine = create_async_engine(settings.DATABASE_URL, **_engine_kwargs())
 
 async_session_factory = async_sessionmaker(
     engine,
@@ -164,6 +209,34 @@ async def _has_required_columns(conn) -> bool:
     return True
 
 
+async def _has_required_catalogue_constraints(conn) -> bool:
+    """Tables/columns alone cannot conceal an unapplied or failed 0011 migration."""
+    result = await conn.execute(text("""
+        SELECT EXISTS (
+            SELECT 1 FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid
+            JOIN pg_namespace n ON n.oid=t.relnamespace
+            WHERE n.nspname=:schema AND t.relname='snapshot_items'
+              AND c.conname='fk_snapshot_items_chat_version' AND c.convalidated
+        ) AND EXISTS (
+            SELECT 1 FROM pg_index i JOIN pg_class x ON x.oid=i.indexrelid
+            JOIN pg_namespace n ON n.oid=x.relnamespace
+            WHERE n.nspname=:schema AND x.relname='ix_snapshot_items_chat_version_id'
+              AND i.indisvalid
+        ) AND EXISTS (
+            SELECT 1 FROM pg_index i JOIN pg_class x ON x.oid=i.indexrelid
+            JOIN pg_namespace n ON n.oid=x.relnamespace
+            WHERE n.nspname=:schema AND x.relname='uq_chat_complete_inventory'
+              AND i.indisvalid AND i.indisunique AND i.indpred IS NOT NULL
+        ) AND EXISTS (
+            SELECT 1 FROM pg_index i JOIN pg_class x ON x.oid=i.indexrelid
+            JOIN pg_namespace n ON n.oid=x.relnamespace
+            WHERE n.nspname=:schema AND x.relname='ix_chat_item_versions_parent_lookup'
+              AND i.indisvalid
+        )
+    """), {"schema": settings.DB_SCHEMA})
+    return bool(result.scalar())
+
+
 async def wait_for_schema_ready(
     timeout_seconds: int = SCHEMA_READY_TIMEOUT_SECONDS,
     poll_interval_seconds: float = SCHEMA_READY_POLL_INTERVAL_SECONDS,
@@ -174,7 +247,8 @@ async def wait_for_schema_ready(
     while monotonic() < deadline:
         try:
             async with engine.connect() as conn:
-                if await _has_required_tables(conn) and await _has_required_columns(conn):
+                if (await _has_required_tables(conn) and await _has_required_columns(conn)
+                    and await _has_required_catalogue_constraints(conn)):
                     return True
         except Exception as exc:  # pragma: no cover - defensive startup logging
             last_error = exc
@@ -278,6 +352,43 @@ async def _ensure_enum_values() -> None:
             # Postgres version / transaction semantics differ a bit here; IF NOT EXISTS
             # plus the guarded fallback keeps startup idempotent.
             pass
+
+
+_ADD_COLUMN_RE = None  # compiled lazily; module import stays cheap
+
+
+def _prune_existing_add_columns(statements, existing_columns):
+    """Drop ``ALTER TABLE <t> ADD COLUMN IF NOT EXISTS <c>`` statements
+    whose (table, column) is already present; pass everything else
+    through untouched.
+
+    ALTER TABLE takes AccessExclusiveLock even when IF NOT EXISTS makes
+    it a no-op, and init_db holds every lock it takes until the single
+    schema-sync transaction commits. On a fully-migrated database that
+    meant every service boot briefly exclusive-locked snapshots,
+    snapshot_items, resources, ... in sequence — and ABBA-deadlocked
+    against worker INSERTs (worker holds snapshot_items + wants the FK
+    RowShare on snapshots; boot holds snapshots + wants snapshot_items).
+    The 2026-07-20/21 crash-looping snapshot-service re-ran schema-sync
+    every restart and killed one SharePoint walk INSERT per boot.
+
+    `existing_columns` is a set of lowercased (table, column) tuples
+    from information_schema.
+    """
+    global _ADD_COLUMN_RE
+    if _ADD_COLUMN_RE is None:
+        import re
+        _ADD_COLUMN_RE = re.compile(
+            r"^\s*ALTER\s+TABLE\s+(\S+)\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+(\S+)",
+            re.IGNORECASE,
+        )
+    kept = []
+    for stmt in statements:
+        m = _ADD_COLUMN_RE.match(" ".join(str(stmt).split()))
+        if m and (m.group(1).strip('"').lower(), m.group(2).strip('"').lower()) in existing_columns:
+            continue
+        kept.append(stmt)
+    return kept
 
 
 async def init_db() -> None:
@@ -1182,6 +1293,25 @@ async def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS idx_snapshot_items_chat_created "
         "ON snapshot_items (snapshot_id, folder_path, created_at) "
         "WHERE item_type IN ('TEAMS_CHAT_MESSAGE','TEAMS_MESSAGE','TEAMS_MESSAGE_REPLY')",
+        # ix_snapshot_items_blob_path (blob reference guard, see
+        # shared/backup_cleanup.py) is deliberately NOT here, and must
+        # never be added here. snapshot_items is a PLAIN ~87GB table in
+        # production (verified 2026-07-31: relkind='r', zero partitions —
+        # the partitioning migration was never applied) holding tens of
+        # millions of rows: a non-concurrent build takes ShareLock on it,
+        # blocking every INSERT, cannot finish inside this transaction's
+        # statement_timeout, and — because _execute_batch has no
+        # per-statement savepoint — would abort the whole schema-sync
+        # transaction on EVERY service boot, silently reverting the rest
+        # of the index batch, the ALTERs and create_all (the outer
+        # handler's wait_for_schema_ready still reports success). Same
+        # class of failure as the ADD COLUMN deadlock documented in
+        # _prune_existing_add_columns. It lives in
+        # alembic/versions/0010_blob_reference_guard_indexes.py
+        # with the single CREATE INDEX CONCURRENTLY runbook (snapshot_items is
+        # a plain table in prod — there are no partitions to fan out to). The
+        # guard is CORRECT without it — the index only makes the unkeyed
+        # residue cheap.
         # idx_jobs_tenant_type_status is intentionally NOT here — it depends
         # on jobs.status having already been converted from VARCHAR to the
         # jobstatus enum. It's created in post_alter_index_statements below.
@@ -1189,6 +1319,13 @@ async def init_db() -> None:
         # freshness check both want this index.
         "CREATE INDEX IF NOT EXISTS ix_chat_url_cache_last_used "
         "ON chat_url_cache (tenant_id, last_used_at)",
+        # ix_chat_url_cache_blob_path (reverse lookup for the blob
+        # reference guard's cache invalidation) is likewise alembic-only:
+        # chat_url_cache is a hot cross-user dedup table taking
+        # INSERT … ON CONFLICT drain claims, so a blocking build here
+        # risks the same all-or-nothing abort of this batch. Correctness
+        # does not depend on it; the invalidation UPDATE is simply
+        # cheaper with it.
         "CREATE INDEX IF NOT EXISTS ix_chat_threads_tenant "
         "ON chat_threads (tenant_id, last_drained_at)",
         # Hot read path: hydrate a chat thread newest-first.
@@ -1419,6 +1556,9 @@ async def init_db() -> None:
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS pre_toggle_job_id UUID REFERENCES jobs(id);",
         "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS backend_id UUID REFERENCES storage_backends(id);",
         "ALTER TABLE snapshot_items ADD COLUMN IF NOT EXISTS backend_id UUID REFERENCES storage_backends(id);",
+        # Automatic job-retry policy (Configuration tab, 2026-08-18).
+        "ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS job_retry_max INTEGER NOT NULL DEFAULT 3;",
+        "ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS job_retry_delay_minutes INTEGER NOT NULL DEFAULT 5;",
         "CREATE INDEX IF NOT EXISTS idx_snapshots_backend ON snapshots(backend_id);",
         "CREATE INDEX IF NOT EXISTS idx_snapshot_items_backend ON snapshot_items(backend_id);",
         # Idempotency guard — pairs with the idempotent create_snapshot()
@@ -1632,7 +1772,20 @@ async def init_db() -> None:
             await _execute_batch(conn, enum_type_statements)
             await _execute_batch(conn, table_statements)
 
-            for stmt in add_column_statements:
+            # Prune no-op ADD COLUMNs against the catalog first: ALTER
+            # TABLE exclusive-locks the table even when IF NOT EXISTS
+            # skips the work, and this transaction holds those locks
+            # until commit — which deadlocked worker INSERTs on every
+            # service boot (see _prune_existing_add_columns).
+            _existing_columns = {
+                (r[0], r[1])
+                for r in (await conn.execute(text(
+                    "SELECT lower(table_name), lower(column_name) "
+                    "FROM information_schema.columns "
+                    "WHERE table_schema = current_schema()"
+                ))).all()
+            }
+            for stmt in _prune_existing_add_columns(add_column_statements, _existing_columns):
                 await conn.execute(text("SAVEPOINT add_col_sp"))
                 try:
                     await conn.execute(text(stmt))
@@ -1652,6 +1805,11 @@ async def init_db() -> None:
                     await conn.execute(text("ROLLBACK TO SAVEPOINT alter_sp"))  # Already converted
 
             await conn.run_sync(Base.metadata.create_all)
+            # Existing hot snapshot_items needs the explicit additive migration;
+            # create_all cannot add its column/FK/index and boot must not build it.
+            if (not await _has_required_columns(conn) or
+                not await _has_required_catalogue_constraints(conn)):
+                raise RuntimeError("Chat catalogue schema is incomplete; apply Alembic revision 0011")
 
         # Enum value additions (e.g. jobstatus PENDING/CANCELLING) must run
         # OUTSIDE a transaction. Chat-export indexes that reference those
@@ -1709,3 +1867,232 @@ async def _seed_preset_policies_for_existing_tenants() -> None:
 
 async def close_db():
     await engine.dispose()
+
+
+# ── Cluster-wide bound on giant snapshot_items copy statements ──
+# 2026-08-18 convoy: N concurrent carry-forward INSERT…SELECTs convoyed the
+# database on LWLock:BufferMapping, so heavy copies take one of
+# CARRY_FORWARD_BUCKETS cluster-wide advisory slots (xact-scoped: auto-release
+# at commit/rollback, cannot leak).
+#
+# 2026-08-24 regression fix (the "pooler disturbance"): the original
+# implementation waited with a blocking SELECT pg_advisory_xact_lock INSIDE
+# the caller's transaction. Under pgbouncer transaction pooling every waiter
+# therefore PINNED a pooler server connection for its whole wait — one >1h
+# giant copy holding a bucket queued 80+ waiters, exhausted the pool
+# (default_pool_size 120), and query_wait_timeout=120s killed every other
+# TM Vault connection (asyncpg ConnectionDoesNotExistError storms; wedged
+# walks, stall-guard aborts, failed backups). The fix: TRY the lock in a
+# fresh, short transaction; on a miss END that transaction (transaction-mode
+# pgbouncer releases the server connection) and sleep OUTSIDE any
+# transaction, then retry. The lock itself stays xact-scoped, so the winner's
+# commit/rollback releases it exactly as before, and the herd bound holds:
+# at most CARRY_FORWARD_BUCKETS copies run at once — but waiters no longer
+# occupy pooler slots while they queue.
+CARRY_FORWARD_LOCK_CLASS = 420018  # arbitrary app-unique advisory class
+CARRY_FORWARD_BUCKETS = int(os.getenv("CARRY_FORWARD_BUCKETS", "3"))
+# 2026-08-27 starvation fix: try-lock polling has no FIFO, so the archive's
+# single GIANT copy (coarse 5-10s poll) lost every freed slot to thousands
+# of fast-polling (0.25-0.75s) MICRO copies for 4h on two consecutive Gold
+# dispatches and died on the wait ceiling. Fairness comes from partitioning,
+# not queueing: GIANT sites (whole-resource INSERT…SELECT / UPDATE) take
+# reserved buckets [CARRY_FORWARD_BUCKETS, CARRY_FORWARD_BUCKETS +
+# GIANT_CARRY_FORWARD_BUCKETS) that micro callers never probe. The default
+# of 3 keeps the bound on CONCURRENT GIANT statements exactly at the
+# 2026-08-18 LWLock:BufferMapping convoy ceiling — raising it re-risks that
+# convoy and must stay an explicit env decision.
+GIANT_CARRY_FORWARD_BUCKETS = int(os.getenv("GIANT_CARRY_FORWARD_BUCKETS", "3"))
+# Fixed, env-independent base for giant-lane bucket ids. Deliberately NOT
+# CARRY_FORWARD_BUCKETS-relative: two pods running different
+# CARRY_FORWARD_BUCKETS values would otherwise overlap one pod's micro range
+# with the other's giant range and silently re-create the starvation
+# (2026-08-27 review). 1M is far above any plausible micro bucket count.
+GIANT_CARRY_FORWARD_LANE_BASE = 1_000_000
+# Two fast retries absorb brief contention; sustained contention backs off
+# to a capped cadence. Waits of an hour+ remain legitimate for giant copies,
+# so there is no default ceiling. Local followers never open DB sessions.
+CARRY_FORWARD_WAIT_BASE_S = float(os.getenv("CARRY_FORWARD_WAIT_BASE_S", "5"))
+CARRY_FORWARD_WAIT_JITTER_S = float(os.getenv("CARRY_FORWARD_WAIT_JITTER_S", "5"))
+CARRY_FORWARD_WAIT_MAX_S = float(os.getenv("CARRY_FORWARD_WAIT_MAX_S", "0"))  # 0 = no ceiling
+CARRY_FORWARD_WAIT_CAP_S = float(os.getenv("CARRY_FORWARD_WAIT_CAP_S", "30"))
+CARRY_FORWARD_FAST_RETRIES = 2
+_CARRY_FORWARD_CANCEL_POLL_S = 0.5
+# Weak values avoid retaining a lock's bound event loop after its tasks end.
+_CARRY_FORWARD_LOCAL_GATES = WeakKeyDictionary()
+_CARRY_FORWARD_LOG_INTERVAL_S = 60.0  # one wait line per minute per waiter
+# ⚠Monitoring note: try-lock waiters do NOT appear in pg_locks/pg_stat_activity
+# as advisory-lock waiters (the old live-diagnosis signal) — the
+# "[CARRY_FORWARD] waiting" log line below is the replacement signal.
+
+
+def carry_forward_bucket(key: str, *, lane: str = "micro") -> int:
+    """Stable bucket for a carry-forward key. md5, not hash():
+    PYTHONHASHSEED makes hash() differ across interpreters.
+
+    ``lane="giant"`` maps into the reserved bucket range so per-item micro
+    copies can never starve a whole-resource copy (see module comment)."""
+    import hashlib
+    digest = int(hashlib.md5((key or "").encode()).hexdigest(), 16)
+    if lane == "giant":
+        return GIANT_CARRY_FORWARD_LANE_BASE + digest % max(1, GIANT_CARRY_FORWARD_BUCKETS)
+    if lane != "micro":
+        raise ValueError(f"unknown carry-forward lane {lane!r}")
+    return digest % max(1, CARRY_FORWARD_BUCKETS)
+
+
+def _carry_forward_local_gate(lane: str, bucket: int) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    gates = _CARRY_FORWARD_LOCAL_GATES.setdefault(loop, WeakValueDictionary())
+    gate = gates.get((lane, bucket))
+    if gate is None:
+        gate = asyncio.Lock()
+        gates[(lane, bucket)] = gate
+    return gate
+
+
+@asynccontextmanager
+async def carry_forward_slot_session(
+    key: str,
+    *,
+    lane: str = "micro",
+    on_wait=None,
+    what: str = "",
+    wait_base_s: float | None = None,
+    wait_jitter_s: float | None = None,
+    should_cancel=None,
+) -> AsyncGenerator[AsyncSession, None]:
+    """Yield a session holding the key's existing transaction-scoped slot.
+
+    Probe pg_try_advisory_xact_lock in a fresh transaction. Misses roll
+    back and close before backoff. One local contender per
+    loop/lane/bucket probes; local followers wait without DB sessions.
+    The local permit lasts through the caller's copy and session close.
+
+    Two fast retries preserve short MICRO waits (including per-site cadence
+    overrides); continued misses back off exponentially with capped jitter.
+    ``on_wait`` ticks liveness for DB misses and local waits; its exceptions
+    are ignored. DB exceptions propagate immediately.
+
+    ``should_cancel`` may be a sync or async bool callback; true raises
+    CancelledError. It is checked before probes and at most every 0.5s while
+    sleeping or locally queued. The optional wait ceiling bounds acquisition,
+    including local queueing and DB probes, but never the caller's copy.
+    Logs include only slot metadata, never key or caller-supplied ``what``.
+    """
+    base = max(0.0, CARRY_FORWARD_WAIT_BASE_S if wait_base_s is None else wait_base_s)
+    jitter = max(0.0, CARRY_FORWARD_WAIT_JITTER_S if wait_jitter_s is None else wait_jitter_s)
+    cap = max(0.001, CARRY_FORWARD_WAIT_CAP_S)
+    backoff = min(base, cap)
+    bucket = carry_forward_bucket(key, lane=lane)
+    gate = _carry_forward_local_gate(lane, bucket)
+    attempt = 0
+    started = monotonic()
+    last_log = started
+    deadline = started + CARRY_FORWARD_WAIT_MAX_S if CARRY_FORWARD_WAIT_MAX_S > 0 else None
+    wait_kind = "local" if gate.locked() else "database"
+    waited_locally = gate.locked()
+    acquired = False
+
+    def log(outcome):
+        logger.info(
+            "[CARRY_FORWARD] %s slot bucket=%d lane=%s attempts=%d elapsed=%.3fs",
+            outcome, bucket, lane, attempt, monotonic() - started,
+            extra={
+                "copy_slot_outcome": outcome,
+                "copy_slot_bucket": bucket,
+                "copy_slot_lane": lane,
+                "copy_slot_attempts": attempt,
+                "copy_slot_wait_s": max(0.0, monotonic() - started),
+                "copy_slot_wait_kind": wait_kind,
+            },
+        )
+
+    def wait_timeout():
+        log("timeout")
+        return RuntimeError(
+            f"carry-forward slot wait exceeded "
+            f"CARRY_FORWARD_WAIT_MAX_S={CARRY_FORWARD_WAIT_MAX_S:g}s "
+            f"(bucket={bucket}, lane={lane})"
+        )
+
+    async def check_wait():
+        if should_cancel is not None:
+            cancelled = should_cancel()
+            if isawaitable(cancelled):
+                cancelled = await cancelled
+            if cancelled:
+                raise asyncio.CancelledError
+        if deadline is not None and monotonic() >= deadline:
+            raise wait_timeout()
+
+    def tick_wait():
+        nonlocal last_log
+        if on_wait is not None:
+            try:
+                on_wait()
+            except Exception:  # noqa: BLE001 — liveness must not kill the wait
+                pass
+        if monotonic() - last_log >= _CARRY_FORWARD_LOG_INTERVAL_S:
+            last_log = monotonic()
+            log("waiting")
+
+    timeout = asyncio.timeout(CARRY_FORWARD_WAIT_MAX_S if deadline is not None else None)
+    try:
+        async with timeout:
+            await check_wait()
+            while True:
+                try:
+                    async with asyncio.timeout(_CARRY_FORWARD_CANCEL_POLL_S):
+                        await gate.acquire()
+                    break
+                except TimeoutError:
+                    tick_wait()
+                    await check_wait()
+            try:
+                while True:
+                    await check_wait()
+                    async with async_session_factory() as session:
+                        got = (await session.execute(
+                            text("SELECT pg_try_advisory_xact_lock(:cls, :b)"),
+                            {"cls": CARRY_FORWARD_LOCK_CLASS, "b": bucket},
+                        )).scalar()
+                        if got:
+                            await check_wait()
+                            timeout.reschedule(None)
+                            acquired = True
+                            if attempt or waited_locally:
+                                log("acquired")
+                            yield session
+                            return
+                        # Release the pooler connection before any wait.
+                        await session.rollback()
+                    attempt += 1
+                    wait_kind = "database"
+                    tick_wait()
+                    if attempt <= CARRY_FORWARD_FAST_RETRIES:
+                        delay = min(base, 0.25) + random.uniform(0, min(jitter, 0.5))
+                    else:
+                        # Keep random spread even after the exponential hits its cap.
+                        spread = min(jitter, cap / 2)
+                        delay = min(backoff, cap - spread) + random.uniform(0, spread)
+                        backoff = min(cap, backoff * 2)
+                    remaining = min(cap, delay)
+                    while remaining > 0:
+                        await check_wait()
+                        duration = remaining
+                        if deadline is not None:
+                            duration = min(duration, max(0.0, deadline - monotonic()))
+                        if should_cancel is not None:
+                            duration = min(duration, _CARRY_FORWARD_CANCEL_POLL_S)
+                        await asyncio.sleep(duration)
+                        remaining -= duration
+            finally:
+                gate.release()
+    except TimeoutError:
+        if timeout.expired():
+            raise wait_timeout() from None
+        raise
+    except asyncio.CancelledError:
+        if not acquired:
+            log("cancelled")
+        raise

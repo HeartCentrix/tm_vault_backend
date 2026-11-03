@@ -1,13 +1,16 @@
 """Dashboard Service - Aggregated metrics and statistics"""
 import asyncio
 import logging
+import os
+import random
 from contextlib import asynccontextmanager
+from contextlib import suppress
 from typing import Optional
 from uuid import UUID
 from datetime import datetime, timedelta, timezone, date as _date
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import FastAPI, Depends, Query, HTTPException
+from fastapi import FastAPI, Depends, Query, HTTPException, Request
 
 
 def _resolve_tz(tz_name: Optional[str]) -> ZoneInfo:
@@ -42,9 +45,13 @@ def _bucket_date(dt: datetime, tz: ZoneInfo) -> _date:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(tz).date()
-from sqlalchemy import select, func, text, and_, or_
+from sqlalchemy import select, func, text, and_, or_, event
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from shared.database import get_db, close_db, AsyncSession, engine
+from shared.config import settings
+from shared.database import get_db, close_db, AsyncSession, engine, async_session_factory
 from shared.models import (
     Resource, Job, JobType, JobStatus, Snapshot, SnapshotItem, SnapshotStatus,
     ResourceType, ResourceStatus, Tenant, TenantType, UI_HIDDEN_TYPES,
@@ -110,11 +117,23 @@ async def lifespan(app: FastAPI):
     from shared import core_metrics
     core_metrics.init()
     await _wait_for_db()
+    prewarm_task = _start_protected_prewarm()
     yield
+    if prewarm_task is not None:
+        prewarm_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await prewarm_task
     await close_db()
+    await _refresh_engine.dispose()
+    if _ro_engine is not None:
+        await _ro_engine.dispose()
 
 
+from shared.audit_middleware import AuditMiddleware  # Ops/Data Check 3: mutation-audit backstop
 app = FastAPI(title="Dashboard Service", version="1.0.0", lifespan=lifespan)
+app.add_middleware(AuditMiddleware, service_name="dashboard-service")
+from shared.auth_enforcement import AuthMiddleware  # Ops/Data Check 17: verified principal required
+app.add_middleware(AuthMiddleware, service_name="dashboard-service", enforce_tenant_scope=True)
 
 
 # Per-user content types — kept for M365_RESOURCE_TYPES below (service-level
@@ -134,9 +153,12 @@ USER_CONTENT_TYPES = {
 # Each bucket's type set MUST exactly mirror the corresponding tab in
 # tm_vault/src/services/resource.ts:M365_TAB_TYPE_MAP. The denominator of
 # every Protection Status card has to equal the count shown when the operator
-# clicks into that tab — anything else is a lie. SharePoint additionally
-# applies the same group-name-collision exclusion that
-# /api/v1/resources/by-type?type=SHAREPOINT_SITE applies (handled below).
+# clicks into that tab — anything else is a lie. No bucket gets a bespoke
+# query: every one of them is summed from the single GROUP BY below, over the
+# PROTECTION_SCOPE_* universe /by-type uses. SharePoint used to be re-counted
+# with a group-name-collision exclusion; /by-type deleted that rule on
+# 2026-07-15 and the leftover copy here reported 752 sites against a tab
+# showing 4,239 (QA-05, 2026-08-11).
 PROTECTION_BUCKETS = {
     "users": {ResourceType.ENTRA_USER},
     "sharedMailboxes": {ResourceType.SHARED_MAILBOX},
@@ -146,6 +168,18 @@ PROTECTION_BUCKETS = {
     "entraId": {ResourceType.ENTRA_DIRECTORY},
     "powerPlatform": {ResourceType.POWER_BI, ResourceType.POWER_APPS, ResourceType.POWER_AUTOMATE},
 }
+
+# ── Canonical Protection-universe scope ───────────────────────────────────
+#
+# VERBATIM MIRROR of services/resource-service/main.py's constants of the
+# same names — read the long comment there for the 2026-08-11 measurements
+# and the reasoning. Duplicated (not imported) because the two services ship
+# as separate images with no shared service-level module; the right home is
+# shared/models.py next to UI_HIDDEN_TYPES.
+# tests/services/test_protection_scope_single_definition.py loads both
+# modules and fails if these ever diverge again.
+PROTECTION_SCOPE_EXCLUDED_STATUSES: frozenset = frozenset()
+PROTECTION_SCOPE_EXCLUDED_TYPES: frozenset = frozenset(UI_HIDDEN_TYPES)
 
 AZURE_PROTECTION_BUCKETS = {
     "virtualMachines": {ResourceType.AZURE_VM},
@@ -193,6 +227,7 @@ M365_RESOURCE_TYPES = {
     ResourceType.USER_CONTACTS,
     ResourceType.USER_CALENDAR,
     ResourceType.USER_CHATS,
+    ResourceType.USER_ARCHIVE,
     ResourceType.TEAMS_CHAT_EXPORT,
 }
 
@@ -235,6 +270,17 @@ def format_bytes(bytes_val: int) -> str:
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "dashboard"}
+
+
+@app.get("/health/deep")
+async def health_deep(detailed: bool = Query(True)):
+    """Aggregated subsystem health (DB, RabbitMQ, queues, workers, storage,
+    leases). Consumed by the gateway's GET /api/v1/health. Never raises —
+    a failing subsystem degrades its component, not the whole response."""
+    from shared.health import build_health
+    report = await build_health(detailed=detailed)
+    report["service"] = "dashboard"
+    return report
 
 
 @app.get("/api/v1/dashboard/overview")
@@ -360,6 +406,50 @@ def _roll_up_group_outcome(children):
     return None  # all cancelled / pending — not counted
 
 
+# How long an in-flight batch may run before the 24-hour card calls it
+# stalled. TMV-022 (QA sweep 2026-08-11): two BACKUP Jobs of batch
+# 2123e84f had been RUNNING since 18:07 UTC while the card read "Success,
+# 2 success / 0 failures" — `_roll_up_group_outcome` returns None for any
+# group holding a RUNNING/QUEUED child and the endpoint tallied only the
+# three terminal buckets, so an in-flight batch was counted NOWHERE.
+#
+# Why age and not a heartbeat: `jobs.updated_at` is not one. Job
+# ee9bac4f ran 13.6 h to a clean COMPLETED with updated_at last touched
+# 4 minutes in — an idle-time rule would flag healthy long runs.
+#
+# Why 24 h: measured over 30 days of terminal BACKUP jobs on prod (n=832)
+# p50 = 327 s, p90 = 4,846 s, p99 = 60,651 s (16.8 h); the longest clean
+# COMPLETED run was 54.6 h. So 24 h sits above the 99th percentile and
+# below nothing legitimate except the rare whale — a coarse net, tunable
+# without a rebuild. `inProgress` is the real fix; `stalled` is the
+# at-risk flag on top of it.
+#
+# Deliberately independent of the known phantom "In Progress" batch
+# (overlap guard counting held resources as missing Tier-2 children,
+# still unfixed): this reads Job.status only and needs no batch-rollup
+# semantics, so a phantom shows up as in-flight — which is what an
+# operator should see — rather than being swallowed as it is today.
+_STALL_AFTER_SECONDS = int(os.getenv("DASHBOARD_STALL_AFTER_SECONDS", "86400"))
+
+
+def _group_inflight_state(children, oldest_created_at, now):
+    """None | "inflight" | "stalled" for a batch group.
+
+    Only groups `_roll_up_group_outcome` declines to bucket are relevant:
+    a group with a FAILED child is already reported as a failure, and a
+    group where everything terminated is already success/warnings.
+    """
+    statuses = [s for s, _ in children]
+    if any(s == JobStatus.FAILED for s in statuses):
+        return None
+    if not any(s in (JobStatus.RUNNING, JobStatus.QUEUED) for s in statuses):
+        return None
+    if oldest_created_at is None:
+        return "inflight"
+    age = (now - oldest_created_at).total_seconds()
+    return "stalled" if age >= _STALL_AFTER_SECONDS else "inflight"
+
+
 @app.get("/api/v1/dashboard/status/24hour")
 async def get_24hour_status(
     tenantId: Optional[str] = Query(None),
@@ -400,21 +490,58 @@ async def get_24hour_status(
 
     from collections import defaultdict
     groups: dict = defaultdict(list)
+    group_started: dict = {}
     for r in rows:
         key = _batch_group_key(*r)
         groups[key].append((r.status, r.result))
+        if r.created_at is not None:
+            prev = group_started.get(key)
+            if prev is None or r.created_at < prev:
+                group_started[key] = r.created_at
 
-    success = warnings = failures = 0
-    for children in groups.values():
+    now = datetime.utcnow()
+    success = warnings = failures = in_progress = stalled = 0
+    oldest_in_progress = None
+    for key, children in groups.items():
         outcome = _roll_up_group_outcome(children)
         if outcome == "success":
             success += 1
-        elif outcome == "warnings":
+            continue
+        if outcome == "warnings":
             warnings += 1
-        elif outcome == "failures":
+            continue
+        if outcome == "failures":
             failures += 1
+            continue
+        # outcome is None: cancelled/pending (invisible by design) OR
+        # in-flight, which used to be invisible by accident. See
+        # _STALL_AFTER_SECONDS.
+        started = group_started.get(key)
+        state = _group_inflight_state(children, started, now)
+        if state is None:
+            continue
+        in_progress += 1
+        if state == "stalled":
+            stalled += 1
+        if started is not None and (
+            oldest_in_progress is None or started < oldest_in_progress
+        ):
+            oldest_in_progress = started
 
-    return {"success": success, "warnings": warnings, "failures": failures}
+    return {
+        "success": success,
+        "warnings": warnings,
+        "failures": failures,
+        # New (TMV-022). `inProgress` counts every in-flight batch —
+        # `stalled` is the subset past _STALL_AFTER_SECONDS. The headline
+        # must not read "Success" while inProgress > 0.
+        "inProgress": in_progress,
+        "stalled": stalled,
+        "oldestInProgressStartedAt": (
+            oldest_in_progress.isoformat() if oldest_in_progress else None
+        ),
+        "stallThresholdSeconds": _STALL_AFTER_SECONDS,
+    }
 
 
 @app.get("/api/v1/dashboard/status/7day")
@@ -527,19 +654,34 @@ async def get_protection_status(
     service_key = parse_service_type(serviceType)
     service_resource_types = resource_types_for_service(service_key)
 
-    filters = [Resource.status.in_([ResourceStatus.DISCOVERED, ResourceStatus.ACTIVE])]
+    # Canonical Protection scope — the ONE definition these cards share with
+    # the /api/v1/resources/by-type tab lists (PROTECTION_SCOPE_* above).
+    #
+    # 2026-08-11 (QA-05): this used to add
+    # `Resource.status.in_([DISCOVERED, ACTIVE])`, which /by-type does not
+    # apply. On prod tenant 163c487b… that hid 8,373 INACCESSIBLE rows from
+    # the cards while the tabs listed them — Users 6,680 vs 13,812, Shared
+    # 120 vs 1,293, Rooms 132 vs 154, Groups & Teams 10,109 vs 10,142 — and
+    # it also dropped 2 of the tenant's 13 SLA-assigned resources from the
+    # NUMERATOR (1 ENTRA_USER + 1 SHARED_MAILBOX are INACCESSIBLE but still
+    # carry a policy). The tab is the correct universe: a terminated user
+    # whose mailbox we still hold has to stay listed and countable, or there
+    # is no UI path to recover it (see shared/tier2_discovery.py:168,
+    # "readers (UI, audit) want the full list").
+    filters = []
+    if PROTECTION_SCOPE_EXCLUDED_STATUSES:
+        filters.append(
+            Resource.status.notin_(sorted(PROTECTION_SCOPE_EXCLUDED_STATUSES))
+        )
     if tenantId:
         filters.append(Resource.tenant_id == UUID(tenantId))
     if service_resource_types:
         filters.append(Resource.type.in_(service_resource_types))
-    # Mirror resource-service's UI_HIDDEN_TYPES filter so the Overview card
-    # universe matches the tab list universe exactly. Without this, a hidden
-    # type (e.g. TEAMS_CHANNEL — redundant with its M365_GROUP twin) inflates
-    # the Groups & Teams total here even though /by-type hides those rows.
-    # The Tab shows 11; previously this query summed 15 because TEAMS_CHANNEL
-    # rows still got counted. See shared.models.UI_HIDDEN_TYPES for per-type
-    # rationale.
-    filters.append(Resource.type.notin_(UI_HIDDEN_TYPES))
+    # Hidden types: /by-type returns an empty page for these (TEAMS_CHANNEL is
+    # redundant with its M365_GROUP twin), so the cards must not count them
+    # either. The Groups & Teams tab shows 11; this query summed 15 before
+    # the exclusion. See shared.models.UI_HIDDEN_TYPES for per-type rationale.
+    filters.append(Resource.type.notin_(PROTECTION_SCOPE_EXCLUDED_TYPES))
 
     stmt = (
         select(
@@ -579,42 +721,21 @@ async def get_protection_status(
 
     bucket_values = {name: bucket_item(name, PROTECTION_BUCKETS) for name in PROTECTION_BUCKETS}
 
-    # SharePoint sites: the Sites tab hides sites whose name collides with an
-    # M365 group / Entra group / Teams channel (the admin API surfaces the
-    # group's display name as the site title, so a single Team appears as
-    # both a SP site row AND a Groups & Teams row otherwise). The Overview
-    # card must hide the same rows or the denominator inflates above what
-    # the operator can actually click into. The exclusion below MUST stay
-    # in sync with resource-service /api/v1/resources/by-type's
-    # sp_exclude_clause — a future change to the rule has to touch both.
-    sp_params = {}
-    sp_tenant_clause = ""
-    if tenantId:
-        sp_tenant_clause = "AND r.tenant_id = :tenant_id"
-        sp_params["tenant_id"] = str(UUID(tenantId))
-    sp_total_row = (await db.execute(text(f"""
-        SELECT
-            COUNT(*) AS total,
-            COUNT(*) FILTER (WHERE r.sla_policy_id IS NOT NULL) AS protected_count
-        FROM resources r
-        WHERE r.type = 'SHAREPOINT_SITE'
-          AND r.status IN ('DISCOVERED', 'ACTIVE')
-          {sp_tenant_clause}
-          AND NOT EXISTS (
-            SELECT 1 FROM resources g
-            WHERE g.tenant_id = r.tenant_id
-              AND g.type IN ('M365_GROUP', 'ENTRA_GROUP', 'TEAMS_CHANNEL')
-              AND LOWER(g.display_name) = LOWER(r.display_name)
-              AND (
-                    COALESCE(r.email, '') = ''
-                 OR LOWER(COALESCE(g.email, '')) = LOWER(COALESCE(r.email, ''))
-              )
-          )
-    """), sp_params)).first()
-    bucket_values["sharepointSites"] = {
-        "total": int(sp_total_row.total or 0),
-        "protectedCount": int(sp_total_row.protected_count or 0),
-    }
+    # SharePoint deliberately gets NO special case any more.
+    #
+    # 2026-08-11 (QA-05): this used to re-count SHAREPOINT_SITE with an
+    # extra "NOT EXISTS a group with the same display_name" exclusion,
+    # justified as staying in sync with a `sp_exclude_clause` in
+    # resource-service /by-type. That clause no longer exists: on 2026-07-15
+    # /by-type stopped hiding group-connected sites (group backups capture
+    # profile + members only, NOT the group's site content, so hiding the
+    # site left no UI path to protect 3,465 of 4,204 pilot sites) and now
+    # merely annotates them with `group_connected` for a badge. The card kept
+    # the dead rule and reported 752 sites against a tab showing 4,239 —
+    # 3,487 protectable sites missing from the denominator. The generic
+    # GROUP BY above already counts SHAREPOINT_SITE exactly the way the tab
+    # does; anything re-derived here is a second source of truth by
+    # construction.
 
     total = sum(item["total"] for item in bucket_values.values())
     protected = sum(item["protectedCount"] for item in bucket_values.values())
@@ -632,96 +753,231 @@ async def get_protection_status(
     }
 
 
-@app.get("/api/v1/dashboard/backup/size")
+# Protected size is a durable read model; HTTP requests never rebuild item history.
+from shared.protected_size import read_summary as _read_size_summary
+from shared.protected_size import refresh_once as _refresh_size_once
+from shared.database import _engine_kwargs
+from shared.auth_enforcement import verified_user
+
+_SIZE_REQUEST_BUDGET_S = float(os.getenv('PROTECTED_REQUEST_BUDGET_S', '5'))
+_PREWARM_INTERVAL_S = int(os.getenv('PROTECTED_PREWARM_INTERVAL_S', '300'))
+_REFRESH_IDLE_S = float(os.getenv('PROTECTED_REFRESH_IDLE_S', '2'))
+_PREWARM_ENABLED = os.getenv('PROTECTED_PREWARM_ENABLED', 'true').lower() in ('true', '1', 'yes')
+_prewarm_task: Optional[asyncio.Task] = None
+_RO_HOST = os.getenv('DB_RO_HOST', '').strip()
+_RO_PORT = int(os.getenv('DB_RO_PORT', '5432'))
+_ro_engine = None
+_ro_session_factory = None
+
+
+def _size_engine(url):
+    kwargs = _engine_kwargs()
+    kwargs.update(pool_size=1, max_overflow=0, pool_timeout=5)
+    size_engine = create_async_engine(url, **kwargs)
+    schema = '"' + settings.DB_SCHEMA.replace('"', '""') + '",public'
+
+    @event.listens_for(size_engine.sync_engine, 'begin')
+    def set_transaction_schema(connection):
+        # Transaction pooling can ignore startup search_path; set it on the actual backend.
+        connection.exec_driver_sql('SET LOCAL search_path TO ' + schema)
+
+    return size_engine
+
+
+_refresh_engine = _size_engine(settings.DATABASE_URL)
+_refresh_session_factory = async_sessionmaker(_refresh_engine, class_=AsyncSession, expire_on_commit=False)
+if _RO_HOST:
+    _ro_engine = _size_engine(make_url(settings.DATABASE_URL).set(host=_RO_HOST, port=_RO_PORT))
+    _ro_session_factory = async_sessionmaker(_ro_engine, class_=AsyncSession, expire_on_commit=False)
+
+
+async def _protected_prewarm_pass() -> dict:
+    return await _refresh_size_once(
+        _refresh_session_factory, source_factory=_ro_session_factory,
+        page_size=1000, statement_timeout_ms=5000,
+    )
+
+
+async def _protected_prewarm_loop():
+    await asyncio.sleep(random.uniform(.1, 1))
+    failures = 0
+    while True:
+        try:
+            result = await _protected_prewarm_pass()
+            failures = 0
+            idle = result.get('status') in ('idle', 'busy', 'deferred', 'replica_lag',
+                                          'replica_deferred', 'backoff', 'retry', 'lost_lease')
+            await asyncio.sleep(_REFRESH_IDLE_S if idle else .05)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            failures += 1
+            log.exception('[protected-size] background refresh failed; published totals remain available')
+            await asyncio.sleep(min(30, 2 ** min(failures, 5)))
+
+
+def _start_protected_prewarm() -> Optional[asyncio.Task]:
+    global _prewarm_task
+    if not _PREWARM_ENABLED:
+        return None
+    if _prewarm_task is None or _prewarm_task.done():
+        _prewarm_task = asyncio.create_task(_protected_prewarm_loop())
+    return _prewarm_task
+
+
+async def _size_scope(db: AsyncSession, principal: dict, requested_tenant) -> Optional[tuple[UUID, ...]]:
+    roles = {str(role).upper() for role in principal.get('roles', [])}
+    requested = None
+    if requested_tenant is not None:
+        try:
+            requested = UUID(str(requested_tenant))
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=422, detail='Invalid tenantId')
+    if principal.get('_principal') == 'internal' or 'SUPER_ADMIN' in roles:
+        return (requested,) if requested else None
+    entitled = set()
+    for tenant in principal.get('tenant_ids', []):
+        try:
+            entitled.add(UUID(str(tenant)))
+        except (ValueError, TypeError):
+            continue
+    if 'ORG_ADMIN' in roles:
+        try:
+            organization = UUID(str(principal.get('org_id')))
+        except (ValueError, TypeError):
+            entitled = set()
+        else:
+            entitled = set((await db.execute(select(Tenant.id).where(Tenant.org_id == organization))).scalars().all())
+    if requested:
+        if requested not in entitled:
+            raise HTTPException(status_code=403, detail='Not entitled to the requested tenant')
+        return (requested,)
+    return tuple(sorted(entitled, key=lambda value: value.int))
+
+
+_SIZE_HISTORY_SQL = '''
+    SELECT timezone(:tz, s.completed_at AT TIME ZONE 'UTC')::date AS day,
+           COALESCE(SUM(s.bytes_added), 0)::bigint AS bytes
+    FROM snapshots s JOIN resources r ON r.id = s.resource_id
+    WHERE s.status::text IN ('COMPLETED', 'PARTIAL', 'PENDING_DELETION')
+      AND s.completed_at >= :window_start AND s.completed_at < :window_end
+      AND (:all_tenants OR r.tenant_id = ANY(CAST(:tenant_ids AS uuid[])))
+      AND (:all_types OR r.type::text = ANY(CAST(:resource_types AS text[])))
+    GROUP BY timezone(:tz, s.completed_at AT TIME ZONE 'UTC')::date
+'''
+
+
+def _size_response(summary: dict, daily_data: list, *, history_complete: bool) -> dict:
+    total = summary['totalBytes']
+    day = daily_data[-1]['bytes'] if daily_data else 0
+    week = sum(row['bytes'] for row in daily_data[-7:])
+    growth = int(round(sum(row['bytes'] for row in daily_data) / 30.0))
+    baseline_complete = (
+        total is not None and not summary.get('partial') and not summary.get('stale')
+        and not summary.get('initializingScope') and summary.get('freshness') == 'fresh'
+    )
+    can_project = baseline_complete and history_complete
+    def change(value):
+        return format_bytes(abs(value)) + (' ↑' if value > 0 else ' ↓')
+    return {
+        **summary,
+        'total': format_bytes(total) if total is not None else 'Calculating',
+        'allTimeTotal': format_bytes(total) if total is not None else None,
+        'oneDayChange': change(day) if history_complete else None,
+        'sevenDayChange': change(week) if history_complete else None,
+        'oneMonthChange': change(week) if history_complete else None,  # Existing seven-day client alias.
+        'dailyData': daily_data,
+        'dailyGrowthBytes': growth if history_complete else None,
+        'historyStatus': 'complete' if history_complete else 'unavailable',
+        'historyPartial': not history_complete,
+        'growthMetric': 'captured-change-volume',
+        'projectionKind': 'linear-capture-volume-estimate',
+        'projectedBytes1y': total + growth * 365 if can_project else None,
+        'projectedBytes3y': total + growth * 1095 if can_project else None,
+    }
+
+
+@app.get('/api/v1/dashboard/backup/size')
 async def get_backup_size(
-    tenantId: Optional[str] = Query(None),
+    request: Request,
+    tenantId: Optional[UUID] = Query(None),
     serviceType: Optional[str] = Query(None),
-    tz: Optional[str] = Query(
-        None,
-        description=(
-            "IANA timezone to bucket daily growth in. "
-            "Defaults to UTC."
-        ),
-    ),
+    tz: Optional[str] = Query(None, description='IANA timezone for daily captured-volume buckets.'),
     db: AsyncSession = Depends(get_db),
 ):
-    service_key = parse_service_type(serviceType)
-    service_resource_types = resource_types_for_service(service_key)
-    client_tz = _resolve_tz(tz)
-
-    filters = []
-    if tenantId:
-        filters.append(Resource.tenant_id == UUID(tenantId))
-    if service_resource_types:
-        filters.append(Resource.type.in_(service_resource_types))
-
-    # Single source of truth: Resource.storage_bytes. The snapshots table holds
-    # many legacy FAILED rows and bytes_added is unreliable per snapshot, so using
-    # it produced a dashboard where the headline said 7.9 MB but the chart/pills
-    # read 0. All four fields below are derived from resources only.
-    # Dedup: a Tier-1 ONEDRIVE/MAILBOX walk + a Tier-2 USER_ONEDRIVE/USER_MAIL
-    # walk both write storage_bytes for the same user. Exclude the Tier-2 dupe.
-    total = int((await db.execute(
-        select(func.sum(Resource.storage_bytes))
-        .where(exclude_tier2_storage_dupes_clause(), *filters)
-    )).scalar() or 0)
-
-    # Per-day growth based on when each resource was last backed up.
-    # Window anchored to client tz so the 30-day frame and per-day
-    # bucket boundaries align with the operator's calendar. Without
-    # this, a backup at 22:31 UTC (04:01 IST) lands in the previous
-    # IST day on the chart.
-    today = _bucket_date(datetime.utcnow(), client_tz)
-    window_start = today - timedelta(days=29)
-    window_start_ts = datetime.combine(window_start, datetime.min.time())
-
-    # Per-day GROWTH = bytes ACTUALLY backed up that day (snapshots.bytes_added),
-    # bucketed by snapshot completed_at in the operator's tz. The old code
-    # bucketed each resource's FULL current storage_bytes on its last_backup_at
-    # day, so re-backing a large resource (any incremental) dragged its ENTIRE
-    # size onto the recent day — e.g. a 63 MB Jun-25 incremental showed as
-    # ~146 GB because every resource's last_backup_at had advanced to Jun 25.
-    # bytes_added is the true per-day delta and matches the Activity feed.
-    # Terminal-success snapshots only (bytes_added on FAILED/in-flight rows is
-    # noise); Tier-2 storage dupes excluded for parity with `total`.
-    per_day_rows = (await db.execute(
-        select(Snapshot.completed_at, Snapshot.bytes_added)
-        .join(Resource, Resource.id == Snapshot.resource_id)
-        .where(
-            exclude_tier2_storage_dupes_clause(),
-            Snapshot.completed_at.isnot(None),
-            Snapshot.completed_at >= window_start_ts,
-            Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL]),
-            *filters,
-        )
-    )).all()
-    per_day_map: dict = {}
-    for ts, b in per_day_rows:
-        if ts is None:
-            continue
-        day_key = _bucket_date(ts, client_tz)
-        per_day_map[day_key] = per_day_map.get(day_key, 0) + int(b or 0)
-
-    # Anchor the cumulative line to END at the current vault size (`total`),
-    # with in-window movement driven by the real per-day deltas. bytes_added is
-    # a delta-sum and won't perfectly reconcile with the dedup'd current size,
-    # so derive the baseline by subtraction rather than a second sum.
-    baseline = max(0, total - sum(per_day_map.values()))
-
+    summary = None
+    history_complete = False
     daily_data = []
-    running_total = baseline
-    for i in range(30):
-        date = window_start + timedelta(days=i)
-        running_total += per_day_map.get(date, 0)
-        daily_data.append({"date": date.isoformat(), "bytes": running_total})
+    tasks = []
 
-    seven_day_change = daily_data[-1]["bytes"] - (daily_data[-8]["bytes"] if len(daily_data) > 7 else 0)
-    one_day_change = daily_data[-1]["bytes"] - (daily_data[-2]["bytes"] if len(daily_data) > 1 else 0)
+    async def stop_reads():
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            try:
+                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=.5)
+            except TimeoutError:
+                # An unresponsive canceled connection must never return to the pool.
+                with suppress(Exception):
+                    await asyncio.wait_for(db.invalidate(), timeout=.5)
+            tasks.clear()
 
-    return {
-        "total": format_bytes(total),
-        "oneDayChange": format_bytes(abs(one_day_change)) + (" ↑" if one_day_change > 0 else " ↓"),
-        "oneMonthChange": format_bytes(abs(seven_day_change)) + (" ↑" if seven_day_change > 0 else " ↓"),
-        "allTimeTotal": format_bytes(total),
-        "dailyData": daily_data,
-    }
+    async def read():
+        nonlocal summary, history_complete, daily_data
+        principal = verified_user(request)
+        service_key = parse_service_type(serviceType)
+        resource_types = resource_types_for_service(service_key)
+        type_names = tuple(sorted(t.value for t in resource_types)) if resource_types else None
+        schema = '"' + settings.DB_SCHEMA.replace('"', '""') + '",public'
+        await db.execute(text(
+            "SELECT set_config('statement_timeout', :timeout, true), "
+            "set_config('search_path', :schema, true)"
+        ), {'timeout': str(max(1, int(_SIZE_REQUEST_BUDGET_S * 1000))), 'schema': schema})
+        tenant_ids = await _size_scope(db, principal, tenantId)
+        summary = await _read_size_summary(db, tenant_ids=tenant_ids, service_types=type_names)
+        if await request.is_disconnected():
+            raise HTTPException(status_code=499, detail='Client disconnected')
+        client_tz = _resolve_tz(tz)
+        today = datetime.now(timezone.utc).astimezone(client_tz).date()
+        start = today - timedelta(days=29)
+        start_utc = datetime.combine(start, datetime.min.time(), client_tz).astimezone(timezone.utc).replace(tzinfo=None)
+        end_utc = datetime.combine(today + timedelta(days=1), datetime.min.time(), client_tz).astimezone(timezone.utc).replace(tzinfo=None)
+        hist_rows = (await db.execute(text(_SIZE_HISTORY_SQL), {
+            'tz': str(client_tz), 'window_start': start_utc, 'window_end': end_utc,
+            'all_tenants': tenant_ids is None, 'tenant_ids': list(tenant_ids or ()),
+            'all_types': type_names is None, 'resource_types': list(type_names or ()),
+        })).all()
+        buckets = {str(day): int(value or 0) for day, value in hist_rows}
+        daily_data = [{'date': (start + timedelta(days=i)).isoformat(),
+                       'bytes': buckets.get((start + timedelta(days=i)).isoformat(), 0)} for i in range(30)]
+        history_complete = True
+        # Finish the read transaction inside the handler budget; get_db has no SQL to commit.
+        await db.rollback()
+
+    async def disconnected():
+        while not await request.is_disconnected():
+            await asyncio.sleep(.025)
+
+    try:
+        async with asyncio.timeout(_SIZE_REQUEST_BUDGET_S):
+            if await request.is_disconnected():
+                raise HTTPException(status_code=499, detail='Client disconnected')
+            work = asyncio.create_task(read())
+            monitor = asyncio.create_task(disconnected())
+            tasks = [work, monitor]
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            if monitor in done:
+                await monitor
+                raise HTTPException(status_code=499, detail='Client disconnected')
+            await work
+    except (TimeoutError, DBAPIError):
+        # AsyncSession cannot roll back while its child is still using the connection.
+        await stop_reads()
+        log.warning('[protected-size] bounded dashboard read unavailable', exc_info=True)
+        with suppress(Exception):
+            await asyncio.wait_for(db.rollback(), timeout=.5)
+        if summary is None:
+            raise HTTPException(status_code=503, detail='Backup size is temporarily unavailable')
+    finally:
+        await stop_reads()
+    return _size_response(summary, daily_data, history_complete=history_complete)

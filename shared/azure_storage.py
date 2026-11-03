@@ -250,72 +250,28 @@ class AzureStorageShard:
     async def upload_blob_from_file(self, container_name: str, blob_path: str, file_path: str,
                                     file_size: int = 0, overwrite: bool = True,
                                     metadata: Optional[Dict] = None) -> Dict:
-        """
-        Upload from local file using resilient block upload with retry.
-
-        Enterprise-grade upload for files up to multi-GB:
-        - Splits file into blocks (100 MB each for efficiency)
-        - Uploads blocks in parallel with configurable concurrency
-        - Retries individual failed blocks with exponential backoff
-        - Commits block list only when ALL blocks succeed
-        - No single point of failure — one slow block doesn't kill the upload
-
-        NOTE: The async Azure SDK requires an open file object, NOT a string path.
-        Passing a string path causes the upload to hang indefinitely (SDK bug).
-        """
+        """Upload seekable file parts with owned tasks and bounded SDK reads."""
+        from shared.provider_runtime import storage_buffer_budget
+        from shared.storage.file_upload import file_upload_capacity, part_size_for, send_file_parts
+        file_size = file_size or os.path.getsize(file_path)
+        concurrency, reservation = file_upload_capacity(settings.AZURE_UPLOAD_CONCURRENCY)
+        block_size = part_size_for(file_size, max_parts=50000,
+            minimum=100*1024*1024, maximum=4000*1024*1024)
         try:
             await self._ensure_container(container_name)
-
-            async_client = self.get_async_client()
-            blob_client = async_client.get_blob_client(container=container_name, blob=blob_path)
-
-            # Block size: 100 MB — optimal for Azure (max 50K blocks = 5 TB max blob)
-            block_size = 100 * 1024 * 1024  # 100 MB
-            num_blocks = max(1, (file_size + block_size - 1) // block_size)
-
-            # For small files (< block_size), use simple upload (faster)
-            if file_size <= block_size:
-                with open(file_path, "rb") as f:
-                    await asyncio.wait_for(
-                        blob_client.upload_blob(
-                            f,
-                            overwrite=overwrite,
-                            metadata=_sanitize_metadata(metadata),
-                            max_concurrency=settings.AZURE_UPLOAD_CONCURRENCY,
-                            length=file_size,
-                        ),
-                        timeout=3600.0,  # 1 hour for large files
-                    )
-                return {
-                    "success": True,
-                    "blob_url": blob_client.url,
-                    "blob_path": blob_path,
-                    "size_bytes": file_size,
-                    "method": "stream_upload",
-                }
-
-            # Large file: use SDK's built-in block upload with file object.
-            # The SDK automatically splits into blocks and uploads in parallel.
-            # Using a file object (not path string) is critical — path strings hang.
-            with open(file_path, "rb") as f:
-                await asyncio.wait_for(
-                    blob_client.upload_blob(
-                        f,
-                        overwrite=overwrite,
-                        metadata=_sanitize_metadata(metadata),
-                        max_concurrency=8,  # Upload 8 blocks in parallel
-                        length=file_size,
-                    ),
-                    timeout=3600.0,  # 1 hour for very large files
-                )
-
-            return {
-                "success": True,
-                "blob_url": blob_client.url,
-                "blob_path": blob_path,
-                "size_bytes": file_size,
-                "method": "stream_upload",
-            }
+            blob_client = self.get_async_client().get_blob_client(container=container_name, blob=blob_path)
+            generation = uuid.uuid4().hex
+            async def stage(number, body, length):
+                block_id = f'{generation}-{number:08d}'
+                await blob_client.stage_block(block_id=block_id, data=body, length=length)
+                return block_id
+            async with storage_buffer_budget(reservation), asyncio.timeout(3600):
+                block_ids = await send_file_parts(file_path, file_size, part_size=block_size,
+                    concurrency=concurrency, send=stage)
+                await blob_client.commit_block_list(block_ids, metadata=_sanitize_metadata(metadata),
+                    **({} if overwrite else {'if_none_match': '*'}))
+            return {'success': True, 'blob_url': blob_client.url, 'blob_path': blob_path,
+                'size_bytes': file_size, 'method': 'stream_upload'}
         except asyncio.TimeoutError:
             print(f"[AzureStorage] Stream upload TIMEOUT for {container_name}/{blob_path} after 1hr")
             return {
@@ -540,8 +496,33 @@ class AzureStorageShard:
             }
         except AzureError:
             return None
-    
-    async def wait_for_copy_complete(self, container_name: str, blob_path: str, 
+
+    async def head_blob(self, container_name: str, blob_path: str) -> Optional[Dict]:
+        """Strict existence/size probe: returns the same dict as
+        ``get_blob_properties`` but None ONLY when the blob is confirmed
+        absent (404). Every other error RAISES — callers that pick a
+        size regime from this probe (SharePoint restore streaming,
+        ITO-10282) must never mistake a transient storage error for
+        'blob missing' and silently fall back to a RAM-buffered read.
+        """
+        async_client = self.get_async_client()
+        blob_client = async_client.get_blob_client(container=container_name, blob=blob_path)
+        try:
+            props = await blob_client.get_blob_properties()
+        except ResourceNotFoundError:
+            return None
+        return {
+            "name": props.name,
+            "size": props.size,
+            "etag": getattr(props, "etag", None),
+            "content_type": props.content_settings.content_type if props.content_settings else None,
+            "last_modified": props.last_modified,
+            "copy_status": props.copy.status if props.copy else None,
+            "copy_progress": props.copy.progress if props.copy else None,
+            "metadata": props.metadata,
+        }
+
+    async def wait_for_copy_complete(self, container_name: str, blob_path: str,
                                      timeout_seconds: int = 3600, poll_interval: int = 5) -> Dict:
         """
         Wait for a server-side copy to complete.
@@ -696,6 +677,13 @@ class _StoreFacade:
             "metadata": p.metadata,
         }
 
+    async def head_blob(self, container_name, blob_path):
+        """Strict probe: None only on confirmed-absent; store errors
+        (e.g. BackendUnreachableError) propagate. The underlying
+        ``get_properties`` already has these semantics — this alias
+        keeps parity with AzureStorageShard.head_blob."""
+        return await self.get_blob_properties(container_name, blob_path)
+
     async def delete_blob(self, container_name, blob_path):
         await self._store.delete(container_name, blob_path)
 
@@ -768,6 +756,14 @@ class _StoreFacade:
             await close()
 
 
+class StorageRouterNotReadyError(RuntimeError):
+    """The DB-driven storage router never loaded in this process (Postgres
+    was unreachable at boot) and no raw Azure shards exist to fall back
+    to. Raised instead of the misleading "No storage shards configured"
+    so operators see the real cause; the router keeps retrying in the
+    background (shared.storage.startup) and workers gate on it."""
+
+
 class AzureStorageManager:
     """
     Manages multiple Azure Storage Accounts for sharding.
@@ -833,6 +829,25 @@ class AzureStorageManager:
         else:
             print("[AzureStorage] WARNING: No Azure Storage configured")
     
+    def _no_shards_error(self, detail: str = "") -> RuntimeError:
+        """Build the error for "no usable shard". Distinguishes a router
+        that never loaded (the 2026-10-13 silent-zombie case) from a
+        genuinely unconfigured Azure fallback."""
+        try:
+            from shared.storage.router import router as _router
+            loaded = bool(_router.active_backend_id())
+        except Exception:
+            loaded = False
+        if not loaded:
+            return StorageRouterNotReadyError(
+                "storage router not loaded (storage_backends/system_config "
+                "could not be read from Postgres at startup) and no raw "
+                "Azure shards are configured — refusing the legacy raw-shard "
+                "fallback; the router keeps retrying in the background and "
+                "this work must be retried once it has loaded"
+            )
+        return RuntimeError("No storage shards configured" + detail)
+
     def _router_facade(self, tenant_id: str, resource_id: str):
         """Return a _StoreFacade over the router's active backend, if loaded.
 
@@ -894,7 +909,7 @@ class AzureStorageManager:
         if facade is not None:
             return facade
         if not self.shards:
-            raise RuntimeError("No storage shards configured")
+            raise self._no_shards_error()
         hash_input = f"{tenant_id}:{resource_id}"
         hash_value = int(hashlib.md5(hash_input.encode()).hexdigest(), 16)
         shard_index = hash_value % len(self.shards)
@@ -923,7 +938,7 @@ class AzureStorageManager:
             # write streams on the facade's underlying bucket(s).
             return facade
         if not self.shards:
-            raise RuntimeError("No storage shards configured")
+            raise self._no_shards_error()
         return self.shards[index % len(self.shards)]
 
     def get_default_shard(self):
@@ -932,7 +947,7 @@ class AzureStorageManager:
         if facade is not None:
             return facade
         if not self.shards:
-            raise RuntimeError("No storage shards configured — set AZURE_STORAGE_ACCOUNT_NAME and AZURE_STORAGE_ACCOUNT_KEY")
+            raise self._no_shards_error(" — set AZURE_STORAGE_ACCOUNT_NAME and AZURE_STORAGE_ACCOUNT_KEY")
         return self.shards[0]
 
     def get_shard_for_item(self, item):
@@ -1923,7 +1938,7 @@ async def upload_blob_with_retry_from_file(container_name: str, blob_path: str, 
     """
     Upload from a local file with parallel block uploads.
     Streams from disk — never loads full file into memory.
-    Uses large block sizes (100MB) for maximum throughput.
+    Seekable parts use bounded SDK reads independently of file size.
     """
     import os
     last_error = None
@@ -2019,7 +2034,20 @@ async def upload_blob_with_dedup(
     hiccup the dedup check silently falls through to a real upload
     — never blocks the backup.
     """
-    if content_hash and len(content) >= min_size_bytes:
+    existing = await _readable_dedup_result(tenant_id, content_hash, container_name,
+        len(content), shard, min_size_bytes)
+    if existing:
+        return existing
+
+    return await upload_blob_with_retry(
+        container_name, blob_path, content, shard,
+        max_retries=max_retries, metadata=metadata,
+    )
+
+
+async def _readable_dedup_result(tenant_id, content_hash, container_name, content_size,
+                               shard, min_size_bytes):
+    if content_hash and content_size >= min_size_bytes:
         try:
             from shared.blob_dedup import find_existing_blob
             from shared.database import async_session_factory
@@ -2064,7 +2092,7 @@ async def upload_blob_with_dedup(
                         "success": True,
                         "blob_path": existing,
                         "blob_url": existing,
-                        "size_bytes": len(content),
+                        "size_bytes": content_size,
                         "method": "dedup_hit",
                     }
                 # Existing blob is not readable from container_name —
@@ -2075,7 +2103,18 @@ async def upload_blob_with_dedup(
             # Dedup is advisory — a DB hiccup must not block the backup.
             pass
 
-    return await upload_blob_with_retry(
-        container_name, blob_path, content, shard,
-        max_retries=max_retries, metadata=metadata,
-    )
+    return None
+
+
+async def upload_blob_with_dedup_from_file(tenant_id, content_hash, container_name,
+        blob_path, file_path, shard, *, file_size, max_retries=3, metadata=None, min_size_bytes=1024):
+    """Same tenant/container dedup contract with a bounded file upload."""
+    import os
+    if os.path.getsize(file_path) != file_size:
+        raise ValueError("archive spool length changed before upload")
+    existing = await _readable_dedup_result(tenant_id, content_hash, container_name,
+        file_size, shard, min_size_bytes)
+    if existing:
+        return existing
+    return await upload_blob_with_retry_from_file(container_name, blob_path, file_path,
+        shard, file_size=file_size, max_retries=max_retries, metadata=metadata)

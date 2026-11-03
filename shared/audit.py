@@ -23,13 +23,37 @@ the real workflow. Event shape mirrors what audit-service's
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 import httpx
 
 log = logging.getLogger("tmvault.audit")
+
+# Strong refs so fire-and-forget emits are not garbage-collected mid-flight.
+_BG_EMITS: Set["asyncio.Task"] = set()
+
+
+def emit_audit_event_bg(**fields: Any) -> None:
+    """Schedule ``emit_audit_event`` fire-and-forget on the running loop.
+
+    Use on latency-sensitive request paths (login / refresh / logout) so a
+    slow or down audit-service adds no latency to the request — the whole
+    audit path is already best-effort (``emit_audit_event`` swallows transport
+    errors), and here we additionally decline to *wait* for it. No running loop
+    (called from sync/non-async context) means the emit is skipped rather than
+    crashing the caller."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        log.warning("emit_audit_event_bg with no running loop (action=%s) — skipped",
+                    fields.get("action"))
+        return
+    task = loop.create_task(emit_audit_event(**fields))
+    _BG_EMITS.add(task)
+    task.add_done_callback(_BG_EMITS.discard)
 
 _AUDIT_POST_TIMEOUT_S = float(os.getenv("AUDIT_POST_TIMEOUT_S", "5.0"))
 
@@ -42,6 +66,60 @@ def _audit_url() -> str:
     return f"{base}/api/v1/audit/log"
 
 
+_MISSING_KEY_CALLS = 0
+_MISSING_KEY_LOG_EVERY = 500
+
+
+def reset_internal_key_warning() -> None:
+    """Test hook: forget that the missing-key warning has already fired."""
+    global _MISSING_KEY_CALLS
+    _MISSING_KEY_CALLS = 0
+
+
+def internal_audit_headers() -> Dict[str, str]:
+    """Headers every ``/api/v1/audit/log`` POST must carry.
+
+    audit-service gates the route on the internal-services shared secret
+    (``X-Internal-Api-Key``) — without it the endpoint accepted forged audit
+    events from anyone who could reach the ingress. Callers that build their
+    own httpx request use this helper so the header can't drift. Read from
+    the env for the same reason ``_audit_url`` does.
+
+    A missing key is reported LOUDLY (rate-limited) rather than returned as a
+    quiet ``{}``. The gate's two halves live in different pods and are wired
+    separately — services enumerate individual ``secretKeyRef`` entries in
+    ``deploy/taylor-morrison/k8s/40-services.yaml`` while workers inherit the
+    whole Secret via ``envFrom`` — so a half-configured rollout is a real
+    state. In it this emitter sends no header, audit-service answers 401, and
+    the raw ``client.post`` call sites in job-service / snapshot-service
+    neither inspect the status (httpx does not raise on 4xx) nor let the
+    exception escape their bare ``except Exception: pass``. Without this
+    warning the audit row simply disappears — on a compliance product. The
+    caller still gets ``{}`` and still attempts the POST: audit emission is
+    fire-and-forget and must never block the workflow it is describing.
+    """
+    key = os.getenv("INTERNAL_API_KEY", "")
+    if key:
+        return {"X-Internal-Api-Key": key}
+
+    global _MISSING_KEY_CALLS
+    _MISSING_KEY_CALLS += 1
+    if (
+        _MISSING_KEY_CALLS == 1
+        or _MISSING_KEY_CALLS % _MISSING_KEY_LOG_EVERY == 0
+    ):
+        log.error(
+            "INTERNAL_API_KEY is not set in this pod (occurrence #%d): audit "
+            "POSTs will carry no X-Internal-Api-Key and audit-service will "
+            "reject them with 401 once the gate is configured. Add "
+            "INTERNAL_API_KEY to Secret tmvault-secrets AND make sure this "
+            "pod's Deployment enumerates it (services do not use "
+            "envFrom/secretRef).",
+            _MISSING_KEY_CALLS,
+        )
+    return {}
+
+
 async def emit_audit_event(**fields: Any) -> None:
     """Low-level: POST a pre-shaped audit event.
 
@@ -52,7 +130,18 @@ async def emit_audit_event(**fields: Any) -> None:
     """
     try:
         async with httpx.AsyncClient(timeout=_AUDIT_POST_TIMEOUT_S) as client:
-            await client.post(_audit_url(), json=fields)
+            resp = await client.post(
+                _audit_url(), json=fields, headers=internal_audit_headers()
+            )
+        # httpx doesn't raise on 4xx/5xx. A rejected POST means the event was
+        # dropped — most likely INTERNAL_API_KEY missing/mismatched between
+        # this caller and audit-service — so say so instead of losing the
+        # audit row silently.
+        if resp.status_code >= 400:
+            log.error(
+                "audit emit rejected (action=%s): HTTP %s %s",
+                fields.get("action"), resp.status_code, resp.text[:200],
+            )
     except Exception as exc:
         log.warning("audit emit failed (action=%s): %s", fields.get("action"), exc)
 

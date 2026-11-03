@@ -18,13 +18,20 @@ from datetime import datetime
 from typing import Dict, Optional, List
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from pydantic import BaseModel
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from redis.asyncio import Redis
 
 from shared.database import async_session_factory
-from shared.models import Resource, Tenant, Snapshot
+from shared.models import (
+    MailFolderDelta,
+    MailFolderFingerprint,
+    Resource,
+    SharePointDriveDelta,
+    Snapshot,
+    Tenant,
+)
 from shared.config import settings
 
 app = FastAPI(title="Delta Token Service", version="2.0.0")
@@ -39,6 +46,36 @@ audit_log = logging.getLogger("delta_token.audit")
 # so we cap how often the same resource can be invalidated. The limit lives
 # in Redis so it spans replicas; falls open if Redis isn't configured.
 INVALIDATION_MIN_INTERVAL_SECONDS = 60
+
+# The backup-worker's real incremental cursors live in resource.extra_data
+# (metadata) and the per-folder/per-drive delta tables — NOT in the snapshot
+# row this endpoint historically cleared. Any key that survives invalidation
+# means the next "full" backup silently keeps running incremental on the
+# corrupt token. Keep in sync with INCREMENTAL_CURSOR_KEYS in
+# workers/backup-worker/main.py.
+WORKER_CURSOR_KEYS: tuple = (
+    "mail_delta_token",              # legacy MAILBOX/SHARED/ROOM
+    "mail_delta_tokens_by_folder",   # USER_MAIL per-folder map (current)
+    "mail_folder_fingerprints",      # USER_MAIL legacy fingerprint cache
+    "mail_folder_baseline_at",       # USER_MAIL baseline timestamp
+    "delta_token",                   # generic incremental cursor
+    "chat_delta_tokens",             # USER_CHATS per-chat map
+    "chat_skip_baseline_at",         # USER_CHATS skip baseline
+    "onedrive_delta_link",           # USER_ONEDRIVE / ONEDRIVE
+    "drive_delta_tokens_by_site",    # SHAREPOINT_SITE per-site map
+    "calendar_delta_tokens",         # USER_CALENDAR default-calendar map
+    "calendar_subcalendar_fetched_at",  # USER_CALENDAR sub-calendar throttle
+)
+
+# extra_data cursor maps keyed by a sub-container id (mail folder, drive,
+# chat, calendar). A folder-scoped invalidation pops just that one entry.
+PER_FOLDER_CURSOR_MAPS: tuple = (
+    "mail_delta_tokens_by_folder",
+    "mail_folder_fingerprints",
+    "drive_delta_tokens_by_site",
+    "chat_delta_tokens",
+    "calendar_delta_tokens",
+)
 
 
 def require_internal_api_key(
@@ -106,6 +143,10 @@ async def startup():
                 host=settings.REDIS_HOST,
                 port=settings.REDIS_PORT,
                 db=settings.REDIS_DB,
+                # `or None` is load-bearing (ITO-10192): password="" would
+                # send AUTH against a no-auth server and error, so pods
+                # without the env var keep working unchanged.
+                password=settings.REDIS_PASSWORD or None,
                 decode_responses=True
             )
             await redis_client.ping()
@@ -298,26 +339,119 @@ async def invalidate_delta_token(
         resource_id, folder_id, client_ip, api_key_fp,
     )
 
-    # Remove from Redis cache.
+    # Remove from Redis cache. A resource-wide invalidation must also clear
+    # every per-folder key (delta_token:{rid}:{fid}) — deleting only the base
+    # key left per-folder cursors alive after a "full" invalidation.
     if redis_client:
-        cache_key = build_cache_key(resource_id, folder_id)
-        await redis_client.delete(cache_key)
+        if folder_id:
+            await redis_client.delete(build_cache_key(resource_id, folder_id))
+        else:
+            await redis_client.delete(build_cache_key(resource_id))
+            async for key in redis_client.scan_iter(
+                match=f"delta_token:{resource_id}:*"
+            ):
+                await redis_client.delete(key)
 
-    # Clear from latest snapshot.
+    cleared = {
+        "resource_cursor_keys": 0,
+        "snapshot_rows": 0,
+        "mail_folder_rows": 0,
+        "mail_fingerprint_rows": 0,
+        "sharepoint_drive_rows": 0,
+    }
     async with async_session_factory() as session:
-        snapshot_result = await session.execute(
-            select(Snapshot)
-            .where(Snapshot.resource_id == resource_uuid)
-            .order_by(Snapshot.started_at.desc())
-            .limit(1)
-        )
-        snapshot = snapshot_result.scalars().first()
+        # Strip the worker's cursors from resource.extra_data. Historically
+        # this endpoint only nulled the latest snapshot's delta_token — a
+        # store the worker never reads as its cursor — so it returned
+        # "invalidated" while the next backup kept running incremental on
+        # the corrupt token (items silently missing until restore time).
+        resource = await session.get(Resource, resource_uuid)
+        if resource is not None:
+            extra = dict(resource.extra_data or {})
+            if folder_id:
+                for map_key in PER_FOLDER_CURSOR_MAPS:
+                    cursor_map = extra.get(map_key)
+                    if isinstance(cursor_map, dict) and folder_id in cursor_map:
+                        extra[map_key] = {
+                            k: v for k, v in cursor_map.items() if k != folder_id
+                        }
+                        cleared["resource_cursor_keys"] += 1
+            else:
+                for key in WORKER_CURSOR_KEYS:
+                    if key in extra:
+                        extra.pop(key)
+                        cleared["resource_cursor_keys"] += 1
+            resource.extra_data = extra
 
-        if snapshot:
-            snapshot.delta_token = None
-            await session.commit()
+        # Per-folder / per-drive cursor tables (fingerprints too — a stale
+        # fingerprint would let skip-by-fp bypass the forced full walk).
+        if folder_id:
+            mail_del = await session.execute(
+                delete(MailFolderDelta)
+                .where(MailFolderDelta.resource_id == resource_uuid)
+                .where(MailFolderDelta.folder_id == folder_id)
+                .execution_options(synchronize_session=False)
+            )
+            fp_del = await session.execute(
+                delete(MailFolderFingerprint)
+                .where(MailFolderFingerprint.resource_id == resource_uuid)
+                .where(MailFolderFingerprint.folder_id == folder_id)
+                .execution_options(synchronize_session=False)
+            )
+            sp_del = await session.execute(
+                delete(SharePointDriveDelta)
+                .where(SharePointDriveDelta.resource_id == resource_uuid)
+                .where(SharePointDriveDelta.drive_id == folder_id)
+                .execution_options(synchronize_session=False)
+            )
+        else:
+            mail_del = await session.execute(
+                delete(MailFolderDelta)
+                .where(MailFolderDelta.resource_id == resource_uuid)
+                .execution_options(synchronize_session=False)
+            )
+            fp_del = await session.execute(
+                delete(MailFolderFingerprint)
+                .where(MailFolderFingerprint.resource_id == resource_uuid)
+                .execution_options(synchronize_session=False)
+            )
+            sp_del = await session.execute(
+                delete(SharePointDriveDelta)
+                .where(SharePointDriveDelta.resource_id == resource_uuid)
+                .execution_options(synchronize_session=False)
+            )
+        cleared["mail_folder_rows"] = getattr(mail_del, "rowcount", 0) or 0
+        cleared["mail_fingerprint_rows"] = getattr(fp_del, "rowcount", 0) or 0
+        cleared["sharepoint_drive_rows"] = getattr(sp_del, "rowcount", 0) or 0
 
-    return {"status": "invalidated", "resource_id": resource_id}
+        # Snapshot-level cursor. Resource-wide invalidation must null EVERY
+        # row: GET /delta-token falls back to the newest snapshot WHERE
+        # delta_token IS NOT NULL, so nulling only the latest row just
+        # resurrected the second-newest token on the next read.
+        if folder_id:
+            snapshot_result = await session.execute(
+                select(Snapshot)
+                .where(Snapshot.resource_id == resource_uuid)
+                .order_by(Snapshot.started_at.desc())
+                .limit(1)
+            )
+            snapshot = snapshot_result.scalars().first()
+            if snapshot is not None and snapshot.delta_token is not None:
+                snapshot.delta_token = None
+                cleared["snapshot_rows"] = 1
+        else:
+            snap_upd = await session.execute(
+                update(Snapshot)
+                .where(Snapshot.resource_id == resource_uuid)
+                .where(Snapshot.delta_token.isnot(None))
+                .values(delta_token=None)
+                .execution_options(synchronize_session=False)
+            )
+            cleared["snapshot_rows"] = getattr(snap_upd, "rowcount", 0) or 0
+
+        await session.commit()
+
+    return {"status": "invalidated", "resource_id": resource_id, "cleared": cleared}
 
 
 @app.get(

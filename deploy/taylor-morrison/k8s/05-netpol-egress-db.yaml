@@ -1,0 +1,17 @@
+# 05-netpol-egress-db.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tmvault-egress-postgres
+  namespace: itops
+spec:
+  podSelector:
+    matchLabels: { stack: tmvault }
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: databases }
+      ports:
+        - { protocol: TCP, port: 5432 }
+    - {}    # allow all other egress (Wasabi 443, Graph, in-ns RabbitMQ/Redis, DNS)

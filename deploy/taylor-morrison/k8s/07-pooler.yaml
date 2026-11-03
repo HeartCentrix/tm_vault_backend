@@ -1,0 +1,63 @@
+# deploy/taylor-morrison/k8s/07-pooler.yaml
+apiVersion: postgresql.cnpg.io/v1
+kind: Pooler
+metadata:
+  name: tmvault-pooler-rw
+  namespace: databases
+spec:
+  cluster:
+    name: postgres-ha
+  instances: 2
+  type: rw
+  pgbouncer:
+    poolMode: transaction
+    parameters:
+      max_client_conn: "4000"
+      # 2026-08-12: sized at 60, this pool severed ~1,181 client connections
+      # in 24 h with "closing because: query_wait_timeout (age=60s)" — which
+      # surfaces in every worker as
+      #   asyncpg.ConnectionDoesNotExistError: connection was closed in the
+      #   middle of operation
+      # and is NOT harmless: it lands mid-INSERT, so chat drains were counted
+      # FAILED and snapshots finalized PARTIAL over lost writes. The bursts
+      # were fleet-synchronised (11 of 20 backup workers in the same minute),
+      # which is the signature of server-slot famine, not stale connections.
+      #
+      # Demand vs supply was 26:1 — 20 backup workers x (DB_POOL_SIZE 40 +
+      # DB_MAX_OVERFLOW 40) = up to 1,600 clients against 2 x 60 = 120 server
+      # slots. 120 x 2 pods = 240 keeps total PG backends near 480 of
+      # max_connections 800 (172 tmvault + ~185 other DBs today), so there is
+      # headroom without pushing work_mem (64 MB) risk.
+      default_pool_size: "120"      # server conns tmvault may hold on PG
+      reserve_pool_size: "10"
+      # Back to pgbouncer's own default. A queued query must wait, not be
+      # severed in flight — the client pool is still over-provisioned
+      # (see DB_POOL_SIZE/DB_MAX_OVERFLOW), so queueing has to stay survivable.
+      query_wait_timeout: "120"
+      ignore_startup_parameters: "search_path,extra_float_digits"
+  template:
+    metadata:
+      labels:
+        cnpg.io/poolerName: tmvault-pooler-rw
+    spec:
+      containers: []
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    cnpg.io/poolerName: tmvault-pooler-rw
+                topologyKey: kubernetes.io/hostname
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: tmvault-pooler-pdb
+  namespace: databases
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      cnpg.io/poolerName: tmvault-pooler-rw

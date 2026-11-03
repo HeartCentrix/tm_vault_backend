@@ -116,3 +116,28 @@ async def test_upload_stream_plaintext_when_writes_off():
     assert not envelope.is_encrypted(stored)
     assert stored == plaintext
     assert info.content_md5 == hashlib.sha256(plaintext).hexdigest()
+
+async def test_file_upload_encrypts_with_bounded_spools_and_keeps_exact_route(mgr, tmp_path, monkeypatch):
+    from shared import provider_runtime
+    from shared.provider_runtime import ExecutionBudget
+    budget = ExecutionBudget(resident_bytes=20*1024*1024)
+    monkeypatch.setattr(provider_runtime, '_budget', budget)
+    sink = {}
+    st = _store(sink)
+    path = tmp_path / 'plain'
+    plaintext = b'file-payload' * 500_000
+    path.write_bytes(plaintext)
+    original = FakeS3.upload_part
+    async def consume_file(self, Bucket, Key, PartNumber, UploadId, Body, ContentLength):
+        assert 0 < budget.used_bytes <= budget.resident_bytes
+        assert not isinstance(Body, (bytes, bytearray))
+        data = bytearray()
+        while block := Body.read(65536): data.extend(block)
+        assert len(data) == ContentLength
+        return await original(self, Bucket, Key, PartNumber, UploadId, bytes(data))
+    monkeypatch.setattr(FakeS3, 'upload_part', consume_file)
+    info = await st.upload_from_file('c','from-file',str(path),len(plaintext))
+    _, dek = await mgr.active_dek('t1')
+    assert envelope.decrypt_blob(sink['c/from-file'], dek) == plaintext
+    assert info.content_md5 == hashlib.sha256(plaintext).hexdigest()
+    assert budget.used_bytes == 0

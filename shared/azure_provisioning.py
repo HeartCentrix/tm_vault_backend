@@ -126,7 +126,10 @@ async def _get_our_sp_object_id_in_tenant(tenant: Tenant) -> str:
     has its own object ID for the same multi-tenant app."""
     graph_token = await _get_graph_app_token(tenant)
     app_id = settings.MICROSOFT_CLIENT_ID or settings.AZURE_AD_CLIENT_ID
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient() as raw:
+        from types import SimpleNamespace
+        from shared.provider_http import download_client
+        client = download_client(raw, SimpleNamespace(tenant_id=str(tenant.external_tenant_id), client_id=app_id))
         resp = await client.get(
             f"https://graph.microsoft.com/v1.0/servicePrincipals"
             f"?$filter=appId eq '{app_id}'",

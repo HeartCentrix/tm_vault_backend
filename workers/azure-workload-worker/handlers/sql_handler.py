@@ -64,7 +64,11 @@ class SqlBackupHandler:
 
         server_name = resource.extra_data.get("server_name", "") if resource.extra_data else ""
         rg = resource.azure_resource_group or ""
-        db_name = resource.external_id
+        # external_id is now the ARM database id (discovery re-keyed it so
+        # same-named DBs on different servers stop colliding); the connectable
+        # database name travels in metadata. Fall back to external_id for rows
+        # discovered before the re-key.
+        db_name = (resource.extra_data.get("database_name", "") if resource.extra_data else "") or resource.external_id
 
         if not server_name or not rg:
             raise ValueError(f"No server_name or azure_resource_group found in resource {resource.external_id}")
@@ -291,10 +295,28 @@ class SqlBackupHandler:
                           f"{table_bytes / 1024:.1f} KB in {table_duration:.1f}s")
 
         tasks = [export_table(schema, table) for schema, table in tables]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # A table whose export raised (ODBC disconnect, upload failure,
+        # throttling) must never vanish silently: every incremental after
+        # this snapshot builds on the gap and the hole is only discovered
+        # at restore time. Inspect each outcome and fail the backup if
+        # any table is missing — a FAILED snapshot beats a green one
+        # with holes.
+        failed_tables = []
+        for (schema, table), res in zip(tables, results):
+            if isinstance(res, BaseException):
+                self._log(f"  ✗ Table [{schema}].[{table}] export FAILED: {res}", "ERROR")
+                failed_tables.append(f"{schema}.{table}")
+        if failed_tables:
+            raise RuntimeError(
+                f"{len(failed_tables)}/{len(tables)} table exports failed: "
+                + ", ".join(failed_tables[:10])
+                + ("…" if len(failed_tables) > 10 else "")
+            )
 
         return {
-            "tables_count": len(tables),
+            "tables_count": len(table_details),
             "rows_count": total_rows,
             "total_bytes": total_bytes,
             "blob_prefix": blob_prefix,

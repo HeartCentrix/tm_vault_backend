@@ -1,15 +1,18 @@
 """Tenant Service - Manages tenants and organizations"""
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, List
 from uuid import UUID, uuid4
 from datetime import datetime, timezone, timedelta
 import csv
+from shared.csv_safe import SafeCsvWriter  # Check 17: CSV formula-injection
 import io
 
 from fastapi import FastAPI, Depends, HTTPException, Query, Response, BackgroundTasks
+from pydantic import BaseModel
 from sqlalchemy import select, func, text
 
 from shared.config import settings
+from shared.app_settings import get_app_settings, update_app_settings
 from shared.database import get_db, close_db, AsyncSession, engine, async_session_factory
 from shared.models import Tenant, TenantType, TenantStatus, Organization, Resource, ResourceStatus, ResourceType, SlaPolicy, BackupBatch
 from shared.schemas import (
@@ -48,7 +51,14 @@ TYPE_MAP = {
 
 
 async def run_tenant_discovery(db: AsyncSession, tenant: Tenant) -> int:
-    """Run discovery for a single tenant. Returns count of new resources."""
+    """Run discovery for a single tenant. Returns count of new resources.
+
+    NOTE: As of the app-settings/discovery-schedule change, both the
+    create-tenant handler and the /discover endpoint publish a
+    ``discovery.m365`` message instead of calling this in-process. This
+    function (the old unbounded ``graph.discover_all()`` path) is currently
+    UNUSED but kept for reference / manual fallback.
+    """
     tenant.status = TenantStatus.DISCOVERING
     await db.flush()
 
@@ -131,7 +141,12 @@ async def lifespan(app: FastAPI):
     await close_db()
 
 
+from shared.audit import internal_audit_headers  # Check 17: internal call auth
+from shared.audit_middleware import AuditMiddleware  # Ops/Data Check 3: mutation-audit backstop
 app = FastAPI(title="Tenant Service", version="1.0.0", lifespan=lifespan)
+app.add_middleware(AuditMiddleware, service_name="tenant-service")
+from shared.auth_enforcement import AuthMiddleware  # Ops/Data Check 17: verified principal required
+app.add_middleware(AuthMiddleware, service_name="tenant-service", require_admin_for_mutations=True, enforce_tenant_scope=True)
 
 
 @app.get("/health")
@@ -196,15 +211,26 @@ async def create_tenant(request: TenantCreateRequest, db: AsyncSession = Depends
     db.add(tenant)
     await db.flush()
 
-    # Auto-trigger discovery for the new tenant
+    # Enqueue discovery onto the worker queue (fast streaming + batched path).
+    # The backup-scheduler reconciler re-enqueues any PENDING_DISCOVERY tenant,
+    # so even if the publish below fails the tenant is still picked up.
     try:
-        count = await run_tenant_discovery(db, tenant)
+        tenant.status = TenantStatus.PENDING_DISCOVERY
+        await db.flush()
+        from shared.message_bus import message_bus as msg_bus
+        if not msg_bus.connection:
+            await msg_bus.connect()
+        await msg_bus.publish("discovery.m365", {
+            "jobId": str(uuid4()),
+            "tenantId": str(tenant.id),
+            "externalTenantId": tenant.external_tenant_id,
+            "discoveryScope": ["users", "groups", "mailboxes", "shared_mailboxes", "sharepoint", "teams"],
+        }, priority=5)
         await db.commit()
     except Exception as e:
-        # Don't fail tenant creation if discovery fails
-        tenant.status = TenantStatus.DISCONNECTED
+        # Don't fail tenant creation if enqueue fails — reconciler will
+        # re-enqueue while the tenant remains PENDING_DISCOVERY.
         await db.commit()
-        # Still return the tenant - user can retry discovery manually
         pass
 
     return TenantResponse(
@@ -340,60 +366,32 @@ async def trigger_discovery(tenant_id: str, background_tasks: BackgroundTasks, d
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
 
-    tenant.status = TenantStatus.DISCOVERING
+    # Mark PENDING_DISCOVERY so the backup-scheduler reconciler also covers
+    # this tenant if the publish below fails.
+    tenant.status = TenantStatus.PENDING_DISCOVERY
     await db.commit()
 
-    tenant_display = tenant.display_name
+    # NOTE: no DISCOVERY_STARTED emit here. The discovery-worker emits the
+    # canonical one when it picks the message up (seconds later); emitting
+    # a second STARTED for the same (tenant, resource_type) wedges the
+    # Activity feed's greedy STARTED↔RUN pairing — the orphan STARTED
+    # steals the NEXT run's terminal event, leaving that run "In Progress"
+    # forever (2026-07-15, manual trigger of 07-14 17:34).
 
-    async def _post_audit(payload: dict) -> None:
-        try:
-            import httpx
-            async with httpx.AsyncClient(timeout=5.0) as _c:
-                await _c.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json=payload)
-        except Exception:
-            pass
+    # Publish onto the worker queue (fast streaming + batched path) instead of
+    # running discovery in-process.
+    discovery_id = str(uuid4())
+    from shared.message_bus import message_bus as msg_bus
+    if not msg_bus.connection:
+        await msg_bus.connect()
+    await msg_bus.publish("discovery.m365", {
+        "jobId": discovery_id,
+        "tenantId": str(tenant.id),
+        "externalTenantId": tenant.external_tenant_id,
+        "discoveryScope": ["users", "groups", "mailboxes", "shared_mailboxes", "sharepoint", "teams"],
+    }, priority=5)
 
-    await _post_audit({
-        "action": "DISCOVERY_STARTED",
-        "tenant_id": tenant_id,
-        "actor_type": "USER",
-        "resource_type": "M365",
-        "resource_name": tenant_display,
-        "details": {"type": "M365"},
-    })
-
-    async def _run():
-        async with async_session_factory() as bg_db:
-            t = await bg_db.get(Tenant, tenant.id)
-            try:
-                count = await run_tenant_discovery(bg_db, t)
-                await bg_db.commit()
-                print(f"[DISCOVERY] M365 complete for {tenant_id}: {count} resources")
-                await _post_audit({
-                    "action": "DISCOVERY_RUN",
-                    "tenant_id": tenant_id,
-                    "actor_type": "USER",
-                    "resource_type": "M365",
-                    "resource_name": tenant_display,
-                    "outcome": "SUCCESS",
-                    "details": {"resourcesFound": count, "type": "M365"},
-                })
-            except Exception as e:
-                t.status = TenantStatus.DISCONNECTED
-                await bg_db.commit()
-                print(f"[DISCOVERY] M365 failed for {tenant_id}: {e}")
-                await _post_audit({
-                    "action": "DISCOVERY_RUN",
-                    "tenant_id": tenant_id,
-                    "actor_type": "USER",
-                    "resource_type": "M365",
-                    "resource_name": tenant_display,
-                    "outcome": "FAILURE",
-                    "details": {"error": str(e), "type": "M365"},
-                })
-
-    background_tasks.add_task(_run)
-    return {"discoveryId": str(uuid4()), "status": "started", "message": "Discovery running in background"}
+    return {"discoveryId": discovery_id, "status": "started", "message": "Discovery enqueued"}
 
 
 @app.post("/api/v1/tenants/{tenant_id}/discover-azure")
@@ -624,6 +622,7 @@ async def backup_user_with_discovery(
             async with _httpx.AsyncClient(timeout=15.0) as _c:
                 r = await _c.post(
                     f"{settings.JOB_SERVICE_URL}/api/v1/backups/trigger-bulk",
+                    headers=internal_audit_headers(),  # Check 17: authenticate service-to-service call
                     json={
                         "resourceIds": backup_targets,
                         "fullBackup": False,
@@ -707,6 +706,38 @@ async def get_org(org_id: str, db: AsyncSession = Depends(get_db)):
         tenantCount=0,
         createdAt=org.created_at.isoformat() if org.created_at else "",
     )
+
+
+class AppSettingsUpdate(BaseModel):
+    discovery_time: Optional[str] = None
+    timezone: Optional[str] = None
+    job_retry_max: Optional[int] = None
+    job_retry_delay_minutes: Optional[int] = None
+
+
+@app.get("/api/v1/settings/app")
+async def get_app_settings_endpoint(db: AsyncSession = Depends(get_db)):
+    """Return the global app settings (daily discovery time + timezone)."""
+    result = await get_app_settings(db)
+    await db.commit()
+    return result
+
+
+@app.put("/api/v1/settings/app")
+async def update_app_settings_endpoint(
+    request: AppSettingsUpdate, db: AsyncSession = Depends(get_db)
+):
+    """Update the global app settings. Validates time (HH:MM) + timezone."""
+    try:
+        result = await update_app_settings(
+            db, discovery_time=request.discovery_time, timezone=request.timezone,
+            job_retry_max=request.job_retry_max,
+            job_retry_delay_minutes=request.job_retry_delay_minutes,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    await db.commit()
+    return result
 
 
 @app.get("/api/v1/tenants/{tenant_id}/info", response_model=TenantInfoResponse)
@@ -798,7 +829,7 @@ async def download_usage_report(tenant_id: str, db: AsyncSession = Depends(get_d
     
     # Create CSV in memory
     output = io.StringIO()
-    writer = csv.writer(output)
+    writer = SafeCsvWriter(csv.writer(output))
     
     # Header row with report date
     writer.writerow(["Report date:", today.strftime("%b %d %Y")])

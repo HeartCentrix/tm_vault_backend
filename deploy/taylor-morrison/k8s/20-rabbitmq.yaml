@@ -1,0 +1,58 @@
+# 20-rabbitmq.yaml
+# NOTE: cluster Kyverno requires harbor.taylormorrison.com images + runAsNonRoot.
+# Official rabbitmq:3.13-management-alpine mirrored to Harbor as tmvault-rabbitmq:3.13-mgmt.
+#
+# Pilot single-node broker, NO persistent volume:
+#   - fsGroup on a *persisted* volume makes the .erlang.cookie group-readable on remount,
+#     which Erlang rejects ("cookie file must be accessible by owner only"). An emptyDir
+#     starts empty every boot so the cookie is regenerated 0400 (owner-only) and boots clean.
+#   - RABBITMQ_NODENAME pinned to rabbit@localhost so the node name is stable across pod
+#     restarts (a Deployment pod name changes each roll, which would orphan mnesia data).
+#   - Queues are transient for the pilot; HA/persistence is deferred to prod.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: tmvault-rabbitmq, namespace: itops, labels: { app: tmvault-rabbitmq, stack: tmvault } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: tmvault-rabbitmq } }
+  strategy: { type: Recreate }
+  template:
+    metadata: { labels: { app: tmvault-rabbitmq, stack: tmvault } }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: rabbitmq
+          image: harbor.taylormorrison.com/library/tmvault-rabbitmq@sha256:3c498e636fd64462480c5f9ff842eb224ab84160a8ada1ded5375e9569e9230c
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+          env:
+            - { name: RABBITMQ_NODENAME, value: "rabbit@localhost" }
+            - { name: RABBITMQ_DEFAULT_USER, value: "tmvault" }
+            - name: RABBITMQ_DEFAULT_PASS
+              valueFrom: { secretKeyRef: { name: tmvault-secrets, key: RABBITMQ_PASSWORD } }
+          ports: [ { containerPort: 5672 }, { containerPort: 15672 } ]
+          volumeMounts: [ { name: data, mountPath: /var/lib/rabbitmq } ]
+          readinessProbe:
+            exec: { command: ["rabbitmq-diagnostics","-q","ping"] }
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 10
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata: { name: tmvault-rabbitmq, namespace: itops, labels: { app: tmvault-rabbitmq, stack: tmvault } }
+spec:
+  selector: { app: tmvault-rabbitmq }
+  ports:
+    - { name: amqp, port: 5672, targetPort: 5672 }
+    - { name: mgmt, port: 15672, targetPort: 15672 }
