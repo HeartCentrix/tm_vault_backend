@@ -12887,9 +12887,18 @@ class BackupWorker:
                             and _needs_attachments(extra["raw"])
                         ]
                         if emails_with_att:
-                            att_items, att_bytes = await self._usermail_backup_attachments(
-                                graph_client, resource, snapshot, tenant, user_id, emails_with_att,
-                            )
+                            try:
+                                att_items, att_bytes = await self._usermail_backup_attachments(
+                                    graph_client, resource, snapshot, tenant, user_id, emails_with_att,
+                                )
+                            except EnumerationFailed as exc:
+                                await self._record_enumeration_failure(
+                                    snapshot_id=snapshot.id,
+                                    reason=str(exc),
+                                    partition_id=message.get("partitionId"),
+                                    resource_label=f"[USER_MAIL] {resource.display_name or resource.id}",
+                                )
+                                return {"item_count": 0, "bytes_added": 0, "failed": True}
                 elif resource.type.value == "USER_CHATS":
                     user_id = (
                         (resource.extra_data or {}).get("user_id") or resource.external_id
@@ -13410,8 +13419,12 @@ class BackupWorker:
         # shard settled COMPLETED (and the union carry ran) over a cancelled
         # snapshot. Re-raise it — fail_snapshot stamps cancelled_at for the
         # whole-resource path; the shard handler settles the row FAILED.
+        from shared.provider_admission import ProviderDeferred
+        from shared.provider_runtime import ProviderBudgetExhausted, ProviderTurnDeferred
         for _r in results:
-            if isinstance(_r, (JobCancelledMidFlight, ChatCatalogueWorkLeaseMoved)):
+            if isinstance(_r, (JobCancelledMidFlight, ChatCatalogueWorkLeaseMoved,
+                               ProviderDeferred, ProviderBudgetExhausted,
+                               ProviderTurnDeferred, asyncio.CancelledError)):
                 raise _r
 
         # Per-resource BACKUP_COMPLETED / BACKUP_FAILED used to fire
@@ -13479,6 +13492,8 @@ class BackupWorker:
             to go wider. Raising blindly risks resource starvation
             and quicker 429s, so we don't raise it prospectively.
         """
+        from shared.provider_admission import ProviderDeferred
+        from shared.provider_runtime import ProviderBudgetExhausted, ProviderTurnDeferred
         sem_concurrency = int(
             os.getenv("USER_MAIL_ATT_CONCURRENCY", "8"),
         )
@@ -13571,37 +13586,37 @@ class BackupWorker:
         # per-msg path in _one_message (graph_client.list_message_
         # attachments follows nextLink); those are rare. Attachments
         # without `id` are dropped same as before.
-        from shared.graph_batch import BatchRequest
+        from shared.graph_batch import BatchReadError, BatchRequest
         msg_ids = [m.get("id") for m in messages_with_attachments if m.get("id")]
         att_lists_cache: Dict[str, List[Dict[str, Any]]] = {}
-        batch_limit = int(os.getenv("USER_MAIL_ATT_BATCH", "20"))
-        try:
+        batch_limit = min(20, mailbox_batch_concurrency(os.getenv("USER_MAIL_ATT_BATCH"), default=20))
+        for start in range(0, len(msg_ids), batch_limit):
             batch_reqs = [
                 BatchRequest(
                     id=mid, method="GET",
                     url=f"/users/{user_id}/messages/{mid}/attachments",
                 )
-                for mid in msg_ids
+                for mid in msg_ids[start:start + batch_limit]
             ]
-            if batch_reqs:
-                # graph_client.batch chunks to 20 per HTTP call
-                # internally; we just hand it the full list.
+            try:
                 batch_result = await graph_client.batch(batch_reqs)
-                for mid, resp in batch_result.items():
-                    if getattr(resp, "status", 0) == 200:
-                        att_lists_cache[mid] = (
-                            (resp.body or {}).get("value", []) or []
-                        )
-                    # Non-200 (404/403/paginated) → fall back to direct
-                    # call in _one_message. Leaving the cache entry
-                    # absent signals the fallback.
-        except Exception as be:
-            # Bulk list failed — each msg falls back to its own
-            # direct GET. Still functional, just slower.
-            print(
-                f"[{self.worker_id}] [ATT-BATCH] batch list failed: "
-                f"{type(be).__name__}: {be}; falling back to per-msg",
-            )
+            except (ProviderDeferred, ProviderBudgetExhausted):
+                raise
+            except BatchReadError as be:
+                batch_result = be.responses
+                print(f"[{self.worker_id}] [ATT-BATCH] incomplete: {be.stage}; "
+                      f"retained {len(batch_result)}/{len(batch_reqs)} responses")
+            except Exception as be:
+                print(f"[{self.worker_id}] [ATT-BATCH] batch list failed: "
+                      f"{type(be).__name__}; falling back to per-msg")
+                continue
+            for mid, resp in batch_result.items():
+                body = getattr(resp, "body", None)
+                if (getattr(resp, "status", 0) == 200 and isinstance(body, dict)
+                        and "@odata.nextLink" not in body and isinstance(body.get("value"), list)
+                        and all(isinstance(att, dict) for att in body["value"])):
+                    att_lists_cache[mid] = body["value"]
+                # Incomplete, malformed and failed lists use the full paged reader.
 
         # ── Multi-app concurrent MIME pre-fetch ──────────────────────
         # Identify which messages have body cid: refs not covered by
@@ -13665,6 +13680,9 @@ class BackupWorker:
                 _ok = 0
                 _fail = 0
                 for _mid, _r in bulk_results.items():
+                    if isinstance(_r, (ProviderDeferred, ProviderBudgetExhausted,
+                                       ProviderTurnDeferred, asyncio.CancelledError)):
+                        raise _r
                     if isinstance(_r, (bytes, bytearray)):
                         mime_pre_map[_mid] = bytes(_r)
                         _ok += 1
@@ -13675,6 +13693,8 @@ class BackupWorker:
                     f"[{self.worker_id}] [MIME-BULK] result: "
                     f"{_ok} ok, {_fail} fail of {len(need_mime_msg_ids)}",
                 )
+            except (ProviderDeferred, ProviderBudgetExhausted):
+                raise
             except Exception as e:
                 # Hard failure on the bulk path — every msg falls back to
                 # the per-msg serial path inside _one_message. Logs the
@@ -13696,9 +13716,15 @@ class BackupWorker:
                 async with sem:
                     try:
                         attachments = await graph_client.list_message_attachments(user_id, msg_id)
+                        if (not isinstance(attachments, list)
+                                or any(not isinstance(att, dict) for att in attachments)):
+                            raise ValueError("invalid attachment collection")
+                    except (ProviderDeferred, ProviderBudgetExhausted):
+                        raise
                     except Exception as e:
-                        print(f"[{self.worker_id}] [ATT-LIST FAIL] msg {msg_id}: {type(e).__name__}: {e}")
-                        return [], 0
+                        raise EnumerationFailed(
+                            f"required mail attachment listing failed: {type(e).__name__}"
+                        ) from None
 
             local_items: List[SnapshotItem] = []
             local_bytes = 0
@@ -13736,6 +13762,8 @@ class BackupWorker:
                         try:
                             async with sem:
                                 content_bytes = await graph_client.get_message_attachment_content(user_id, msg_id, att_id)
+                        except (ProviderDeferred, ProviderBudgetExhausted):
+                            raise
                         except Exception as e:
                             print(f"[{self.worker_id}] [ATT-FAIL] {att_name} (file) on {msg_id}: {type(e).__name__}: {e}")
                             return None, 0
@@ -13791,6 +13819,8 @@ class BackupWorker:
                             else:
                                 blob_path = None
                                 content_hash = None
+                        except (ProviderDeferred, ProviderBudgetExhausted):
+                            raise
                         except Exception as e:
                             print(f"[{self.worker_id}] [ATT-UPLOAD] {att_name} on {msg_id}: {type(e).__name__}: {e}")
                             blob_path = None
@@ -13837,6 +13867,9 @@ class BackupWorker:
                     return_exceptions=True,
                 )
                 for _r in _att_results:
+                    if isinstance(_r, (ProviderDeferred, ProviderBudgetExhausted,
+                                       ProviderTurnDeferred, asyncio.CancelledError)):
+                        raise _r
                     if isinstance(_r, Exception):
                         print(
                             f"[{self.worker_id}] [ATT-TASK] msg {msg_id} "
@@ -13898,6 +13931,8 @@ class BackupWorker:
                                 mime_bytes = await graph_client.get_message_mime_source(
                                     user_id, msg_id,
                                 )
+                            except (ProviderDeferred, ProviderBudgetExhausted):
+                                raise
                             except Exception as e:
                                 # 403 / 404 / size-cap are all silent —
                                 # the original email still reads, we just
@@ -13949,6 +13984,8 @@ class BackupWorker:
                                     p_blob = await _upload_once_per_hash(
                                         p_hash, payload,
                                     )
+                                except (ProviderDeferred, ProviderBudgetExhausted):
+                                    raise
                                 except Exception as e:
                                     print(
                                         f"[{self.worker_id}] [MIME-UPLOAD] "
@@ -14006,6 +14043,9 @@ class BackupWorker:
                                 return_exceptions=True,
                             )
                             for _mr in _mime_results:
+                                if isinstance(_mr, (ProviderDeferred, ProviderBudgetExhausted,
+                                                    ProviderTurnDeferred, asyncio.CancelledError)):
+                                    raise _mr
                                 if isinstance(_mr, Exception):
                                     print(
                                         f"[{self.worker_id}] [MIME-TASK] "
@@ -14043,6 +14083,8 @@ class BackupWorker:
         all_items: List[SnapshotItem] = []
         total_bytes = 0
         for r in results:
+            if isinstance(r, BaseException):
+                raise r
             if isinstance(r, tuple):
                 items, b = r
                 all_items.extend(items)
