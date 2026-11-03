@@ -20,7 +20,7 @@ async def bootstrap(store, monkeypatch, bw, *, tokens=None):
         snapshot = await db.get(models.Snapshot, scope.snapshot_id)
         snapshot.extra_data = {}
         (await db.get(models.Resource, store.resource)).type = models.ResourceType.USER_MAIL
-    await worker._record_mail_bootstrap_origin(snapshot, tokens or {}, ['inbox', 'sent'])
+    await worker._record_mail_bootstrap_origin(snapshot, tokens or {}, ['inbox', 'sent'], cursor_read_ok=True)
     return scope, worker
 
 
@@ -51,7 +51,7 @@ async def test_no_prior_bootstrap_resumed_within_run_completes_without_execution
     # A redelivery observes cursors now; the original cursor-free proof survives.
     async with store.factory() as db:
         snapshot = await db.get(models.Snapshot, scope.snapshot_id)
-    await worker._record_mail_bootstrap_origin(snapshot, {'inbox': 'resumed'}, ['inbox', 'sent'])
+    await worker._record_mail_bootstrap_origin(snapshot, {'inbox': 'resumed'}, ['inbox', 'sent'], cursor_read_ok=True)
     task = await enqueue(store, scope)
     assert task.state == 'COMPLETED' and task.prepared and task.attempts == 0
     assert task.row_count == task.bytes_count == task.checkpoint == 0
@@ -108,7 +108,7 @@ async def test_bootstrap_origin_cannot_be_created_after_unattributed_mail_writes
         db.add(models.SnapshotItem(snapshot_id=snapshot.id, tenant_id=store.tenant,
             item_type='EMAIL', external_id='unattributed', name='mail', content_size=7, backend_id=store.backend))
     worker = bw.BackupWorker.__new__(bw.BackupWorker)
-    await worker._record_mail_bootstrap_origin(snapshot, {}, ['inbox'])
+    await worker._record_mail_bootstrap_origin(snapshot, {}, ['inbox'], cursor_read_ok=True)
     async with store.factory() as db:
         assert 'mail_bootstrap_origin' not in (await db.get(models.Snapshot, scope.snapshot_id)).extra_data
 
@@ -155,3 +155,44 @@ async def test_validated_noop_uses_fenced_resume_to_finalize_mail_snapshot(store
         assert snapshot.item_count == 1 and snapshot.bytes_total == 7
         assert snapshot.extra_data['mail_carry_forward_pending'] is False
         assert not snapshot.extra_data.get('copy_required_failed')
+
+
+async def test_cursor_free_capture_resumes_only_its_own_durable_checkpoint_tokens(store, monkeypatch, bw):
+    scope, worker = await bootstrap(store, monkeypatch, bw)
+    async with store.factory() as db:
+        snapshot = await db.get(models.Snapshot, scope.snapshot_id)
+    tokens = await worker._record_mail_bootstrap_origin(
+        snapshot, {'inbox': 'other-job-cursor', 'sent': 'other-job-cursor'}, ['inbox', 'sent'],
+        cursor_read_ok=True)
+    assert tokens == {}  # No folder in this snapshot has completed its baseline.
+    async with store.factory.begin() as db:
+        live = await db.get(models.Snapshot, scope.snapshot_id)
+        live.extra_data = {**live.extra_data, 'copy_mail_checkpoint_tokens': {'inbox': 'own-checkpoint'}}
+    tokens = await worker._record_mail_bootstrap_origin(
+        snapshot, {'inbox': 'other-job-cursor', 'sent': 'other-job-cursor'}, ['inbox', 'sent'],
+        cursor_read_ok=True)
+    assert tokens == {'inbox': 'own-checkpoint'}
+
+
+async def test_failed_authoritative_cursor_read_cannot_prove_cursor_free_bootstrap(store, monkeypatch, bw):
+    from sqlalchemy import text
+    scope, _ = await prepare(store, monkeypatch, bw)
+    worker = bw.BackupWorker.__new__(bw.BackupWorker)
+    worker.worker_id = 'synthetic-mail-read-failure'
+    async with store.factory.begin() as db:
+        snapshot = await db.get(models.Snapshot, scope.snapshot_id)
+        (await db.get(models.Resource, store.resource)).type = models.ResourceType.USER_MAIL
+        db.add(models.MailFolderDelta(resource_id=store.resource, folder_id='inbox', delta_token='hidden-historical-cursor'))
+    async with store.factory.begin() as db:
+        await db.execute(text('ALTER TABLE mail_folder_delta RENAME TO unavailable_mail_folder_delta'))
+    read_result = {}
+    tokens = await worker._load_mail_folder_deltas(store.resource, read_result=read_result)
+    assert tokens == {} and read_result == {'ok': False}
+    await worker._record_mail_bootstrap_origin(snapshot, tokens, ['inbox', 'sent'],
+        cursor_read_ok=read_result['ok'])
+    async with store.factory() as db:
+        snapshot = await db.get(models.Snapshot, scope.snapshot_id)
+        assert snapshot.extra_data['mail_bootstrap_origin']['cursor_free'] is False
+    await finish_folders(store, scope)
+    task = await enqueue(store, scope)
+    assert task.state == 'FAILED' and task.error == {'code': 'mail_bootstrap_coverage_unproven'}

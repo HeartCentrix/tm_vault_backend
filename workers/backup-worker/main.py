@@ -5262,7 +5262,7 @@ class BackupWorker:
         return waiting
 
     async def _load_mail_folder_deltas(
-        self, resource_id: uuid.UUID,
+        self, resource_id: uuid.UUID, *, read_result: Optional[Dict[str, bool]] = None,
     ) -> Dict[str, str]:
         """Read all per-folder delta tokens for one mailbox resource.
 
@@ -5271,8 +5271,11 @@ class BackupWorker:
         single SELECT against the new `mail_folder_delta` table.
         Returns `{folder_id: delta_token}` — same shape as the old
         dict so call sites don't need to change. Empty dict if the
-        resource has no rows yet (first run / pre-migration).
+        resource has no rows yet (first run / pre-migration). `read_result`
+        distinguishes a successful empty read from the compatibility fallback.
         """
+        if read_result is not None:
+            read_result["ok"] = False
         try:
             async with async_session_factory() as session:
                 rows = (await session.execute(
@@ -5285,6 +5288,8 @@ class BackupWorker:
                     ),
                     {"rid": str(resource_id)},
                 )).fetchall()
+            if read_result is not None:
+                read_result["ok"] = True
             return {str(r[0]): str(r[1]) for r in rows if r[1]}
         except Exception as e:
             # Table may not exist on a stale deploy; fail open with
@@ -7378,8 +7383,9 @@ class BackupWorker:
                                 f"[{self.worker_id}] [USER_MAIL] resource re-read "
                                 f"failed (using pre-hook mirror): {_rr_err}"
                             )
+                    _mail_cursor_read: Dict[str, bool] = {}
                     _new_table_tokens = await self._load_mail_folder_deltas(
-                        resource.id,
+                        resource.id, read_result=_mail_cursor_read,
                     )
                     _legacy_tokens = dict(
                         _ed_fresh.get("mail_delta_tokens_by_folder", {}) or {},
@@ -7387,10 +7393,10 @@ class BackupWorker:
                     mail_existing_tokens: Dict[str, str] = {
                         **_legacy_tokens, **_new_table_tokens,
                     }
-                    if not (message or {}).get("partitionFilter"):
-                        await self._record_mail_bootstrap_origin(
-                            snapshot, mail_existing_tokens, folder_tree.keys(),
-                        )
+                    mail_existing_tokens = await self._record_mail_bootstrap_origin(
+                        snapshot, mail_existing_tokens, folder_tree.keys(),
+                        cursor_read_ok=_mail_cursor_read.get("ok") is True,
+                    )
                     mail_new_tokens: Dict[str, str] = {}
                     # Folders whose drain finished cleanly AND whose pages
                     # all persisted. ONLY these may have their fingerprint
@@ -17455,11 +17461,13 @@ class BackupWorker:
         )
         return "COMPLETED"
 
-    async def _record_mail_bootstrap_origin(self, snapshot, existing_tokens, folder_ids):
-        """Retain the cursor baseline before any shard/page can write this capture."""
+    async def _record_mail_bootstrap_origin(
+        self, snapshot, existing_tokens, folder_ids, *, cursor_read_ok=False,
+    ):
+        """Retain the baseline; a bootstrap resumes only this snapshot's cursors."""
         if snapshot is None:
-            return
-        origin = {"cursor_free": not bool(existing_tokens),
+            return existing_tokens
+        origin = {"cursor_free": cursor_read_ok is True and not bool(existing_tokens),
                   "folder_ids": sorted({str(fid) for fid in folder_ids if fid})}
         async with async_session_factory() as session:
             from shared.copy_workflow import verify_copy_resume
@@ -17480,7 +17488,14 @@ class BackupWorker:
                               AND j.status::text IN ('RUNNING', 'QUEUED', 'PENDING', 'RETRYING'))
             """), {"sid": str(snapshot.id), "rid": str(snapshot.resource_id),
                     "token": snapshot.lease_token, "origin": json.dumps(origin)})
+            extra = await session.scalar(select(Snapshot.extra_data).where(Snapshot.id == snapshot.id)) or {}
             await session.commit()
+        recorded = extra.get("mail_bootstrap_origin") or {}
+        if isinstance(recorded, dict) and recorded.get("cursor_free") is True:
+            # Global cursors may belong to a different job that finished after
+            # fanout; untouched folders must still bootstrap into this snapshot.
+            return dict(extra.get("copy_mail_checkpoint_tokens") or {})
+        return existing_tokens
 
     async def _record_shard_carry_inputs(
         self,
