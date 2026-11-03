@@ -1,8 +1,8 @@
-"""Per-job backup checkpoint shared by OneDrive + any future streaming-backup workload.
+"""OneDrive resume identity and the legacy serialized checkpoint format.
 
-Lives on `Job.result.backup_checkpoint`. Commit cadence is "N files OR M bytes
-since last commit, whichever first". Resume filters file metadata by the
-`files_done_ext_ids` set so redeliveries don't re-download.
+Workers reconstruct progress from committed snapshot-item rows. The former
+Job.result.backup_checkpoint slot is shared by sibling resources and cannot
+vouch for source versions or survive concurrent shard writes.
 
 SNAPSHOT BINDING (2026-08-04): a checkpoint vouches for blobs recorded on ONE
 snapshot's rows. A job whose snapshot died (swept/OOM) gets a NEW snapshot on
@@ -21,6 +21,59 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
+
+
+def file_source_conflicts(source: dict, current: dict, *, drive_id: str) -> bool:
+    """Known disagreements abort capture; missing evidence only prevents resume."""
+    if not isinstance(source, dict) or not isinstance(current, dict):
+        return False
+    for key in ("id", "eTag", "cTag"):
+        if source.get(key) and current.get(key) and source[key] != current[key]:
+            return True
+    if source.get("size") is not None and current.get("size") is not None and source["size"] != current["size"]:
+        return True
+    for item in (source, current):
+        observed_drive = (item.get("parentReference") or {}).get("driveId")
+        if observed_drive and observed_drive != drive_id:
+            return True
+    source_hashes = (source.get("file") or {}).get("hashes") or {}
+    current_hashes = (current.get("file") or {}).get("hashes") or {}
+    return any(source_hashes.get(key) and current_hashes.get(key)
+               and source_hashes[key] != current_hashes[key]
+               for key in ("sha256Hash", "sha1Hash", "quickXorHash"))
+
+
+def file_receipt_matches(*, source: dict, current: dict, drive_id: str,
+                         blob_path: Optional[str], content_size: int) -> bool:
+    """A snapshot-owned blob is reusable only for the same observed file version.
+
+    Legacy rows without a verifiable source version are downloaded again; a
+    job checkpoint alone never proves either version identity or durable bytes.
+    """
+    if not blob_path or not isinstance(source, dict) or source.get("id") != current.get("id"):
+        return False
+    try:
+        if int(source.get("size")) != int(current.get("size")) or int(content_size) != int(current.get("size")):
+            return False
+    except (TypeError, ValueError):
+        return False
+    for item in (source, current):
+        parent_drive = (item.get("parentReference") or {}).get("driveId")
+        if parent_drive and parent_drive != drive_id:
+            return False
+    # eTag includes metadata changes; cTag/hashes require matching metadata too.
+    if source.get("eTag") or current.get("eTag"):
+        return bool(source.get("eTag") and source.get("eTag") == current.get("eTag"))
+    if source.get("name") != current.get("name") or source.get("parentReference") != current.get("parentReference"):
+        return False
+    if source.get("cTag") or current.get("cTag"):
+        return bool(source.get("cTag") and source.get("cTag") == current.get("cTag"))
+    saved_hashes = (source.get("file") or {}).get("hashes") or {}
+    current_hashes = (current.get("file") or {}).get("hashes") or {}
+    for key in ("sha256Hash", "sha1Hash", "quickXorHash"):
+        if saved_hashes.get(key) or current_hashes.get(key):
+            return bool(saved_hashes.get(key) and saved_hashes.get(key) == current_hashes.get(key))
+    return False
 
 
 @dataclass

@@ -3,7 +3,8 @@
 Bundles up to 20 non-paginated GET sub-requests into one HTTP call.
 Retries 429/502/503/504 sub-responses (and outer-$batch failures mapped
 onto the subs) in a follow-up batch honoring each sub's Retry-After;
-401 re-mints the token and replays. Rejects endpoints known to paginate
+401 re-mints the token and replays. Transport failures retry only GET/HEAD
+subrequests within the same attempt budget. Rejects endpoints known to paginate
 (delta, $skiptoken,
 $top) at submission time — $batch cannot follow @odata.nextLink inside
 a sub-response and using it for paged data silently truncates.
@@ -38,6 +39,7 @@ import httpx
 from shared.graph_ratelimit import (
     GraphRetryExhaustedError, parse_retry_after,
 )
+from shared.provider_read import ProviderReadError
 
 
 GRAPH_BATCH_URL = "https://graph.microsoft.com/v1.0/$batch"
@@ -70,6 +72,14 @@ class BatchResponse:
     body: dict
 
 
+class BatchReadError(ProviderReadError):
+    """Incomplete read batch; explicit fallback callers may reuse responses."""
+
+    def __init__(self, stage, responses, *, status=None, code=None, attempts=1):
+        super().__init__(stage, status=status, code=code, attempts=attempts)
+        self.responses = dict(responses)
+
+
 class BatchClient:
     """Async wrapper around /v1.0/$batch."""
 
@@ -92,21 +102,31 @@ class BatchClient:
         from shared.config import settings as s
         self.validate_requests(requests)
         result: Dict[str, BatchResponse] = {}
+        failure = None
+        readonly = all(r.method.upper() in ("GET", "HEAD") for r in requests)
         chunk_size = s.GRAPH_BATCH_MAX_SIZE
         for i in range(0, len(requests), chunk_size):
             chunk = requests[i:i + chunk_size]
-            sub_result = await self._send_chunk_with_retry(chunk)
+            try:
+                sub_result = await self._send_chunk_with_retry(chunk)
+            except BatchReadError as error:
+                if not readonly:
+                    error.responses = {**result, **error.responses}
+                    raise
+                failure, sub_result = error, error.responses
             result.update(sub_result)
+        if failure is not None:
+            failure.responses = result
+            raise failure
         return result
 
     async def _send_chunk_with_retry(
-        self, chunk: List[BatchRequest],
+        self, chunk: List[BatchRequest], *, attempts: int = 0,
     ) -> Dict[str, BatchResponse]:
         from shared.config import settings as s
         from shared.multi_app_manager import multi_app_manager
         pending = list(chunk)
         collected: Dict[str, BatchResponse] = {}
-        attempts = 0
         # Track which app's token is being used for this chunk's lifetime.
         # On 429/503 we try to swap to a healthier app before sleeping —
         # /$batch hits Graph's per-app throttle the same as single requests
@@ -121,10 +141,41 @@ class BatchClient:
         last_status: Dict[str, int] = {}
         while pending and attempts < s.GRAPH_MAX_RETRIES + 1:
             attempts += 1
-            responses = await self._send_once(
-                pending, override_token=current_token,
-                override_app_id=current_app_id,
-            )
+            try:
+                responses = await self._send_once(
+                    pending, override_token=current_token,
+                    override_app_id=current_app_id,
+                )
+            except httpx.TransportError as error:
+                # A lost outer response cannot prove whether a mutation ran.
+                if any(r.method.upper() not in ("GET", "HEAD") for r in pending):
+                    raise
+                if attempts >= s.GRAPH_MAX_RETRIES + 1:
+                    raise BatchReadError("batch_transport", collected,
+                        code=type(error).__name__, attempts=attempts) from None
+                await asyncio.sleep(min(8.0, 2.0 ** (attempts - 1)))
+                continue
+            except ProviderReadError as error:
+                if (error.stage != "response_byte_limit"
+                        or any(r.method.upper() not in ("GET", "HEAD") for r in pending)):
+                    raise
+                # Release the oversized response buffer before descending.
+                error.__traceback__ = None
+                if len(pending) == 1 or attempts >= s.GRAPH_MAX_RETRIES + 1:
+                    raise BatchReadError(error.stage, collected,
+                        status=error.status_code, attempts=attempts) from None
+                midpoint = len(pending) // 2
+                failure = None
+                for half in (pending[:midpoint], pending[midpoint:]):
+                    try:
+                        collected.update(await self._send_chunk_with_retry(half, attempts=attempts))
+                    except BatchReadError as split_error:
+                        failure = split_error
+                        collected.update(split_error.responses)
+                if failure is not None:
+                    failure.responses = collected
+                    raise failure
+                return collected
             failed: List[BatchRequest] = []
             max_retry_after = 0.0
             by_id = {r.id: r for r in pending}

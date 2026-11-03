@@ -4971,7 +4971,9 @@ class GraphClient:
         the transient, and per-URL failures don't leak into the bulk
         unreachable cache (only true permanent 4xx do).
         """
-        from shared.graph_batch import BatchRequest
+        from shared.graph_batch import BatchReadError, BatchRequest
+        from shared.provider_admission import ProviderDeferred
+        from shared.provider_runtime import ProviderBudgetExhausted
         import base64 as _b64
         out: Dict[str, Optional[Dict[str, Any]]] = {}
         if not source_urls:
@@ -5016,6 +5018,10 @@ class GraphClient:
 
         try:
             responses = await self.batch(reqs)
+        except (ProviderDeferred, ProviderBudgetExhausted):
+            raise
+        except BatchReadError as exc:
+            responses = exc.responses
         except Exception as exc:
             # Whole-batch failure is rare — graph_batch already retries
             # 429/503 internally with the Retry-After header honored.
@@ -5340,27 +5346,26 @@ class GraphClient:
         drive_id: str,
         item_ids: List[str],
         chunk_size: int = 20,
-    ) -> Dict[str, List[Dict[str, Any]]]:
+    ) -> Dict[str, Optional[List[Dict[str, Any]]]]:
         """Bulk-list /versions for many items via Graph /$batch.
 
         Returns {item_id → versions_list}, newest-first per item.
-        Missing items (403/404) map to []. Items that exhaust the batch
-        retry budget map to None so the caller can fall back to a
-        per-item call.
+        Missing items (403/404) map to []. Unreadable or incomplete
+        responses map to None so the caller can fall back to a per-item
+        call, while confirmed complete results remain usable.
 
         Why this exists: each item needs its own GET /versions which costs
         a TCP/TLS/auth round-trip; on a 5k-user, millions-of-files corpus
         that overhead dominates list-phase wall time. $batch bundles up to
         20 sub-requests behind one auth handshake.
 
-        Note: $batch does not follow @odata.nextLink. The /versions
-        endpoint defaults to ~50 results; we cap callers at MAX_FILE_VERSIONS
-        which is well under that, so single-page is sufficient.
+        Note: $batch does not follow @odata.nextLink. Paginated results
+        require the full per-item reader before they can be used.
         """
         if not item_ids:
             return {}
 
-        from shared.graph_batch import BatchRequest
+        from shared.graph_batch import BatchReadError, BatchRequest
 
         # Build one BatchRequest per item. Sub-request URLs use the relative
         # path Microsoft Graph expects inside $batch (no host prefix). We
@@ -5376,23 +5381,28 @@ class GraphClient:
         # Honor caller-provided chunk_size if smaller than the Graph hard
         # cap of 20. BatchClient handles its own chunking via the global
         # GRAPH_BATCH_MAX_SIZE setting.
-        responses = await self.batch(requests)
+        try:
+            responses = await self.batch(requests)
+        except BatchReadError as exc:
+            responses = exc.responses
 
-        out: Dict[str, List[Dict[str, Any]]] = {}
+        out: Dict[str, Optional[List[Dict[str, Any]]]] = {}
         for i, item_id in enumerate(item_ids):
             resp = responses.get(str(i))
             if resp is None:
-                out[item_id] = []
+                out[item_id] = None
                 continue
             if resp.status in (403, 404):
                 out[item_id] = []
                 continue
             if 200 <= resp.status < 300:
-                out[item_id] = (resp.body or {}).get("value", []) or []
+                body = resp.body
+                out[item_id] = (body["value"] if isinstance(body, dict)
+                    and "@odata.nextLink" not in body and isinstance(body.get("value"), list) else None)
                 continue
             # Unrecoverable (429 after retries, 5xx). Signal None so the
             # caller can fall back to a single-shot list_file_versions().
-            out[item_id] = None  # type: ignore
+            out[item_id] = None
         return out
 
     async def stream_file_version_3tier(
@@ -6988,12 +6998,17 @@ class GraphClient:
         self,
         drive_id: str,
         item_ids: "List[str]",
-    ) -> "Dict[str, Tuple[Optional[str], int, Optional[str]]]":
+        *,
+        include_source_metadata: bool = False,
+    ) -> Dict[str, tuple]:
         """Bulk-fetch downloadUrl + size + quickXorHash for up to N items
         via /v1.0/$batch. Returns a map {item_id: (download_url, size,
         quickXorHash)} — download_url may be None when the item is a
         cloud-native object (Whiteboard, OneNote, Loop component) with
         no downloadable bytes.
+
+        include_source_metadata appends a fourth element containing the
+        observed item identity/version, excluding the signed download URL.
 
         Enterprise win: the per-file GET /drives/{}/items/{} call is
         the serial bottleneck on many-small-files drives. For 10k
@@ -7008,7 +7023,10 @@ class GraphClient:
         `(None, 0, None)` entries rather than aborting the whole batch,
         so one bad file doesn't poison the drive's URL map.
         """
-        from shared.graph_batch import BatchRequest
+        from shared.graph_batch import BatchReadError, BatchRequest
+        from shared.provider_admission import ProviderDeferred
+        from shared.provider_runtime import ProviderBudgetExhausted
+        from shared.provider_work import ProviderWorkConflict
         if not item_ids:
             return {}
         reqs = [
@@ -7018,9 +7036,18 @@ class GraphClient:
             )
             for iid in item_ids
         ]
-        out: Dict[str, Tuple[Optional[str], int, Optional[str]]] = {}
+        out: Dict[str, tuple] = {}
         try:
             responses = await self.batch(reqs)
+        except (ProviderDeferred, ProviderBudgetExhausted, ProviderWorkConflict):
+            raise
+        except BatchReadError as exc:
+            responses = exc.responses
+            print(
+                f"[GraphClient] get_download_urls_batch incomplete: "
+                f"{exc.stage}; retained {len(responses)}/{len(reqs)} responses; "
+                f"unresolved items fall back to per-item get_download_url",
+            )
         except Exception as exc:
             # Batch call itself failed — fall back to per-item GETs
             # so throughput degrades gracefully instead of erroring
@@ -7034,7 +7061,7 @@ class GraphClient:
         for iid in item_ids:
             resp = responses.get(iid)
             if resp is None or resp.status != 200:
-                out[iid] = (None, 0, None)
+                out[iid] = (None, 0, None, {}) if include_source_metadata else (None, 0, None)
                 continue
             body = resp.body or {}
             du = body.get("@microsoft.graph.downloadUrl")
@@ -7045,10 +7072,14 @@ class GraphClient:
                 .get("quickXorHash")
             )
             out[iid] = (du, size, qxh)
+            if include_source_metadata:
+                out[iid] += ({key: body[key] for key in (
+                    "id", "name", "size", "eTag", "cTag", "parentReference", "file",
+                ) if key in body},)
         return out
 
     async def get_download_url(self, drive_id: str, item_id: str,
-                               max_attempts: int = 3) -> Tuple[str, int, Optional[str]]:
+                               max_attempts: int = 3, *, include_source_metadata: bool = False) -> tuple:
         """
         Reliably obtain a fresh @microsoft.graph.downloadUrl for a drive item.
 
@@ -7060,7 +7091,8 @@ class GraphClient:
           - Some file types (whiteboards, notebooks, packages) have NO download URL
             even though they have a 'file' facet — these are cloud-native objects.
 
-        Returns: (download_url, size_bytes, quick_xor_hash_or_none)
+        Returns: (download_url, size_bytes, quick_xor_hash_or_none).
+        include_source_metadata appends the observed item identity/version.
         Raises: RuntimeError if the item itself is not downloadable (callers
         string-match 'downloadUrl' in that message to skip cloud-native
         objects silently — the message contract matters).
@@ -7073,12 +7105,17 @@ class GraphClient:
         # For app-only access, do NOT use $select - Graph ignores it or strips downloadUrl
         # for application permission tokens. Get the full item and extract what we need.
         url = f"{self.GRAPH_URL}/drives/{drive_id}/items/{item_id}"
+        from shared.provider_admission import ProviderDeferred
+        from shared.provider_runtime import ProviderBudgetExhausted
+        from shared.provider_work import ProviderWorkConflict
         last_error = None
         fetch_failed = False  # True when the LAST attempt never saw the item
         for attempt in range(max_attempts):
             item = None
             try:
                 item = await self._get(url)
+            except (ProviderDeferred, ProviderBudgetExhausted, ProviderWorkConflict):
+                raise
             except Exception as e:
                 last_error = str(e)
                 fetch_failed = True
@@ -7092,6 +7129,10 @@ class GraphClient:
                 qxh = (item.get("file") or {}).get("hashes", {}).get("quickXorHash")
                 file_facet = item.get("file")
                 if download_url:
+                    if include_source_metadata:
+                        return download_url, size, qxh, {key: item[key] for key in (
+                            "id", "name", "size", "eTag", "cTag", "parentReference", "file",
+                        ) if key in item}
                     return download_url, size, qxh
                 # DEBUG: log what Graph returned
                 keys = list(item.keys()) if isinstance(item, dict) else "not a dict"

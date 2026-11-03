@@ -138,6 +138,11 @@ class GraphRateLimiter:
         self._bucket = self._local  # may be replaced by Redis bucket in ``maybe_init_redis``
         self._rate = rate
         self._burst = burst
+        # Brief local contention should not cancel sibling streams and restart
+        # an entire durable turn. Long provider cooldowns still defer immediately.
+        self._admission_wait_s = float(os.environ.get('PROVIDER_ADMISSION_WAIT_SECONDS', '5'))
+        if not math.isfinite(self._admission_wait_s) or not 0 <= self._admission_wait_s <= 30:
+            raise ValueError('provider admission wait must be between 0 and 30 seconds')
 
     @property
     def scoped_enabled(self):
@@ -160,24 +165,29 @@ class GraphRateLimiter:
                 tenant_concurrency=int(os.environ.get("PROVIDER_TENANT_CONCURRENCY", "8")),
                 resource_concurrency=int(os.environ.get("PROVIDER_RESOURCE_CONCURRENCY", "4"))),
             namespace=os.environ.get("PROVIDER_ADMISSION_NAMESPACE", "tmvault"))
+        logger.info('provider_network_limits global=%s tenant=%s resource=%s rate=%s burst=%s local_wait_s=%s',
+            self._scoped.limits.global_concurrency, self._scoped.limits.tenant_concurrency,
+            self._scoped.limits.resource_concurrency, self._rate, self._burst, self._admission_wait_s)
         return self._scoped
 
     @asynccontextmanager
-    async def admit(self, context, *, cost=1, wait_budget=1):
+    async def admit(self, context, *, cost=1, wait_budget=None):
         if not self.scoped_enabled:
             yield
             return
         coordinator = await self._scoped_coordinator(context)
-        async with coordinator.admit(context, cost=cost, wait_budget=wait_budget):
+        async with coordinator.admit(context, cost=cost,
+                wait_budget=self._admission_wait_s if wait_budget is None else wait_budget):
             yield
 
     @asynccontextmanager
-    async def admit_many(self, requirements, *, wait_budget=1):
+    async def admit_many(self, requirements, *, wait_budget=None):
         if not self.scoped_enabled:
             yield
             return
         coordinator = await self._scoped_coordinator(requirements[0][0])
-        async with coordinator.admit_many(requirements, wait_budget=wait_budget):
+        async with coordinator.admit_many(requirements,
+                wait_budget=self._admission_wait_s if wait_budget is None else wait_budget):
             yield
 
     async def cooldown(self, context, seconds):

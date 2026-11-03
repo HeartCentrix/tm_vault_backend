@@ -79,6 +79,68 @@ async def test_one_app_cannot_escape_workload_cooldown_by_rotation(redis_client)
     assert error.value.retry_after > 590
 
 
+async def test_denial_reports_safe_scope_and_reason(redis_client):
+    module = importlib.import_module('shared.provider_admission')
+    admission = module.ScopedProviderAdmission(redis_client,
+        limits=module.AdmissionLimits(tenant_concurrency=1, global_concurrency=2), namespace='reason')
+    selected = scope(module)
+    async with admission.admit(selected, wait_budget=0):
+        with pytest.raises(module.ProviderDeferred) as denied:
+            async with admission.admit(selected, wait_budget=0):
+                pytest.fail('tenant slot limit was bypassed')
+        assert (denied.value.reason, denied.value.scope) == ('concurrency', 'tenant')
+    await admission.cooldown(selected, 60)
+    with pytest.raises(module.ProviderDeferred) as cooling:
+        async with admission.admit(selected, wait_budget=0):
+            pytest.fail('cooldown was bypassed')
+    assert (cooling.value.reason, cooling.value.scope) == ('cooldown', 'workload')
+
+
+async def test_short_slot_wait_completes_without_restarting_provider_turn(redis_client, monkeypatch):
+    from shared.graph_rate_limiter import GraphRateLimiter
+    module = importlib.import_module('shared.provider_admission')
+    monkeypatch.setenv('PROVIDER_SCOPED_ADMISSION_ENABLED', 'true')
+    monkeypatch.setenv('PROVIDER_ADMISSION_WAIT_SECONDS', '2')
+    admission = module.ScopedProviderAdmission(redis_client,
+        limits=module.AdmissionLimits(tenant_concurrency=1), namespace='short-wait')
+    limiter = GraphRateLimiter()
+    limiter._scoped = admission
+    selected = scope(module)
+    entered = asyncio.Event()
+
+    async def holding_request():
+        async with admission.admit(selected, wait_budget=0):
+            entered.set()
+            await asyncio.sleep(1.2)
+
+    holder = asyncio.create_task(holding_request())
+    await entered.wait()
+    try:
+        async with asyncio.timeout(3):
+            async with limiter.admit(selected):
+                assert holder.done()
+    finally:
+        await holder
+
+
+async def test_local_wait_does_not_shorten_server_cooldown(redis_client, monkeypatch):
+    from shared.graph_rate_limiter import GraphRateLimiter
+    module = importlib.import_module('shared.provider_admission')
+    monkeypatch.setenv('PROVIDER_SCOPED_ADMISSION_ENABLED', 'true')
+    monkeypatch.setenv('PROVIDER_ADMISSION_WAIT_SECONDS', '2')
+    admission = module.ScopedProviderAdmission(redis_client, namespace='long-wait')
+    limiter = GraphRateLimiter()
+    limiter._scoped = admission
+    selected = scope(module)
+    await admission.cooldown(selected, 60)
+    started = time.monotonic()
+    with pytest.raises(module.ProviderDeferred) as deferred:
+        async with limiter.admit(selected):
+            pytest.fail('ignored server cooldown')
+    assert deferred.value.retry_after > 59
+    assert time.monotonic() - started < 1
+
+
 async def test_batch_costs_are_atomic_and_include_all_workloads(redis_client):
     module = importlib.import_module('shared.provider_admission')
     admission = module.ScopedProviderAdmission(redis_client,

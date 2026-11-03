@@ -1,7 +1,7 @@
 """Bounded provider turns, durable recovery and cooperative deferral."""
 from __future__ import annotations
 import asyncio
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager, contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -9,7 +9,7 @@ import logging
 import os
 import time
 from uuid import uuid4
-from sqlalchemy import and_, exists, func, or_, select
+from sqlalchemy import exists, func, select
 from shared import provider_work as work
 from shared.models import ProviderWork, ProviderWorkUnit, Snapshot, SnapshotPartition
 from shared.provider_admission import ProviderDeferred
@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 _EXECUTION = ContextVar('provider_execution', default=None)
 _UNIT = ContextVar('provider_unit', default=None)
 _PREPAID_STORAGE = ContextVar('prepaid_storage_bytes', default=None)
+_TRANSFER = ContextVar('provider_logical_transfer', default=None)
+_RECEIPT = ContextVar('provider_receipt_drain', default=None)
+_DRAIN_EXPIRED = 'provider_concurrency_drain_expired'
+CONCURRENCY_DRAIN_SECONDS = 300
 
 
 class ProviderTurnDeferred(BaseException):
@@ -109,6 +113,12 @@ class ProviderExecution:
     lease_lost: bool = False
     owner_task: object = field(default_factory=asyncio.current_task)
     provider_tasks: set = field(default_factory=set)
+    congestion: ProviderDeferred | None = None
+    drain_deadline: float | None = None
+    drain_task: object = None
+    transfers: set = field(default_factory=set)
+    transfers_changed: asyncio.Event = field(default_factory=asyncio.Event)
+    drain_callbacks: set = field(default_factory=set)
 
     def defer(self, error):
         if self.deferred is None or error.next_eligible_at > self.deferred.next_eligible_at:
@@ -126,12 +136,145 @@ class UnitExecution:
     remaining: int = 0
 
 
+@dataclass(eq=False)
+class ProviderTransfer:
+    execution: ProviderExecution
+    owner_task: object
+    deadline: float | None
+    implicit: bool = False
+    active: bool = False
+
+
 def current_execution():
     return _EXECUTION.get()
 
 
 def current_unit():
     return _UNIT.get()
+
+
+@asynccontextmanager
+async def provider_transfer_scope(*, timeout=None, implicit=False):
+    """Keep one admitted file alive across range gaps, storage and buffered receipts."""
+    execution, task = current_execution(), asyncio.current_task()
+    inherited = _TRANSFER.get()
+    if execution is None or (inherited and inherited.execution is execution
+            and (not inherited.implicit or inherited.owner_task is task)):
+        yield inherited
+        return
+    deadlines = [time.monotonic() + timeout] if timeout is not None and timeout > 0 else []
+    unit = current_unit()
+    if unit is not None:
+        deadlines.append(time.monotonic() + (unit.deadline_at - datetime.now(timezone.utc)).total_seconds())
+    transfer = ProviderTransfer(execution, task, min(deadlines) if deadlines else None, implicit)
+    marker = _TRANSFER.set(transfer)
+    try:
+        await before_provider_admission()
+        yield transfer
+    finally:
+        _TRANSFER.reset(marker)
+        execution.transfers.discard(transfer)
+        execution.transfers_changed.set()
+
+
+@contextmanager
+def provider_drain_callback(callback):
+    execution = current_execution()
+    registered = execution is not None and callback not in execution.drain_callbacks
+    if registered:
+        execution.drain_callbacks.add(callback)
+    try:
+        yield
+    finally:
+        if registered:
+            execution.drain_callbacks.discard(callback)
+
+
+@contextmanager
+def provider_receipt_scope():
+    """Allow bounded proof/receipt work through local congestion, never provider limits."""
+    marker = _RECEIPT.set(current_execution())
+    try:
+        yield
+    finally:
+        _RECEIPT.reset(marker)
+
+
+def _can_drain(execution):
+    transfer = _TRANSFER.get()
+    return (_RECEIPT.get() is execution or
+        bool(transfer and transfer.execution is execution and transfer.active))
+
+
+async def before_provider_admission():
+    check_provider_turn()
+    execution = current_execution()
+    if execution is None or execution.congestion is None:
+        return
+    if _can_drain(execution):
+        if time.monotonic() >= execution.drain_deadline:
+            raise ProviderTurnDeferred(execution.congestion)
+        return
+    await asyncio.shield(execution.drain_task)
+    raise ProviderTurnDeferred(execution.deferred or execution.congestion)
+
+
+def provider_admission_granted():
+    """A Redis grant activates a logical transfer; racing new grants must be released."""
+    check_provider_turn()
+    execution, transfer = current_execution(), _TRANSFER.get()
+    if execution is None:
+        return True
+    if execution.congestion is not None and not _can_drain(execution):
+        return False
+    if transfer and transfer.execution is execution and not transfer.active:
+        transfer.active = True
+        if _RECEIPT.get() is not execution:
+            execution.transfers.add(transfer)
+    return True
+
+
+async def _drain_congestion(execution):
+    marker = _TRANSFER.set(None)
+    deadline = asyncio.timeout_at(execution.drain_deadline)
+    try:
+        try:
+            async with deadline:
+                while execution.transfers:
+                    execution.transfers_changed.clear()
+                    await execution.transfers_changed.wait()
+                with provider_receipt_scope():
+                    for callback in tuple(execution.drain_callbacks):
+                        await callback()
+        except TimeoutError:
+            if not deadline.expired():
+                raise
+            execution.defer(execution.congestion)
+            for transfer in tuple(execution.transfers):
+                transfer.owner_task.cancel(_DRAIN_EXPIRED)
+        else:
+            execution.defer(execution.congestion)
+    finally:
+        _TRANSFER.reset(marker)
+
+
+async def wait_provider_concurrency(error):
+    """Continue the same Redis grant attempt while already-admitted transfers drain."""
+    execution = current_execution()
+    if execution is None:
+        return False
+    if execution.congestion is None:
+        execution.congestion = error
+        deadlines = [time.monotonic() + CONCURRENCY_DRAIN_SECONDS]
+        deadlines.extend(transfer.deadline for transfer in execution.transfers if transfer.deadline is not None)
+        unit = current_unit()
+        if unit is not None:
+            deadlines.append(time.monotonic() + (unit.deadline_at - datetime.now(timezone.utc)).total_seconds())
+        execution.drain_deadline = min(deadlines)
+        execution.drain_task = asyncio.create_task(_drain_congestion(execution))
+    await before_provider_admission()
+    await asyncio.sleep(min(error.retry_after, max(0, execution.drain_deadline - time.monotonic())))
+    return True
 
 
 def check_provider_turn():
@@ -237,6 +380,9 @@ def yield_provider_turn():
 
 
 async def _join_provider_tasks(execution):
+    if execution.drain_task is not None:
+        execution.drain_task.cancel()
+        await asyncio.gather(execution.drain_task, return_exceptions=True)
     while True:
         tasks = [task for task in execution.provider_tasks if not task.done()]
         if not tasks:
@@ -255,7 +401,6 @@ class ProviderWorkRunner:
         self.owner_id, self.budget = owner_id or uuid4(), budget or execution_budget()
         self._tasks, self._closing = set(), False
         self._wake = asyncio.Event()
-        self._settlement_cursor = None
 
     def wake(self):
         self._wake.set()
@@ -283,7 +428,12 @@ class ProviderWorkRunner:
                         await work.renew_work(session, execution.claim)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as error:
+            from shared.provider_observability import workflow_error_details
+            reason, locations = workflow_error_details(error)
+            logger.warning('provider_lease_renewal_failed work_id=%s snapshot_id=%s generation=%s error_type=%s reason=%s locations=%s',
+                execution.claim.work_id, execution.claim.snapshot_id, execution.claim.generation,
+                type(error).__name__, reason, locations)
             execution.lease_lost = True
             owner_task.cancel()
 
@@ -306,6 +456,9 @@ class ProviderWorkRunner:
                     async with unit_scope('planning', 'planning'):
                         result = await self.resume_callback(claim)
                         check_provider_turn()
+                        if execution.drain_task is not None:
+                            await asyncio.shield(execution.drain_task)
+                            check_provider_turn()
                         async with self.factory() as session:
                             handed = await session.get(ProviderWork, claim.work_id)
                             if handed.state in work.TERMINAL and handed.last_reason == 'copy_handoff':
@@ -315,27 +468,24 @@ class ProviderWorkRunner:
                         await work.finish_work(session, claim)
                 renewer.cancel()
                 await asyncio.gather(renewer, return_exceptions=True)
-                await self.settle_callback(claim.work_id)
+                await self.settle_once(claim.work_id)
                 return result
             except (ProviderDeferred, ProviderTurnDeferred) as deferred:
                 error = deferred.error if isinstance(deferred, ProviderTurnDeferred) else deferred
-                execution.defer(error)
-                await _join_provider_tasks(execution)
-                error = execution.deferred
-                async with self.factory.begin() as session:
-                    await work.suspend_current_work(session, claim, next_eligible_at=error.next_eligible_at,
-                        reason=getattr(error, 'stage', 'provider_wait'))
-                logger.info('provider_turn_deferred work_id=%s snapshot_id=%s stage=%s next_eligible_at=%s',
-                    claim.work_id, claim.snapshot_id, getattr(error, 'stage', 'provider_wait'), error.next_eligible_at)
-                return {'provider_waiting': True, 'provider_work_id': str(claim.work_id)}
+                return await self._commit_deferral(execution, error)
             except ProviderBudgetExhausted:
                 await _join_provider_tasks(execution)
                 with work.work_scope(claim):
                     async with self.factory.begin() as session:
                         await work.fail_exhausted_work(session, claim)
-                await self.settle_callback(claim.work_id)
+                renewer.cancel()
+                await asyncio.gather(renewer, return_exceptions=True)
+                await self.settle_once(claim.work_id)
                 return {'provider_exhausted': True, 'provider_work_id': str(claim.work_id)}
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as cancelled:
+                if (cancelled.args == (_DRAIN_EXPIRED,) and execution.congestion is not None
+                        and not execution.lease_lost and not self._closing):
+                    return await self._commit_deferral(execution, execution.congestion)
                 await _join_provider_tasks(execution)
                 # Only an owned nonterminal leaf can be released; user cancellation
                 # wins under the same parent locks. A hard crash is lease-recovered.
@@ -347,8 +497,11 @@ class ProviderWorkRunner:
                     return {'provider_lease_lost': True}
                 raise
             except Exception as error:
-                logger.warning('provider_turn_error work_id=%s snapshot_id=%s job_id=%s error_type=%s',
-                    claim.work_id, claim.snapshot_id, claim.job_id, type(error).__name__)
+                from shared.provider_observability import workflow_error_details
+                reason, locations = workflow_error_details(error)
+                logger.warning('provider_turn_error work_id=%s snapshot_id=%s job_id=%s generation=%s error_type=%s reason=%s locations=%s',
+                    claim.work_id, claim.snapshot_id, claim.job_id, claim.generation,
+                    type(error).__name__, reason, locations)
                 raise
             finally:
                 logger.info('provider_turn_ended work_id=%s snapshot_id=%s elapsed_s=%.3f',
@@ -357,6 +510,19 @@ class ProviderWorkRunner:
                 renewer.cancel()
                 await asyncio.gather(renewer, return_exceptions=True)
                 _EXECUTION.reset(token)
+
+    async def _commit_deferral(self, execution, error):
+        execution.defer(error)
+        await _join_provider_tasks(execution)
+        error, claim = execution.deferred, execution.claim
+        async with self.factory.begin() as session:
+            await work.suspend_current_work(session, claim, next_eligible_at=error.next_eligible_at,
+                reason=getattr(error, 'stage', 'provider_wait'))
+        logger.info('provider_turn_deferred work_id=%s snapshot_id=%s stage=%s reason=%s scope=%s retry_after_s=%s next_eligible_at=%s',
+            claim.work_id, claim.snapshot_id, getattr(error, 'stage', 'provider_wait'),
+            getattr(error, 'reason', None), getattr(error, 'scope', None),
+            error.retry_after, error.next_eligible_at)
+        return {'provider_waiting': True, 'provider_work_id': str(claim.work_id)}
 
     async def _worker(self):
         while not self._closing:
@@ -371,20 +537,28 @@ class ProviderWorkRunner:
                 await asyncio.wait_for(self._wake.wait(), self.poll_s)
             self._wake.clear()
 
+    async def settle_once(self, work_id=None):
+        async with self.budget.permit(control=True):
+            async with self.factory.begin() as session:
+                claim = await work.claim_parent_settlement(session, owner_id=self.owner_id, work_id=work_id)
+            if claim is None:
+                return False
+            try:
+                with work.settling_parent(claim):
+                    # Leave recovery time inside the 120-second claim if a callback stalls.
+                    async with asyncio.timeout(60):
+                        await self.settle_callback(claim.work_id)
+            finally:
+                async with self.factory.begin() as session:
+                    await work.release_parent_settlement(session, claim)
+            return True
+
     async def _settle(self):
         while not self._closing:
             try:
-                async with self.budget.permit(control=True):
-                    async with self.factory() as session:
-                        query = select(ProviderWork.id, ProviderWork.created_at).where(ProviderWork.parent_settle_pending)
-                        if self._settlement_cursor is not None:
-                            created, key = self._settlement_cursor
-                            query = query.where(or_(ProviderWork.created_at > created,
-                                and_(ProviderWork.created_at == created, ProviderWork.id > key)))
-                        rows = (await session.execute(query.order_by(ProviderWork.created_at, ProviderWork.id).limit(32))).all()
-                        self._settlement_cursor = (rows[-1].created_at, rows[-1].id) if rows else None
-                    for work_id, _ in rows:
-                        await self.settle_callback(work_id)
+                for _ in range(32):
+                    if self._closing or not await self.settle_once():
+                        break
             except asyncio.CancelledError:
                 raise
             except Exception as error:

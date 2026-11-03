@@ -53,9 +53,11 @@ class AdmissionLimits:
 
 
 class ProviderDeferred(ProviderReadError):
-    def __init__(self, context, delay, *, server_time=None, stage='provider_wait'):
+    def __init__(self, context, delay, *, server_time=None, stage='provider_wait', reason=None, scope=None):
         super().__init__(stage, retry_after=max(0.0, delay))
         self.context = context
+        self.reason = reason
+        self.scope = scope
         self.next_eligible_at = datetime.fromtimestamp(
             (server_time if server_time is not None else time.time()) + self.retry_after,
             timezone.utc)
@@ -77,16 +79,21 @@ class ScopedProviderAdmission:
     local lease=tonumber(ARGV[4])
     local cancelled=KEYS[#KEYS]
     redis.call('ZREMRANGEBYSCORE',cancelled,'-inf',now)
-    if redis.call('ZSCORE',cancelled,token) then return {'-1','0',tostring(now)} end
+    if redis.call('ZSCORE',cancelled,token) then return {'-1','0',tostring(now),'cancelled','0'} end
     local values={}
     local wait=0
+    local reason='none'
+    local denied=0
     for i,b in ipairs(spec) do
       local last=tonumber(redis.call('HGET',KEYS[i],'last') or now)
       local balance=tonumber(redis.call('HGET',KEYS[i],'tokens') or b[2])
       local until_time=tonumber(redis.call('HGET',KEYS[i],'until') or 0)
       balance=math.min(b[2],balance+math.max(0,now-last)*b[1])
       values[i]=balance
-      wait=math.max(wait,until_time-now,math.max(0,b[3]-balance)/b[1])
+      local cooldown=until_time-now
+      local rate_wait=math.max(0,b[3]-balance)/b[1]
+      if cooldown>wait then wait=cooldown; reason='cooldown'; denied=i end
+      if rate_wait>wait then wait=rate_wait; reason='rate'; denied=i end
       redis.call('HSET',KEYS[i],'last',now,'tokens',balance)
       redis.call('EXPIRE',KEYS[i],math.ceil(math.max(600,until_time-now+600)))
     end
@@ -95,16 +102,17 @@ class ScopedProviderAdmission:
       redis.call('ZREMRANGEBYSCORE',key,'-inf',now)
       if redis.call('ZCARD',key)>=limit then
         local first=redis.call('ZRANGE',key,0,0,'WITHSCORES')
-        wait=math.max(wait,math.min(0.5,math.max(0.01,tonumber(first[2])-now)))
+        local slot_wait=math.min(0.5,math.max(0.01,tonumber(first[2])-now))
+        if slot_wait>wait then wait=slot_wait; reason='concurrency'; denied=-i end
       end
     end
-    if wait>0 then return {'0',tostring(wait),tostring(now)} end
+    if wait>0 then return {'0',tostring(wait),tostring(now),reason,tostring(denied)} end
     for i,b in ipairs(spec) do redis.call('HSET',KEYS[i],'tokens',values[i]-b[3]) end
     for i,_ in ipairs(slots) do
       redis.call('ZADD',KEYS[#spec+i],now+lease,token)
       redis.call('EXPIRE',KEYS[#spec+i],math.ceil(lease+60))
     end
-    return {'1','0',tostring(now)}
+    return {'1','0',tostring(now),'none','0'}
     """
     _RELEASE = """
     local clock=redis.call('TIME')
@@ -178,7 +186,7 @@ class ScopedProviderAdmission:
         context = requirements[0][0]
         if not isinstance(context, ProviderRequestContext):
             raise ValueError('provider admission requires verified request context')
-        costs, slot_limits = {}, {}
+        costs, slot_limits, scopes = {}, {}, {}
         for scope, cost in requirements:
             if (not isinstance(scope, ProviderRequestContext) or
                     (scope.tenant_id, scope.app_id, scope.cloud) != (context.tenant_id, context.app_id, context.cloud)):
@@ -186,6 +194,8 @@ class ScopedProviderAdmission:
             if not math.isfinite(cost) or cost <= 0:
                 raise ValueError('invalid provider admission cost')
             scoped_buckets, scoped_slots, scoped_limits = self._keys(scope)
+            scopes.update(zip(scoped_buckets, ('global', 'tenant', 'workload', 'app', 'resource')))
+            scopes.update(zip(scoped_slots, ('global', 'tenant', 'resource')))
             for key in scoped_buckets:
                 costs[key] = costs.get(key, 0) + cost
             for key, limit in zip(scoped_slots, scoped_limits):
@@ -215,8 +225,11 @@ class ScopedProviderAdmission:
 
         try:
             while True:
+                from shared.provider_runtime import (before_provider_admission,
+                    provider_admission_granted, wait_provider_concurrency)
+                await before_provider_admission()
                 try:
-                    granted, delay, clock = await self._grant_script(keys=[*buckets, *slots, cancelled], args=[
+                    granted, delay, clock, reason, denied = await self._grant_script(keys=[*buckets, *slots, cancelled], args=[
                         json.dumps([[self.limits.rate, self.limits.burst, costs[key]] for key in buckets]),
                         json.dumps(limits), token, self.limits.lease_seconds])
                 except Exception:
@@ -224,12 +237,25 @@ class ScopedProviderAdmission:
                 if int(granted) == -1:
                     raise ProviderDeferred(context, 1, stage='admission_cancelled')
                 if int(granted) == 1:
+                    if not provider_admission_granted():
+                        # Do not pin a racing new grant while older transfers need its slot.
+                        try:
+                            await self._release_script(keys=[*slots, cancelled], args=[token, self.limits.lease_seconds])
+                        except Exception:
+                            raise ProviderDeferred(context, 5, stage='coordinator_unavailable') from None
+                        await before_provider_admission()
                     break
                 delay = float(delay)
                 if delay <= 0 or not math.isfinite(delay):
                     raise ProviderDeferred(context, 5, stage='invalid_coordinator_reply')
                 if time.monotonic() - started + delay > wait_budget:
-                    raise ProviderDeferred(context, delay, server_time=float(clock))
+                    index = int(denied)
+                    key = buckets[index - 1] if index > 0 else slots[-index - 1]
+                    error = ProviderDeferred(context, delay, server_time=float(clock),
+                        reason=reason.decode() if isinstance(reason, bytes) else reason, scope=scopes[key])
+                    if error.reason == 'concurrency' and await wait_provider_concurrency(error):
+                        continue
+                    raise error
                 await asyncio.sleep(delay)
             renewer = asyncio.create_task(renew())
             try:

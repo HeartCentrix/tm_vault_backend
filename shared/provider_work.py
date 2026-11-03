@@ -9,7 +9,7 @@ import json
 import math
 import os
 from uuid import UUID, uuid4
-from sqlalchemy import delete, exists, func, select, update
+from sqlalchemy import case, delete, exists, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import aliased
 from shared.models import (Job, Snapshot, SnapshotPartition, Resource, SlaPolicy,
@@ -42,7 +42,7 @@ def enabled():
 
 
 def guards_enabled():
-    return _GUARDS or enabled() or _CURRENT.get() is not None
+    return _GUARDS or enabled() or _CURRENT.get() is not None or isinstance(_SETTLING.get(), ProviderClaim)
 
 
 async def initialize_guards(factory):
@@ -71,8 +71,8 @@ def work_scope(claim):
 
 
 @contextmanager
-def settling_parent():
-    token = _SETTLING.set(True)
+def settling_parent(claim=None):
+    token = _SETTLING.set(claim or _SETTLING.get() or True)
     try:
         yield
     finally:
@@ -110,11 +110,15 @@ async def _parents(session, snapshot_id, partition_id=None, *, skip_locked=False
         raise ProviderWorkConflict('provider snapshot removed')
     job = await session.scalar(select(Job).where(Job.id == hint.job_id).with_for_update(skip_locked=skip_locked, read=share_job)
         .execution_options(populate_existing=True))
+    if job is None:
+        raise ProviderWorkConflict('provider parent locked or removed')
     snapshot = await session.scalar(select(Snapshot).where(Snapshot.id == hint.id).with_for_update(skip_locked=skip_locked)
         .execution_options(populate_existing=True))
+    if snapshot is None:
+        raise ProviderWorkConflict('provider parent locked or removed')
     partition = await session.scalar(select(SnapshotPartition).where(SnapshotPartition.id == _uuid(partition_id))
         .with_for_update(skip_locked=skip_locked).execution_options(populate_existing=True)) if partition_id else None
-    if job is None or snapshot is None or (partition_id and partition is None):
+    if partition_id and partition is None:
         raise ProviderWorkConflict('provider parent locked or removed')
     return job, snapshot, partition
 
@@ -221,10 +225,9 @@ async def claim_due_work(session, *, owner_id, lease_seconds=120, _clamp_rounds=
         .order_by(tq.virtual_finish, pq.virtual_finish, rq.virtual_finish, ProviderWork.queue_entered_at, ProviderWork.id)
         .limit(64))).all()
     for hint in candidates:
-        if (await session.scalar(select(func.count()).select_from(ProviderWork).where(running, ProviderWork.tenant_id == hint.tenant_id))) >= control.tenant_capacity:
-            continue
         try:
-            job, snapshot, partition = await _parents(session, hint.snapshot_id, hint.partition_id, skip_locked=True)
+            job, snapshot, partition = await _parents(session, hint.snapshot_id, hint.partition_id,
+                skip_locked=True, share_job=True)
         except ProviderWorkConflict:
             continue
         row = await session.scalar(select(ProviderWork).where(ProviderWork.id == hint.id).with_for_update(skip_locked=True)
@@ -312,9 +315,13 @@ async def claim_due_work(session, *, owner_id, lease_seconds=120, _clamp_rounds=
         row.parent_lease_token, row.snapshot_lease_token, row.job_lease_token = leaf.lease_token, snapshot.lease_token, job.lease_token
         if copy is not None:
             copy.parent_lease_token, copy.snapshot_lease_token, copy.job_lease_token = row.parent_lease_token, row.snapshot_lease_token, row.job_lease_token
-        for key in (row.tenant_queue_key, row.policy_queue_key, row.resource_queue_key):
-            queue = await session.get(ProviderWorkQueue, key)
-            queue.virtual_finish += 1 / queue.weight
+        keys = (row.tenant_queue_key, row.policy_queue_key, row.resource_queue_key)
+        # Match ensure_work's tenant -> policy -> resource lock order before charging.
+        await session.execute(select(ProviderWorkQueue.key).where(ProviderWorkQueue.key.in_(keys))
+            .order_by(case({key: index for index, key in enumerate(keys)}, value=ProviderWorkQueue.key))
+            .with_for_update())
+        await session.execute(update(ProviderWorkQueue).where(ProviderWorkQueue.key.in_(keys))
+            .values(virtual_finish=ProviderWorkQueue.virtual_finish + 1.0 / ProviderWorkQueue.weight))
         await session.flush()
         return _receipt(row)
     return None
@@ -449,22 +456,69 @@ async def fail_exhausted_work(session, claim):
     row.last_reason = 'provider_budget_exhausted'
 
 
+async def claim_parent_settlement(session, *, owner_id, work_id=None, lease_seconds=120):
+    """Claim one terminal receipt without consuming provider execution capacity."""
+    if lease_seconds <= 0:
+        raise ValueError('provider settlement lease must be positive')
+    now = func.clock_timestamp()
+    query = select(ProviderWork).where(ProviderWork.parent_settle_pending,
+        ProviderWork.state.in_(('COMPLETED', 'PARTIAL', 'FAILED')),
+        ProviderWork.next_eligible_at <= now,
+        ProviderWork.lease_expires_at.is_(None) | (ProviderWork.lease_expires_at <= now))
+    if work_id is not None:
+        query = query.where(ProviderWork.id == _uuid(work_id))
+    row = await session.scalar(query.order_by(ProviderWork.created_at, ProviderWork.id)
+        .limit(1).with_for_update(skip_locked=True).execution_options(populate_existing=True))
+    if row is None:
+        return None
+    row.generation += 1
+    row.lease_owner_id = _uuid(owner_id)
+    row.lease_expires_at = await session.scalar(select(func.clock_timestamp())) + timedelta(seconds=lease_seconds)
+    await session.flush()
+    return _receipt(row)
+
+
+async def release_parent_settlement(session, claim, *, retry_seconds=30):
+    """Only the current settler can release its lease and defer an unfinished receipt."""
+    if retry_seconds < 0:
+        raise ValueError('provider settlement retry must be nonnegative')
+    result = await session.execute(update(ProviderWork).where(ProviderWork.id == claim.work_id,
+        ProviderWork.generation == claim.generation, ProviderWork.lease_owner_id == claim.owner_id,
+        ProviderWork.state.in_(('COMPLETED', 'PARTIAL', 'FAILED')),
+        ProviderWork.lease_expires_at > func.clock_timestamp())
+        .values(lease_owner_id=None, lease_expires_at=None,
+            next_eligible_at=func.clock_timestamp() + timedelta(seconds=retry_seconds)))
+    return result.rowcount == 1
+
+
 async def finish_parent_settlement(session, work_id):
     hint = await session.get(ProviderWork, _uuid(work_id))
     if hint is None:
         return False
     job, snapshot, _ = await _parents(session, hint.snapshot_id, hint.partition_id)
-    row = await session.scalar(select(ProviderWork).where(ProviderWork.id == hint.id).with_for_update())
+    row = await session.scalar(select(ProviderWork).where(ProviderWork.id == hint.id).with_for_update()
+        .execution_options(populate_existing=True))
+    settlement = _SETTLING.get()
+    if isinstance(settlement, ProviderClaim):
+        now = await session.scalar(select(func.clock_timestamp()))
+        if (row.id != settlement.work_id or row.generation != settlement.generation
+            or row.lease_owner_id != settlement.owner_id or row.lease_expires_at is None
+            or row.lease_expires_at <= now or not row.parent_settle_pending or row.state == 'CANCELLED'):
+            raise ProviderWorkConflict('provider settlement ownership changed')
     if row.state not in TERMINAL:
         raise ProviderWorkConflict('provider work has not finished')
     if (snapshot.status.value not in ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELLED')
             or job.status.value not in ('COMPLETED', 'FAILED', 'CANCELLED')):
         return False
     row.parent_settle_pending = False
+    row.lease_owner_id = row.lease_expires_at = None
     return True
 
 
 def _guard_claim():
+    settlement = _SETTLING.get()
+    if isinstance(settlement, ProviderClaim):
+        return settlement
     from shared.provider_runtime import current_execution
     execution = current_execution()
     return None if execution and execution.deferred else _CURRENT.get()
@@ -486,7 +540,8 @@ def pending_provider_sql(snapshot_expr=None, partition_expr=None, job_expr=None)
     exclusion = " AND pw.id <> '" + str(own.work_id) + "'::uuid" if own else ''
     predicate = 'NOT EXISTS (SELECT 1 FROM provider_work pw WHERE ' + active + ' AND ' + ' AND '.join(conditions) + exclusion + ')'
     if own:
-        predicate += " AND EXISTS (SELECT 1 FROM provider_work ow WHERE ow.id='" + str(own.work_id) + "'::uuid AND ow.generation=" + str(own.generation) + " AND ow.state='RESUMING' AND ow.lease_owner_id='" + str(own.owner_id) + "'::uuid AND ow.lease_expires_at > NOW())"
+        state = "ow.state IN ('COMPLETED','PARTIAL','FAILED') AND ow.parent_settle_pending" if isinstance(_SETTLING.get(), ProviderClaim) else "ow.state='RESUMING'"
+        predicate += " AND EXISTS (SELECT 1 FROM provider_work ow WHERE ow.id='" + str(own.work_id) + "'::uuid AND ow.generation=" + str(own.generation) + " AND " + state + " AND ow.lease_owner_id='" + str(own.owner_id) + "'::uuid AND ow.lease_expires_at > NOW())"
     return '(' + predicate + ')'
 
 
@@ -500,8 +555,10 @@ async def has_pending_provider(session, *, snapshot_id=None, partition_id=None, 
         raise ValueError('provider guard needs parent scope')
     own = _guard_claim()
     if own:
+        state = (ProviderWork.state.in_(('COMPLETED', 'PARTIAL', 'FAILED')) & ProviderWork.parent_settle_pending
+            if isinstance(_SETTLING.get(), ProviderClaim) else ProviderWork.state == 'RESUMING')
         valid = await session.scalar(select(ProviderWork.id).where(ProviderWork.id == own.work_id,
-            ProviderWork.generation == own.generation, ProviderWork.state == 'RESUMING',
+            ProviderWork.generation == own.generation, state,
             ProviderWork.lease_owner_id == own.owner_id, ProviderWork.lease_expires_at > func.clock_timestamp()))
         if valid is None:
             return True

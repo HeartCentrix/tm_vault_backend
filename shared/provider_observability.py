@@ -1,6 +1,20 @@
 """Content-free progress for an already authorized Activity/job selection."""
 from uuid import UUID
+from pathlib import Path
+import traceback
 from sqlalchemy import text
+
+
+def workflow_error_details(error):
+    """Internal conflict messages are fixed strings; remote error bodies are not."""
+    from shared.copy_work import CopyWorkConflict
+    from shared.provider_work import ProviderWorkConflict
+    reason = ' '.join(str(error).split())[:240] if isinstance(error,
+        (CopyWorkConflict, ProviderWorkConflict)) else type(error).__name__
+    # Keep stack locations, never locals, SQL parameters or exception chains.
+    locations = ' <- '.join(f'{Path(frame.filename).name}:{frame.lineno}:{frame.name}'
+        for frame in traceback.extract_tb(error.__traceback__)[-8:])
+    return reason, locations
 
 
 async def provider_work_summaries(session, *, job_ids):

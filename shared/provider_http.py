@@ -118,8 +118,8 @@ def request_context(owner, url, *, operation=None):
 
 @asynccontextmanager
 async def admitted(limiter, context, **kwargs):
-    from shared.provider_runtime import provider_request_scope
-    async with provider_request_scope():
+    from shared.provider_runtime import provider_request_scope, provider_transfer_scope
+    async with provider_request_scope(), provider_transfer_scope(implicit=True):
         async with _admitted(limiter, context, **kwargs):
             yield
 
@@ -172,7 +172,7 @@ class AdmittedHttpClient:
             raise ProviderDeferred(context, delay, stage='provider_throttle')
 
     async def _batch(self, method, url, **kwargs):
-        from shared.provider_runtime import account_provider_attempt, provider_request_scope
+        from shared.provider_runtime import account_provider_attempt, provider_request_scope, provider_transfer_scope
         context = request_context(self.owner, url)
         payload = kwargs.get('json')
         entries = payload.get('requests') if isinstance(payload, dict) else None
@@ -192,7 +192,7 @@ class AdmittedHttpClient:
             sub = request_context(self.owner, 'https://graph.microsoft.com/v1.0' + route)
             requests[item['id']] = sub
             costs.append((sub, 1))
-        async with provider_request_scope():
+        async with provider_request_scope(), provider_transfer_scope(implicit=True):
             async with self.limiter.admit_many(costs):
                 await account_provider_attempt(context)
                 kwargs['follow_redirects'] = False
