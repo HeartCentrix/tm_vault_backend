@@ -13,9 +13,10 @@ from shared.models import Snapshot, SnapshotItem
 pytestmark = pytest.mark.integration
 
 
-async def test_versioned_plain_messages_list_hosted_once_and_publish_both_passes(store, adapters, caplog):
+async def test_overlapping_pages_observe_each_message_once_per_independent_pass(store, adapters, caplog):
     caplog.set_level(logging.INFO, logger='shared.chat_capture')
-    adapters.source.messages = [dict(message(), id=str(i), etag=f'version-{i}') for i in range(1000)]
+    messages = [dict(message(), id=str(i)) for i in range(1000)]
+    adapters.source.messages = messages + deepcopy(messages)
     listed = []
     original = adapters.source.iter_hosted_contents
 
@@ -28,17 +29,17 @@ async def test_versioned_plain_messages_list_hosted_once_and_publish_both_passes
     scope, result = await run_capture(store, adapters)
     assert result.outcome == 'complete' and result.item_count == 1000
     assert adapters.source.passes == 2
-    assert len(listed) == 1000 and len(set(listed)) == 1000
+    assert len(listed) == 2000 and len(set(listed)) == 1000
     progress = [record.getMessage() for record in caplog.records if record.name == 'shared.chat_capture']
-    assert len(progress) == 40
-    assert 'messages_observed=1000 hosted_list_requests=0 hosted_empty_reused=1000' in progress[-1]
+    assert len(progress) == 80
+    assert 'messages_observed=1000 hosted_enumerations=1000 duplicate_messages_skipped=1000' in progress[-1]
     async with store.factory() as session:
         assert await session.scalar(select(func.count()).select_from(SnapshotItem).where(
             SnapshotItem.snapshot_id == scope.snapshot_id)) == 1000
 
 
-@pytest.mark.parametrize('tag', [None, '', 7])
-async def test_missing_or_invalid_message_version_keeps_both_hosted_checks(store, adapters, tag):
+@pytest.mark.parametrize('tag', [None, '', 7, 'stable'])
+async def test_message_version_never_skips_independent_hosted_observation(store, adapters, tag):
     adapters.source.messages = [dict(message(), etag=tag)]
     calls = []
 
@@ -73,7 +74,7 @@ async def test_nonempty_hosted_content_is_still_independently_checked(store, ada
     assert len(adapters.storage.uploads) == 1
 
 
-async def test_failed_hosted_list_does_not_seed_empty_proof(store, adapters):
+async def test_failed_hosted_list_remains_partial_and_second_pass_rechecks(store, adapters):
     adapters.source.messages = [dict(message(), etag='stable')]
     calls = []
 
@@ -90,7 +91,7 @@ async def test_failed_hosted_list_does_not_seed_empty_proof(store, adapters):
 
 
 @pytest.mark.parametrize('field,value', [('etag', 'v2'), ('body', {'content': 'edited'})])
-async def test_changed_parent_cannot_reuse_old_empty_proof(store, adapters, field, value):
+async def test_changed_parent_reconciles_new_observations(store, adapters, field, value):
     adapters.source.messages = [dict(message(), etag='v1')]
     calls = []
 
@@ -110,7 +111,33 @@ async def test_changed_parent_cannot_reuse_old_empty_proof(store, adapters, fiel
     _, result = await run_capture(store, adapters)
     assert result.outcome == 'complete'
     assert adapters.source.passes == 4  # changed first pair is reconciled again
-    assert calls == [1, 2, 3]
+    assert calls == [1, 2, 3, 4]
+
+
+async def test_hosted_visibility_change_with_same_parent_version_is_reconciled(store, adapters):
+    adapters.source.messages = [dict(message(), etag='stable')]
+    calls = []
+
+    async def hosted(chat, mid):
+        calls.append(adapters.source.passes)
+        if adapters.source.passes >= 2:
+            yield {'id': 'image', 'contentType': 'image/png'}
+
+    adapters.source.iter_hosted_contents = hosted
+    _, result = await run_capture(store, adapters)
+    assert result.outcome == 'complete' and result.item_count == 2
+    assert adapters.source.passes == 4 and calls == [1, 2, 3, 4]
+
+
+async def test_refreshed_attachment_url_on_overlapping_page_is_verified_without_false_movement(store, adapters):
+    first = message(attached=True)
+    first['attachments'][0]['contentUrl'] = 'https://tenant.sharepoint.com/file.pdf?sig=before'
+    second = deepcopy(first)
+    second['attachments'][0]['contentUrl'] = 'https://tenant.sharepoint.com/file.pdf?sig=after'
+    adapters.source.messages = [first, second]
+    _, result = await run_capture(store, adapters)
+    assert result.outcome == 'complete' and result.item_count == 2
+    assert adapters.source.passes == 2
 
 
 async def test_hosted_404_remains_partial_with_read_progress(store, adapters, caplog):
@@ -128,7 +155,7 @@ async def test_hosted_404_remains_partial_with_read_progress(store, adapters, ca
     assert result.outcome == 'partial' and result.item_count == 1
     progress = [record.getMessage() for record in caplog.records if record.name == 'shared.chat_capture']
     assert len(progress) == 2
-    assert all('required_binary=1 verified_binary=0 unresolved=1' in value for value in progress)
+    assert all('verified_binary=0 unresolved=1' in value for value in progress)
 
 
 async def test_captured_binaries_restore_after_previous_snapshot_is_deleted(store, adapters, snapshot_api, monkeypatch):

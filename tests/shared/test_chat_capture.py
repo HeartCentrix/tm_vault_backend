@@ -150,6 +150,26 @@ def test_failure_diagnostics_retain_safe_provider_fields():
         assert detail["provider_request_id"] == "request-id-123"
 
 
+def test_overlapping_message_pages_are_deduplicated_only_within_each_pass():
+    module = importlib.import_module('shared.chat_capture')
+    message = {'id': 'message', 'etag': 'same', 'body': {'content': 'hello'}}
+    with module.ChatObservationLedger(scope()) as ledger:
+        assert ledger.observe_message(0, message)
+        assert not ledger.observe_message(0, message)
+        assert ledger.observe_message(1, message)
+
+
+def test_overlapping_pages_compare_raw_payload_even_when_storage_sanitizes_it():
+    module = importlib.import_module('shared.chat_capture')
+    before = {'id': 'message', 'etag': 'same', 'attachments': [
+        {'id': 'file', 'contentUrl': 'https://tenant.sharepoint.com/a?sig=before'}]}
+    after = {'id': 'message', 'etag': 'same', 'attachments': [
+        {'id': 'file', 'contentUrl': 'https://tenant.sharepoint.com/a?sig=after'}]}
+    with module.ChatObservationLedger(scope()) as ledger:
+        assert ledger.observe_message(0, before)
+        assert ledger.observe_message(0, after)  # resolve and verify the changed URL normally
+
+
 def test_mismatch_diagnostics_distinguish_missing_and_changed_keys_without_payload():
     module = importlib.import_module("shared.chat_capture")
     with module.ChatObservationLedger(scope()) as ledger:

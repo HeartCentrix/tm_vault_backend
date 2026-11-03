@@ -52,7 +52,7 @@ class ChatObservationLedger:
         self.db.execute("CREATE TABLE observed (pass INTEGER, key TEXT, semantic TEXT, binary INTEGER, PRIMARY KEY(pass,key))")
         self.db.execute("CREATE TABLE expected (pass INTEGER, key TEXT, required INTEGER, PRIMARY KEY(pass,key))")
         self.db.execute("CREATE TABLE failures (pass INTEGER, phase TEXT, error_type TEXT, status INTEGER, graph_id TEXT, parent_graph_id TEXT, provider_code TEXT, provider_inner_code TEXT, provider_request_id TEXT)")
-        self.db.execute("CREATE TABLE empty_hosted (message_id TEXT PRIMARY KEY, source_sha256 TEXT NOT NULL)")
+        self.db.execute("CREATE TABLE source_messages (pass INTEGER, message_id TEXT, source_sha256 TEXT NOT NULL, PRIMARY KEY(pass,message_id))")
 
     def __enter__(self):
         return self
@@ -66,24 +66,20 @@ class ChatObservationLedger:
         self.db.execute("INSERT INTO expected VALUES (?,?,?) ON CONFLICT(pass,key) DO UPDATE SET required=MAX(required,excluded.required)",
                         (observation, key, int(required)))
 
-    @staticmethod
-    def _message_version(message):
-        # A message timestamp or plain-looking body does not prove empty membership.
-        tag = message.get("etag")
-        if not isinstance(tag, str) or not tag.strip():
-            return None
-        return _digest(_payload(message))
-
-    def remember_empty_hosted(self, message):
-        version = self._message_version(message)
-        if version is not None:
-            self.db.execute("INSERT OR REPLACE INTO empty_hosted VALUES (?,?)", (message["id"], version))
-
-    def verified_empty_hosted(self, message):
-        version = self._message_version(message)
-        return version is not None and self.db.execute(
-            "SELECT 1 FROM empty_hosted WHERE message_id=? AND source_sha256=?",
-            (message["id"], version)).fetchone() is not None
+    def observe_message(self, observation, message):
+        # Overlapping pages need one observation per message, independently in each pass.
+        identifier = message.get("id")
+        if not isinstance(identifier, str) or not identifier:
+            raise ValueError("source message identity is missing")
+        source = hashlib.sha256(json.dumps(message, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False).encode()).hexdigest()
+        previous = self.db.execute("SELECT source_sha256 FROM source_messages WHERE pass=? AND message_id=?",
+            (observation, identifier)).fetchone()
+        if previous is not None and previous[0] == source:
+            return False
+        # A refreshed signed URL needs normal verification, not a forced reconciliation.
+        self.db.execute("INSERT OR REPLACE INTO source_messages VALUES (?,?,?)", (observation, identifier, source))
+        return True
 
     def record(self, observation, item):
         key = qualified_chat_item_key(self.scope.chat_id, item.item_type, item.graph_id, item.parent_graph_id)
@@ -156,7 +152,8 @@ class _Pass:
     pages: int = 0
     messages: int = 0
     hosted_lists: int = 0
-    hosted_reused: int = 0
+    duplicate_messages: int = 0
+    verified_binary: int = 0
 
 
 class _CaptureLeaseKeeper:
@@ -366,6 +363,9 @@ async def _observe(*, scope, keeper, factory, storage, source, ledger, observati
                     parent = dict(raw)
                     if exclude_message is not None and exclude_message({**parent, "_chat_folder_path": folder_path}):
                         continue
+                    if not ledger.observe_message(observation, raw):
+                        stats.duplicate_messages += 1
+                        continue
                     identifier = parent.get("id")
                     native = parent.get("attachments") or []
                     valid = isinstance(native, list) and all(isinstance(a, dict) and isinstance(a.get("id"), str) and a["id"] for a in native)
@@ -374,14 +374,9 @@ async def _observe(*, scope, keeper, factory, storage, source, ledger, observati
                         stats.unresolved += 1
                     hosted, hosted_complete = [], True
                     try:
-                        if observation == 1 and ledger.verified_empty_hosted(raw):
-                            stats.hosted_reused += 1
-                        else:
-                            stats.hosted_lists += 1
-                            async for child in source.iter_hosted_contents(scope.chat_id, identifier):
-                                hosted.append(child)
-                            if observation == 0 and not hosted and valid:
-                                ledger.remember_empty_hosted(raw)
+                        stats.hosted_lists += 1
+                        async for child in source.iter_hosted_contents(scope.chat_id, identifier):
+                            hosted.append(child)
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
@@ -418,7 +413,8 @@ async def _observe(*, scope, keeper, factory, storage, source, ledger, observati
                                 captured = await _binary(scope=scope, keeper=keeper, factory=factory, storage=storage,
                                     source_client=source, item_type=kind, graph_id=child["id"], parent_id=identifier,
                                     payload=child, stage=observation == 0, file_versions=file_versions)
-                                ledger.record(observation, captured)
+                                if ledger.record(observation, captured):
+                                    stats.verified_binary += 1
                         except (asyncio.CancelledError, ChatSourceMovement, catalogue.ChatCatalogueConflict, catalogue.ChatCatalogueIntegrityError, SQLAlchemyError):
                             raise
                         except Exception as exc:
@@ -432,10 +428,9 @@ async def _observe(*, scope, keeper, factory, storage, source, ledger, observati
             stats.pages += 1
             logger.info(
                 "chat_capture_progress attempt_id=%s observation=%s pages=%s messages_observed=%s "
-                "hosted_list_requests=%s hosted_empty_reused=%s required_binary=%s verified_binary=%s unresolved=%s",
+                "hosted_enumerations=%s duplicate_messages_skipped=%s verified_binary=%s unresolved=%s",
                 keeper.lease.attempt_id, observation + 1, stats.pages, stats.messages,
-                stats.hosted_lists, stats.hosted_reused, ledger.required_count(observation),
-                ledger.durable_count(observation), stats.unresolved)
+                stats.hosted_lists, stats.duplicate_messages, stats.verified_binary, stats.unresolved)
         stats.complete = True
     except (asyncio.CancelledError, ChatSourceMovement, catalogue.ChatCatalogueConflict, catalogue.ChatCatalogueIntegrityError, SQLAlchemyError):
         raise
