@@ -218,6 +218,53 @@ async def _published_chat(session, scope):
 
 
 _FOLDER_NAME_MAX = 80
+_GRAPH_TIME_FRACTION = __import__("re").compile(r"\.(\d{1,})(?=[+-]|Z|$)")
+
+
+def _graph_time(value):
+    """Parse a Graph ISO timestamp (any fraction length, Z or offset) to aware UTC."""
+    if not isinstance(value, str) or not value:
+        return None
+    text = _GRAPH_TIME_FRACTION.sub(lambda m: "." + (m.group(1) + "000000")[:6], value.replace("Z", "+00:00"))
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def visible_history_start(chat, principal_id):
+    """The principal's membership visibleHistoryStartDateTime, or None for full history.
+
+    Teams shares a chat's history from this instant with that member; "0001-01-01"
+    means everything. Unknown membership or an unparseable value keeps full history,
+    so a backup never silently drops messages it cannot prove are hidden."""
+    me = (principal_id or "").lower()
+    for member in chat.get("members") or []:
+        if isinstance(member, dict) and str(member.get("userId") or "").lower() == me:
+            value = member.get("visibleHistoryStartDateTime")
+            if not isinstance(value, str) or value.startswith("0001-"):
+                return None
+            return _graph_time(value)
+    return None
+
+
+def _visibility_filter(chat, principal_id, exclude_message, scope_filter_hash):
+    """Per-chat exclusion + stable filter hash combining the configured filter and the
+    principal's visible-history boundary (unchanged when history is fully visible)."""
+    boundary = visible_history_start(chat, principal_id)
+    if boundary is None:
+        return exclude_message, scope_filter_hash
+
+    def excluded(raw):
+        created = _graph_time(raw.get("createdDateTime"))
+        if created is not None and created < boundary:
+            return True
+        return bool(exclude_message is not None and exclude_message(raw))
+
+    digest = hashlib.sha256(json.dumps(["chat-visible-history-v1", scope_filter_hash, boundary.isoformat()],
+                                       separators=(",", ":")).encode()).hexdigest()
+    return excluded, digest
 
 
 def chat_folder(chat, principal_id):
@@ -333,10 +380,12 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
             if published - selected and allowed is None:
                 errors.append("chat membership changed across capture attempts")
             keys = sorted(selected)
-            effective_hash = effective_capture_scope_hash(source.permission_scope_hash, scope_filter_hash)
+            # Each user's backup holds the history Teams shares with that user.
+            filters = {cid: _visibility_filter(chats[cid], principal, exclude_message, scope_filter_hash) for cid in keys}
             def chat_scope(cid):
                 return ChatCaptureScope(snapshot_id, resource_id, tenant_id, cid, principal,
-                    effective_hash, backend_id, partition_id, snapshot_lease_token=snapshot_lease_token,
+                    effective_capture_scope_hash(source.permission_scope_hash, filters[cid][1]),
+                    backend_id, partition_id, snapshot_lease_token=snapshot_lease_token,
                     partition_lease_token=partition_lease_token, job_lease_token=job_lease_token)
             async def capture(cid):
                 await cancel_check()
@@ -348,7 +397,7 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                     if result is None:
                         result = await capture_chat_inventory(scope=scope, graph_client=source, storage=storage,
                             session_factory=session_factory, folder_path=chat_folder(chats[cid], principal),
-                            exclude_message=exclude_message, scope_filter_hash=scope_filter_hash)
+                            exclude_message=filters[cid][0], scope_filter_hash=filters[cid][1])
                     try:
                         await run_catalogue_transaction(session_factory,
                             lambda session: refresh_catalogue_progress(session, scope))

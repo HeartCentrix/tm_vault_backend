@@ -57,6 +57,7 @@ class Source:
         self.cancel_file = False
         self.movement = None
         self.fail_urls = set()
+        self.hosted_downloads = 0
 
     async def iter_message_pages(self, chat_id):
         self.passes += 1
@@ -100,6 +101,7 @@ class Source:
 
     @asynccontextmanager
     async def open_hosted(self, chat_id, message_id, hcid):
+        self.hosted_downloads += 1
         async def chunks():
             yield b"PNG"
         yield chunks(), 3, "image/png"
@@ -191,6 +193,26 @@ async def test_initial_then_unchanged_reuses_immutable_inventory(store, adapters
         assert await session.scalar(select(func.count()).select_from(SnapshotItem)) == 6
 
 
+async def test_unchanged_chat_matching_a_verified_inventory_needs_one_pass(store, adapters):
+    """Pass 1 reproducing an inventory that two passes already verified COMPLETE is a
+    consistent state; the second listing only doubled incremental Graph cost."""
+    _, first = await run_capture(store, adapters)
+    assert first.outcome == "complete" and adapters.source.passes == 2
+    _, second = await run_capture(store, adapters)
+    assert second.outcome == "complete" and second.reused and second.inventory_id == first.inventory_id
+    assert adapters.source.passes == 3
+    adapters.source.messages[0]["body"]["content"] = "edited"
+    _, third = await run_capture(store, adapters)
+    assert third.outcome == "complete" and not third.reused and adapters.source.passes == 5
+
+
+async def test_single_pass_can_be_disabled(store, adapters, monkeypatch):
+    monkeypatch.setenv("CHAT_SINGLE_PASS_UNCHANGED", "false")
+    await run_capture(store, adapters)
+    await run_capture(store, adapters)
+    assert adapters.source.passes == 4
+
+
 async def test_old_body_edit_preserves_previous_snapshot_payload(store, adapters):
     old_scope, old = await run_capture(store, adapters)
     adapters.source.messages[0]["body"]["content"] = "edited old message"
@@ -223,7 +245,9 @@ async def test_missing_tags_force_byte_fetch_but_still_reuse_same_content(store,
     _, repeated = await run_capture(store, adapters)
     assert first.outcome == repeated.outcome == "complete"
     assert repeated.reused and repeated.uploaded_bytes == 0
-    assert first_downloads >= 2 and adapters.source.downloads >= first_downloads + 2
+    # Without tags the bytes are fetched and checksummed on every run; an unchanged run
+    # reproducing a verified inventory does so in its single pass.
+    assert first_downloads >= 2 and adapters.source.downloads >= first_downloads + 1
 
 
 async def test_required_file_failure_preserves_readable_partial(store, adapters):
@@ -319,6 +343,21 @@ async def test_reconciliation_restart_reuses_binaries_from_the_failed_attempt(st
     _, result = await run_capture(store, adapters)
     assert result.outcome == "complete" and adapters.source.passes == 4
     assert len(adapters.storage.uploads) == 1
+
+
+async def test_hosted_content_of_an_unchanged_message_is_not_downloaded_again(store, adapters):
+    """Hosted images have no source version tag, so every observation pass and every
+    incremental re-downloaded them. The parent message version marks them."""
+    stamped = dict(message(hosted=True), lastModifiedDateTime="2026-11-01T10:00:00Z", etag="1780000000000")
+    adapters.source.messages = [stamped]
+    _, first = await run_capture(store, adapters)
+    assert first.outcome == "complete" and adapters.source.hosted_downloads == 1
+    _, second = await run_capture(store, adapters)
+    assert second.outcome == "complete" and adapters.source.hosted_downloads == 1
+    edited = dict(stamped, lastModifiedDateTime="2026-11-02T10:00:00Z", etag="1780000000999")
+    adapters.source.messages = [edited]
+    _, third = await run_capture(store, adapters)
+    assert third.outcome == "complete" and adapters.source.hosted_downloads == 2
 
 
 async def test_upload_retry_uses_new_generation_and_preserves_spool(store, adapters, monkeypatch):

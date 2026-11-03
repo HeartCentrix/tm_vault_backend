@@ -223,6 +223,34 @@ async def test_exclusions_filter_messages_and_children_in_both_observations(stor
         assert list((await session.scalars(select(models.ChatItemVersion.graph_id))).all()) == ["kept"]
 
 
+async def test_capture_keeps_only_history_visible_to_the_principal(store, source_adapter):
+    """A member invited with limited history sees messages from visibleHistoryStartDateTime on;
+    their backup must hold exactly that (Divyansh: 11 of 364, 2026-11-04). Full-history
+    members ("0001-01-01") keep everything."""
+    scope = await legacy_scope(store)
+    source_adapter.source.chats = [{"id": "chat-alpha", "topic": "Frozen name", "chatType": "group", "members": [
+        {"userId": "principal-alpha", "displayName": "Me", "visibleHistoryStartDateTime": "2026-09-01T16:07:24.118Z"}]}]
+    source_adapter.source.messages["chat-alpha"] = [
+        {"id": "before", "createdDateTime": "2026-08-31T10:00:00Z", "body": {"content": "old"}, "attachments": []},
+        {"id": "after", "createdDateTime": "2026-09-01T16:07:24.118Z", "body": {"content": "new"}, "attachments": []},
+        {"id": "undated", "body": {"content": "kept when the source gives no creation time"}, "attachments": []}]
+    result = await source_adapter.run(scope)
+    assert result["outcome"] == "complete" and result["item_count"] == 2
+    async with store.factory.begin() as session:
+        assert sorted((await session.scalars(select(models.ChatItemVersion.graph_id))).all()) == ["after", "undated"]
+
+
+async def test_full_history_member_keeps_every_message(store, source_adapter):
+    scope = await legacy_scope(store)
+    source_adapter.source.chats = [{"id": "chat-alpha", "topic": None, "chatType": "oneOnOne", "members": [
+        {"userId": "principal-alpha", "displayName": "Me", "visibleHistoryStartDateTime": "0001-01-01T00:00:00Z"},
+        {"userId": "other", "displayName": "Other", "visibleHistoryStartDateTime": "2030-01-01T00:00:00Z"}]}]
+    source_adapter.source.messages["chat-alpha"] = [
+        {"id": "ancient", "createdDateTime": "2020-01-01T00:00:00Z", "body": {"content": "old"}, "attachments": []}]
+    result = await source_adapter.run(scope)
+    assert result["outcome"] == "complete" and result["item_count"] == 1
+
+
 async def test_resuming_published_chat_does_not_reenumerate_its_messages(store, source_adapter):
     scope = await legacy_scope(store)
     first = await source_adapter.run(scope)

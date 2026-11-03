@@ -208,7 +208,12 @@ class StrictChatGraphSource:
 
     async def _pause(self, response: httpx.Response | None, attempt: int):
         delay = parse_retry_after(response.headers.get("Retry-After")) if response is not None else None
-        await asyncio.sleep(min(120, max(0, delay if delay is not None else 2 ** attempt)))
+        wait = min(120, max(0, delay if delay is not None else 2 ** attempt))
+        logging.getLogger(__name__).warning("chat_graph_retry status=%s endpoint=%s attempt=%s retry_after=%s wait_s=%s",
+                       response.status_code if response is not None else "transport",
+                       response.request.url.path.rsplit("/", 1)[-1] if response is not None else "-",
+                       attempt, delay, wait)
+        await asyncio.sleep(wait)
 
     async def _json(self, url: str, *, params=None) -> dict:
         _target(url, graph=True)

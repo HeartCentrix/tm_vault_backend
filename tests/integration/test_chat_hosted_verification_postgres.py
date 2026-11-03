@@ -62,7 +62,9 @@ async def test_message_version_never_skips_independent_hosted_observation(store,
     assert result.outcome == 'complete' and calls == ['message', 'message']
 
 
-async def test_nonempty_hosted_content_is_still_independently_checked(store, adapters):
+async def test_hosted_content_of_an_unchanged_message_is_read_once_per_attempt(store, adapters):
+    # Like files with an unchanged etag, hosted content is tagged by its parent message
+    # version; pass 2 reuses pass 1's verified bytes instead of downloading again.
     adapters.source.messages = [dict(message(hosted=True), etag='stable')]
     lists, reads = [], []
     original_list, original_open = adapters.source.iter_hosted_contents, adapters.source.open_hosted
@@ -79,8 +81,22 @@ async def test_nonempty_hosted_content_is_still_independently_checked(store, ada
     adapters.source.iter_hosted_contents, adapters.source.open_hosted = hosted, opened
     _, result = await run_capture(store, adapters)
     assert result.outcome == 'complete' and result.item_count == 2
-    assert lists == ['message', 'message'] and reads == ['image', 'image']
+    assert lists == ['message', 'message'] and reads == ['image']
     assert len(adapters.storage.uploads) == 1
+
+
+async def test_hosted_content_without_a_message_version_is_still_independently_checked(store, adapters):
+    adapters.source.messages = [message(hosted=True)]
+    reads = []
+    original_open = adapters.source.open_hosted
+
+    def opened(chat, mid, cid):
+        reads.append(cid)
+        return original_open(chat, mid, cid)
+
+    adapters.source.open_hosted = opened
+    _, result = await run_capture(store, adapters)
+    assert result.outcome == 'complete' and reads == ['image', 'image']
 
 
 async def test_failed_hosted_list_remains_partial_and_second_pass_rechecks(store, adapters):

@@ -117,6 +117,13 @@ class ChatObservationLedger:
         digest.update(b"]]")
         return digest.hexdigest()
 
+    def mirror(self, source, target):
+        """Copy one pass's observations to another (single-pass reuse of a verified state)."""
+        for table in ("observed", "expected"):
+            self.db.execute(f"DELETE FROM {table} WHERE pass=?", (target,))
+        self.db.execute("INSERT INTO observed SELECT ?, key, semantic, binary FROM observed WHERE pass=?", (target, source))
+        self.db.execute("INSERT INTO expected SELECT ?, key, required FROM expected WHERE pass=?", (target, source))
+
     def item_count(self, observation):
         return self.db.execute("SELECT COUNT(*) FROM observed WHERE pass=?", (observation,)).fetchone()[0]
 
@@ -352,14 +359,24 @@ async def _retained(*, scope, keeper, factory, storage, item_type, graph_id, par
     return item
 
 
+def _hosted_marker(message):
+    """Version tag for hosted content: Graph gives hostedContents no etag, but they only
+    change with their message, whose etag/lastModifiedDateTime move on every edit."""
+    etag, modified = message.get("etag"), message.get("lastModifiedDateTime")
+    if not (isinstance(etag, str) and etag) and not (isinstance(modified, str) and modified):
+        return None
+    return "chat-message:" + hashlib.sha256(json.dumps([message.get("id"), etag, modified],
+                                                        separators=(",", ":")).encode()).hexdigest()
+
+
 async def _binary(*, scope, keeper, factory, storage, source_client, item_type,
-                  graph_id, parent_id, payload, stage, file_versions=None):
+                  graph_id, parent_id, payload, stage, file_versions=None, hosted_marker=None):
     file = item_type == "CHAT_ATTACHMENT"
     raw = await source_client.resolve_file(payload.get("contentUrl")) if file else None
     payload = dict(payload)
     if file and isinstance(raw.get("file"), dict) and isinstance(raw["file"].get("mimeType"), str):
         payload["captured_content_type"] = raw["file"]["mimeType"]
-    source = _file_source(raw) if file else dict(source_drive_id=None, source_item_id=None, source_etag=None, source_ctag=None)
+    source = _file_source(raw) if file else dict(source_drive_id=None, source_item_id=None, source_etag=hosted_marker, source_ctag=None)
     cache_key = tuple(source.items()) if file and (source['source_etag'] or source['source_ctag']) else None
     if file_versions is not None and cache_key in file_versions:
         content, content_type = file_versions[cache_key]
@@ -477,7 +494,7 @@ async def _observe(*, scope, keeper, factory, storage, source, ledger, observati
                     parent_item = CapturedChatItem("TEAMS_CHAT_MESSAGE", identifier, None, parent, None)
                     if ledger.record(observation, parent_item) and observation == 0:
                         parents.append(parent_item)
-                    prepared.append((identifier, attachments, hosted))
+                    prepared.append((identifier, attachments, hosted, _hosted_marker(parent)))
                     stats.messages += 1
             finally:
                 # Parent rows must already exist before any child upload/link;
@@ -485,7 +502,7 @@ async def _observe(*, scope, keeper, factory, storage, source, ledger, observati
                 if parents:
                     await _stage(factory, keeper, parents)
             pending = []
-            for identifier, attachments, hosted in prepared:
+            for identifier, attachments, hosted, marker in prepared:
                 for kind, values in (("CHAT_ATTACHMENT", attachments), ("CHAT_HOSTED_CONTENT", hosted)):
                     for child in values:
                         try:
@@ -496,7 +513,8 @@ async def _observe(*, scope, keeper, factory, storage, source, ledger, observati
                             else:
                                 captured = await _binary(scope=scope, keeper=keeper, factory=factory, storage=storage,
                                     source_client=source, item_type=kind, graph_id=child["id"], parent_id=identifier,
-                                    payload=child, stage=observation == 0, file_versions=file_versions)
+                                    payload=child, stage=observation == 0, file_versions=file_versions,
+                                    hosted_marker=marker if kind == "CHAT_HOSTED_CONTENT" else None)
                                 if ledger.record(observation, captured):
                                     stats.verified_binary += 1
                         except (asyncio.CancelledError, ChatSourceMovement, catalogue.ChatCatalogueConflict, catalogue.ChatCatalogueIntegrityError, SQLAlchemyError):
@@ -522,6 +540,20 @@ async def _observe(*, scope, keeper, factory, storage, source, ledger, observati
         ledger.failure(observation, "message_enumeration", exc)
         stats.unresolved += 1
     return stats
+
+
+def _single_pass_enabled():
+    return os.getenv("CHAT_SINGLE_PASS_UNCHANGED", "true").strip().lower() not in ("0", "false", "no", "off")
+
+
+async def _verified_state(factory, scope, fingerprint, observation_hash_version):
+    async def find(session):
+        return await session.scalar(select(ChatInventory.id).where(
+            ChatInventory.tenant_id == scope.tenant_id, ChatInventory.chat_id == scope.chat_id,
+            ChatInventory.authentication_context_sha256 == authentication_context_fingerprint(scope),
+            ChatInventory.observation_hash_version == observation_hash_version,
+            ChatInventory.membership_sha256 == fingerprint, ChatInventory.state == "COMPLETE").limit(1))
+    return await run_catalogue_transaction(factory, find) is not None
 
 
 async def _restart(factory, keeper, scope):
@@ -608,8 +640,17 @@ async def _capture_chat_inventory(*, scope, graph_client, storage, session_facto
                     try:
                         first = await _observe(scope=scope, keeper=keeper, factory=session_factory, storage=storage,
                             source=source, ledger=ledger, observation=0, exclude_message=exclude_message, folder_path=folder_path)
-                        second = await _observe(scope=scope, keeper=keeper, factory=session_factory, storage=storage,
-                            source=source, ledger=ledger, observation=1, exclude_message=exclude_message, folder_path=folder_path)
+                        if (first.complete and not first.unresolved and _single_pass_enabled() and
+                                await _verified_state(session_factory, scope, ledger.fingerprint(0), lease.observation_hash_version)):
+                            # Pass 1 reproduced a state two passes already verified COMPLETE:
+                            # that is a consistent observation, so the second listing is skipped.
+                            ledger.mirror(0, 1)
+                            second = _Pass(complete=True, pages=first.pages, messages=first.messages)
+                            logger.info("chat_single_pass_reuse attempt_id=%s chat=%s messages=%s",
+                                        lease.attempt_id, scope.chat_id, first.messages)
+                        else:
+                            second = await _observe(scope=scope, keeper=keeper, factory=session_factory, storage=storage,
+                                source=source, ledger=ledger, observation=1, exclude_message=exclude_message, folder_path=folder_path)
                         movement = (first.complete and second.complete and not first.unresolved and not second.unresolved and
                                     ledger.fingerprint(0) != ledger.fingerprint(1))
                     except ChatSourceMovement as exc:

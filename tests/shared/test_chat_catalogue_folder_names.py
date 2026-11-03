@@ -44,3 +44,14 @@ def test_no_members_falls_back_to_the_hash_and_slashes_are_not_paths():
     assert chat_folder({"id": "19:e@thread.v2", "topic": None, "chatType": "oneOnOne"}, ME).startswith("chats/Chat ")
     chat = {"id": "19:f@unq.gbl.spaces", "topic": None, "chatType": "oneOnOne", "members": [member("Me", ME), member("A/B", "2")]}
     assert chat_folder(chat, ME) == "chats/A-B"
+
+
+def test_visible_history_start_reads_the_principal_membership():
+    from datetime import datetime, timezone
+    from shared.chat_catalogue_entry import visible_history_start
+    chat = {"members": [member("Other", "2") | {"visibleHistoryStartDateTime": "2030-01-01T00:00:00Z"},
+                        member("Me", ME) | {"visibleHistoryStartDateTime": "2026-09-01T16:07:24.118Z"}]}
+    assert visible_history_start(chat, ME.upper()) == datetime(2026, 9, 1, 16, 7, 24, 118000, tzinfo=timezone.utc)
+    assert visible_history_start({"members": [member("Me", ME) | {"visibleHistoryStartDateTime": "0001-01-01T00:00:00Z"}]}, ME) is None
+    assert visible_history_start({"members": [member("Other", "2")]}, ME) is None
+    assert visible_history_start({"members": [member("Me", ME) | {"visibleHistoryStartDateTime": "garbage"}]}, ME) is None
