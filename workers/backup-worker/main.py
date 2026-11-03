@@ -5012,10 +5012,13 @@ class BackupWorker:
                 snapshot = await self.create_snapshot(resource, leaf_message, job_id)
                 if snapshot.status != SnapshotStatus.IN_PROGRESS:
                     continue
+                # Commit the one-time status transition before taking leaf
+                # locks. Sibling intake only needs shared parent validation.
                 async with async_session_factory.begin() as session:
-                    job = await session.get(Job, job_id, with_for_update=True)
-                    if job.status in (JobStatus.QUEUED, JobStatus.PENDING):
-                        job.status = JobStatus.RUNNING
+                    await session.execute(sa_update(Job).where(Job.id == job_id,
+                        Job.status.in_((JobStatus.QUEUED, JobStatus.PENDING)),
+                        Job.lease_token == original_job_token).values(status=JobStatus.RUNNING))
+                async with async_session_factory.begin() as session:
                     await provider_work.ensure_work(session, snapshot_id=snapshot.id,
                         snapshot_token=snapshot.lease_token, job_token=original_job_token,
                         continuation={'message': leaf_message})
@@ -7182,6 +7185,9 @@ class BackupWorker:
                     if live.started_at:
                         live.duration_secs = int((live.completed_at - live.started_at).total_seconds())
                 else:
+                    # Parent locks are already held. Persist owned degradation
+                    # markers before settlement reloads the authoritative state.
+                    await session.flush()
                     await self._settle_inline_snapshot_finalize(session, live, resource)
                 await session.flush()
                 status = live.status
@@ -16890,6 +16896,23 @@ class BackupWorker:
         )
         return "snapshot_failed"
 
+    async def _lock_snapshot_settlement_parent(self, session, snapshot_id) -> bool:
+        """Acquire Job -> Snapshot before caller counters can autoflush."""
+        from shared.copy_workflow import verify_copy_resume
+        with session.no_autoflush:
+            # Copy settlement needs an exclusive parent fence; take it before
+            # the shared validation lock to avoid a concurrent lock upgrade.
+            if not await verify_copy_resume(session):
+                return False
+            job_id = await session.scalar(select(Snapshot.job_id).where(Snapshot.id == snapshot_id))
+            if job_id is None:
+                return False
+            job = await session.scalar(select(Job.id).where(Job.id == job_id).with_for_update(read=True))
+            if job is None:
+                return False
+            return await session.scalar(select(Snapshot.id).where(Snapshot.id == snapshot_id)
+                .with_for_update(key_share=True)) is not None
+
     async def _settle_inline_snapshot_finalize(
         self, session, snap, resource,
     ) -> str:
@@ -16912,9 +16935,13 @@ class BackupWorker:
 
         Wiring pinned by tests/workers/test_inline_finalize_wiring.py.
         """
-        from shared.copy_workflow import has_pending_copy, verify_copy_resume
-        if not await verify_copy_resume(session):
-            raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before terminal write")
+        from shared.copy_workflow import has_pending_copy
+        if not await self._lock_snapshot_settlement_parent(session, snap.id):
+            raise ChatCatalogueWorkLeaseMoved("snapshot settlement parent ownership moved")
+        with session.no_autoflush:
+            # A concurrent finalizer/cleanup may have won while we waited.
+            # Refresh status without discarding this caller's pending counters.
+            await session.refresh(snap, attribute_names=["status", "extra_data"])
         if await has_pending_copy(session, snapshot_id=snap.id):
             return "deferred_copy"
         from shared.chat_presentation import presentation_ready
@@ -18141,8 +18168,8 @@ class BackupWorker:
                 return None
         copy_guard = pending_copy_sql(snapshot_expr="s.id")
         async with async_session_factory() as session:
-            if not await verify_copy_resume(session):
-                raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before snapshot settlement")
+            if not await self._lock_snapshot_settlement_parent(session, snapshot_id):
+                raise ChatCatalogueWorkLeaseMoved("parent ownership moved before snapshot settlement")
             row = (await session.execute(
                 text(
                     f"""
@@ -18357,8 +18384,8 @@ class BackupWorker:
         # `_backup_user_content_parallel`'s finalize block. Idempotent —
         # safe on both winning-flip and preempted-by-REAPER paths.
         async with async_session_factory() as session:
-            if not await verify_copy_resume(session):
-                raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before counter reconciliation")
+            if not await self._lock_snapshot_settlement_parent(session, snapshot_id):
+                raise ChatCatalogueWorkLeaseMoved("parent ownership moved before counter reconciliation")
             CHILD_ITEM_TYPES = (
                 "CHAT_ATTACHMENT",
                 "EMAIL_ATTACHMENT",
@@ -18379,7 +18406,7 @@ class BackupWorker:
             # claim — either we commit first (claim's recheck then skips
             # the terminal row) or the claim commits first (we see
             # PENDING_DELETION below and skip). No interleave window.
-            snap = await session.get(Snapshot, snapshot_id, with_for_update=True)
+            snap = await session.get(Snapshot, snapshot_id, with_for_update={"key_share": True})
             if snap is not None and snap.status == SnapshotStatus.PENDING_DELETION:
                 # A sweeper claimed this snapshot for teardown while the
                 # partitions drained. Writing COMPLETED over the claim
@@ -18576,6 +18603,9 @@ class BackupWorker:
                             f"rewind error: {type(_lrw_err).__name__}: {_lrw_err}"
                         )
 
+            # Release the shared parent fence even when teardown skipped the
+            # snapshot, before the bulk finalizer can update that same Job.
+            await session.commit()
             # Bubble the new bytes up to the parent Job so the
             # Activity row reflects this snapshot's work. On the
             # preempted path REAPER already rolled the parent up
@@ -31651,12 +31681,12 @@ class BackupWorker:
         }
         _incoming_extra = dict(snapshot.extra_data or {})
 
-        from shared.copy_workflow import has_pending_copy, verify_copy_resume
+        from shared.copy_workflow import has_pending_copy
         from shared.db_retry import run_with_db_retry as _db_retry
 
         async def _attempt() -> bool:
             async with async_session_factory() as s:
-                if not await verify_copy_resume(s):
+                if not await self._lock_snapshot_settlement_parent(s, _sid):
                     return False
                 if await has_pending_copy(s, snapshot_id=_sid):
                     return False
@@ -31672,7 +31702,7 @@ class BackupWorker:
                         Snapshot.duration_secs,
                     )
                     .where(Snapshot.id == _sid)
-                    .with_for_update()
+                    .with_for_update(key_share=True)
                 )).first()
                 if row is None:
                     print(

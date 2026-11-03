@@ -131,3 +131,54 @@ async def test_cancelled_job_still_fences_sibling_validation(store):
         with pytest.raises(work.ProviderWorkConflict):
             await work._owned(db, owner)
 
+
+
+@pytest.mark.parametrize('failure', ['exhausted', 'cancelled'])
+async def test_renewal_retry_cannot_bypass_failure_or_cancellation(store, monkeypatch, failure):
+    receipt = await enqueue(store)
+    original = work.renew_work
+    calls = 0
+    async def renew(db, owner, **kwargs):
+        nonlocal calls
+        calls += 1
+        if failure == 'cancelled' and calls == 2:
+            async with store.factory.begin() as cancel:
+                await cancel.execute(update(models.Job).where(models.Job.id == receipt.job_id)
+                    .values(status=models.JobStatus.CANCELLED))
+        await original(db, owner, **kwargs)
+        await db.execute(text("DO $$ BEGIN RAISE EXCEPTION 'abort renewal' USING ERRCODE='40P01'; END $$"))
+
+    async def resume(owner):
+        await asyncio.Event().wait()
+
+    async def settle(_):
+        pytest.fail('Lost ownership must not settle the backup')
+
+    monkeypatch.setattr(work, 'renew_work', renew)
+    runner = runtime.ProviderWorkRunner(store.factory, resume, settle, renew_s=.01)
+    assert await asyncio.wait_for(runner.run_once(), 3) == {'provider_lease_lost': True}
+    assert calls == (3 if failure == 'exhausted' else 2)
+
+
+async def test_running_job_intake_does_not_wait_for_sibling_checkpoint(store, monkeypatch):
+    from sqlalchemy import delete
+    from unittest.mock import AsyncMock
+    from test_provider_work_postgres import _worker_fixture
+    worker_module = _worker_fixture._load('bw_intake_lock', 'workers/backup-worker/main.py')
+    first = await enqueue(store)
+    owner = await claim(store)
+    second = await sibling(store, first)
+    async with store.factory.begin() as db:
+        snapshot = await db.get(models.Snapshot, second.snapshot_id)
+        await db.execute(delete(models.ProviderWork).where(models.ProviderWork.id == second.work_id))
+    monkeypatch.setattr(worker_module, 'async_session_factory', store.factory)
+    worker = worker_module.BackupWorker.__new__(worker_module.BackupWorker)
+    worker.worker_id = 'intake-lock-test'
+    worker.create_snapshot = AsyncMock(return_value=snapshot)
+    async with store.factory.begin() as checkpoint:
+        await work.record_unit_checkpoint(checkpoint, owner, unit_key='page', kind='mail')
+        assert await asyncio.wait_for(worker._enqueue_provider_message({
+            'jobId': str(first.job_id), 'resourceId': str(snapshot.resource_id)}), 2)
+    async with store.factory() as db:
+        rows = (await db.scalars(select(models.ProviderWork).where(models.ProviderWork.snapshot_id == snapshot.id))).all()
+        assert len(rows) == 1 and rows[0].state == 'WAITING'

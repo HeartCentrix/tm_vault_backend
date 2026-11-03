@@ -145,6 +145,10 @@ class _Worker:
     _worker_region = "default"
     _heartbeat = types.SimpleNamespace(worker_uuid=_OWNER)
 
+    async def _lock_snapshot_settlement_parent(self, session, snapshot_id):
+        # Parent ordering is exercised with real PostgreSQL separately.
+        return True
+
 
 class _Dead(Exception):
     """Stands in for the connection drop that exhausts a retry ladder."""

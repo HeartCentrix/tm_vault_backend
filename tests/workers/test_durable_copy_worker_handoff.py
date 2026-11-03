@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+from contextlib import nullcontext
 import pathlib
 import sys
 import types
@@ -98,7 +99,8 @@ async def test_pending_copy_blocks_inline_status_and_cursor_promotion(worker_mod
         id=uuid.uuid4(), type=worker_module.ResourceType.USER_ONEDRIVE,
         display_name="test", extra_data={},
     )
-    session = types.SimpleNamespace(get=AsyncMock(side_effect=AssertionError("no cursor promotion")))
+    session = types.SimpleNamespace(get=AsyncMock(side_effect=AssertionError("no cursor promotion")),
+        no_autoflush=nullcontext(), scalar=AsyncMock(return_value=uuid.uuid4()), refresh=AsyncMock())
 
     outcome = await worker._settle_inline_snapshot_finalize(session, snapshot, resource)
     assert outcome == "deferred_copy"
@@ -210,7 +212,8 @@ async def test_required_copy_failure_cannot_promote_pending_cursor(worker_module
     resource = types.SimpleNamespace(
         id=uuid.uuid4(), type=worker_module.ResourceType.USER_MAIL, display_name="test",
     )
-    session = types.SimpleNamespace(get=AsyncMock(side_effect=AssertionError("no cursor promotion")))
+    session = types.SimpleNamespace(get=AsyncMock(side_effect=AssertionError("no cursor promotion")),
+        no_autoflush=nullcontext(), scalar=AsyncMock(return_value=uuid.uuid4()), refresh=AsyncMock())
     # Avoid unrelated cancellation DB lookup.
     from unittest.mock import patch
     with patch.object(worker_module, "_is_job_cancelled", AsyncMock(return_value=False)):
