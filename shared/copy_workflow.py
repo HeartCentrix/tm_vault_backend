@@ -281,11 +281,12 @@ async def defer_current_copy(kind, params, lane='giant'):
 
 async def _lock_parents(session, workflow, *, shared=False):
     # Same order as API cancellation: job -> snapshot -> partition -> workflow.
-    job=await session.scalar(select(Job).where(Job.id==workflow.job_id).with_for_update(read=shared))
-    snapshot=await session.scalar(select(Snapshot).where(Snapshot.id==workflow.target_snapshot_id).with_for_update(read=shared))
+    # Parent keys are immutable here; child FK checks must not join this lock chain.
+    job=await session.scalar(select(Job).where(Job.id==workflow.job_id).with_for_update(read=shared, key_share=not shared))
+    snapshot=await session.scalar(select(Snapshot).where(Snapshot.id==workflow.target_snapshot_id).with_for_update(read=shared, key_share=not shared))
     partition=None
     if workflow.partition_id:
-        partition=await session.scalar(select(SnapshotPartition).where(SnapshotPartition.id==workflow.partition_id).with_for_update(read=shared))
+        partition=await session.scalar(select(SnapshotPartition).where(SnapshotPartition.id==workflow.partition_id).with_for_update(read=shared, key_share=not shared))
     return job,snapshot,partition
 
 
