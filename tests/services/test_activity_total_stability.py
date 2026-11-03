@@ -33,6 +33,7 @@ see tests/shared/test_graph_get_params.py).
 """
 from __future__ import annotations
 
+import ast
 import pathlib
 import re
 
@@ -59,7 +60,11 @@ def test_batch_scan_window_is_not_derived_from_page_or_size():
     discovery_total) — there the limit is only a merge window and the total is
     honest. Banning the expression globally would have "fixed" working code.
     """
-    blk = _block("def _list_activities_batch(")
+    function = next(
+        node for node in ast.parse(_SRC).body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_list_activities_batch"
+    )
+    blk = ast.get_source_segment(_SRC, function)
     # Only the prose reference to the old expression may remain.
     code = "\n".join(
         line for line in blk.splitlines()

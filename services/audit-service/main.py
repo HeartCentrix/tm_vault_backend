@@ -938,6 +938,214 @@ async def health():
     return {"status": "healthy", "service": "audit-log"}
 
 
+def _batch_activity_sources(operation, status):
+    op_upper = operation.upper() if operation else None
+    include_backup = op_upper is None or op_upper == "BACKUP"
+    include_discovery = op_upper is None or op_upper == "DISCOVERY"
+    include_warnings = include_backup
+    if status == "Warning":
+        include_backup = False
+        include_discovery = False
+    elif status in ("Done", "In Progress", "Failed", "Canceled"):
+        include_warnings = False
+    return include_backup, include_discovery, include_warnings
+
+
+def _activity_event_query(actions, *, tenant_id, start_date, end_date, limit,
+                          resource_types=None, resource_type=None):
+    filters = [AuditEvent.action.in_(actions)]
+    if tenant_id:
+        filters.append(AuditEvent.tenant_id == uuid.UUID(tenant_id))
+    if start_date:
+        filters.append(AuditEvent.occurred_at >= datetime.fromisoformat(start_date))
+    if end_date:
+        filters.append(AuditEvent.occurred_at <= datetime.fromisoformat(end_date))
+    if resource_types:
+        filters.append(AuditEvent.resource_type.in_(resource_types))
+    if resource_type:
+        filters.append(AuditEvent.resource_type == resource_type)
+    return (
+        select(AuditEvent).where(and_(*filters))
+        .order_by(desc(AuditEvent.occurred_at)).limit(limit)
+    )
+
+
+async def _batch_backup_activity_rows(db, *, tenant_id, start_date, end_date, limit, status):
+    from shared.batch_rollup import build_batch_rollup_query, shape_batch_row
+
+    items = []
+    stmt = build_batch_rollup_query(
+        tenant_id=tenant_id,
+        start_date=start_date,
+        end_date=end_date,
+        operation="BACKUP",
+        size=limit,
+        offset=0,
+    )
+    rows = (await activity_phase("batch_db_including_pool", db.execute(stmt))).all()
+    for r in rows:
+        row = shape_batch_row(r)
+        if status and status != "Warning":
+            if row.get("status") != status:
+                continue
+        items.append(row)
+    return items
+
+
+def _ransomware_warning_message(details):
+    anomaly = details.get("anomaly_type") or "Anomaly"
+    avg_prior = details.get("avg_prior_item_count")
+    current = details.get("current_item_count")
+    drop_pct = details.get("drop_pct")
+    deleted_items = details.get("deleted_item_count")
+    if anomaly == "ITEM_MASS_DELETION" and deleted_items is not None and avg_prior is not None:
+        pct = f" ({drop_pct}% of live inventory)" if drop_pct is not None else ""
+        return f"Ransomware signal: {deleted_items} items deleted{pct}."
+    if anomaly == "ITEM_COUNT_DROP" and avg_prior is not None and current is not None:
+        pct = f" ({drop_pct}% drop)" if drop_pct is not None else ""
+        return f"Ransomware signal: item count dropped from avg {avg_prior} to {current}{pct}."
+    return f"Ransomware signal detected ({anomaly})."
+
+
+def _warning_activity_row(event):
+    details = event.details or {}
+    message = details.get("message")
+    if not message:
+        if event.action == "RANSOMWARE_SIGNAL":
+            message = _ransomware_warning_message(details)
+        elif event.action == "BACKUP_SKIPPED_SLA_SCOPE":
+            message = "Backup skipped because the assigned SLA does not cover this resource type."
+        else:
+            message = ACTIONS.get(event.action, event.action)
+    occurred_at = event.occurred_at.isoformat() if event.occurred_at else ""
+    return {
+        "id": f"audit-{event.id}",
+        "start_time": occurred_at,
+        "operation": "BACKUP",
+        "object": event.resource_name or event.resource_type or "Unknown resource",
+        "status": "Warning",
+        "finish_time": occurred_at,
+        "details": message,
+    }
+
+
+def _deduplicate_discovery_starts(started_sorted, run_sorted):
+    # Collapse duplicate STARTEDs (same key, ≤120s apart, no RUN
+    # between) — see the identical block in list_activities' legacy
+    # branch for the full failure story (orphan STARTED steals the
+    # next run's terminal event; feed wedges at "In Progress").
+    _dedup_started: List[AuditEvent] = []
+    _last_started_at: Dict[Any, datetime] = {}
+    for s in started_sorted:
+        key = (s.tenant_id, s.resource_type)
+        s_at = s.occurred_at or datetime.min
+        prev_at = _last_started_at.get(key)
+        if prev_at is not None and (s_at - prev_at).total_seconds() <= _DUP_STARTED_WINDOW_S:
+            run_between = any(
+                (r.tenant_id, r.resource_type) == key
+                and prev_at <= (r.occurred_at or datetime.min) <= s_at
+                for r in run_sorted
+            )
+            if not run_between:
+                _last_started_at[key] = s_at
+                continue
+        _last_started_at[key] = s_at
+        _dedup_started.append(s)
+    return _dedup_started
+
+
+def _pair_discovery_events(events):
+    started_sorted = sorted(
+        (e for e in events if e.action == "DISCOVERY_STARTED"),
+        key=lambda e: e.occurred_at or datetime.min,
+    )
+    run_sorted = sorted(
+        (e for e in events if e.action == "DISCOVERY_RUN"),
+        key=lambda e: e.occurred_at or datetime.min,
+    )
+    started_sorted = _deduplicate_discovery_starts(started_sorted, run_sorted)
+    run_buckets: Dict[Any, List[AuditEvent]] = {}
+    for r in run_sorted:
+        run_buckets.setdefault((r.tenant_id, r.resource_type), []).append(r)
+    paired_run_ids: Set[Any] = set()
+    paired: List[Tuple[AuditEvent, Optional[AuditEvent]]] = []
+    for s in started_sorted:
+        bucket = run_buckets.get((s.tenant_id, s.resource_type), [])
+        match: Optional[AuditEvent] = None
+        while bucket:
+            candidate = bucket[0]
+            if (candidate.occurred_at or datetime.min) >= (s.occurred_at or datetime.min) \
+                    and candidate.id not in paired_run_ids:
+                match = candidate
+                paired_run_ids.add(candidate.id)
+                bucket.pop(0)
+                break
+            bucket.pop(0)
+        paired.append((s, match))
+    orphan_runs = [r for r in run_sorted if r.id not in paired_run_ids]
+
+    return paired, orphan_runs
+
+
+def _discovery_outcome(run, disco_type):
+    if run is None:
+        return "In Progress", f"{disco_type} discovery in progress", ""
+    outcome = (run.outcome or "").upper()
+    if outcome == "SUCCESS":
+        disco_status = "Done"
+        found = (run.details or {}).get("resourcesFound")
+        detail_text = f"{disco_type} discovery completed"
+        if found is not None:
+            detail_text += f" — {found} resources"
+    elif outcome == "FAILURE":
+        disco_status = "Failed"
+        err = (run.details or {}).get("error") or "unknown error"
+        detail_text = f"{disco_type} discovery failed: {err}"
+    else:
+        disco_status = "In Progress"
+        detail_text = f"{disco_type} discovery"
+    finish_time = run.occurred_at.isoformat() if run.occurred_at else ""
+    return disco_status, detail_text, finish_time
+
+
+def _discovery_activity_row(started, run, status):
+    anchor = started or run
+    if anchor is None:
+        return None
+    details_src = (run.details if run else started.details) or {}
+    disco_type = details_src.get("type") or anchor.resource_type or "Discovery"
+    disco_status, detail_text, finish_time = _discovery_outcome(run, disco_type)
+    if status and status != disco_status:
+        return None
+    anchor_for_id = run or started
+    start_time = anchor.occurred_at
+    object_name = (started.resource_name if started else None) \
+        or (run.resource_name if run else None) or disco_type
+    return {
+        "id": f"discovery-{anchor_for_id.id}",
+        "start_time": start_time.isoformat() if start_time else "",
+        "operation": "DISCOVERY",
+        "object": object_name,
+        "status": disco_status,
+        "finish_time": finish_time,
+        "details": detail_text,
+    }
+
+
+def _discovery_activity_rows(events, status):
+    paired, orphan_runs = _pair_discovery_events(events)
+    items = []
+    for started, run in paired:
+        row = _discovery_activity_row(started, run, status)
+        if row:
+            items.append(row)
+    for run in orphan_runs:
+        row = _discovery_activity_row(None, run, status)
+        if row:
+            items.append(row)
+    return items
+
+
 @activity_span("batch_with_shape")
 async def _list_activities_batch(
     *,
@@ -965,28 +1173,13 @@ async def _list_activities_batch(
     tenantId, which covers the common case. Cross-service filtering
     stays accurate on the legacy per-Job path (``?group=job``).
     """
-    from shared.batch_rollup import build_batch_rollup_query, shape_batch_row
-
     service_key = _parse_service_type(serviceType)
     service_resource_types = _resource_types_for_service(service_key)
     service_type_values = (
         {rt.value if hasattr(rt, "value") else str(rt) for rt in service_resource_types}
         if service_resource_types else None
     )
-    op_upper = operation.upper() if operation else None
-
-    # Operation filter gates which source contributes rows.
-    include_backup = (op_upper is None) or (op_upper == "BACKUP")
-    include_discovery = (op_upper is None) or (op_upper == "DISCOVERY")
-    # Warnings are BACKUP-domain alerts (RANSOMWARE_SIGNAL etc.).
-    include_warnings = include_backup and (status != "Warning" or status is None or status == "Warning")
-    # Status filter: "Warning" hides backup+discovery rows; "Done"/"In Progress"/
-    # "Failed"/"Canceled" hides warning rows.
-    if status == "Warning":
-        include_backup = False
-        include_discovery = False
-    elif status in ("Done", "In Progress", "Failed", "Canceled"):
-        include_warnings = False
+    include_backup, include_discovery, include_warnings = _batch_activity_sources(operation, status)
 
     # Scan window is a FIXED cap, deliberately not derived from page/size.
     #
@@ -1009,187 +1202,27 @@ async def _list_activities_batch(
     items: List[Dict[str, Any]] = []
 
     async with async_session_factory() as db:
-        # --- 1. BACKUP rows via batch CTE rollup ---
         if include_backup:
-            stmt = build_batch_rollup_query(
-                tenant_id=tenantId,
-                start_date=start_date,
-                end_date=end_date,
-                operation="BACKUP",
-                size=fetch_limit,
-                offset=0,
-            )
-            rows = (await activity_phase("batch_db_including_pool", db.execute(stmt))).all()
-            for r in rows:
-                row = shape_batch_row(r)
-                if status and status != "Warning":
-                    if row.get("status") != status:
-                        continue
-                items.append(row)
-
-        # --- 2. WARNING audit events (RANSOMWARE_SIGNAL, BACKUP_SKIPPED_SLA_SCOPE) ---
+            items.extend(await _batch_backup_activity_rows(
+                db, tenant_id=tenantId, start_date=start_date,
+                end_date=end_date, limit=fetch_limit, status=status,
+            ))
         if include_warnings:
-            wfilters = [AuditEvent.action.in_(WARNING_ACTIVITY_ACTIONS)]
-            if tenantId:
-                wfilters.append(AuditEvent.tenant_id == uuid.UUID(tenantId))
-            if start_date:
-                wfilters.append(AuditEvent.occurred_at >= datetime.fromisoformat(start_date))
-            if end_date:
-                wfilters.append(AuditEvent.occurred_at <= datetime.fromisoformat(end_date))
-            if service_type_values:
-                wfilters.append(AuditEvent.resource_type.in_(service_type_values))
-            wstmt = (
-                select(AuditEvent).where(and_(*wfilters))
-                .order_by(desc(AuditEvent.occurred_at)).limit(fetch_limit)
+            stmt = _activity_event_query(
+                WARNING_ACTIVITY_ACTIONS, tenant_id=tenantId,
+                start_date=start_date, end_date=end_date, limit=fetch_limit,
+                resource_types=service_type_values,
             )
-            for event in (await activity_phase("warnings_db_including_pool", db.execute(wstmt))).scalars().all():
-                details = event.details or {}
-                message = details.get("message")
-                if not message:
-                    if event.action == "RANSOMWARE_SIGNAL":
-                        anomaly = details.get("anomaly_type") or "Anomaly"
-                        avg_prior = details.get("avg_prior_item_count")
-                        current = details.get("current_item_count")
-                        drop_pct = details.get("drop_pct")
-                        deleted_items = details.get("deleted_item_count")
-                        if anomaly == "ITEM_MASS_DELETION" and deleted_items is not None and avg_prior is not None:
-                            pct = f" ({drop_pct}% of live inventory)" if drop_pct is not None else ""
-                            message = f"Ransomware signal: {deleted_items} items deleted{pct}."
-                        elif anomaly == "ITEM_COUNT_DROP" and avg_prior is not None and current is not None:
-                            pct = f" ({drop_pct}% drop)" if drop_pct is not None else ""
-                            message = f"Ransomware signal: item count dropped from avg {avg_prior} to {current}{pct}."
-                        else:
-                            message = f"Ransomware signal detected ({anomaly})."
-                    elif event.action == "BACKUP_SKIPPED_SLA_SCOPE":
-                        message = "Backup skipped because the assigned SLA does not cover this resource type."
-                    else:
-                        message = ACTIONS.get(event.action, event.action)
-                items.append({
-                    "id": f"audit-{event.id}",
-                    "start_time": event.occurred_at.isoformat() if event.occurred_at else "",
-                    "operation": "BACKUP",
-                    "object": event.resource_name or event.resource_type or "Unknown resource",
-                    "status": "Warning",
-                    "finish_time": event.occurred_at.isoformat() if event.occurred_at else "",
-                    "details": message,
-                })
-
-        # --- 3. DISCOVERY rows (STARTED + RUN paired) ---
+            events = (await activity_phase("warnings_db_including_pool", db.execute(stmt))).scalars().all()
+            items.extend(_warning_activity_row(event) for event in events)
         if include_discovery:
-            dfilters = [AuditEvent.action.in_(DISCOVERY_ACTIVITY_ACTIONS)]
-            if tenantId:
-                dfilters.append(AuditEvent.tenant_id == uuid.UUID(tenantId))
-            if start_date:
-                dfilters.append(AuditEvent.occurred_at >= datetime.fromisoformat(start_date))
-            if end_date:
-                dfilters.append(AuditEvent.occurred_at <= datetime.fromisoformat(end_date))
-            if service_key:
-                dfilters.append(AuditEvent.resource_type == service_key.upper())
-            dstmt = (
-                select(AuditEvent).where(and_(*dfilters))
-                .order_by(desc(AuditEvent.occurred_at)).limit(fetch_limit)
+            stmt = _activity_event_query(
+                DISCOVERY_ACTIVITY_ACTIONS, tenant_id=tenantId,
+                start_date=start_date, end_date=end_date, limit=fetch_limit,
+                resource_type=service_key.upper() if service_key else None,
             )
-            dev = (await activity_phase("discovery_db_including_pool", db.execute(dstmt))).scalars().all()
-            started_sorted = sorted(
-                (e for e in dev if e.action == "DISCOVERY_STARTED"),
-                key=lambda e: e.occurred_at or datetime.min,
-            )
-            run_sorted = sorted(
-                (e for e in dev if e.action == "DISCOVERY_RUN"),
-                key=lambda e: e.occurred_at or datetime.min,
-            )
-            # Collapse duplicate STARTEDs (same key, ≤120s apart, no RUN
-            # between) — see the identical block in list_activities' legacy
-            # branch for the full failure story (orphan STARTED steals the
-            # next run's terminal event; feed wedges at "In Progress").
-            _dedup_started: List[AuditEvent] = []
-            _last_started_at: Dict[Any, datetime] = {}
-            for s in started_sorted:
-                key = (s.tenant_id, s.resource_type)
-                s_at = s.occurred_at or datetime.min
-                prev_at = _last_started_at.get(key)
-                if prev_at is not None and (s_at - prev_at).total_seconds() <= _DUP_STARTED_WINDOW_S:
-                    run_between = any(
-                        (r.tenant_id, r.resource_type) == key
-                        and prev_at <= (r.occurred_at or datetime.min) <= s_at
-                        for r in run_sorted
-                    )
-                    if not run_between:
-                        _last_started_at[key] = s_at
-                        continue
-                _last_started_at[key] = s_at
-                _dedup_started.append(s)
-            started_sorted = _dedup_started
-            run_buckets: Dict[Any, List[AuditEvent]] = {}
-            for r in run_sorted:
-                run_buckets.setdefault((r.tenant_id, r.resource_type), []).append(r)
-            paired_run_ids: Set[Any] = set()
-            paired: List[Tuple[AuditEvent, Optional[AuditEvent]]] = []
-            for s in started_sorted:
-                bucket = run_buckets.get((s.tenant_id, s.resource_type), [])
-                match: Optional[AuditEvent] = None
-                while bucket:
-                    candidate = bucket[0]
-                    if (candidate.occurred_at or datetime.min) >= (s.occurred_at or datetime.min) \
-                            and candidate.id not in paired_run_ids:
-                        match = candidate
-                        paired_run_ids.add(candidate.id)
-                        bucket.pop(0)
-                        break
-                    bucket.pop(0)
-                paired.append((s, match))
-            orphan_runs = [r for r in run_sorted if r.id not in paired_run_ids]
-
-            def _disco_row(started: Optional[AuditEvent], run: Optional[AuditEvent]):
-                anchor = started or run
-                if anchor is None:
-                    return None
-                details_src = (run.details if run else started.details) or {}
-                disco_type = details_src.get("type") or anchor.resource_type or "Discovery"
-                if run is None:
-                    disco_status = "In Progress"
-                    detail_text = f"{disco_type} discovery in progress"
-                    finish_time = ""
-                else:
-                    outcome = (run.outcome or "").upper()
-                    if outcome == "SUCCESS":
-                        disco_status = "Done"
-                        found = (run.details or {}).get("resourcesFound")
-                        detail_text = f"{disco_type} discovery completed"
-                        if found is not None:
-                            detail_text += f" — {found} resources"
-                    elif outcome == "FAILURE":
-                        disco_status = "Failed"
-                        err = (run.details or {}).get("error") or "unknown error"
-                        detail_text = f"{disco_type} discovery failed: {err}"
-                    else:
-                        disco_status = "In Progress"
-                        detail_text = f"{disco_type} discovery"
-                    finish_time = run.occurred_at.isoformat() if run.occurred_at else ""
-                if status and status != disco_status:
-                    return None
-                anchor_for_id = run or started
-                start_time = (started.occurred_at if started else run.occurred_at)
-                object_name = (started.resource_name if started else None) \
-                    or (run.resource_name if run else None) or disco_type
-                return {
-                    "id": f"discovery-{anchor_for_id.id}",
-                    "start_time": start_time.isoformat() if start_time else "",
-                    "operation": "DISCOVERY",
-                    "object": object_name,
-                    "status": disco_status,
-                    "finish_time": finish_time,
-                    "details": detail_text,
-                }
-
-            for s, r in paired:
-                row = _disco_row(s, r)
-                if row:
-                    items.append(row)
-            for r in orphan_runs:
-                row = _disco_row(None, r)
-                if row:
-                    items.append(row)
+            events = (await activity_phase("discovery_db_including_pool", db.execute(stmt))).scalars().all()
+            items.extend(_discovery_activity_rows(events, status))
 
     # Merge + sort + paginate.
     items.sort(key=lambda it: it.get("start_time") or "", reverse=True)

@@ -1719,6 +1719,39 @@ def _real_restore_point():
     )
 
 
+async def _content_snapshot_totals(db, child, snap, count_types):
+    # Aggregate count + bytes across every sibling snapshot of this
+    # child (newest-wins dedup by external_id). Mirrors the approach
+    # used by the /mail, /chats, /calendar endpoints so the tab badge
+    # matches the count rendered in the middle panel.
+    agg_count = int(snap.item_count or 0)
+    agg_bytes = int(snap.bytes_total or 0)
+    if count_types:
+        sib_ids = [
+            row[0] for row in (await db.execute(
+                select(Snapshot.id).where(
+                    Snapshot.resource_id == child.id,
+                    Snapshot.created_at <= snap.created_at,
+                    # Mirror _resolve_sibling_snapshot_ids: FAILED
+                    # runs' leftover metadata rows must not count
+                    # toward tab badges, and PENDING_DELETION rows
+                    # are mid-teardown (sweep claim) — their items/
+                    # blobs are being deleted right now.
+                    Snapshot.status.notin_([
+                        SnapshotStatus.FAILED,
+                        SnapshotStatus.PENDING_DELETION,
+                    ]),
+                )
+            )).all()
+        ]
+        if sib_ids:
+            agg_count, agg_bytes = await _rollup_latest_items(
+                db, child.id, snap.id, sib_ids, count_types,
+            )
+
+    return agg_count, agg_bytes
+
+
 @app.get("/api/v1/resources/{resource_id}/content-snapshots")
 async def get_content_snapshots(
     resource_id: str,
@@ -1814,35 +1847,9 @@ async def get_content_snapshots(
             by_content[tab] = None
             continue
 
-        # Aggregate count + bytes across every sibling snapshot of this
-        # child (newest-wins dedup by external_id). Mirrors the approach
-        # used by the /mail, /chats, /calendar endpoints so the tab badge
-        # matches the count rendered in the middle panel.
-        agg_count = int(snap.item_count or 0)
-        agg_bytes = int(snap.bytes_total or 0)
-        count_types = COUNT_TYPE_PER_TAB.get(tab) or []
-        if count_types:
-            sib_ids = [
-                row[0] for row in (await db.execute(
-                    select(Snapshot.id).where(
-                        Snapshot.resource_id == child.id,
-                        Snapshot.created_at <= snap.created_at,
-                        # Mirror _resolve_sibling_snapshot_ids: FAILED
-                        # runs' leftover metadata rows must not count
-                        # toward tab badges, and PENDING_DELETION rows
-                        # are mid-teardown (sweep claim) — their items/
-                        # blobs are being deleted right now.
-                        Snapshot.status.notin_([
-                            SnapshotStatus.FAILED,
-                            SnapshotStatus.PENDING_DELETION,
-                        ]),
-                    )
-                )).all()
-            ]
-            if sib_ids:
-                agg_count, agg_bytes = await _rollup_latest_items(
-                    db, child.id, snap.id, sib_ids, count_types,
-                )
+        agg_count, agg_bytes = await _content_snapshot_totals(
+            db, child, snap, COUNT_TYPE_PER_TAB.get(tab) or [],
+        )
 
         # status / snapshotItemCount (TMV-010, 2026-08-11). The QA sweep read
         # the Chats tab badge (719,826) against `snapshots.item_count`

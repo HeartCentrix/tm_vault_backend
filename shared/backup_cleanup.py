@@ -685,6 +685,171 @@ async def hold_protected_reuse_roots(
     return getattr(result, "rowcount", 0) or 0
 
 
+def _collect_blob_candidates(candidates):
+    # Collapse to one entry per path; a path can arrive from several
+    # rows (two items dedup'd onto it) and any of their checksums is a
+    # valid probe key.
+    by_path: Dict[str, Dict[str, Any]] = {}
+    for c in candidates:
+        if not c.blob_path:
+            continue
+        slot = by_path.setdefault(
+            c.blob_path, {"tenants": set(), "checksums": set(), "sources": set()},
+        )
+        if c.tenant_id is not None:
+            slot["tenants"].add(c.tenant_id)
+        if c.content_checksum:
+            slot["checksums"].add(c.content_checksum)
+        if c.snapshot_id is not None:
+            slot["sources"].add(c.snapshot_id)
+    return by_path
+
+
+def _blob_retention_reason(path, slot, doomed_set, protected_roots):
+    if is_catalogue_blob_path(path):
+        return "catalogue_owned"
+    owner = _owning_snapshot_id(path)
+    if owner is not None and owner not in doomed_set:
+        return RETAIN_FOREIGN_OWNER
+    if (slot["sources"] & protected_roots) or (
+        owner is not None and owner in protected_roots
+    ):
+        return RETAIN_REUSE_DESCENDANT
+    return None
+
+
+async def _retain_pending_copy_blobs(session, survivors, retained):
+    # Frozen manifests may outlive their source snapshot_items rows.
+    copy_guard = copy_blob_pinned_sql("candidate.blob_path")
+    if survivors and copy_guard != "TRUE":
+        paths = sorted(survivors)
+        for start in range(0, len(paths), _PROBE_CHUNK):
+            pinned = (await session.execute(text(f"""
+                SELECT candidate.blob_path
+                  FROM unnest(CAST(:paths AS text[])) AS candidate(blob_path)
+                 WHERE NOT ({copy_guard})
+            """), {"paths": paths[start:start + _PROBE_CHUNK]})).all()
+            for row in pinned:
+                survivors.discard(row.blob_path)
+                retained[row.blob_path] = "pending_copy"
+
+
+def _classify_blob_probe_keys(by_path, survivors):
+    keyed: Dict[UUID, Set[str]] = {}
+    unkeyed: List[str] = []
+    for path in survivors:
+        slot = by_path[path]
+        if slot["tenants"] and slot["checksums"]:
+            for tid in slot["tenants"]:
+                keyed.setdefault(tid, set()).update(slot["checksums"])
+        else:
+            unkeyed.append(path)
+
+    return keyed, unkeyed
+
+
+def _retain_shared_blob_references(rows, doomed_set, protected_roots, survivors, retained):
+    for row in rows:
+        path = row.blob_path
+        if not path or path not in survivors:
+            continue
+        sid = row.snapshot_id
+        if sid not in doomed_set or sid in protected_roots:
+            survivors.discard(path)
+            retained[path] = RETAIN_SHARED_REFERENCE
+
+
+async def _probe_keyed_blob_references(session, keyed, doomed_set, protected_roots, survivors, retained):
+    for tenant_id, checksums in keyed.items():
+        ordered = sorted(checksums)
+        for start in range(0, len(ordered), _PROBE_CHUNK):
+            stmt = (
+                select(
+                    SnapshotItem.snapshot_id,
+                    SnapshotItem.blob_path,
+                    SnapshotItem.content_checksum,
+                )
+                .where(SnapshotItem.tenant_id == tenant_id)
+                .where(SnapshotItem.content_checksum.in_(
+                    ordered[start:start + _PROBE_CHUNK]
+                ))
+            )
+            _retain_shared_blob_references(
+                (await session.execute(stmt)).all(), doomed_set,
+                protected_roots, survivors, retained,
+            )
+
+
+def _bound_unkeyed_paths(unkeyed, budget, survivors, retained):
+    # --- Gate 3b: bounded exact-path fallback for unkeyed candidates --
+    # Unkeyed is a normal, expected shape, not an anomaly: every
+    # azure-workload-worker row sets content_checksum=None, and so does
+    # every attachment_blob_paths fan-out. They still get a real
+    # reference check; the budget only decides how many get it in one
+    # run, and the ones that don't are KEPT.
+    unkeyed.sort()
+    budget = max(0, int(budget))
+    if len(unkeyed) > budget:
+        for path in unkeyed[budget:]:
+            survivors.discard(path)
+            retained[path] = RETAIN_UNVERIFIABLE
+        logger.warning(
+            "[backup_cleanup] unkeyed probe budget spent: %d of %d "
+            "checksum-less path(s) RETAINED unverified this call (they "
+            "need an unindexed snapshot_items scan; reconcile against "
+            "orphan GC, or build ix_snapshot_items_blob_path)",
+            len(unkeyed) - budget, len(unkeyed),
+        )
+        unkeyed = unkeyed[:budget]
+
+    return unkeyed
+
+
+def _retain_unprobed_blobs(paths, why, survivors, retained):
+    if not paths:
+        return
+    for path in paths:
+        survivors.discard(path)
+        retained[path] = RETAIN_UNVERIFIABLE
+    logger.warning(
+        "[backup_cleanup] %d checksum-less path(s) RETAINED unverified "
+        "(%s) — a full sequential scan of the 87GB snapshot_items heap "
+        "was not affordable here; reconcile against orphan GC, or build "
+        "ix_snapshot_items_blob_path so this probe stops being a scan",
+        len(paths), why,
+    )
+
+
+async def _probe_unkeyed_blob_references(session, unkeyed, doomed_set, protected_roots, survivors, retained):
+    if not unkeyed:
+        return 0
+    if _UNKEYED_PROBE_TIMEOUT_MS <= 0:
+        _retain_unprobed_blobs(unkeyed, "unkeyed fallback disabled by env", survivors, retained)
+        return 0
+    if _unkeyed_probe_in_flight:
+        # Single-flight: another teardown is already scanning the heap.
+        # Piling a second scan on top is how the live Gold backups get
+        # starved, and both entry points fire detached tasks.
+        _retain_unprobed_blobs(unkeyed, "another unkeyed probe already in flight", survivors, retained)
+        return 0
+
+    probed = 0
+    with _unkeyed_probe_slot():
+        for start in range(0, len(unkeyed), _PROBE_CHUNK):
+            chunk = unkeyed[start:start + _PROBE_CHUNK]
+            try:
+                rows = await _probe_unkeyed_paths_bounded(session, chunk)
+            except Exception as exc:
+                # Timeout or DB error. Keep the bytes, keep the keyed
+                # verdicts, and do NOT charge the run's budget for a
+                # scan that produced no answer.
+                _retain_unprobed_blobs(unkeyed[start:], f"probe failed: {exc}", survivors, retained)
+                break
+            probed += len(chunk)
+            _retain_shared_blob_references(rows, doomed_set, protected_roots, survivors, retained)
+    return probed
+
+
 async def select_deletable_blob_paths(
     session: AsyncSession,
     *,
@@ -789,23 +954,7 @@ async def select_deletable_blob_paths(
     """
     doomed = list(dict.fromkeys(doomed_snapshot_ids))
     doomed_set = set(doomed)
-
-    # Collapse to one entry per path; a path can arrive from several
-    # rows (two items dedup'd onto it) and any of their checksums is a
-    # valid probe key.
-    by_path: Dict[str, Dict[str, Any]] = {}
-    for c in candidates:
-        if not c.blob_path:
-            continue
-        slot = by_path.setdefault(
-            c.blob_path, {"tenants": set(), "checksums": set(), "sources": set()},
-        )
-        if c.tenant_id is not None:
-            slot["tenants"].add(c.tenant_id)
-        if c.content_checksum:
-            slot["checksums"].add(c.content_checksum)
-        if c.snapshot_id is not None:
-            slot["sources"].add(c.snapshot_id)
+    by_path = _collect_blob_candidates(candidates)
     if not by_path:
         return BlobDeletionPlan()
 
@@ -815,135 +964,19 @@ async def select_deletable_blob_paths(
     retained: Dict[str, str] = {}
     survivors: Set[str] = set()
     for path, slot in by_path.items():
-        if is_catalogue_blob_path(path):
-            retained[path] = "catalogue_owned"
-            continue
-        owner = _owning_snapshot_id(path)
-        if owner is not None and owner not in doomed_set:
-            retained[path] = RETAIN_FOREIGN_OWNER
-            continue
-        if (slot["sources"] & protected_roots) or (
-            owner is not None and owner in protected_roots
-        ):
-            retained[path] = RETAIN_REUSE_DESCENDANT
-            continue
-        survivors.add(path)
-
-    # Frozen manifests may outlive their source snapshot_items rows.
-    copy_guard = copy_blob_pinned_sql("candidate.blob_path")
-    if survivors and copy_guard != "TRUE":
-        paths = sorted(survivors)
-        for start in range(0, len(paths), _PROBE_CHUNK):
-            pinned = (await session.execute(text(f"""
-                SELECT candidate.blob_path
-                  FROM unnest(CAST(:paths AS text[])) AS candidate(blob_path)
-                 WHERE NOT ({copy_guard})
-            """), {"paths": paths[start:start + _PROBE_CHUNK]})).all()
-            for row in pinned:
-                survivors.discard(row.blob_path)
-                retained[row.blob_path] = "pending_copy"
-
-    # --- Gate 3a: indexed (tenant_id, content_checksum) sharer probe --
-    keyed: Dict[UUID, Set[str]] = {}
-    unkeyed: List[str] = []
-    for path in survivors:
-        slot = by_path[path]
-        if slot["tenants"] and slot["checksums"]:
-            for tid in slot["tenants"]:
-                keyed.setdefault(tid, set()).update(slot["checksums"])
+        reason = _blob_retention_reason(path, slot, doomed_set, protected_roots)
+        if reason is not None:
+            retained[path] = reason
         else:
-            unkeyed.append(path)
+            survivors.add(path)
 
-    for tenant_id, checksums in keyed.items():
-        ordered = sorted(checksums)
-        for start in range(0, len(ordered), _PROBE_CHUNK):
-            stmt = (
-                select(
-                    SnapshotItem.snapshot_id,
-                    SnapshotItem.blob_path,
-                    SnapshotItem.content_checksum,
-                )
-                .where(SnapshotItem.tenant_id == tenant_id)
-                .where(SnapshotItem.content_checksum.in_(
-                    ordered[start:start + _PROBE_CHUNK]
-                ))
-            )
-            for row in (await session.execute(stmt)).all():
-                path = row.blob_path
-                if not path or path not in survivors:
-                    continue
-                sid = row.snapshot_id
-                if sid not in doomed_set or sid in protected_roots:
-                    survivors.discard(path)
-                    retained[path] = RETAIN_SHARED_REFERENCE
-
-    # --- Gate 3b: bounded exact-path fallback for unkeyed candidates --
-    # Unkeyed is a normal, expected shape, not an anomaly: every
-    # azure-workload-worker row sets content_checksum=None, and so does
-    # every attachment_blob_paths fan-out. They still get a real
-    # reference check; the budget only decides how many get it in one
-    # run, and the ones that don't are KEPT.
-    unkeyed.sort()
-    budget = max(0, int(unkeyed_probe_budget))
-    if len(unkeyed) > budget:
-        for path in unkeyed[budget:]:
-            survivors.discard(path)
-            retained[path] = RETAIN_UNVERIFIABLE
-        logger.warning(
-            "[backup_cleanup] unkeyed probe budget spent: %d of %d "
-            "checksum-less path(s) RETAINED unverified this call (they "
-            "need an unindexed snapshot_items scan; reconcile against "
-            "orphan GC, or build ix_snapshot_items_blob_path)",
-            len(unkeyed) - budget, len(unkeyed),
-        )
-        unkeyed = unkeyed[:budget]
-
-    def _retain_unprobed(paths: Sequence[str], why: str) -> None:
-        if not paths:
-            return
-        for path in paths:
-            survivors.discard(path)
-            retained[path] = RETAIN_UNVERIFIABLE
-        logger.warning(
-            "[backup_cleanup] %d checksum-less path(s) RETAINED unverified "
-            "(%s) — a full sequential scan of the 87GB snapshot_items heap "
-            "was not affordable here; reconcile against orphan GC, or build "
-            "ix_snapshot_items_blob_path so this probe stops being a scan",
-            len(paths), why,
-        )
-
-    probed = 0
-    if unkeyed and _UNKEYED_PROBE_TIMEOUT_MS <= 0:
-        _retain_unprobed(unkeyed, "unkeyed fallback disabled by env")
-    elif unkeyed and _unkeyed_probe_in_flight:
-        # Single-flight: another teardown is already scanning the heap.
-        # Piling a second scan on top is how the live Gold backups get
-        # starved, and both entry points fire detached tasks.
-        _retain_unprobed(unkeyed, "another unkeyed probe already in flight")
-    elif unkeyed:
-        with _unkeyed_probe_slot():
-            for start in range(0, len(unkeyed), _PROBE_CHUNK):
-                chunk = unkeyed[start:start + _PROBE_CHUNK]
-                try:
-                    rows = await _probe_unkeyed_paths_bounded(session, chunk)
-                except Exception as exc:
-                    # Timeout or DB error. Keep the bytes, keep the keyed
-                    # verdicts, and do NOT charge the run's budget for a
-                    # scan that produced no answer.
-                    _retain_unprobed(
-                        unkeyed[start:], f"probe failed: {exc}",
-                    )
-                    break
-                probed += len(chunk)
-                for row in rows:
-                    path = row.blob_path
-                    if not path or path not in survivors:
-                        continue
-                    sid = row.snapshot_id
-                    if sid not in doomed_set or sid in protected_roots:
-                        survivors.discard(path)
-                        retained[path] = RETAIN_SHARED_REFERENCE
-
+    await _retain_pending_copy_blobs(session, survivors, retained)
+    keyed, unkeyed = _classify_blob_probe_keys(by_path, survivors)
+    await _probe_keyed_blob_references(session, keyed, doomed_set, protected_roots, survivors, retained)
+    unkeyed = _bound_unkeyed_paths(unkeyed, unkeyed_probe_budget, survivors, retained)
+    probed = await _probe_unkeyed_blob_references(
+        session, unkeyed, doomed_set, protected_roots, survivors, retained,
+    )
     return BlobDeletionPlan(
         deletable=frozenset(survivors),
         retained=retained,

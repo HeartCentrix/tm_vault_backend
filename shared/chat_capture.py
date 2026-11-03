@@ -442,7 +442,7 @@ async def capture_chat_inventory(*, scope, graph_client, storage, session_factor
                         movement, first.conflicts = True, 1
                     if movement:
                         mismatch = ledger.difference_details()
-                        async def save_mismatch(session):
+                        async def save_mismatch(session, mismatch=mismatch):
                             attempt, _ = await catalogue._attempt(session, keeper.lease)
                             attempt.evidence_history = [*(attempt.evidence_history or []), {"observation_mismatch": mismatch}]
                         await run_catalogue_transaction(session_factory, save_mismatch)

@@ -15,6 +15,9 @@ import enum
 from shared.database import Base
 
 
+SNAPSHOT_ID_FOREIGN_KEY = "snapshots.id"
+
+
 def utcnow():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -474,7 +477,7 @@ class Job(Base):
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), index=True)
     resource_id = Column(UUID(as_uuid=True), ForeignKey("resources.id"))
     batch_resource_ids = Column(ARRAY(UUID(as_uuid=True)), default=[])  # NEW: for mass backup
-    snapshot_id = Column(UUID(as_uuid=True), ForeignKey("snapshots.id"))
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey(SNAPSHOT_ID_FOREIGN_KEY))
     status = Column(SAEnum(JobStatus), default=JobStatus.QUEUED)
     priority = Column(Integer, default=5)
     attempts = Column(Integer, default=0)
@@ -564,7 +567,7 @@ class Snapshot(Base):
     # parent so a chain can never cross isolation boundaries.
     reuse_of_snapshot_id = Column(
         UUID(as_uuid=True),
-        ForeignKey("snapshots.id", ondelete="RESTRICT"),
+        ForeignKey(SNAPSHOT_ID_FOREIGN_KEY, ondelete="RESTRICT"),
         nullable=True,
     )
     # Denormalised: terminal ancestor in the chain. Lets the read-path
@@ -574,7 +577,7 @@ class Snapshot(Base):
     # together with reuse_of_snapshot_id.
     reuse_chain_root_id = Column(
         UUID(as_uuid=True),
-        ForeignKey("snapshots.id", ondelete="RESTRICT"),
+        ForeignKey(SNAPSHOT_ID_FOREIGN_KEY, ondelete="RESTRICT"),
         nullable=True,
     )
     # Reconciliation lease (2026-05-16 design).
@@ -621,7 +624,7 @@ class Snapshot(Base):
 class SnapshotItem(Base):
     __tablename__ = "snapshot_items"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    snapshot_id = Column(UUID(as_uuid=True), ForeignKey("snapshots.id"), nullable=False, index=True)
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey(SNAPSHOT_ID_FOREIGN_KEY), nullable=False, index=True)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), index=True)
     external_id = Column(String, nullable=False)
     parent_external_id = Column(String, index=True)
@@ -668,7 +671,7 @@ class SnapshotPartition(Base):
     __tablename__ = "snapshot_partitions"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     snapshot_id = Column(UUID(as_uuid=True),
-                         ForeignKey("snapshots.id", ondelete="CASCADE"),
+                         ForeignKey(SNAPSHOT_ID_FOREIGN_KEY, ondelete="CASCADE"),
                          nullable=False, index=True)
     tenant_id = Column(UUID(as_uuid=True), nullable=False)
     resource_id = Column(UUID(as_uuid=True), nullable=False)
@@ -1150,7 +1153,7 @@ class VmFileIndex(Base):
     hot query path driving the directory listing UI."""
     __tablename__ = "vm_file_index"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    snapshot_id = Column(UUID(as_uuid=True), ForeignKey("snapshots.id", ondelete="CASCADE"), nullable=False, index=True)
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey(SNAPSHOT_ID_FOREIGN_KEY, ondelete="CASCADE"), nullable=False, index=True)
     volume_item_id = Column(UUID(as_uuid=True), nullable=False, index=True)
     parent_path = Column(String, nullable=False, index=True)
     name = Column(String, nullable=False)
@@ -1416,7 +1419,7 @@ class OneDriveFileRetry(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
     resource_id = Column(UUID(as_uuid=True), ForeignKey("resources.id", ondelete="CASCADE"), nullable=False, index=True)
-    snapshot_id = Column(UUID(as_uuid=True), ForeignKey("snapshots.id", ondelete="CASCADE"), nullable=False, index=True)
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey(SNAPSHOT_ID_FOREIGN_KEY, ondelete="CASCADE"), nullable=False, index=True)
     file_external_id = Column(String(256), nullable=False)
     file_name = Column(Text, nullable=True)
     drive_id = Column(Text, nullable=True)
@@ -1621,7 +1624,7 @@ class ChatCaptureAttempt(Base):
     __tablename__ = "chat_capture_attempts"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     # Preserve upload ownership after snapshot deletion; a null owner fences publication.
-    snapshot_id = Column(UUID(as_uuid=True), ForeignKey("snapshots.id", ondelete="SET NULL"), index=True)
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey(SNAPSHOT_ID_FOREIGN_KEY, ondelete="SET NULL"), index=True)
     resource_id = Column(UUID(as_uuid=True), ForeignKey("resources.id"), nullable=False)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
     chat_id = Column(Text, nullable=False)
@@ -1737,7 +1740,7 @@ class ChatInventoryItem(Base):
 
 class SnapshotChatInventory(Base):
     __tablename__ = "snapshot_chat_inventories"
-    snapshot_id = Column(UUID(as_uuid=True), ForeignKey("snapshots.id", ondelete="CASCADE"), primary_key=True)
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey(SNAPSHOT_ID_FOREIGN_KEY, ondelete="CASCADE"), primary_key=True)
     chat_id = Column(Text, primary_key=True)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
     inventory_id = Column(UUID(as_uuid=True), ForeignKey("chat_inventories.id", ondelete="RESTRICT"), nullable=False, index=True)
@@ -1752,7 +1755,7 @@ class SnapshotChatInventory(Base):
 
 class ChatPresentationPlan(Base):
     __tablename__ = "chat_presentation_plans"
-    snapshot_id = Column(UUID(as_uuid=True), ForeignKey("snapshots.id", ondelete="CASCADE"), primary_key=True)
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey(SNAPSHOT_ID_FOREIGN_KEY, ondelete="CASCADE"), primary_key=True)
     state = Column(String(16), nullable=False, default="PENDING")
     task_id = Column(UUID(as_uuid=True))
     expected_count = Column(BigInteger, nullable=False, default=0)
@@ -1762,7 +1765,7 @@ class ChatPresentationPlan(Base):
 
 class ChatPresentationDraft(Base):
     __tablename__ = "chat_presentation_drafts"
-    snapshot_id = Column(UUID(as_uuid=True), ForeignKey("snapshots.id", ondelete="CASCADE"), primary_key=True)
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey(SNAPSHOT_ID_FOREIGN_KEY, ondelete="CASCADE"), primary_key=True)
     workflow_id = Column(UUID(as_uuid=True), ForeignKey("copy_workflows.id", ondelete="CASCADE"), primary_key=True)
     capture_attempt = Column(BigInteger, primary_key=True)
     chat_id = Column(Text, primary_key=True)
@@ -1776,7 +1779,7 @@ class ChatPresentationDraft(Base):
 
 class SnapshotChatPresentation(Base):
     __tablename__ = "snapshot_chat_presentations"
-    snapshot_id = Column(UUID(as_uuid=True), ForeignKey("snapshots.id", ondelete="CASCADE"), primary_key=True)
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey(SNAPSHOT_ID_FOREIGN_KEY, ondelete="CASCADE"), primary_key=True)
     chat_id = Column(Text, primary_key=True)
     folder_path = Column(Text, nullable=False)
     quality = Column(Integer, nullable=False)

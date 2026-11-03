@@ -139,10 +139,10 @@ class ScopedProviderAdmission:
     def __init__(self, redis, *, limits=None, namespace='tmvault'):
         self.redis, self.limits = redis, limits or AdmissionLimits()
         self.prefix = 'provider:{' + _hash(namespace)[:16] + '}:'
-        self._grant = redis.register_script(self._GRANT)
-        self._release = redis.register_script(self._RELEASE)
-        self._renew = redis.register_script(self._RENEW)
-        self._cooldown = redis.register_script(self._COOLDOWN)
+        self._grant_script = redis.register_script(self._GRANT)
+        self._release_script = redis.register_script(self._RELEASE)
+        self._renew_script = redis.register_script(self._RENEW)
+        self._cooldown_script = redis.register_script(self._COOLDOWN)
 
     def _keys(self, context):
         tenant = self.prefix + _hash(context.cloud, context.tenant_id)
@@ -162,7 +162,7 @@ class ScopedProviderAdmission:
             raise ValueError('invalid provider cooldown')
         buckets, _, _ = self._keys(context)
         try:
-            return float(await self._cooldown(keys=[buckets[2]], args=[seconds]))
+            return float(await self._cooldown_script(keys=[buckets[2]], args=[seconds]))
         except Exception:
             raise ProviderDeferred(context, max(5, seconds), stage='coordinator_unavailable') from None
 
@@ -205,7 +205,7 @@ class ScopedProviderAdmission:
             try:
                 while True:
                     await asyncio.sleep(self.limits.lease_seconds / 3)
-                    if not await self._renew(keys=slots, args=[token, self.limits.lease_seconds]):
+                    if not await self._renew_script(keys=slots, args=[token, self.limits.lease_seconds]):
                         raise RuntimeError('provider network lease lost')
             except asyncio.CancelledError:
                 raise
@@ -216,7 +216,7 @@ class ScopedProviderAdmission:
         try:
             while True:
                 try:
-                    granted, delay, clock = await self._grant(keys=[*buckets, *slots, cancelled], args=[
+                    granted, delay, clock = await self._grant_script(keys=[*buckets, *slots, cancelled], args=[
                         json.dumps([[self.limits.rate, self.limits.burst, costs[key]] for key in buckets]),
                         json.dumps(limits), token, self.limits.lease_seconds])
                 except Exception:
@@ -246,7 +246,7 @@ class ScopedProviderAdmission:
                 with suppress(asyncio.CancelledError):
                     await renewer
             # Fence a late grant as well as removing any existing token.
-            release = asyncio.create_task(self._release(keys=[*slots, cancelled], args=[token, self.limits.lease_seconds]))
+            release = asyncio.create_task(self._release_script(keys=[*slots, cancelled], args=[token, self.limits.lease_seconds]))
             try:
                 await asyncio.shield(release)
             except asyncio.CancelledError:

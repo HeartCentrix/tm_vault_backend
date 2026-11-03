@@ -1883,7 +1883,10 @@ async def _bulk_assign_by_filter(
     return response
 
 
-@app.post("/api/v1/resources/bulk-assign-policy", status_code=200)
+@app.post(
+    "/api/v1/resources/bulk-assign-policy", status_code=200,
+    responses={400: {"description": "Invalid filter, policy ID, or policy assignment scope"}},
+)
 async def bulk_assign_policy(request: BulkAssignRequest, db: AsyncSession = Depends(get_db)):
     """
     Assign an SLA policy to multiple resources at once.

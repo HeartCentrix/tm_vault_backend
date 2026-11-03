@@ -37,28 +37,30 @@ async def _request_export(graph, url, ids, *, timeout, read_body):
         token = await graph._get_token()
         retry = None
         try:
-            async with graph._admit_data_request(url, method='POST', operation='archive_export'):
-                async with graph._http_session() as client:
-                    async with client.stream('POST', url, headers={'Authorization': f'Bearer {token}'},
-                            json={'itemIds': ids}, timeout=timeout, follow_redirects=False) as response:
-                        if response.status_code == 308:
-                            target = response.headers.get('Location')
-                            export_base(target, original_base)
-                            if redirects >= 2 or target == url:
-                                raise ProviderReadError('export_redirect_limit', status=308)
-                            redirects += 1
-                            url = target
-                        elif response.status_code == 401 and not auth_refreshed:
-                            auth_refreshed = True
-                            graph._access_token = None
-                        elif response.status_code in (429, 500, 502, 503, 504):
-                            retry = ProviderReadError.from_response(response, 'archive_export', attempts=budget.attempts)
-                        elif response.status_code >= 400:
-                            raise ProviderReadError.from_response(response, 'archive_export', attempts=budget.attempts)
-                        elif response.status_code != 200:
-                            raise ProviderReadError('unexpected_export_status', status=response.status_code)
-                        else:
-                            return await read_body(response)
+            async with (
+                graph._admit_data_request(url, method='POST', operation='archive_export'),
+                graph._http_session() as client,
+                client.stream('POST', url, headers={'Authorization': f'Bearer {token}'},
+                    json={'itemIds': ids}, timeout=timeout, follow_redirects=False) as response,
+            ):
+                if response.status_code == 308:
+                    target = response.headers.get('Location')
+                    export_base(target, original_base)
+                    if redirects >= 2 or target == url:
+                        raise ProviderReadError('export_redirect_limit', status=308)
+                    redirects += 1
+                    url = target
+                elif response.status_code == 401 and not auth_refreshed:
+                    auth_refreshed = True
+                    graph._access_token = None
+                elif response.status_code in (429, 500, 502, 503, 504):
+                    retry = ProviderReadError.from_response(response, 'archive_export', attempts=budget.attempts)
+                elif response.status_code >= 400:
+                    raise ProviderReadError.from_response(response, 'archive_export', attempts=budget.attempts)
+                elif response.status_code != 200:
+                    raise ProviderReadError('unexpected_export_status', status=response.status_code)
+                else:
+                    return await read_body(response)
         except httpx.TransportError:
             retry = ProviderReadError('archive_export_transport', attempts=budget.attempts)
         if retry is not None:

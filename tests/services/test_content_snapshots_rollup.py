@@ -146,4 +146,7 @@ def test_endpoint_no_longer_materializes_rows_in_python():
     import inspect
     src = inspect.getsource(_ss.get_content_snapshots)
     assert "seen: set = set()" not in src
-    assert "_rollup_latest_items" in src
+    assert "_content_snapshot_totals" in src
+    totals_src = inspect.getsource(_ss._content_snapshot_totals)
+    assert "seen: set = set()" not in totals_src
+    assert "_rollup_latest_items" in totals_src
