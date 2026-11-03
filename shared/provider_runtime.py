@@ -282,7 +282,12 @@ class ProviderWorkRunner:
                         await work.renew_work(session, execution.claim)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as error:
+            from shared.provider_observability import workflow_error_details
+            reason, locations = workflow_error_details(error)
+            logger.warning('provider_lease_renewal_failed work_id=%s snapshot_id=%s generation=%s error_type=%s reason=%s locations=%s',
+                execution.claim.work_id, execution.claim.snapshot_id, execution.claim.generation,
+                type(error).__name__, reason, locations)
             execution.lease_lost = True
             owner_task.cancel()
 
