@@ -338,6 +338,14 @@ async def _bulk_upsert_snapshot_items(session, rows: List[Dict[str, Any]]) -> in
     return total
 
 
+async def _persist_entra_snapshot_items(session, items):
+    """Provider resumption may replay records already committed by an earlier turn."""
+    from shared.snapshot_item_writes import snapshot_item_rows
+    from shared.provider_runtime import check_provider_turn
+    check_provider_turn()
+    return await _bulk_upsert_snapshot_items(session, snapshot_item_rows(items))
+
+
 async def _persist_chat_snapshot_items(rows):
     from shared.snapshot_item_writes import current_chat_write_scope, persist_chat_snapshot_rows
     try:
@@ -24223,6 +24231,14 @@ class BackupWorker:
                 return_exceptions=True,
             )
 
+            # gather(return_exceptions=True) also collects provider control flow.
+            # Do not persist a partial enumeration before its deferred turn resumes.
+            from shared.provider_runtime import check_provider_turn
+            check_provider_turn()
+            for result in results:
+                if isinstance(result, BaseException) and not isinstance(result, Exception):
+                    raise result
+
             # Collect all items
             cal_delta = None
             for result in results:
@@ -24393,7 +24409,7 @@ class BackupWorker:
             if isinstance(result, dict) and result.get("success"):
                 item_name = _entra_item_display_name(item_data)
                 db_items.append(SnapshotItem(
-                    snapshot_id=snapshot.id, tenant_id=tenant.id,
+                    snapshot_id=snapshot.id, tenant_id=tenant.id, backend_id=snapshot.backend_id,
                     external_id=item_id, item_type=item_type,
                     name=item_name,
                     content_hash=content_hash, content_size=len(content_bytes),
@@ -24406,8 +24422,7 @@ class BackupWorker:
 
         if db_items:
             async with async_session_factory() as session:
-                session.add_all(db_items)
-                await session.commit()
+                await _persist_entra_snapshot_items(session, db_items)
 
         # Calendar event attachments — for ENTRA_USER backups only. afi captures
         # event attachments the same way it captures email attachments.
