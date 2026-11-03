@@ -181,6 +181,36 @@ async def test_pinned_capture_preserves_long_cooldown_for_durable_handoff(source
     assert sum(request.url.host == "graph.microsoft.com" for request in requests) == 1
 
 
+async def test_hosted_content_requests_eventual_consistency(source_factory):
+    make, requests, *_ = source_factory
+    async with make(lambda request: httpx.Response(200, content=b'image')) as source:
+        async with source.open_hosted('chat', 'edited-message', 'image') as (body, _, _):
+            assert b''.join([chunk async for chunk in body]) == b'image'
+    content_request = next(request for request in requests if request.url.path.endswith('/$value'))
+    assert content_request.headers.get('ConsistencyLevel') == 'eventual'
+
+
+async def test_scoped_chat_pacing_does_not_double_charge_local_resource(source_factory, pacing_clock, monkeypatch):
+    from shared.graph_rate_limiter import graph_rate_limiter
+    monkeypatch.setenv('PROVIDER_SCOPED_ADMISSION_ENABLED', 'true')
+    contexts = []
+
+    @asynccontextmanager
+    async def admit(context, **kwargs):
+        contexts.append(context)
+        yield
+
+    monkeypatch.setattr(graph_rate_limiter, 'admit', admit)
+    make, *_ = source_factory
+    async with make(lambda request: httpx.Response(200, json={'value': []})) as source:
+        assert [page async for page in source.iter_message_pages('chat')] == [[]]
+        assert [item async for item in source.iter_hosted_contents('chat', 'message')] == []
+        assert [chat async for chat in source.iter_chats()] == []
+    assert [(c.paced_chat, c.resource) for c in contexts] == [
+        (True, 'chat:chat'), (True, 'chat:chat'), (True, 'user_chats:user')]
+    assert pacing_clock['now'] == 0.0
+
+
 async def test_user_chat_lists_have_separate_shared_pacing(source_factory, pacing_clock):
     make, *_ = source_factory
     sent = []
