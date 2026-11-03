@@ -146,3 +146,26 @@ def test_cancel_on_terminal_job_commits_remaining_copy_cancellation(monkeypatch)
     session = Session(job)
     asyncio.run(_js.cancel_job(str(job.id), session))
     assert session.commits == 1
+
+
+def test_cancel_takes_batch_advisory_lock_before_locking_the_job_row():
+    """Lock order must match cancel-on-terminal: advisory(batch) -> jobs row.
+
+    Observed 2026-11-04 on Railway: cancel A held jobs row FOR UPDATE and waited for
+    the batch advisory lock; sibling cancel B held the advisory lock and cascaded an
+    UPDATE onto A's row -> deadlock detected, cancel returned 500.
+    """
+    job = _job(JobType.BACKUP)
+
+    class Session(_FakeSession):
+        async def execute(self, stmt, params=None):
+            if hasattr(stmt, "column_descriptions"):
+                self.calls.append((str(stmt), {}))
+                return _Result([self.job])
+            return await super().execute(stmt, params)
+
+    session = Session(job)
+    asyncio.run(_js.cancel_job(str(job.id), session))
+    order = [s for s, _ in session.calls if "pg_advisory_xact_lock" in s or "FOR UPDATE" in s]
+    assert "pg_advisory_xact_lock" in order[0], order
+    assert any("FOR UPDATE" in s for s in order[1:]), order

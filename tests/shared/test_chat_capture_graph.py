@@ -306,12 +306,14 @@ async def test_file_requests_keep_existing_budgets_without_chat_pacing(source_fa
     assert sent == [0.0, 0.5, 1.0, 1.5]
 
 
-async def test_full_paging_uses_user_scope_and_top_50(source_factory):
+async def test_message_paging_uses_direct_chat_route_and_top_50(source_factory):
+    """/users/{p}/chats/{c}/messages returned inconsistent subsets (364 vs 11) on a real tenant;
+    /chats/{c}/messages was consistent, and is what the pre-catalogue worker used."""
     make, requests, clients, *_ = source_factory
-    url = "https://graph.microsoft.com/v1.0/users/user/chats/chat/messages"
+    url = "https://graph.microsoft.com/v1.0/chats/chat/messages"
 
     def handler(request):
-        assert request.url.path == "/v1.0/users/user/chats/chat/messages"
+        assert request.url.path == "/v1.0/chats/chat/messages"
         assert "$filter" not in request.url.params and "$expand" not in request.url.params
         if "$skiptoken" not in request.url.params:
             assert request.url.params["$top"] == "50"
@@ -331,7 +333,9 @@ async def test_chat_and_hosted_collections_paginate(source_factory):
 
     def handler(request):
         if request.url.path.endswith("/hostedContents"):
+            assert request.url.path == "/v1.0/chats/chat/messages/message/hostedContents"
             return httpx.Response(200, json={"value": [{"id": "hosted"}]})
+        assert request.url.path == "/v1.0/users/user/chats"  # membership stays principal-scoped
         return httpx.Response(200, json={"value": [{"id": "chat"}]})
 
     async with make(handler) as source:
@@ -345,7 +349,7 @@ async def test_next_link_equivalent_path_encoding_is_accepted(source_factory):
 
     def handler(request):
         if "$skiptoken" not in request.url.params:
-            return httpx.Response(200, json={"value": [], "@odata.nextLink": "https://graph.microsoft.com/v1.0/users/user/chats/19:chat@thread.v2/messages?$skiptoken=next"})
+            return httpx.Response(200, json={"value": [], "@odata.nextLink": "https://graph.microsoft.com/v1.0/chats/19:chat@thread.v2/messages?$skiptoken=next"})
         return httpx.Response(200, json={"value": [{"id": "message", "chatId": chat_id}]})
 
     async with make(handler) as source:
@@ -363,8 +367,8 @@ async def test_malformed_page_never_looks_complete(source_factory, payload):
 @pytest.mark.parametrize("collection", ["chats", "messages", "hosted"])
 async def test_teams_page_counts_are_not_treated_as_collection_totals(source_factory, collection):
     make, requests, *_ = source_factory
-    path = {"chats": "/users/user/chats", "messages": "/users/user/chats/chat/messages",
-        "hosted": "/users/user/chats/chat/messages/message/hostedContents"}[collection]
+    path = {"chats": "/users/user/chats", "messages": "/chats/chat/messages",
+        "hosted": "/chats/chat/messages/message/hostedContents"}[collection]
 
     def handler(request):
         if "$skiptoken" not in request.url.params:
@@ -385,7 +389,7 @@ async def test_teams_page_counts_are_not_treated_as_collection_totals(source_fac
 
 async def test_cursor_cycle_is_rejected(source_factory):
     make, *_ = source_factory
-    url = "https://graph.microsoft.com/v1.0/users/user/chats/chat/messages?$skiptoken=loop"
+    url = "https://graph.microsoft.com/v1.0/chats/chat/messages?$skiptoken=loop"
     async with make(lambda request: httpx.Response(200, json={"value": [], "@odata.nextLink": url})) as source:
         with pytest.raises(RuntimeError, match="cycle"):
             _ = [page async for page in source.iter_message_pages("chat")]
@@ -397,7 +401,7 @@ async def test_next_page_failure_propagates_instead_of_terminal_success(source_f
     def handler(request):
         if "$skiptoken" in request.url.params:
             return httpx.Response(403)
-        return httpx.Response(200, json={"value": [{"id": "one"}], "@odata.nextLink": "https://graph.microsoft.com/v1.0/users/user/chats/chat/messages?$skiptoken=next"})
+        return httpx.Response(200, json={"value": [{"id": "one"}], "@odata.nextLink": "https://graph.microsoft.com/v1.0/chats/chat/messages?$skiptoken=next"})
 
     async with make(handler) as source:
         with pytest.raises(RuntimeError, match="403"):
@@ -627,3 +631,14 @@ async def test_binary_source_chunks_fit_shared_spool_buffer(source_factory):
         async with source.open_hosted('chat','message','hosted') as (stream, size, _):
             sizes = [len(chunk) async for chunk in stream]
     assert sum(sizes)==1024*1024 and max(sizes)<=65536
+
+
+async def test_direct_chat_routes_share_the_per_chat_pace_bucket(source_factory, monkeypatch):
+    from shared import chat_capture_graph
+    make, *_ = source_factory
+    monkeypatch.setattr(chat_capture_graph, "_RESOURCE_BUCKETS", {})
+    async with make(lambda request: httpx.Response(200, json={"value": []})) as source:
+        for path in ("/v1.0/chats/abc/messages", "/v1.0/chats/abc/messages/m1/hostedContents",
+                     "/v1.0/chats/abc/messages/m1/hostedContents/h1/$value"):
+            await source._pace("https://graph.microsoft.com" + path)
+        assert list(chat_capture_graph._RESOURCE_BUCKETS) == [(source._initial_tenant, "chat", "abc")]

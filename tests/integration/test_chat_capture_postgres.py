@@ -668,7 +668,8 @@ async def test_card_attachment_with_volatile_graph_id_is_stable_across_passes(st
     def card(identity):
         return {"id": identity, "contentType": "application/vnd.microsoft.card.adaptive",
                 "content": '{"type":"AdaptiveCard","body":[{"type":"TextBlock","text":"same card"}]}'}
-    adapters.source.movement = lambda passes: [dict(message(), attachments=[card(f"volatile-{passes}")])]
+    adapters.source.movement = lambda passes: [dict(message(), attachments=[card(f"volatile-{passes}")],
+        body={"contentType": "html", "content": f'<attachment id="volatile-{passes}"></attachment>'})]
     _, result = await run_capture(store, adapters)
     assert result.outcome == "complete" and result.item_count == 2
     assert adapters.source.passes == 2

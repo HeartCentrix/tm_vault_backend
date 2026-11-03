@@ -1151,10 +1151,10 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
     In-flight workers poll `_is_job_cancelled()` between items and
     raise early, so the window between "cancel issued" and "no more new
     blobs written" is bounded by one item, not one resource."""
-    # FOR UPDATE: in-flight writers hold KEY SHARE on the parent, so cancellation
-    # waits for their commit instead of racing it.
-    job = (await db.execute(select(Job).where(Job.id == _parse_uuid(job_id, "job_id"))
-                            .with_for_update())).scalar_one_or_none()
+    # Lock order: batch advisory lock first, then the jobs row. A sibling cancel
+    # holding the advisory lock cascades UPDATEs onto this job's row, so taking
+    # the row first deadlocks against it (seen 2026-11-04).
+    job = (await db.execute(select(Job).where(Job.id == _parse_uuid(job_id, "job_id")))).scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -1182,6 +1182,13 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
         # Lock acquisition is best-effort — falling through without it
         # is safer than 500-ing the cancel button.
         print(f"[JOB_SERVICE] cancel advisory_xact_lock failed (continuing): {_le}")
+
+    # FOR UPDATE: in-flight writers hold KEY SHARE on the parent, so cancellation
+    # waits for their commit instead of racing it.
+    job = (await db.execute(select(Job).where(Job.id == job.id).with_for_update()
+                            .execution_options(populate_existing=True))).scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
 
     cancelled_copy_workflows = await cancel_copy_work(db, job_id=job.id, reason="job_cancelled")
 

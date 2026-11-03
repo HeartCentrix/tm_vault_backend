@@ -218,6 +218,31 @@ def stable_attachment_identity(attachment):
     return "card:" + hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()[:40]
 
 
+_ATTACHMENT_REFERENCE = re.compile(r"""(<attachment\s+id\s*=\s*["'])([^"']+)(["'])""", re.IGNORECASE)
+
+
+def stable_attachment_references(message):
+    """Copy of ``message`` whose metadata-only attachment ids, and the matching
+    ``<attachment id="...">`` tokens in the body, are content-derived. Invalid
+    attachment sets are returned unchanged for the caller to classify."""
+    native = message.get("attachments")
+    if not isinstance(native, list) or not native:
+        return message
+    if any(not isinstance(a, dict) or not isinstance(a.get("id"), str) or not a["id"] for a in native):
+        return message
+    mapping = {a["id"]: stable_attachment_identity(a) for a in native}
+    mapping = {old: new for old, new in mapping.items() if old != new}
+    if not mapping:
+        return message
+    out = {**message, "attachments": [{**a, "id": mapping.get(a["id"], a["id"])} for a in native]}
+    body = message.get("body")
+    content = body.get("content") if isinstance(body, dict) else None
+    if isinstance(content, str) and content:
+        out["body"] = {**body, "content": _ATTACHMENT_REFERENCE.sub(
+            lambda m: m.group(1) + mapping.get(m.group(2), m.group(2)) + m.group(3), content)}
+    return out
+
+
 def _file_source(item):
     parent = item.get("parentReference")
     drive, identifier = (parent.get("driveId") if isinstance(parent, dict) else None), item.get("id")
@@ -398,7 +423,7 @@ async def _observe(*, scope, keeper, factory, storage, source, ledger, observati
             prepared, parents = [], []
             try:
                 for raw in page:
-                    parent = dict(raw)
+                    parent = stable_attachment_references(dict(raw))
                     if exclude_message is not None and exclude_message({**parent, "_chat_folder_path": folder_path}):
                         continue
                     if not ledger.observe_message(observation, raw):
@@ -407,9 +432,7 @@ async def _observe(*, scope, keeper, factory, storage, source, ledger, observati
                     identifier = parent.get("id")
                     native = parent.get("attachments") or []
                     valid = isinstance(native, list) and all(isinstance(a, dict) and isinstance(a.get("id"), str) and a["id"] for a in native)
-                    attachments = [{**a, "id": stable_attachment_identity(a)} for a in native] if valid else []
-                    if valid and native:
-                        parent["attachments"] = attachments
+                    attachments = native if valid else []
                     if not valid:
                         stats.unresolved += 1
                     hosted, hosted_complete = [], True

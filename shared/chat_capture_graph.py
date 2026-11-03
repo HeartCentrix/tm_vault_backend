@@ -184,9 +184,12 @@ class StrictChatGraphSource:
         if parsed.hostname != "graph.microsoft.com":
             return
         parts = _path_scope(parsed.path)
-        if parts[:3] != ("", "v1.0", "users") or len(parts) < 5 or parts[4] != "chats":
+        if parts[:3] == ("", "v1.0", "chats") and len(parts) >= 5 and parts[4] == "messages":
+            # Direct chat routes: messages, hostedContents and $value share one per-chat bucket.
+            key = (self._initial_tenant, "chat", parts[3])
+        elif parts[:3] != ("", "v1.0", "users") or len(parts) < 5 or parts[4] != "chats":
             return
-        if len(parts) == 5:
+        elif len(parts) == 5:
             key = (self._initial_tenant, "user_chats", parts[3])
         elif (len(parts) in (7, 9, 11) and parts[6] == "messages"
               and (len(parts) == 7 or parts[8] == "hostedContents")
@@ -279,14 +282,17 @@ class StrictChatGraphSource:
                 yield chat
 
     async def iter_message_pages(self, chat_id: str) -> AsyncIterator[list[dict]]:
-        path = f"/users/{_component(self.principal_id)}/chats/{_component(chat_id)}/messages"
+        # Membership comes from the principal-scoped chat list; message reads use the
+        # direct chat route. On a real tenant the user-nested route returned inconsistent
+        # subsets (364 vs 11 messages) while /chats/{id}/messages was stable.
+        path = f"/chats/{_component(chat_id)}/messages"
         async for page in self._pages(path, params={"$top": "50"}):
             if len(page) > 50 or any(row.get("chatId", chat_id) != chat_id for row in page):
                 raise ChatGraphError("Graph message page changed collection scope")
             yield page
 
     async def iter_hosted_contents(self, chat_id: str, message_id: str) -> AsyncIterator[dict]:
-        path = f"/users/{_component(self.principal_id)}/chats/{_component(chat_id)}/messages/{_component(message_id)}/hostedContents"
+        path = f"/chats/{_component(chat_id)}/messages/{_component(message_id)}/hostedContents"
         async for page in self._pages(path):
             for item in page:
                 yield item
@@ -400,7 +406,7 @@ class StrictChatGraphSource:
 
     @asynccontextmanager
     async def open_hosted(self, chat_id: str, message_id: str, hcid: str):
-        path = f"/users/{_component(self.principal_id)}/chats/{_component(chat_id)}/messages/{_component(message_id)}/hostedContents/{_component(hcid)}/$value"
+        path = f"/chats/{_component(chat_id)}/messages/{_component(message_id)}/hostedContents/{_component(hcid)}/$value"
         async with self._stream(self._client.GRAPH_URL + path, graph=True) as opened:
             yield opened
 

@@ -136,6 +136,20 @@ def observation_payload(payload: Mapping[str, Any], version: int) -> dict[str, A
 
     if "hostedContents" in value:
         value["hostedContents"] = ordered(value["hostedContents"], ("id",))
+    reactions = value.get("reactions")
+    if isinstance(reactions, list):
+        # Graph rotates reaction presentation fields between reads (displayName,
+        # identity tenantId null vs value); reaction identity is type/time/user id.
+        for reaction in reactions:
+            if not isinstance(reaction, dict):
+                continue
+            reaction.pop("displayName", None)
+            identities = reaction.get("user")
+            if isinstance(identities, dict):
+                for identity in identities.values():
+                    if isinstance(identity, dict):
+                        identity.pop("tenantId", None)
+                        identity.pop("displayName", None)
     manifest = value.get("chat_catalogue_expected_children")
     if isinstance(manifest, dict) and "items" in manifest:
         manifest["items"] = ordered(manifest["items"], ("item_type", "graph_id"))

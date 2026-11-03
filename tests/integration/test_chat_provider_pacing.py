@@ -255,6 +255,8 @@ async def test_strict_sources_share_network_pacing_across_pages_and_hosted_conte
                 await asyncio.gather(*tasks, return_exceptions=True)
     assert len(sent) == 4
     assert all(later[0] - earlier[0] >= .95 for earlier, later in zip(sent, sent[1:]))
-    assert {path.split('/')[3] for _, path in sent} == {'alice', 'bob'}
+    assert {path for _, path in sent} == {'/v1.0/chats/A/messages',
+        '/v1.0/chats/A/messages/message/hostedContents',
+        '/v1.0/chats/A/messages/message/hostedContents/hosted/$value'}
     assert await redis_client.zcard(admission.prefix + 'active') == 0
     assert await redis_client.hlen(admission.prefix + 'fair:pending') == 0
