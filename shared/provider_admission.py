@@ -28,6 +28,7 @@ class ProviderRequestContext:
     workload: str
     resource: str | None = None
     cloud: str = 'graph.microsoft.com'
+    paced_chat: bool = False
 
     def __post_init__(self):
         for value in (self.tenant_id, self.app_id, self.workload, self.cloud):
@@ -35,6 +36,12 @@ class ProviderRequestContext:
                 raise ValueError('provider request requires a verified identity and workload')
         if self.resource is not None and (not isinstance(self.resource, str) or len(self.resource) > 4096):
             raise ValueError('invalid provider resource scope')
+        if type(self.paced_chat) is not bool:
+            raise ValueError('chat pacing must be an explicit boolean')
+        if self.paced_chat and (self.workload != 'teams' or not self.resource or
+                self.resource.partition(':')[0] not in ('chat', 'user_chats') or
+                not self.resource.partition(':')[2]):
+            raise ValueError('chat pacing requires a Teams chat or user chats resource')
 
 
 @dataclass(frozen=True)
@@ -232,6 +239,9 @@ class ScopedProviderAdmission:
             buckets.append(resource)
             slots.append(resource + ':active')
             limits.append(self.limits.resource_concurrency)
+            if context.paced_chat:
+                # Shared across app IDs; generic callers must never refill this bucket.
+                buckets.append(resource + ':paced_chat')
         return buckets, slots, limits
 
     async def cooldown(self, context, seconds):
@@ -255,21 +265,27 @@ class ScopedProviderAdmission:
         context = requirements[0][0]
         if not isinstance(context, ProviderRequestContext):
             raise ValueError('provider admission requires verified request context')
-        costs, slot_limits, scopes = {}, {}, {}
+        costs, slot_limits, scopes, paced_buckets = {}, {}, {}, set()
         for scope, cost in requirements:
             if (not isinstance(scope, ProviderRequestContext) or
                     (scope.tenant_id, scope.app_id, scope.cloud) != (context.tenant_id, context.app_id, context.cloud)):
                 raise ValueError('a provider batch cannot cross credential owners')
             if not math.isfinite(cost) or cost <= 0:
                 raise ValueError('invalid provider admission cost')
+            if scope.paced_chat and cost != 1:
+                raise ValueError('paced chat admission requires unit cost')
             scoped_buckets, scoped_slots, scoped_limits = self._keys(scope)
-            scopes.update(zip(scoped_buckets, ('global', 'tenant', 'workload', 'app', 'resource')))
+            if scope.paced_chat:
+                paced_buckets.add(scoped_buckets[-1])
+            scopes.update(zip(scoped_buckets, ('global', 'tenant', 'workload', 'app', 'resource', 'resource')))
             scopes.update(zip(scoped_slots, ('global', 'tenant', 'resource')))
             for key in scoped_buckets:
                 costs[key] = costs.get(key, 0) + cost
             for key, limit in zip(scoped_slots, scoped_limits):
                 slot_limits[key] = min(slot_limits.get(key, limit), limit)
-        if max(costs.values()) > self.limits.burst:
+        bucket_specs = [[1, 1, cost] if key in paced_buckets else
+            [self.limits.rate, self.limits.burst, cost] for key, cost in costs.items()]
+        if any(cost > burst for _, burst, cost in bucket_specs):
             raise ValueError('provider cost exceeds available burst; split request')
         if not math.isfinite(wait_budget) or wait_budget < 0:
             raise ValueError('invalid provider wait budget')
@@ -322,7 +338,7 @@ class ScopedProviderAdmission:
                 try:
                     polls += 1
                     granted, delay, clock, reason, denied, signal = await self._grant_script(keys=[*buckets, *slots, cancelled, pending, expiry, fair_clock, signals], args=[
-                        json.dumps([[self.limits.rate, self.limits.burst, costs[key]] for key in buckets]),
+                        json.dumps(bucket_specs),
                         json.dumps(limits), token, self.limits.lease_seconds, group, weight, max(costs.values())])
                 except Exception:
                     raise ProviderDeferred(context, 5, stage='coordinator_unavailable') from None
@@ -350,8 +366,9 @@ class ScopedProviderAdmission:
                     key = buckets[index - 1] if index > 0 else slots[-index - 1]
                     error = ProviderDeferred(context, delay, server_time=float(clock),
                         reason=reason.decode() if isinstance(reason, bytes) else reason, scope=scopes[key])
-                    if error.reason == 'concurrency' and await wait_provider_concurrency(error,
-                            wait=wait_for_release, withdraw=withdraw):
+                    chat_pacing_wait = context.paced_chat and error.reason == 'rate' and key in paced_buckets
+                    if (error.reason == 'concurrency' or chat_pacing_wait) and await wait_provider_concurrency(error,
+                            wait=asyncio.sleep if chat_pacing_wait else wait_for_release, withdraw=withdraw):
                         continue
                     raise error
                 if (reason.decode() if isinstance(reason, bytes) else reason) == 'concurrency':
