@@ -164,3 +164,97 @@ async def test_chat_pacing_fails_closed_when_redis_is_unavailable(redis_client):
         assert denied.value.stage == 'coordinator_unavailable'
     finally:
         await unavailable.aclose()
+
+
+async def test_strict_sources_share_network_pacing_across_pages_and_hosted_content(redis_client, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    import importlib
+    import httpx
+    from shared import provider_runtime as runtime
+    from shared.chat_capture_graph import pinned_chat_source
+    from shared.config import settings
+    from shared.graph_client import GraphClient
+    from shared.graph_rate_limiter import GraphRateLimiter, _LocalTokenBucket, _RedisTokenBucket
+
+    monkeypatch.setenv('PROVIDER_SCOPED_ADMISSION_ENABLED', 'true')
+    monkeypatch.setenv('PROVIDER_ADMISSION_WAIT_SECONDS', '0')
+    monkeypatch.setattr(settings, 'GRAPH_STREAM_PACE_REQS_PER_SEC', 0)
+    monkeypatch.setattr(settings, 'GRAPH_APP_PACE_REQS_PER_SEC', 0)
+    namespace = uuid4().hex
+    admission = ScopedProviderAdmission(redis_client, namespace=namespace,
+        limits=AdmissionLimits(global_concurrency=1, tenant_concurrency=1))
+    limiter = GraphRateLimiter()
+    limiter._scoped = admission
+    limiter._bucket = _RedisTokenBucket(redis_client, namespace + ':legacy', 10000, 10000,
+        _LocalTokenBucket(10000, 10000))
+    monkeypatch.setattr(importlib.import_module('shared.graph_rate_limiter'), 'graph_rate_limiter', limiter)
+    sent, first_send = [], asyncio.Event()
+
+    async def transport(request):
+        if request.url.host == 'login.microsoftonline.com':
+            return httpx.Response(200, json={'access_token': 'synthetic-token', 'expires_in': 3600})
+        assert await redis_client.zcard(admission.prefix + 'active') == 1
+        sent.append((time.monotonic(), request.url.path))
+        first_send.set()
+        if request.url.path.endswith('/$value'):
+            return httpx.Response(200, content=b'hosted-bytes')
+        if request.url.path.endswith('/hostedContents'):
+            return httpx.Response(200, json={'value': [{'id': 'hosted'}]})
+        if request.url.params.get('$skiptoken') == 'next':
+            return httpx.Response(200, json={'value': [{'id': 'message-two'}]})
+        return httpx.Response(200, json={'value': [{'id': 'message-one'}],
+            '@odata.nextLink': str(request.url.copy_with(query=b'$skiptoken=next'))})
+
+    original_client = httpx.AsyncClient
+
+    def http_client(*args, **kwargs):
+        return original_client(*args, **kwargs, transport=httpx.MockTransport(transport))
+
+    monkeypatch.setattr(httpx, 'AsyncClient', http_client)
+
+    async def capture(source, *, messages):
+        execution = runtime.ProviderExecution(None, None)
+        now = datetime.now(timezone.utc)
+        unit = runtime.UnitExecution('chat:A', 'chat', now + timedelta(seconds=15), now, 0, remaining=16)
+        execution_marker, unit_marker = runtime._EXECUTION.set(execution), runtime._UNIT.set(unit)
+        try:
+            async with runtime.provider_live_wait_scope():
+                if messages:
+                    result = [page async for page in source.iter_message_pages('A')]
+                    assert result == [[{'id': 'message-one'}], [{'id': 'message-two'}]]
+                else:
+                    assert [item async for item in source.iter_hosted_contents('A', 'message')] == [{'id': 'hosted'}]
+                    async with source.open_hosted('A', 'message', 'hosted') as (body, _, _):
+                        assert b''.join([chunk async for chunk in body]) == b'hosted-bytes'
+                        assert await redis_client.zcard(admission.prefix + 'active') == 1
+                assert runtime.current_execution() is execution
+                assert runtime.current_unit() is unit
+                assert unit.remaining == 14
+                assert execution.deferred is None and execution.drain_task is None
+        finally:
+            runtime._UNIT.reset(unit_marker)
+            runtime._EXECUTION.reset(execution_marker)
+
+    async with pinned_chat_source(GraphClient('app-one', 'secret', 'tenant'), principal_id='alice') as first:
+        async with pinned_chat_source(GraphClient('app-two', 'secret', 'tenant'), principal_id='bob') as second:
+            tasks = [asyncio.create_task(capture(first, messages=True)),
+                asyncio.create_task(capture(second, messages=False))]
+            try:
+                await asyncio.wait_for(first_send.wait(), 1)
+                async with asyncio.timeout(.8):
+                    while await redis_client.hlen(admission.prefix + 'fair:pending') != 2:
+                        await asyncio.sleep(.001)
+                assert len(sent) == 1
+                assert await redis_client.zcard(admission.prefix + 'active') == 0
+                async with admission.admit(ProviderRequestContext('tenant', 'mail-app', 'exchange'), wait_budget=0):
+                    assert len(sent) == 1
+                await asyncio.wait_for(asyncio.gather(*tasks), 6)
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+    assert len(sent) == 4
+    assert all(later[0] - earlier[0] >= .95 for earlier, later in zip(sent, sent[1:]))
+    assert {path.split('/')[3] for _, path in sent} == {'alice', 'bob'}
+    assert await redis_client.zcard(admission.prefix + 'active') == 0
+    assert await redis_client.hlen(admission.prefix + 'fair:pending') == 0
