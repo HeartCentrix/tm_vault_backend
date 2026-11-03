@@ -202,8 +202,9 @@ async def claim_due_work(session, *, owner_id, lease_seconds=120, _clamp_rounds=
     if lease_seconds <= 0:
         raise ValueError('provider lease must be positive')
     await session.execute(insert(ProviderWorkControl).values(id='global', enabled=enabled()).on_conflict_do_nothing())
-    control = await session.scalar(select(ProviderWorkControl).where(ProviderWorkControl.id == 'global').with_for_update())
-    if not control.enabled:
+    control = await session.scalar(select(ProviderWorkControl).where(ProviderWorkControl.id == 'global')
+        .with_for_update(skip_locked=True))
+    if control is None or not control.enabled:
         return None
     now = await session.scalar(select(func.clock_timestamp()))
     running = (ProviderWork.state.in_(('DRAINING', 'RESUMING')) & (ProviderWork.lease_expires_at > now))

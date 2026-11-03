@@ -228,7 +228,10 @@ async def align_ready_workflow(session, workflow_id) -> None:
 async def claim(session, *, owner_id, lease_seconds=90) -> CopyClaim | None:
     # Serializes only short scheduling decisions, never execution or waiting.
     await session.execute(insert(CopyWorkControl).values(id='global').on_conflict_do_nothing())
-    control = await session.scalar(select(CopyWorkControl).where(CopyWorkControl.id == 'global').with_for_update())
+    control = await session.scalar(select(CopyWorkControl).where(CopyWorkControl.id == 'global')
+        .with_for_update(skip_locked=True))
+    if control is None:
+        return None  # Another scheduler owns this turn; retry on the next poll.
     now = await session.scalar(select(func.clock_timestamp()))
     candidates = select(CopyWorkTask).join(CopyWorkflow, CopyWorkflow.id == CopyWorkTask.workflow_id).where(
         CopyWorkflow.state == 'WAITING',
