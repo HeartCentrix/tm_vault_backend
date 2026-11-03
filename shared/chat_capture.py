@@ -32,7 +32,7 @@ from shared.chat_content_stream import spool_chat_content
 from shared.db_retry import run_catalogue_transaction
 from shared.lease import run_bounded
 from shared.provider_read import _identifier
-from shared.models import ChatCaptureAttempt, ChatInventory, ChatInventoryItem, ChatItemVersion, SnapshotChatInventory, SnapshotItem
+from shared.models import ChatBlobObject, ChatCaptureAttempt, ChatInventory, ChatInventoryItem, ChatItemVersion, SnapshotChatInventory, SnapshotItem
 
 logger = logging.getLogger(__name__)
 
@@ -298,10 +298,15 @@ async def _retained(*, scope, keeper, factory, storage, item_type, graph_id, par
             # Cross-context reuse requires this capture's actual source bytes.
             complete_candidate = and_(complete_candidate,
                 ChatInventory.authentication_context_sha256 == authentication_context_fingerprint(scope))
+        # Earlier attempts of this same snapshot/chat (reconciliation restarts) staged
+        # verified LIVE objects; re-uploading them doubled restart cost.
+        earlier_attempt = and_(ChatInventory.capture_attempt_id.in_(select(ChatCaptureAttempt.id).where(
+                ChatCaptureAttempt.snapshot_id == scope.snapshot_id, ChatCaptureAttempt.chat_id == scope.chat_id)),
+            ChatInventory.authentication_context_sha256 == authentication_context_fingerprint(scope))
         retained_membership = exists(select(ChatInventoryItem.logical_key).join(
             ChatInventory, ChatInventory.id == ChatInventoryItem.inventory_id).where(
                 ChatInventoryItem.version_id == ChatItemVersion.id,
-                or_(ChatInventory.id == keeper.lease.staged_inventory_id, complete_candidate)))
+                or_(ChatInventory.id == keeper.lease.staged_inventory_id, complete_candidate, earlier_attempt)))
         query = select(ChatItemVersion).where(ChatItemVersion.tenant_id == scope.tenant_id,
             ChatItemVersion.chat_id == scope.chat_id, ChatItemVersion.logical_key == key, retained_membership)
         for field, value in source.items():
@@ -321,6 +326,12 @@ async def _retained(*, scope, keeper, factory, storage, item_type, graph_id, par
         content = replace(old.content, **source)
         if content.backend_id is not None and content.backend_id != scope.backend_id:
             return None
+        if content.object_id is not None:
+            # GC claims objects FOR UPDATE; a retiring object is not reusable.
+            state = await session.scalar(select(ChatBlobObject.state).where(
+                ChatBlobObject.id == content.object_id).with_for_update())
+            if state != "LIVE":
+                return None
         item_payload = dict(payload)
         if not item_payload.get("captured_content_type") and old.payload.get("captured_content_type"):
             item_payload["captured_content_type"] = old.payload["captured_content_type"]

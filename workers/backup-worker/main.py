@@ -4430,12 +4430,14 @@ def _mail_attachment_candidates(rows):
 
 
 def _mail_attachment_gap(rows) -> int:
-    """Count EMAIL_ATTACHMENT rows whose bytes were not captured and stop their declared
-    size from counting as backed-up bytes (declared_size is kept for diagnostics)."""
+    """Count EMAIL_ATTACHMENT rows whose required bytes were not captured and stop their
+    declared size from counting as backed-up bytes (declared_size is kept for diagnostics).
+    referenceAttachment rows are links; an unresolvable link stays metadata-only."""
     gap = 0
     for row in rows:
         extra = getattr(row, "extra_data", None) or {}
-        if getattr(row, "item_type", None) == "EMAIL_ATTACHMENT" and extra.get("resolved") is False:
+        if (getattr(row, "item_type", None) == "EMAIL_ATTACHMENT" and extra.get("resolved") is False
+                and not str(extra.get("attachment_kind") or "").endswith("referenceAttachment")):
             gap += 1
             if row.content_size:
                 row.extra_data = {**extra, "declared_size": row.content_size}
@@ -13874,8 +13876,10 @@ class BackupWorker:
                         except (ProviderDeferred, ProviderBudgetExhausted):
                             raise
                         except Exception as e:
+                            # Keep the row (resolved=false) so finalize sees the gap
+                            # instead of settling COMPLETED without the attachment.
                             print(f"[{self.worker_id}] [ATT-FAIL] {att_name} (file) on {msg_id}: {type(e).__name__}: {e}")
-                            return None, 0
+                            content_bytes = None
                 elif att_kind.endswith("itemAttachment"):
                     # Nested Outlook item — serialize to JSON so it's
                     # downloadable as a .json file and restorable later.

@@ -136,20 +136,28 @@ def observation_payload(payload: Mapping[str, Any], version: int) -> dict[str, A
 
     if "hostedContents" in value:
         value["hostedContents"] = ordered(value["hostedContents"], ("id",))
+    def strip_enrichment(identities):
+        # Graph adds or drops identity enrichment (tenantId null/value/absent,
+        # displayName) between reads; the identity is the id + identity type.
+        if isinstance(identities, dict):
+            for identity in identities.values():
+                if isinstance(identity, dict):
+                    identity.pop("tenantId", None)
+                    identity.pop("displayName", None)
+
     reactions = value.get("reactions")
     if isinstance(reactions, list):
-        # Graph rotates reaction presentation fields between reads (displayName,
-        # identity tenantId null vs value); reaction identity is type/time/user id.
+        # Reaction identity is type/time/user id; displayName is presentation.
         for reaction in reactions:
-            if not isinstance(reaction, dict):
-                continue
-            reaction.pop("displayName", None)
-            identities = reaction.get("user")
-            if isinstance(identities, dict):
-                for identity in identities.values():
-                    if isinstance(identity, dict):
-                        identity.pop("tenantId", None)
-                        identity.pop("displayName", None)
+            if isinstance(reaction, dict):
+                reaction.pop("displayName", None)
+                strip_enrichment(reaction.get("user"))
+    mentions = value.get("mentions")
+    if isinstance(mentions, list):
+        # Mention identity is id/mentionText/mentioned id; the body carries the text.
+        for mention in mentions:
+            if isinstance(mention, dict):
+                strip_enrichment(mention.get("mentioned"))
     manifest = value.get("chat_catalogue_expected_children")
     if isinstance(manifest, dict) and "items" in manifest:
         manifest["items"] = ordered(manifest["items"], ("item_type", "graph_id"))

@@ -43,3 +43,24 @@ def test_raw_payload_is_not_mutated_and_v1_stays_raw():
     observation_payload(a, 2)
     assert a == before
     assert observation_payload(a, 1)["reactions"][0]["user"]["user"]["tenantId"] == "t-1"
+
+
+def _mentioning(tenant=True, user_id="00000000-0000-0000-0000-000000000001"):
+    user = {"id": user_id, "displayName": "Person", "userIdentityType": "aadUser"}
+    if tenant:
+        user["tenantId"] = "00000000-0000-0000-0000-000000000002"
+    return {"id": "message-1", "body": {"contentType": "html", "content": '<at id="0">Person</at>'},
+            "mentions": [{"id": 0, "mentionText": "Person", "mentioned": {"user": user}}]}
+
+
+def test_optional_mention_tenant_enrichment_is_observation_stable():
+    """Paginated reads of one Bhavya message dropped mentions[].mentioned.user.tenantId in
+    one response out of four (2026-11-04) and restarted a 1,937-message chat."""
+    assert observation_payload(_mentioning(tenant=True), 2) == observation_payload(_mentioning(tenant=False), 2)
+
+
+def test_different_mentioned_user_is_still_a_semantic_change():
+    assert observation_payload(_mentioning(), 2) != observation_payload(_mentioning(user_id="other"), 2)
+    renamed = _mentioning()
+    renamed["mentions"][0]["mentionText"] = "Someone else"
+    assert observation_payload(_mentioning(), 2) != observation_payload(renamed, 2)

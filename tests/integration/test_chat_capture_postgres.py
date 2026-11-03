@@ -311,6 +311,16 @@ async def test_partial_capture_binaries_are_reused_by_the_next_capture(store, ad
     assert second.outcome == "partial" and len(adapters.storage.uploads) == 1
 
 
+async def test_reconciliation_restart_reuses_binaries_from_the_failed_attempt(store, adapters):
+    """A restart after a real message change re-uploaded every unchanged binary
+    (Bhavya chat: 67 objects / 14.4 MB uploaded twice, 2026-11-04)."""
+    adapters.source.messages = [message(attached=True)]
+    adapters.source.movement = lambda n: [message("before" if n == 1 else "after", attached=True)]
+    _, result = await run_capture(store, adapters)
+    assert result.outcome == "complete" and adapters.source.passes == 4
+    assert len(adapters.storage.uploads) == 1
+
+
 async def test_upload_retry_uses_new_generation_and_preserves_spool(store, adapters, monkeypatch):
     import shared.chat_capture_storage as storage_module
 

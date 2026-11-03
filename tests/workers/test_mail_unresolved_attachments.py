@@ -45,3 +45,11 @@ async def test_gap_degrades_snapshot(bw):
     worker._stamp_snapshot_degraded.reset_mock()
     await worker._degrade_for_attachment_gap(snapshot_id, [_row(True)])
     worker._stamp_snapshot_degraded.assert_not_awaited()
+
+
+def test_unresolved_reference_links_are_not_a_capture_gap(bw):
+    """referenceAttachment rows are links to OneDrive/SharePoint files, persisted as
+    metadata when the link cannot be resolved; they are not required mail content."""
+    link = SimpleNamespace(item_type="EMAIL_ATTACHMENT", content_size=50,
+                           extra_data={"resolved": False, "attachment_kind": "#microsoft.graph.referenceAttachment"})
+    assert bw._mail_attachment_gap([link]) == 0 and link.content_size == 50

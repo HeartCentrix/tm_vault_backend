@@ -214,3 +214,20 @@ def test_outer_resource_collector_propagates_control_flow(capture, kind):
              "turn_defer": ProviderTurnDeferred(ProviderDeferred(None, 60)), "cancel": asyncio.CancelledError()}[kind]
     with pytest.raises(type(error)):
         capture[-1]["check_results"]([{"item_count": 1}, error])
+
+
+async def test_failed_content_download_keeps_an_unresolved_row(capture):
+    """A content download error used to return no row at all, so the attachment gap check
+    saw nothing and the snapshot settled COMPLETED with the attachment missing."""
+    att = attachment("binary")
+    del att["contentBytes"]
+    graph = Graph([{"m": response("m", [att])}])
+
+    async def fail(*args, **kwargs):
+        raise RuntimeError("download failed")
+
+    graph.get_message_attachment_content = fail
+    items, size = await run_capture(capture, graph, ["m"])
+    assert [item.external_id for item in items] == ["m::binary"]
+    assert items[0].extra_data["resolved"] is False and size == 0
+    assert capture[-1]["_mail_attachment_gap"](items) == 1
