@@ -180,3 +180,31 @@ async def test_copy_parent_settlement_ignores_completed_provider_receipts_but_no
             assert await module.has_pending_copy(db, snapshot_id=scope.snapshot_id)
             predicate = module.pending_copy_sql(snapshot_expr="'" + str(scope.snapshot_id) + "'::uuid")
             assert not await db.scalar(text('SELECT ' + predicate))
+
+
+async def test_partition_cannot_finish_between_mail_carry_claim_and_copy_registration(store):
+    import ast
+    from pathlib import Path
+    from sqlalchemy import text
+    tree = ast.parse((Path(__file__).resolve().parents[2] / 'workers/backup-worker/main.py').read_text())
+    method = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef)
+                  and n.name == '_finalize_partitioned_snapshot')
+    statement = next(n for n in ast.walk(method) if isinstance(n, ast.JoinedStr)
+                     and any(isinstance(v, ast.Constant) and 'WITH expected AS' in str(v.value) for v in n.values))
+    sql = eval(compile(ast.Expression(statement), '<partition-finalizer-sql>', 'eval'), {'copy_guard': 'TRUE'})
+    scope = await store.new_scope()
+    async with store.factory.begin() as db:
+        snapshot = await db.get(models.Snapshot, scope.snapshot_id)
+        snapshot.extra_data = {'mail_union_carry_claimed': True, 'mail_carry_forward_pending': True}
+        db.add(models.SnapshotPartition(snapshot_id=snapshot.id,
+            tenant_id=store.tenant, resource_id=store.resource, job_id=snapshot.job_id,
+            drive_id='', file_ids=[], partition_index=0, total_files=0, total_bytes_est=0,
+            partition_type='MAIL_FOLDERS', status='COMPLETED', lease_token=0))
+    async with store.factory.begin() as db:
+        assert (await db.execute(text(sql), {'sid': str(scope.snapshot_id)})).first() is None
+        snapshot = await db.get(models.Snapshot, scope.snapshot_id)
+        assert snapshot.status == models.SnapshotStatus.IN_PROGRESS
+        snapshot.extra_data = {**snapshot.extra_data, 'mail_carry_forward_pending': False}
+    async with store.factory.begin() as db:
+        row = (await db.execute(text(sql), {'sid': str(scope.snapshot_id)})).first()
+        assert row.new_status == 'COMPLETED'

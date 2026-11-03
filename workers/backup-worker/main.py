@@ -18067,6 +18067,9 @@ class BackupWorker:
                     WHERE s.id = :sid
                       AND e.n > 0
                       AND s.status = 'IN_PROGRESS'
+                      -- The union-carry claim precedes copy-task registration.
+                      -- A sibling finalizer must not close that ownership gap.
+                      AND COALESCE(s.extra_data->>'mail_carry_forward_pending', 'false') <> 'true'
                       AND {copy_guard}
                   RETURNING s.status::text AS new_status,
                             c.terminal, e.n, s.job_id,
