@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import tempfile
@@ -31,6 +32,8 @@ from shared.lease import run_bounded
 from shared.provider_read import _identifier
 from shared.models import ChatCaptureAttempt, ChatInventory, ChatInventoryItem, ChatItemVersion, SnapshotChatInventory, SnapshotItem
 
+logger = logging.getLogger(__name__)
+
 
 class ChatSourceMovement(RuntimeError):
     """The same source membership/version could not be reconciled."""
@@ -49,6 +52,7 @@ class ChatObservationLedger:
         self.db.execute("CREATE TABLE observed (pass INTEGER, key TEXT, semantic TEXT, binary INTEGER, PRIMARY KEY(pass,key))")
         self.db.execute("CREATE TABLE expected (pass INTEGER, key TEXT, required INTEGER, PRIMARY KEY(pass,key))")
         self.db.execute("CREATE TABLE failures (pass INTEGER, phase TEXT, error_type TEXT, status INTEGER, graph_id TEXT, parent_graph_id TEXT, provider_code TEXT, provider_inner_code TEXT, provider_request_id TEXT)")
+        self.db.execute("CREATE TABLE empty_hosted (message_id TEXT PRIMARY KEY, source_sha256 TEXT NOT NULL)")
 
     def __enter__(self):
         return self
@@ -61,6 +65,25 @@ class ChatObservationLedger:
         key = qualified_chat_item_key(self.scope.chat_id, item_type, graph_id, parent_graph_id)
         self.db.execute("INSERT INTO expected VALUES (?,?,?) ON CONFLICT(pass,key) DO UPDATE SET required=MAX(required,excluded.required)",
                         (observation, key, int(required)))
+
+    @staticmethod
+    def _message_version(message):
+        # A message timestamp or plain-looking body does not prove empty membership.
+        tag = message.get("etag")
+        if not isinstance(tag, str) or not tag.strip():
+            return None
+        return _digest(_payload(message))
+
+    def remember_empty_hosted(self, message):
+        version = self._message_version(message)
+        if version is not None:
+            self.db.execute("INSERT OR REPLACE INTO empty_hosted VALUES (?,?)", (message["id"], version))
+
+    def verified_empty_hosted(self, message):
+        version = self._message_version(message)
+        return version is not None and self.db.execute(
+            "SELECT 1 FROM empty_hosted WHERE message_id=? AND source_sha256=?",
+            (message["id"], version)).fetchone() is not None
 
     def record(self, observation, item):
         key = qualified_chat_item_key(self.scope.chat_id, item.item_type, item.graph_id, item.parent_graph_id)
@@ -130,6 +153,10 @@ class _Pass:
     complete: bool = False
     unresolved: int = 0
     conflicts: int = 0
+    pages: int = 0
+    messages: int = 0
+    hosted_lists: int = 0
+    hosted_reused: int = 0
 
 
 class _CaptureLeaseKeeper:
@@ -347,8 +374,14 @@ async def _observe(*, scope, keeper, factory, storage, source, ledger, observati
                         stats.unresolved += 1
                     hosted, hosted_complete = [], True
                     try:
-                        async for child in source.iter_hosted_contents(scope.chat_id, identifier):
-                            hosted.append(child)
+                        if observation == 1 and ledger.verified_empty_hosted(raw):
+                            stats.hosted_reused += 1
+                        else:
+                            stats.hosted_lists += 1
+                            async for child in source.iter_hosted_contents(scope.chat_id, identifier):
+                                hosted.append(child)
+                            if observation == 0 and not hosted and valid:
+                                ledger.remember_empty_hosted(raw)
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
@@ -366,6 +399,7 @@ async def _observe(*, scope, keeper, factory, storage, source, ledger, observati
                     if ledger.record(observation, parent_item) and observation == 0:
                         parents.append(parent_item)
                     prepared.append((identifier, attachments, hosted))
+                    stats.messages += 1
             finally:
                 # Parent rows must already exist before any child upload/link;
                 # interruption then leaves a readable partial message inventory.
@@ -395,6 +429,13 @@ async def _observe(*, scope, keeper, factory, storage, source, ledger, observati
                             pending = []
             if pending:
                 await _stage(factory, keeper, pending)
+            stats.pages += 1
+            logger.info(
+                "chat_capture_progress attempt_id=%s observation=%s pages=%s messages_observed=%s "
+                "hosted_list_requests=%s hosted_empty_reused=%s required_binary=%s verified_binary=%s unresolved=%s",
+                keeper.lease.attempt_id, observation + 1, stats.pages, stats.messages,
+                stats.hosted_lists, stats.hosted_reused, ledger.required_count(observation),
+                ledger.durable_count(observation), stats.unresolved)
         stats.complete = True
     except (asyncio.CancelledError, ChatSourceMovement, catalogue.ChatCatalogueConflict, catalogue.ChatCatalogueIntegrityError, SQLAlchemyError):
         raise
