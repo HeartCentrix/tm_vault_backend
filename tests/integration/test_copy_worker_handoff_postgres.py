@@ -228,7 +228,7 @@ async def test_replaced_union_resume_cannot_clear_pending_carry(store, monkeypat
 
 
 @pytest.mark.parametrize("staged", [False, True])
-@pytest.mark.parametrize("fault", ["table", "mirror"])
+@pytest.mark.parametrize("fault", ["table", "mirror", "marker"])
 async def test_failed_union_requires_verified_cursor_rewind_before_finishing(store, monkeypatch, bw, staged, fault):
     from contextlib import asynccontextmanager
     from datetime import datetime, timedelta, timezone
@@ -268,6 +268,12 @@ async def test_failed_union_requires_verified_cursor_rewind_before_finishing(sto
     failing = {"enabled": True}
     original_delete = worker._delete_mail_folder_delta
     original_bulk = worker._delete_mail_folder_state_bulk
+    original_patch = worker._patch_snapshot_extra_data
+
+    async def patch(snapshot_id, data):
+        if fault == "marker" and failing["enabled"] and data.get("mail_carry_forward_failed"):
+            return False
+        return await original_patch(snapshot_id, data)
 
     async def delete(*args):
         return False if fault == "table" and failing["enabled"] else await original_delete(*args)
@@ -291,6 +297,7 @@ async def test_failed_union_requires_verified_cursor_rewind_before_finishing(sto
     factory.begin = store.factory.begin
     monkeypatch.setattr(worker, "_delete_mail_folder_delta", delete)
     monkeypatch.setattr(worker, "_delete_mail_folder_state_bulk", bulk)
+    monkeypatch.setattr(worker, "_patch_snapshot_extra_data", patch)
     monkeypatch.setattr(bw, "async_session_factory", factory)
     with pytest.raises(RuntimeError, match="rewind"):
         await worker.resume_copy_workflow(workflow_id)

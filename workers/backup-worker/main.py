@@ -17671,11 +17671,11 @@ class BackupWorker:
         # stamped only after a verified rewind so the reconcile retries a
         # failed eviction (pending stays set) instead of forgetting it
         if _ok:
-            await self._patch_snapshot_extra_data(
+            _ok = bool(await self._patch_snapshot_extra_data(
                 snapshot_id,
                 {"mail_carry_forward_failed": True, "mail_union_carry_claimed": True,
                  "mail_carry_forward_pending": False},
-            )
+            ))
         else:
             await self._patch_snapshot_extra_data(
                 snapshot_id,
