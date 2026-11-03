@@ -3,6 +3,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import timedelta
 import hashlib
+import logging
 import random
 from time import monotonic
 
@@ -14,6 +15,9 @@ from shared.copy_work import ACTIVE_WORKFLOWS, CopyClaim
 from shared.database import CARRY_FORWARD_BUCKETS, GIANT_CARRY_FORWARD_BUCKETS
 from shared.db_retry import first_db_sqlstate
 from shared.models import CopyWorkControl, CopyWorkflow, CopyWorkTask, Job, Snapshot, SnapshotPartition
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -62,7 +66,7 @@ async def _settings(session, claim, statement_timeout_ms, lock_timeout_ms):
          'name': f'tm-copy:{str(claim.task_id)[:8]}:{claim.generation}'[:63]})
 
 
-async def _owned(session, claim):
+async def _owned(session, claim, *, lock_parents=True):
     # Parent-first locks match cancellation. SHARE permits independent batches
     # under the same job while preventing its cancellation from committing
     # between the ownership check and the atomic copy/checkpoint commit.
@@ -71,12 +75,13 @@ async def _owned(session, claim):
             CopyWorkTask.workflow_id == CopyWorkflow.id).where(CopyWorkTask.id == claim.task_id))).first()
     if pointers is None:
         raise _Stale
+    parent_lock = {'read': True, 'nowait': True} if lock_parents else None
     job = await session.get(Job, pointers.job_id,
-        with_for_update={'read': True, 'nowait': True}, populate_existing=True)
+        with_for_update=parent_lock, populate_existing=True)
     snapshot = await session.get(Snapshot, pointers.target_snapshot_id,
-        with_for_update={'read': True, 'nowait': True}, populate_existing=True)
+        with_for_update=parent_lock, populate_existing=True)
     partition = await session.get(SnapshotPartition, pointers.partition_id,
-        with_for_update={'read': True, 'nowait': True}, populate_existing=True) if pointers.partition_id else None
+        with_for_update=parent_lock, populate_existing=True) if pointers.partition_id else None
     workflow = await session.get(CopyWorkflow, pointers.id,
         with_for_update={'nowait': True}, populate_existing=True)
     task = await session.get(CopyWorkTask, claim.task_id,
@@ -144,7 +149,9 @@ async def _settle_once(factory, claim, *, status, error, queued_seconds=0.0, spe
         async with factory.begin() as session:
             await _settings(session, claim, 5000, 1000)
             try:
-                task, _ = await _owned(session, claim)
+                # A proven nonexecution release changes only the owned task. Reading
+                # parents is sufficient: the next execution still locks/fences them.
+                task, _ = await _owned(session, claim, lock_parents=spend_attempt)
             except _Cancelled:
                 # _owned locks and validates the task before reporting cancel.
                 task = await session.get(CopyWorkTask, claim.task_id)
@@ -187,6 +194,8 @@ async def _settle(factory, claim, **kwargs):
         try:
             return await _settle_once(factory, claim, **kwargs)
         except Exception as exc:
+            logger.warning('copy_settlement_failed task_id=%s generation=%s sqlstate=%s phase=settlement error_type=%s',
+                claim.task_id, claim.generation, first_db_sqlstate(exc), type(exc).__name__)
             if attempt == 2 or first_db_sqlstate(exc) not in {'55P03', '57014', '40P01', '40001'}:
                 raise
             await asyncio.sleep(random.uniform(0.05, min(0.5, 0.05 * 2 ** (attempt + 1))))
@@ -201,20 +210,24 @@ async def run_batch(factory, claim: CopyClaim, *, batch_size=512,
     query_seconds = 0.0
     for attempt in range(1, 4):
         admission_started, query_started = monotonic(), None
+        phase = 'settings'
         try:
             async with factory.begin() as session:
                 await _settings(session, claim, statement_timeout_ms, lock_timeout_ms)
+                phase = 'ownership'
                 task, workflow = await _owned(session, claim)
                 control = await session.get(CopyWorkControl, 'global')
                 if control is None or not control.enabled:
                     raise _Deferred('copy_protocol_disabled')
                 if task.wait_max_s and task.cumulative_wait_s >= task.wait_max_s:
                     raise _Deferred('copy_admission_timeout')
+                phase = 'admission'
                 await _physical_guards(session, task, workflow, control)
                 if (task.params or {}).get('_copy_execution_budget_v1') is True and task.attempts > 3:
                     # Unsettled expired claims cannot prove nonexecution. Stop
                     # before a fourth execution, without diagnosing a deadlock.
                     raise _ExecutionUnsettled
+                phase = 'execution'
                 query_started = monotonic()
                 if not task.prepared:
                     await copy_executor.prepare_manifest(session, task)
@@ -252,15 +265,19 @@ async def run_batch(factory, claim: CopyClaim, *, batch_size=512,
             if query_started is not None:
                 query_seconds += monotonic() - query_started
             state = first_db_sqlstate(exc)
+            logger.warning('copy_batch_failed task_id=%s generation=%s sqlstate=%s phase=%s error_type=%s',
+                claim.task_id, claim.generation, state, phase, type(exc).__name__)
             if state == '57014' and attempt < 3:
                 continue
             if state in {'40P01', '40001'}:
                 code = 'copy_deadlock' if state == '40P01' else 'copy_serialization_failure'
                 status = await _settle(factory, claim, status='DEFERRED',
-                    error={'code': code, 'sqlstate': state}, execution_s=query_seconds)
+                    error={'code': code, 'sqlstate': state}, spend_attempt=phase == 'execution', execution_s=query_seconds)
             elif state == '55P03':
                 status = await _settle(factory, claim, status='DEFERRED',
-                    error={'code': 'copy_lock_timeout'}, spend_attempt=query_started is not None,execution_s=query_seconds)
+                    error={'code': 'copy_lock_timeout', 'sqlstate': state, 'phase': phase},
+                    queued_seconds=monotonic() - admission_started if phase != 'execution' else 0,
+                    spend_attempt=phase == 'execution', execution_s=query_seconds)
             else:
                 code = 'copy_statement_timeout' if state == '57014' else 'copy_execution_failed'
                 error = {'code': code}
