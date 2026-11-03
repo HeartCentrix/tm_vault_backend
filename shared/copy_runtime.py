@@ -137,7 +137,10 @@ class CopyWorkRunner:
                 await self.resume_callback(workflow_id)
                 return True
         except Exception as exc:
-            logger.warning('copy_resume_failed workflow_id=%s error_type=%s', workflow_id, type(exc).__name__)
+            from shared.provider_observability import workflow_error_details
+            reason, locations = workflow_error_details(exc)
+            logger.warning('copy_resume_failed workflow_id=%s error_type=%s reason=%s locations=%s',
+                workflow_id, type(exc).__name__, reason, locations)
             return False
         finally:
             self._resuming.discard(workflow_id)

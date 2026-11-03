@@ -325,8 +325,10 @@ class ProviderWorkRunner:
                 async with self.factory.begin() as session:
                     await work.suspend_current_work(session, claim, next_eligible_at=error.next_eligible_at,
                         reason=getattr(error, 'stage', 'provider_wait'))
-                logger.info('provider_turn_deferred work_id=%s snapshot_id=%s stage=%s next_eligible_at=%s',
-                    claim.work_id, claim.snapshot_id, getattr(error, 'stage', 'provider_wait'), error.next_eligible_at)
+                logger.info('provider_turn_deferred work_id=%s snapshot_id=%s stage=%s reason=%s scope=%s retry_after_s=%s next_eligible_at=%s',
+                    claim.work_id, claim.snapshot_id, getattr(error, 'stage', 'provider_wait'),
+                    getattr(error, 'reason', None), getattr(error, 'scope', None),
+                    error.retry_after, error.next_eligible_at)
                 return {'provider_waiting': True, 'provider_work_id': str(claim.work_id)}
             except ProviderBudgetExhausted:
                 await _join_provider_tasks(execution)
@@ -347,8 +349,11 @@ class ProviderWorkRunner:
                     return {'provider_lease_lost': True}
                 raise
             except Exception as error:
-                logger.warning('provider_turn_error work_id=%s snapshot_id=%s job_id=%s error_type=%s',
-                    claim.work_id, claim.snapshot_id, claim.job_id, type(error).__name__)
+                from shared.provider_observability import workflow_error_details
+                reason, locations = workflow_error_details(error)
+                logger.warning('provider_turn_error work_id=%s snapshot_id=%s job_id=%s generation=%s error_type=%s reason=%s locations=%s',
+                    claim.work_id, claim.snapshot_id, claim.job_id, claim.generation,
+                    type(error).__name__, reason, locations)
                 raise
             finally:
                 logger.info('provider_turn_ended work_id=%s snapshot_id=%s elapsed_s=%.3f',
