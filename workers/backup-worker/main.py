@@ -5113,6 +5113,12 @@ class BackupWorker:
                 failed = lossy
             elif continuation.get("resume_kind") == "partition_union":
                 await self._publish_copy_mail_state(snapshot, failed=failed)
+                if failed:
+                    async with async_session_factory() as session:
+                        if not await verify_copy_resume(session):
+                            raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before union rewind")
+                    if not await self._rewind_failed_partitioned_user_mail(snapshot.id):
+                        raise RuntimeError("failed union cursor rewind did not complete")
                 # Settled failures retain their evidence and must also release the carry barrier.
                 if not await self._patch_snapshot_extra_data(snapshot.id, {"mail_carry_forward_pending": False}):
                     raise ChatCatalogueWorkLeaseMoved("copy resume could not release the union carry barrier")
@@ -5268,12 +5274,17 @@ class BackupWorker:
         for state in states.values():
             if failed:
                 # Preserve failure evidence and rewind every staged advance.
+                rewind = {}
                 await self._persist_mail_delta_state(
                     uuid.UUID(state["resource_id"]), new_tokens={}, ok_token_keys=set(),
                     drained_fids=set(), fingerprints_now={},
-                    evicted_token_keys=set(state.get("ok_token_keys") or []),
+                    evicted_token_keys=(set(state.get("ok_token_keys") or [])
+                        | set(state.get("drained_fids") or []) | set(state.get("evicted_token_keys") or [])),
                     quiet_held_back=True, evict_reason="required copy failed",
+                    evict_result=rewind,
                 )
+                if not rewind.get("ok"):
+                    raise RuntimeError("failed copy cursor rewind did not complete")
             else:
                 await self._persist_mail_delta_state(
                     uuid.UUID(state["resource_id"]),
@@ -17444,6 +17455,9 @@ class BackupWorker:
             return
         try:
             async with async_session_factory() as s:
+                from shared.copy_workflow import verify_copy_resume
+                if not await verify_copy_resume(s):
+                    raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before parking cursor rewind")
                 await s.execute(text(
                     "UPDATE resources "
                     "   SET metadata = jsonb_set("
