@@ -59,7 +59,8 @@ def capture(monkeypatch):
         ProviderDeferred=ProviderDeferred, ProviderBudgetExhausted=ProviderBudgetExhausted,
         ProviderTurnDeferred=ProviderTurnDeferred,
         JobCancelledMidFlight=type("JobCancelledMidFlight", (Exception,), {}),
-        ChatCatalogueWorkLeaseMoved=type("ChatCatalogueWorkLeaseMoved", (Exception,), {}))
+        ChatCatalogueWorkLeaseMoved=type("ChatCatalogueWorkLeaseMoved", (Exception,), {}),
+        RunAbandoned=type("RunAbandoned", (Exception,), {}))
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
     worker = SimpleNamespace(worker_id="test-mail", ledger={})
     worker._shard_failure_ledger = lambda: worker.ledger

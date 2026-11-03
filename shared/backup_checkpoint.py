@@ -23,6 +23,26 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 
+def file_source_conflicts(source: dict, current: dict, *, drive_id: str) -> bool:
+    """Known disagreements abort capture; missing evidence only prevents resume."""
+    if not isinstance(source, dict) or not isinstance(current, dict):
+        return False
+    for key in ("id", "eTag", "cTag"):
+        if source.get(key) and current.get(key) and source[key] != current[key]:
+            return True
+    if source.get("size") is not None and current.get("size") is not None and source["size"] != current["size"]:
+        return True
+    for item in (source, current):
+        observed_drive = (item.get("parentReference") or {}).get("driveId")
+        if observed_drive and observed_drive != drive_id:
+            return True
+    source_hashes = (source.get("file") or {}).get("hashes") or {}
+    current_hashes = (current.get("file") or {}).get("hashes") or {}
+    return any(source_hashes.get(key) and current_hashes.get(key)
+               and source_hashes[key] != current_hashes[key]
+               for key in ("sha256Hash", "sha1Hash", "quickXorHash"))
+
+
 def file_receipt_matches(*, source: dict, current: dict, drive_id: str,
                          blob_path: Optional[str], content_size: int) -> bool:
     """A snapshot-owned blob is reusable only for the same observed file version.

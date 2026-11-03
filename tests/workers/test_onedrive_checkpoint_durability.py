@@ -138,11 +138,13 @@ class FakeGraph:
     def __init__(self):
         self.download_url_calls: list = []
 
-    async def get_download_urls_batch(self, drive_id, ids):
+    async def get_download_urls_batch(self, drive_id, ids, *, include_source_metadata=False):
         self.download_url_calls.extend(ids)
         # (url, real_size, quickXorHash) — empty hash keeps the dedup
         # lookup out of the picture.
-        return {i: (f"https://dl/{i}", 1024, "") for i in ids}
+        items = {item["id"]: item for item in FILES}
+        return {i: (f"https://dl/{i}", 1024, "", items[i])
+                if include_source_metadata else (f"https://dl/{i}", 1024, "") for i in ids}
 
 
 def _storage():

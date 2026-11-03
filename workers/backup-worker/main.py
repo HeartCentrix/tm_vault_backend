@@ -12890,6 +12890,7 @@ class BackupWorker:
                             "id": uuid.uuid4(),
                             "snapshot_id": snapshot.id,
                             "tenant_id": tenant.id,
+                            "backend_id": snapshot.backend_id,
                             "external_id": str(ext_id or uuid.uuid4()),
                             "item_type": item_type,
                             "name": (name or "")[:255],
@@ -13188,11 +13189,30 @@ class BackupWorker:
                             # OneDrive drives one worker replica runs — without it,
                             # an uncapped v2 run lets a single worker pick up
                             # every redelivered drive and thrash under memory.
-                            async with self._onedrive_backup_semaphore:
-                                _uploaded, att_bytes = await self._useronedrive_backup_files(
-                                    graph_client, resource, snapshot, tenant, drive_id, file_items,
-                                    expected_job_token=message.get("_job_lease_token"),
+                            from shared.provider_admission import ProviderDeferred
+                            from shared.provider_runtime import ProviderBudgetExhausted
+                            from shared.provider_work import ProviderWorkConflict
+                            try:
+                                async with self._onedrive_backup_semaphore:
+                                    _uploaded, att_bytes = await self._useronedrive_backup_files(
+                                        graph_client, resource, snapshot, tenant, drive_id, file_items,
+                                        expected_job_token=message.get("_job_lease_token"),
+                                    )
+                            except ProviderWorkConflict as exc:
+                                raise ChatCatalogueWorkLeaseMoved("OneDrive provider ownership moved") from exc
+                            except (JobCancelledMidFlight, ChatCatalogueWorkLeaseMoved,
+                                    RunAbandoned, ProviderDeferred, ProviderBudgetExhausted):
+                                raise
+                            except Exception as exc:
+                                # Required bytes were not durably linked. Preserve
+                                # this outcome even if recording its status fails.
+                                await self._record_enumeration_failure(
+                                    snapshot_id=snapshot.id,
+                                    reason="OneDrive required content persistence failed: " + type(exc).__name__,
+                                    partition_id=message.get("partitionId"),
+                                    resource_label=resource.display_name or str(resource.id),
                                 )
+                                return {"item_count": 0, "bytes_added": 0, "failed": True}
 
                 if att_items and resource.type == ResourceType.USER_CHATS:
                     from shared.snapshot_item_writes import snapshot_item_rows
@@ -13477,7 +13497,7 @@ class BackupWorker:
         from shared.provider_admission import ProviderDeferred
         from shared.provider_runtime import ProviderBudgetExhausted, ProviderTurnDeferred
         for _r in results:
-            if isinstance(_r, (JobCancelledMidFlight, ChatCatalogueWorkLeaseMoved,
+            if isinstance(_r, (JobCancelledMidFlight, ChatCatalogueWorkLeaseMoved, RunAbandoned,
                                ProviderDeferred, ProviderBudgetExhausted,
                                ProviderTurnDeferred, asyncio.CancelledError)):
                 raise _r
@@ -13498,6 +13518,8 @@ class BackupWorker:
             }
         item_count = sum(r.get("item_count", 0) for r in results if isinstance(r, dict))
         bytes_added = sum(r.get("bytes_added", 0) for r in results if isinstance(r, dict))
+        if any(isinstance(r, dict) and r.get("failed") for r in results):
+            return {"item_count": item_count, "bytes_added": bytes_added, "failed": True}
         return {"item_count": item_count, "bytes_added": bytes_added}
 
     # ==================== Tier 2 USER_MAIL attachment capture ====================
@@ -16785,9 +16807,19 @@ class BackupWorker:
         # the old code wrote the reason only on the IN_PROGRESS path.
         _outcome = "not_recorded"
         _final_status = None
+        from shared.provider_work import current_claim, _owned, ProviderWorkConflict
         try:
             async with async_session_factory() as _fs:
-                _live = await _fs.get(Snapshot, snapshot_id)
+                provider_claim = current_claim()
+                if provider_claim is not None:
+                    # Stream/storage adapters can stringify an ownership error.
+                    # Fence the status write itself, in the same transaction,
+                    # so that error cannot fail a replacement generation.
+                    _, _, _live, _ = await _owned(_fs, provider_claim, share_job=True)
+                    if str(_live.id) != str(snapshot_id):
+                        raise ProviderWorkConflict("provider failure target changed")
+                else:
+                    _live = await _fs.get(Snapshot, snapshot_id)
                 if _live is None:
                     _outcome = "row_gone"
                 else:
@@ -16819,6 +16851,8 @@ class BackupWorker:
                             "— reason recorded"
                         )
                     await _fs.commit()
+        except ProviderWorkConflict as exc:
+            raise ChatCatalogueWorkLeaseMoved("provider ownership moved before failure settlement") from exc
         except Exception as _mark_exc:
             print(
                 f"[{self.worker_id}] failed to mark snapshot "
@@ -20594,10 +20628,12 @@ class BackupWorker:
         implementation — partial-backup semantics pick remaining files up
         on the next run via the delta token.
         """
-        from shared.backup_checkpoint import BackupCheckpoint, file_receipt_matches
+        from shared.backup_checkpoint import BackupCheckpoint, file_receipt_matches, file_source_conflicts
         from shared.models import Job as _Job, SnapshotPartition as _Partition
-        from shared.provider_work import current_claim, _owned
+        from shared.provider_work import current_claim, _owned, ProviderWorkConflict
         from shared.copy_workflow import verify_copy_resume
+        from shared.provider_admission import ProviderDeferred
+        from shared.provider_runtime import ProviderBudgetExhausted, ProviderTurnDeferred
 
         v2_enabled = settings.ONEDRIVE_BACKUP_V2_ENABLED
         max_files = None if v2_enabled else self.LEGACY_USER_ONEDRIVE_MAX_FILES
@@ -20628,7 +20664,12 @@ class BackupWorker:
             if not await verify_copy_resume(session):
                 raise ChatCatalogueWorkLeaseMoved("OneDrive copy ownership moved")
             if provider_claim is not None:
-                _, job, live, partition = await _owned(session, provider_claim, share_job=True)
+                try:
+                    _, job, live, partition = await _owned(session, provider_claim, share_job=True)
+                except ProviderWorkConflict as exc:
+                    # Ownership loss must cross the legacy collectors as a
+                    # fence signal, never mark the replacement's run failed.
+                    raise ChatCatalogueWorkLeaseMoved("OneDrive provider ownership moved") from exc
             else:
                 # Shared bulk Job reads do not serialize unrelated resources.
                 job = await session.get(_Job, snapshot.job_id,
@@ -20688,8 +20729,9 @@ class BackupWorker:
                         checkpoint.record_file_done(external_id=external_id, size=size)
 
         file_sem = asyncio.Semaphore(file_concurrency)
-        state = {"uploaded_count": 0, "bytes_uploaded": 0}
+        state = {"uploaded_count": 0, "bytes_uploaded": 0, "failed_count": 0}
         updates: List[Tuple[str, str, int, str, Dict[str, Any]]] = []
+        download_sources: Dict[str, Dict[str, Any]] = {}
         state_lock = asyncio.Lock()
         total_files = len(ordered)
 
@@ -20707,7 +20749,7 @@ class BackupWorker:
             f"{total_files} files queued; pre-fetching download URLs "
             f"in $batch groups of 20",
         )
-        batch_url_map: Dict[str, Tuple[Optional[str], int, Optional[str]]] = {}
+        batch_url_map: Dict[str, tuple] = {}
         try:
             ordered_ids = [f["id"] for f in ordered if f.get("id") and not checkpoint.is_done(f["id"])]
             BATCH_SIZE = 20
@@ -20753,7 +20795,7 @@ class BackupWorker:
                     if abandoned["flag"]:
                         return
                     partial = await graph_client.get_download_urls_batch(
-                        drive_id, sub_ids,
+                        drive_id, sub_ids, include_source_metadata=True,
                     )
                 async with progress_lock:
                     batch_url_map.update(partial)
@@ -20774,7 +20816,13 @@ class BackupWorker:
                 _one_batch(ordered_ids[i:i + BATCH_SIZE], i // BATCH_SIZE)
                 for i in range(0, len(ordered_ids), BATCH_SIZE)
             ]
-            await asyncio.gather(*batch_tasks, return_exceptions=True)
+            prefetch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+            for result in prefetch_results:
+                if isinstance(result, ProviderWorkConflict):
+                    raise ChatCatalogueWorkLeaseMoved("OneDrive provider ownership moved") from result
+                if isinstance(result, (ProviderDeferred, ProviderBudgetExhausted,
+                                       ProviderTurnDeferred, asyncio.CancelledError)):
+                    raise result
             if abandoned["flag"]:
                 raise RunAbandoned(
                     f"snapshot {snapshot.id} went terminal during URL "
@@ -20790,6 +20838,10 @@ class BackupWorker:
             # NOT the non-fatal case — the run itself is dead. Propagate
             # so the caller stops instead of "falling back" into 49k
             # doomed serial fetches.
+            raise
+        except ChatCatalogueWorkLeaseMoved:
+            raise
+        except (ProviderDeferred, ProviderBudgetExhausted):
             raise
         except Exception as exc:
             # Non-fatal — per-file path re-fetches as needed.
@@ -20926,6 +20978,32 @@ class BackupWorker:
                     committed_count = checkpoint.files_done_count + len(pending)
                     committed_bytes = checkpoint.bytes_done + sum(row[2] for row in pending)
 
+                # Source metadata can change between enumeration, URL resolution
+                # and transfer. Re-read in bounded batches before opening the
+                # fenced write transaction. A missing version permits capture,
+                # but cannot create a trusted resume receipt.
+                for start in range(0, len(pending), 20):
+                    chunk = pending[start:start + 20]
+                    try:
+                        verified = await graph_client.get_download_urls_batch(
+                            drive_id, [row[0] for row in chunk], include_source_metadata=True)
+                    except ProviderWorkConflict as exc:
+                        raise ChatCatalogueWorkLeaseMoved("OneDrive provider ownership moved") from exc
+                    for ext_id, bp, size, _sha, extra in chunk:
+                        descriptor = download_sources.get(ext_id) or {}
+                        result = verified.get(ext_id)
+                        after = result[3] if result and len(result) > 3 else {}
+                        observed = current_files[ext_id]
+                        if (file_source_conflicts(descriptor, after, drive_id=drive_id)
+                            or file_source_conflicts(observed, after, drive_id=drive_id)):
+                            raise EnumerationFailed("OneDrive source version changed during download")
+                        extra.pop("onedrive_download_source", None)
+                        if (file_receipt_matches(source=descriptor, current=observed,
+                                drive_id=drive_id, blob_path=bp, content_size=size)
+                            and file_receipt_matches(source=descriptor, current=after,
+                                drive_id=drive_id, blob_path=bp, content_size=size)):
+                            extra["onedrive_download_source"] = descriptor
+
                 import json as _json
                 from sqlalchemy import text as _sqltext
                 # external_ids whose row the UPDATE actually matched. Only
@@ -21022,8 +21100,8 @@ class BackupWorker:
         async def _periodic_flusher():
             """Run until `flush_done_evt` fires: wake every
             `flush_interval_s` *or* when backlog crosses the cap,
-            then flush. Exceptions logged but swallowed so flusher
-            never takes down the gather."""
+            then flush. Transient write failures retain the buffer for
+            retry; source conflicts and provider control flow propagate."""
             while not flush_done_evt.is_set():
                 try:
                     await asyncio.wait_for(
@@ -21040,6 +21118,9 @@ class BackupWorker:
                     pass
                 try:
                     await _flush_updates()
+                except (EnumerationFailed, ChatCatalogueWorkLeaseMoved,
+                        ProviderDeferred, ProviderBudgetExhausted):
+                    raise
                 except Exception as fe:
                     print(
                         f"[{self.worker_id}] [USER_ONEDRIVE] periodic "
@@ -21099,18 +21180,24 @@ class BackupWorker:
                 # (or the batch call failed entirely).
                 batch_hit = batch_url_map.get(file_id)
                 if batch_hit and batch_hit[0]:
-                    download_url, real_size, qxh = batch_hit
+                    download_url, real_size, qxh, descriptor = batch_hit
                     if real_size <= 0:
                         real_size = size_hint
                 else:
                     try:
-                        download_url, real_size, qxh = await graph_client.get_download_url(drive_id, file_id)
+                        download_url, real_size, qxh, descriptor = await graph_client.get_download_url(
+                            drive_id, file_id, include_source_metadata=True)
+                    except ProviderWorkConflict as exc:
+                        raise ChatCatalogueWorkLeaseMoved("OneDrive provider ownership moved") from exc
+                    except (ProviderDeferred, ProviderBudgetExhausted):
+                        raise
                     except GraphRetryExhaustedError as e:
                         # Transient exhaustion (429 storm / 5xx) — the file
                         # is real and downloadable; skipping it silently
                         # dropped ordinary files from "successful"
                         # snapshots. Route through the retry queue so it
                         # is counted and re-attempted.
+                        state["failed_count"] += 1
                         err_text = f"get_download_url exhausted: {e}"
                         print(f"[{self.worker_id}] [USER_ONEDRIVE] download-url fetch failed for {file_name}: {err_text}; enqueueing retry")
                         await self._enqueue_onedrive_retry(
@@ -21123,9 +21210,11 @@ class BackupWorker:
                         # 'file' facet but aren't downloadable — skip silently.
                         if "downloadurl" in str(e).lower() or "download url" in str(e).lower():
                             return
+                        state["failed_count"] += 1
                         print(f"[{self.worker_id}] [USER_ONEDRIVE] download-url fetch failed for {file_name}: {e}")
                         return
                     except Exception as e:
+                        state["failed_count"] += 1
                         err_text = f"get_download_url: {type(e).__name__}: {e}"
                         print(f"[{self.worker_id}] [USER_ONEDRIVE] download-url fetch failed for {file_name}: {err_text}; enqueueing retry")
                         await self._enqueue_onedrive_retry(
@@ -21133,6 +21222,10 @@ class BackupWorker:
                             file_payload=f, drive_id=drive_id, err_text=err_text,
                         )
                         return
+
+                if file_source_conflicts(f, descriptor, drive_id=drive_id):
+                    raise EnumerationFailed("OneDrive source version changed before download")
+                download_sources[file_id] = descriptor
 
                 # Streaming pipeline (SeaweedFS/on-prem backend) —
                 # Graph-signed URL is piped directly into the storage
@@ -21233,6 +21326,7 @@ class BackupWorker:
                             upload_result = await _stream_pipe()
                         sha256 = upload_result.get("content_sha256") or ""
                 except asyncio.TimeoutError:
+                    state["failed_count"] += 1
                     print(f"[{self.worker_id}] [USER_ONEDRIVE] timeout for {file_name} (>{per_file_timeout}s); enqueueing retry")
                     await self._enqueue_onedrive_retry(
                         tenant=tenant, resource=resource, snapshot=snapshot,
@@ -21240,7 +21334,12 @@ class BackupWorker:
                         err_text=f"TimeoutError: >{per_file_timeout}s",
                     )
                     return
+                except ProviderWorkConflict as exc:
+                    raise ChatCatalogueWorkLeaseMoved("OneDrive provider ownership moved") from exc
+                except (ProviderDeferred, ProviderBudgetExhausted):
+                    raise
                 except Exception as e:
+                    state["failed_count"] += 1
                     err_text = f"{type(e).__name__}: {e}"
                     print(f"[{self.worker_id}] [USER_ONEDRIVE] stream-backup failed for {file_name}: {err_text}")
                     await self._enqueue_onedrive_retry(
@@ -21250,6 +21349,7 @@ class BackupWorker:
                     return
 
                 if not upload_result.get("success"):
+                    state["failed_count"] += 1
                     err_msg = str(upload_result.get('error') or "")
                     print(f"[{self.worker_id}] [USER_ONEDRIVE] blob upload failed for {file_name}: {err_msg}")
                     await self._enqueue_onedrive_retry(
@@ -21261,9 +21361,6 @@ class BackupWorker:
 
                 extra_patch = {
                     "raw": f,
-                    "onedrive_download_source": {key: f[key] for key in (
-                        "id", "name", "size", "eTag", "cTag", "parentReference", "file",
-                    ) if key in f},
                     "sha256": sha256,
                     "quickxor": qxh,
                     "blobbed_at": datetime.utcnow().isoformat() + "Z",
@@ -21310,6 +21407,10 @@ class BackupWorker:
             await flusher_task
             await _flush_updates()
 
+        if state["failed_count"]:
+            raise EnumerationFailed(
+                f"OneDrive required file content failed for {state['failed_count']} file(s)")
+
         print(
             f"[{self.worker_id}] [USER_ONEDRIVE] blobbed {state['uploaded_count']}/{len(ordered)} files "
             f"({state['bytes_uploaded']} bytes, v2={v2_enabled}, "
@@ -21319,11 +21420,10 @@ class BackupWorker:
 
     # ==================== Tier 2 OneDrive per-file retry queue ====================
     #
-    # A file that exhausts its inline resume budget no longer blocks
-    # snapshot completion. _process_one in _useronedrive_backup_files
-    # captures the failure, calls _enqueue_onedrive_retry to insert a
-    # row into onedrive_file_retries, and returns. The snapshot
-    # completes with its other files; this row sits in the queue.
+    # A file that exhausts its inline resume budget is enqueued for
+    # rescue. The helper flushes its successful files, then reports the
+    # required-content failure so completion cannot advance the delta
+    # cursor while missing bytes remain in the queue.
     #
     # _onedrive_retry_consumer_loop (background asyncio task spawned
     # from start()) polls the table on a fixed interval, claims rows
@@ -26403,8 +26503,10 @@ class BackupWorker:
         result = await self._backup_user_content_parallel(
             [resource], graph_client, tenant, message, job_id,
         )
-        if result.get("copy_waiting"):
+        if result.get("copy_waiting") or result.get("chat_inventory_format") == 1:
             return result
+        if result.get("failed"):
+            raise EnumerationFailed("Tier-2 required content backup failed")
         # Make the outer "ghost" snapshot reflect the parallel handler's
         # totals so the UI doesn't show two rows (one with 0 items, one
         # with the real count) for the same trigger.

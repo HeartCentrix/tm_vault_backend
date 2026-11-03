@@ -6998,12 +6998,17 @@ class GraphClient:
         self,
         drive_id: str,
         item_ids: "List[str]",
-    ) -> "Dict[str, Tuple[Optional[str], int, Optional[str]]]":
+        *,
+        include_source_metadata: bool = False,
+    ) -> Dict[str, tuple]:
         """Bulk-fetch downloadUrl + size + quickXorHash for up to N items
         via /v1.0/$batch. Returns a map {item_id: (download_url, size,
         quickXorHash)} — download_url may be None when the item is a
         cloud-native object (Whiteboard, OneNote, Loop component) with
         no downloadable bytes.
+
+        include_source_metadata appends a fourth element containing the
+        observed item identity/version, excluding the signed download URL.
 
         Enterprise win: the per-file GET /drives/{}/items/{} call is
         the serial bottleneck on many-small-files drives. For 10k
@@ -7021,6 +7026,7 @@ class GraphClient:
         from shared.graph_batch import BatchReadError, BatchRequest
         from shared.provider_admission import ProviderDeferred
         from shared.provider_runtime import ProviderBudgetExhausted
+        from shared.provider_work import ProviderWorkConflict
         if not item_ids:
             return {}
         reqs = [
@@ -7030,10 +7036,10 @@ class GraphClient:
             )
             for iid in item_ids
         ]
-        out: Dict[str, Tuple[Optional[str], int, Optional[str]]] = {}
+        out: Dict[str, tuple] = {}
         try:
             responses = await self.batch(reqs)
-        except (ProviderDeferred, ProviderBudgetExhausted):
+        except (ProviderDeferred, ProviderBudgetExhausted, ProviderWorkConflict):
             raise
         except BatchReadError as exc:
             responses = exc.responses
@@ -7055,7 +7061,7 @@ class GraphClient:
         for iid in item_ids:
             resp = responses.get(iid)
             if resp is None or resp.status != 200:
-                out[iid] = (None, 0, None)
+                out[iid] = (None, 0, None, {}) if include_source_metadata else (None, 0, None)
                 continue
             body = resp.body or {}
             du = body.get("@microsoft.graph.downloadUrl")
@@ -7066,10 +7072,14 @@ class GraphClient:
                 .get("quickXorHash")
             )
             out[iid] = (du, size, qxh)
+            if include_source_metadata:
+                out[iid] += ({key: body[key] for key in (
+                    "id", "name", "size", "eTag", "cTag", "parentReference", "file",
+                ) if key in body},)
         return out
 
     async def get_download_url(self, drive_id: str, item_id: str,
-                               max_attempts: int = 3) -> Tuple[str, int, Optional[str]]:
+                               max_attempts: int = 3, *, include_source_metadata: bool = False) -> tuple:
         """
         Reliably obtain a fresh @microsoft.graph.downloadUrl for a drive item.
 
@@ -7081,7 +7091,8 @@ class GraphClient:
           - Some file types (whiteboards, notebooks, packages) have NO download URL
             even though they have a 'file' facet — these are cloud-native objects.
 
-        Returns: (download_url, size_bytes, quick_xor_hash_or_none)
+        Returns: (download_url, size_bytes, quick_xor_hash_or_none).
+        include_source_metadata appends the observed item identity/version.
         Raises: RuntimeError if the item itself is not downloadable (callers
         string-match 'downloadUrl' in that message to skip cloud-native
         objects silently — the message contract matters).
@@ -7094,12 +7105,17 @@ class GraphClient:
         # For app-only access, do NOT use $select - Graph ignores it or strips downloadUrl
         # for application permission tokens. Get the full item and extract what we need.
         url = f"{self.GRAPH_URL}/drives/{drive_id}/items/{item_id}"
+        from shared.provider_admission import ProviderDeferred
+        from shared.provider_runtime import ProviderBudgetExhausted
+        from shared.provider_work import ProviderWorkConflict
         last_error = None
         fetch_failed = False  # True when the LAST attempt never saw the item
         for attempt in range(max_attempts):
             item = None
             try:
                 item = await self._get(url)
+            except (ProviderDeferred, ProviderBudgetExhausted, ProviderWorkConflict):
+                raise
             except Exception as e:
                 last_error = str(e)
                 fetch_failed = True
@@ -7113,6 +7129,10 @@ class GraphClient:
                 qxh = (item.get("file") or {}).get("hashes", {}).get("quickXorHash")
                 file_facet = item.get("file")
                 if download_url:
+                    if include_source_metadata:
+                        return download_url, size, qxh, {key: item[key] for key in (
+                            "id", "name", "size", "eTag", "cTag", "parentReference", "file",
+                        ) if key in item}
                     return download_url, size, qxh
                 # DEBUG: log what Graph returned
                 keys = list(item.keys()) if isinstance(item, dict) else "not a dict"

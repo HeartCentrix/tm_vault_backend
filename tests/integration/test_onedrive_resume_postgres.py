@@ -53,9 +53,12 @@ async def setup_worker(store, bw, monkeypatch, items, *, blob=False, legacy=Fals
     monkeypatch.setenv("ONEDRIVE_RETRY_QUEUE_ENABLED", "false")
     calls = []
 
-    async def urls(drive_id, ids):
+    source_items = {item["id"]: deepcopy(item) for item in items}
+
+    async def urls(drive_id, ids, *, include_source_metadata=False):
         calls.extend(ids)
-        return {key: (f"https://download.invalid/{key}", 1024, "") for key in ids}
+        return {key: (f"https://download.invalid/{key}", 1024, "", deepcopy(source_items[key]))
+                if include_source_metadata else (f"https://download.invalid/{key}", 1024, "") for key in ids}
 
     async def stream(**kwargs):
         return {"success": True, "content_sha256": "content-digest"}
@@ -69,6 +72,7 @@ async def setup_worker(store, bw, monkeypatch, items, *, blob=False, legacy=Fals
     bw._PARTITION_LEASE_CTX.set(None)
 
     async def run(current=None, **kwargs):
+        source_items.update({item["id"]: deepcopy(item) for item in (items if current is None else current)})
         async with store.factory() as session:
             snapshot = await session.get(models.Snapshot, scope.snapshot_id)
             resource = await session.get(models.Resource, store.resource)
@@ -76,14 +80,14 @@ async def setup_worker(store, bw, monkeypatch, items, *, blob=False, legacy=Fals
         return await worker._useronedrive_backup_files(graph, resource, snapshot, tenant,
             "drive-A", deepcopy(items if current is None else current), **kwargs)
 
-    return SimpleNamespace(scope=scope, worker=worker, run=run, calls=calls)
+    return SimpleNamespace(scope=scope, worker=worker, graph=graph, run=run, calls=calls)
 
 
 async def test_repeated_delta_id_downloads_only_latest_observed_version(store, bw, monkeypatch):
     original, latest = file_item(), file_item(eTag="version-2")
     env = await setup_worker(store, bw, monkeypatch, [original])
     assert await env.run([original, latest]) == (1, 1024)
-    assert env.calls == ["file-1"]
+    assert env.calls == ["file-1", "file-1"]
     async with store.factory() as session:
         row = await session.scalar(select(models.SnapshotItem).where(models.SnapshotItem.snapshot_id == env.scope.snapshot_id))
         assert row.extra_data["raw"]["eTag"] == "version-2"
@@ -106,7 +110,7 @@ async def test_sibling_job_checkpoint_eviction_does_not_repeat_durable_downloads
         job = await session.get(models.Job, (await session.get(models.Snapshot, env.scope.snapshot_id)).job_id)
         job.result = sibling_result
     assert await env.run() == (0, 0)
-    assert env.calls == ["file-1"]
+    assert env.calls == ["file-1", "file-1"]
     async with store.factory() as session:
         job = await session.get(models.Job, (await session.get(models.Snapshot, env.scope.snapshot_id)).job_id)
         assert job.result == sibling_result
@@ -144,7 +148,7 @@ async def test_concurrent_shards_keep_both_sets_of_durable_receipts(store, bw, m
 
     assert await asyncio.gather(shard(0), shard(1)) == [(1, 1024), (1, 1024)]
     assert await asyncio.gather(shard(0), shard(1)) == [(0, 0), (0, 0)]
-    assert sorted(env.calls) == ["file-1", "file-2"]
+    assert sorted(env.calls) == ["file-1", "file-1", "file-2", "file-2"]
 
 
 @pytest.mark.parametrize("kind", ["metadata_only", "changed_version", "changed_drive", "unknown_version", "changed_size", "legacy_unstamped"])
@@ -182,7 +186,7 @@ async def test_metadata_rewrite_cannot_relabel_previously_downloaded_bytes(store
         # its bytes. The downloaded-source receipt must remain independent.
         row.extra_data = {**row.extra_data, "raw": latest}
     assert await env.run([latest]) == (1, 1024)
-    assert env.calls == ["file-1", "file-1"]
+    assert env.calls == ["file-1"] * 4
 
 
 async def test_unmatched_required_row_cannot_report_success(store, bw, monkeypatch):
