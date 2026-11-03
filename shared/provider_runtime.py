@@ -9,7 +9,7 @@ import logging
 import os
 import time
 from uuid import uuid4
-from sqlalchemy import and_, exists, func, or_, select
+from sqlalchemy import exists, func, select
 from shared import provider_work as work
 from shared.models import ProviderWork, ProviderWorkUnit, Snapshot, SnapshotPartition
 from shared.provider_admission import ProviderDeferred
@@ -255,7 +255,6 @@ class ProviderWorkRunner:
         self.owner_id, self.budget = owner_id or uuid4(), budget or execution_budget()
         self._tasks, self._closing = set(), False
         self._wake = asyncio.Event()
-        self._settlement_cursor = None
 
     def wake(self):
         self._wake.set()
@@ -315,7 +314,7 @@ class ProviderWorkRunner:
                         await work.finish_work(session, claim)
                 renewer.cancel()
                 await asyncio.gather(renewer, return_exceptions=True)
-                await self.settle_callback(claim.work_id)
+                await self.settle_once(claim.work_id)
                 return result
             except (ProviderDeferred, ProviderTurnDeferred) as deferred:
                 error = deferred.error if isinstance(deferred, ProviderTurnDeferred) else deferred
@@ -335,7 +334,9 @@ class ProviderWorkRunner:
                 with work.work_scope(claim):
                     async with self.factory.begin() as session:
                         await work.fail_exhausted_work(session, claim)
-                await self.settle_callback(claim.work_id)
+                renewer.cancel()
+                await asyncio.gather(renewer, return_exceptions=True)
+                await self.settle_once(claim.work_id)
                 return {'provider_exhausted': True, 'provider_work_id': str(claim.work_id)}
             except asyncio.CancelledError:
                 await _join_provider_tasks(execution)
@@ -376,20 +377,28 @@ class ProviderWorkRunner:
                 await asyncio.wait_for(self._wake.wait(), self.poll_s)
             self._wake.clear()
 
+    async def settle_once(self, work_id=None):
+        async with self.budget.permit(control=True):
+            async with self.factory.begin() as session:
+                claim = await work.claim_parent_settlement(session, owner_id=self.owner_id, work_id=work_id)
+            if claim is None:
+                return False
+            try:
+                with work.settling_parent(claim):
+                    # Leave recovery time inside the 120-second claim if a callback stalls.
+                    async with asyncio.timeout(60):
+                        await self.settle_callback(claim.work_id)
+            finally:
+                async with self.factory.begin() as session:
+                    await work.release_parent_settlement(session, claim)
+            return True
+
     async def _settle(self):
         while not self._closing:
             try:
-                async with self.budget.permit(control=True):
-                    async with self.factory() as session:
-                        query = select(ProviderWork.id, ProviderWork.created_at).where(ProviderWork.parent_settle_pending)
-                        if self._settlement_cursor is not None:
-                            created, key = self._settlement_cursor
-                            query = query.where(or_(ProviderWork.created_at > created,
-                                and_(ProviderWork.created_at == created, ProviderWork.id > key)))
-                        rows = (await session.execute(query.order_by(ProviderWork.created_at, ProviderWork.id).limit(32))).all()
-                        self._settlement_cursor = (rows[-1].created_at, rows[-1].id) if rows else None
-                    for work_id, _ in rows:
-                        await self.settle_callback(work_id)
+                for _ in range(32):
+                    if self._closing or not await self.settle_once():
+                        break
             except asyncio.CancelledError:
                 raise
             except Exception as error:
