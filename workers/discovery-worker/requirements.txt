@@ -29,3 +29,6 @@ prometheus_client>=0.20.0
 
 # Alembic for prod-safe schema migrations
 alembic>=1.13.0,<2
+
+# Required by the shared Graph admission coordinator at worker startup.
+redis==5.0.3
