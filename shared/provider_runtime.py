@@ -157,7 +157,7 @@ def current_unit():
 
 @asynccontextmanager
 async def provider_live_wait_scope():
-    """Keep bounded chat observations alive through local admission contention."""
+    """Keep bounded source preparation alive through local admission contention."""
     execution, unit = current_execution(), current_unit()
     remaining = ((unit.deadline_at - datetime.now(timezone.utc)).total_seconds()
                  if unit else 1800)

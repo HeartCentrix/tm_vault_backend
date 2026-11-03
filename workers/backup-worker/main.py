@@ -20710,7 +20710,8 @@ class BackupWorker:
         from shared.copy_workflow import verify_copy_resume
         from shared.provider_admission import ProviderDeferred
         from shared.provider_runtime import (ProviderBudgetExhausted, ProviderTurnDeferred,
-            provider_transfer_scope, provider_drain_callback, provider_receipt_scope)
+            provider_transfer_scope, provider_drain_callback, provider_receipt_scope,
+            provider_live_wait_scope)
 
         v2_enabled = settings.ONEDRIVE_BACKUP_V2_ENABLED
         max_files = None if v2_enabled else self.LEGACY_USER_ONEDRIVE_MAX_FILES
@@ -20812,122 +20813,60 @@ class BackupWorker:
         state_lock = asyncio.Lock()
         total_files = len(ordered)
 
-        # ---- $batch download-URL pre-fetch ----
-        # Bundle /drives/{}/items/{} GETs 20-at-a-time so the serial
-        # per-file call to Graph happens once per ~20 files instead
-        # of once per file. At 10k files / ~200 ms per GET that's
-        # ~33 min of URL-fetching wire-time collapsed to ~1.5 min,
-        # without changing per-request Graph cost. If $batch errors
-        # or returns an empty URL for an item, the per-file path
-        # falls back to the original single get_download_url call
-        # so nothing regresses.
+        # Resolve URLs only when a file consumer needs its batch. Waiting on
+        # every partition URL first discarded ready work on provider deferral.
+        pending_ids = [f["id"] for f in ordered
+                       if not checkpoint.is_done(f["id"]) and int(f.get("size") or 0) > 0]
+        batch_positions = {key: index // 20 for index, key in enumerate(pending_ids)}
+        prefetch_concurrency = max(1, min(file_concurrency,
+            int(os.getenv("ONEDRIVE_PREFETCH_CONCURRENCY", "16"))))
+        prefetch_sem = asyncio.Semaphore(prefetch_concurrency)
+        url_batches: Dict[int, asyncio.Task] = {}
+        resolved_batches = 0
         print(
             f"[{self.worker_id}] [USER_ONEDRIVE] {resource.display_name}: "
-            f"{total_files} files queued; pre-fetching download URLs "
-            f"in $batch groups of 20",
+            f"{len(pending_ids)}/{total_files} files pending; resolving URL batches on demand",
         )
-        batch_url_map: Dict[str, tuple] = {}
-        try:
-            ordered_ids = [f["id"] for f in ordered if f.get("id") and not checkpoint.is_done(f["id"])]
-            BATCH_SIZE = 20
-            # Parallel fan-out: previously this loop awaited each batch
-            # call before issuing the next, so 540 URLs took ~10 min
-            # whenever the chats handler was co-running and hogging
-            # Graph budget (each batch sat in the rate-limiter queue
-            # behind every chat message). Firing batches concurrently
-            # under a bounded semaphore lets pre-fetch claim its fair
-            # share of the Graph budget and finish in ~30-60s even with
-            # chats running.
-            #
-            # Default raised from 6 to 16: the original 6 assumed a
-            # single Graph app's 10 RPS ceiling. With the multi-app
-            # pool (12 apps observed rotating in prod) the per-tenant
-            # effective ceiling is ~40+ RPS, so 16 concurrent batches
-            # × ~1s wire still leaves headroom for the chats handler
-            # to fan out in parallel. Field measurement showed fast
-            # tenants saturating at 22 URL/s with concurrency=14;
-            # bumping to 16 captures that headroom for the median
-            # tenant. Throttled tenants are bounded by Graph budget
-            # not local concurrency — they'll see no harm. Operators
-            # can still tune via ONEDRIVE_PREFETCH_CONCURRENCY.
-            prefetch_concurrency = int(os.getenv(
-                "ONEDRIVE_PREFETCH_CONCURRENCY", "16"
-            ))
-            sem = asyncio.Semaphore(prefetch_concurrency)
-            _prefetch_t0 = time.monotonic()
-            total_batches = (len(ordered_ids) + BATCH_SIZE - 1) // BATCH_SIZE
-            done_batches = {"n": 0}
-            progress_lock = asyncio.Lock()
-            # Liveness abort: when the snapshot this prefetch serves is
-            # failed/cancelled under us (stale sweep, operator cancel),
-            # stop immediately. A swept run's consumer once kept
-            # resolving 49k URLs for 16.8h under 429 retry-after-300
-            # storms, starving every live backup on the app pool.
-            abandoned = {"flag": False}
 
-            async def _one_batch(sub_ids: List[str], batch_idx: int):
-                if abandoned["flag"]:
-                    return
-                async with sem:
-                    if abandoned["flag"]:
-                        return
+        async def _fetch_url_batch(batch_index):
+            nonlocal resolved_batches
+            ids = pending_ids[batch_index * 20:(batch_index + 1) * 20]
+            async with prefetch_sem, provider_live_wait_scope():
+                if not await self._snapshot_still_live(snapshot.id):
+                    raise RunAbandoned(f"snapshot {snapshot.id} went terminal before URL resolution")
+                started = time.monotonic()
+                try:
                     partial = await graph_client.get_download_urls_batch(
-                        drive_id, sub_ids, include_source_metadata=True,
-                    )
-                async with progress_lock:
-                    batch_url_map.update(partial)
-                    done_batches["n"] += 1
-                    # Progress every 10 batches (~200 URLs) — keeps
-                    # large drives visible without log spam.
-                    if done_batches["n"] % 10 == 0 or done_batches["n"] == total_batches:
-                        print(
-                            f"[{self.worker_id}] [USER_ONEDRIVE] "
-                            f"url pre-fetch: "
-                            f"{min(done_batches['n'] * BATCH_SIZE, len(ordered_ids))}/"
-                            f"{len(ordered_ids)} URLs resolved",
-                        )
-                        if not await self._snapshot_still_live(snapshot.id):
-                            abandoned["flag"] = True
+                        drive_id, ids, include_source_metadata=True)
+                except ProviderWorkConflict as exc:
+                    raise ChatCatalogueWorkLeaseMoved("OneDrive provider ownership moved") from exc
+                except (ChatCatalogueWorkLeaseMoved, ProviderDeferred, ProviderBudgetExhausted):
+                    raise
+                except Exception as exc:
+                    print(f"[{self.worker_id}] [USER_ONEDRIVE] URL batch failed "
+                          f"({type(exc).__name__}); resolving missing URLs per file")
+                    partial = {}
+                resolved_batches += 1
+                if resolved_batches == 1 or resolved_batches % 10 == 0:
+                    print(f"[{self.worker_id}] [USER_ONEDRIVE] URL batch ready "
+                          f"({len(partial)}/{len(ids)} entries, {time.monotonic() - started:.1f}s; "
+                          f"{resolved_batches} batches resolved)")
+                # Missing results remain placeholders until each consumer has
+                # taken its fallback, so a partial batch is not fetched again.
+                return {key: partial.get(key) for key in ids}
 
-            batch_tasks = [
-                _one_batch(ordered_ids[i:i + BATCH_SIZE], i // BATCH_SIZE)
-                for i in range(0, len(ordered_ids), BATCH_SIZE)
-            ]
-            prefetch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
-            for result in prefetch_results:
-                if isinstance(result, ProviderWorkConflict):
-                    raise ChatCatalogueWorkLeaseMoved("OneDrive provider ownership moved") from result
-                if isinstance(result, (ProviderDeferred, ProviderBudgetExhausted,
-                                       ProviderTurnDeferred, asyncio.CancelledError)):
-                    raise result
-            if abandoned["flag"]:
-                raise RunAbandoned(
-                    f"snapshot {snapshot.id} went terminal during URL "
-                    f"pre-fetch ({done_batches['n']}/{total_batches} batches)"
-                )
-            print(
-                f"[{self.worker_id}] [USER_ONEDRIVE] url pre-fetch "
-                f"done ({len(batch_url_map)}/{len(ordered_ids)} "
-                f"urls in {time.monotonic() - _prefetch_t0:.1f}s, "
-                f"concurrency={prefetch_concurrency})",
-            )
-        except RunAbandoned:
-            # NOT the non-fatal case — the run itself is dead. Propagate
-            # so the caller stops instead of "falling back" into 49k
-            # doomed serial fetches.
-            raise
-        except ChatCatalogueWorkLeaseMoved:
-            raise
-        except (ProviderDeferred, ProviderBudgetExhausted):
-            raise
-        except Exception as exc:
-            # Non-fatal — per-file path re-fetches as needed.
-            print(
-                f"[{self.worker_id}] [USER_ONEDRIVE] batch URL "
-                f"pre-fetch failed: {type(exc).__name__}: {exc}; "
-                f"falling back to serial get_download_url",
-            )
-            batch_url_map = {}
+        async def _download_url_for(file_id):
+            batch_index = batch_positions[file_id]
+            task = url_batches.get(batch_index)
+            if task is None:
+                task = asyncio.create_task(_fetch_url_batch(batch_index))
+                url_batches[batch_index] = task
+            # One cancelled file must not cancel metadata shared by siblings.
+            results = await asyncio.shield(task)
+            result = results.pop(file_id)
+            if not results:
+                del url_batches[batch_index]
+            return result
 
         # Large-file threshold for parallel chunk download. Configurable
         # so operators can tune per environment.
@@ -21261,7 +21200,7 @@ class BackupWorker:
                 # Prefer the pre-fetched $batch URL; only fall back to
                 # a serial GET if $batch returned nothing for this file
                 # (or the batch call failed entirely).
-                batch_hit = batch_url_map.get(file_id)
+                batch_hit = await _download_url_for(file_id)
                 if batch_hit and batch_hit[0]:
                     download_url, real_size, qxh, descriptor = batch_hit
                     if real_size <= 0:
@@ -21477,7 +21416,19 @@ class BackupWorker:
         # snap counters so the UI shows progress in real time.
         with provider_drain_callback(_flush_updates):
             flusher_task = asyncio.create_task(_periodic_flusher())
-            download_tasks = [asyncio.create_task(_process_one(f)) for f in ordered]
+            remaining_files = iter(ordered)
+
+            async def _download_worker():
+                for item in remaining_files:
+                    batch_index = batch_positions.get(item["id"])
+                    if batch_index is not None and batch_index not in url_batches:
+                        # Commit ready bytes before another metadata request can
+                        # put this turn into a real provider cooldown.
+                        await _flush_updates()
+                    await _process_one(item)
+
+            download_tasks = [asyncio.create_task(_download_worker())
+                              for _ in range(min(file_concurrency, len(ordered)))]
             try:
                 await asyncio.gather(*download_tasks)
             finally:
@@ -21487,6 +21438,11 @@ class BackupWorker:
                     if not task.done():
                         task.cancel()
                 await asyncio.gather(*download_tasks, return_exceptions=True)
+                for task in url_batches.values():
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*url_batches.values(), return_exceptions=True)
+                url_batches.clear()
                 flush_done_evt.set()
                 backlog_high_evt.set()
                 await flusher_task
