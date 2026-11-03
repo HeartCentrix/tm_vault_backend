@@ -100,6 +100,7 @@ class _FakeEngine:
 
 
 def _boot_statements(monkeypatch):
+    monkeypatch.setenv("DB_SCHEMA_MODE", "bootstrap")
     fake = _FakeEngine()
     monkeypatch.setattr(db_mod, "engine", fake)
 
@@ -154,3 +155,24 @@ def test_boot_ddl_issues_no_concurrent_index_build(monkeypatch):
     assert offenders == [], (
         f"CONCURRENTLY inside init_db's transaction: {offenders}"
     )
+
+
+def test_runtime_boot_only_verifies_schema(monkeypatch):
+    from unittest.mock import AsyncMock
+    monkeypatch.delenv('DB_SCHEMA_MODE', raising=False)
+    ready = AsyncMock(return_value=True)
+    monkeypatch.setattr(db_mod, 'verify_runtime_schema', ready, raising=False)
+    fake = _FakeEngine()
+    monkeypatch.setattr(db_mod, 'engine', fake)
+    asyncio.run(db_mod.init_db())
+    ready.assert_awaited_once()
+    assert fake.statements == []
+
+
+def test_runtime_boot_rejects_missing_schema(monkeypatch):
+    from unittest.mock import AsyncMock
+    import pytest
+    monkeypatch.setenv('DB_SCHEMA_MODE', 'verify')
+    monkeypatch.setattr(db_mod, 'verify_runtime_schema', AsyncMock(return_value=False), raising=False)
+    with pytest.raises(RuntimeError, match='schema.*incomplete'):
+        asyncio.run(db_mod.init_db())

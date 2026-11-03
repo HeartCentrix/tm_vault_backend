@@ -391,8 +391,34 @@ def _prune_existing_add_columns(statements, existing_columns):
     return kept
 
 
+async def verify_runtime_schema() -> bool:
+    """Read-only runtime readiness; schema changes belong to an offline bootstrap."""
+    from shared import models  # Register all model tables before checking columns.
+    async with engine.connect() as conn:
+        await conn.execute(text("SET LOCAL statement_timeout='10s'"))
+        await conn.execute(text("SET LOCAL lock_timeout='2s'"))
+        columns = set((await conn.execute(text(
+            "SELECT table_name,column_name FROM information_schema.columns WHERE table_schema=:schema"
+        ), {"schema": settings.DB_SCHEMA})).all())
+        required = {(table.name, column.name) for table in Base.metadata.tables.values()
+                    for column in table.columns}
+        if not required.issubset(columns):
+            logger.error("[DB INIT] Missing schema columns: %s", sorted(required-columns))
+            return False
+        return await _has_required_catalogue_constraints(conn)
+
+
 async def init_db() -> None:
-    """Create schema objects on first boot and wait for readiness on contended boot."""
+    """Verify at runtime; explicit offline bootstrap retains the legacy schema setup."""
+    mode = os.getenv("DB_SCHEMA_MODE", "verify").lower()
+    if mode == "verify":
+        if not await verify_runtime_schema():
+            raise RuntimeError("Database schema is incomplete; run offline bootstrap and migrations before starting services")
+        logger.info("[DB INIT] Runtime schema verified without DDL")
+        return
+    if mode != "bootstrap":
+        raise ValueError("DB_SCHEMA_MODE must be verify or bootstrap")
+
 
     enum_type_statements = [
         """DO $$ BEGIN
