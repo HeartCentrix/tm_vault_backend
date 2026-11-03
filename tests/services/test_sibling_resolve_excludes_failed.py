@@ -52,7 +52,10 @@ def test_sibling_resolve_keeps_requested_snapshot_viewable():
 
 
 def test_content_snapshots_rollup_excludes_failed_snapshots():
-    src = inspect.getsource(_ss.get_content_snapshots)
+    endpoint = inspect.getsource(_ss.get_content_snapshots)
+    assert "_content_snapshot_totals(" in endpoint
+    src = inspect.getsource(_ss._content_snapshot_totals)
     # the sib_ids query feeding _rollup_latest_items must carry the filter
-    assert "SnapshotStatus.FAILED" in src and "SnapshotStatus.PENDING_DELETION" in src
+    assert "SnapshotStatus.FAILED" in src
+    assert "SnapshotStatus.PENDING_DELETION" in src
     assert ".notin_(" in src
