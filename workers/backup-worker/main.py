@@ -452,7 +452,9 @@ async def _bulk_upsert_mail_message_bodies(
     Errors are caught and logged but do NOT abort the snapshot — this
     is best-effort optimization metadata.
     """
-    if not messages:
+    # The catalogue is currently write-only: restore reads snapshot_items.
+    # Avoid duplicating every body unless explicitly collecting dedup telemetry.
+    if os.getenv("MAIL_BODY_CATALOGUE_ENABLED", "false").lower() not in ("true", "1", "yes") or not messages:
         return 0
     try:
         from sqlalchemy.dialects.postgresql import insert as _pg_insert
@@ -505,16 +507,15 @@ async def _bulk_upsert_mail_message_bodies(
             })
         if not rows:
             return 0
-        # Chunked insert — same chunk size as snapshot_items for parity.
+        from shared.mail_body_batches import mail_body_batches
         total = 0
-        for i in range(0, len(rows), _BULK_INSERT_CHUNK):
-            chunk = rows[i:i + _BULK_INSERT_CHUNK]
+        for chunk in mail_body_batches(rows):
             stmt = _pg_insert(_MMB).values(chunk).on_conflict_do_nothing(
                 index_elements=["tenant_id", "fingerprint"],
             )
             await session.execute(stmt)
+            await session.commit()
             total += len(chunk)
-        await session.commit()
         return total
     except Exception as e:
         # Best-effort. Don't fail a snapshot over a dedup-table issue.
