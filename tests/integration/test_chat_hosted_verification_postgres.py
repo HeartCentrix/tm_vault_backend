@@ -178,9 +178,12 @@ async def test_hosted_404_remains_partial_with_read_progress(store, adapters, ca
     adapters.source.open_hosted = unavailable
     _, result = await run_capture(store, adapters)
     assert result.outcome == 'partial' and result.item_count == 1
-    progress = [record.getMessage() for record in caplog.records if record.name == 'shared.chat_capture']
+    lines = [record.getMessage() for record in caplog.records if record.name == 'shared.chat_capture']
+    progress = [value for value in lines if value.startswith('chat_capture_progress')]
     assert len(progress) == 2
     assert all('verified_binary=0 unresolved=1' in value for value in progress)
+    failures = [value for value in lines if value.startswith('chat_capture_failure')]
+    assert len(failures) == 2 and all('phase=CHAT_HOSTED_CONTENT' in v and 'status=404' in v for v in failures)
 
 
 async def test_captured_binaries_restore_after_previous_snapshot_is_deleted(store, adapters, snapshot_api, monkeypatch):

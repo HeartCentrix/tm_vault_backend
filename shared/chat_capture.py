@@ -142,6 +142,9 @@ class ChatObservationLedger:
             (observation, phase, type(error).__name__, status, graph_id, parent_id,
              _identifier(getattr(error, "code", None)), _identifier(getattr(error, "inner_code", None)),
              _identifier(getattr(error, "request_id", None))))
+        logger.warning("chat_capture_failure observation=%s phase=%s error=%s status=%s code=%s request_id=%s",
+                       observation, phase, type(error).__name__, status,
+                       _identifier(getattr(error, "code", None)), _identifier(getattr(error, "request_id", None)))
 
     def failure_details(self):
         names = ("observation", "phase", "error_type", "status_code", "graph_id", "parent_graph_id",
