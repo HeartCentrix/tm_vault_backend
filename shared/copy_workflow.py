@@ -443,7 +443,9 @@ async def begin_resume(factory, workflow_id, owner_id):
         workflow=await session.get(CopyWorkflow,_uuid(workflow_id))
         if workflow is None: return None
         job,snapshot,partition=await _lock_parents(session,workflow)
-        workflow=await session.scalar(select(CopyWorkflow).where(CopyWorkflow.id==workflow.id).with_for_update())
+        # Another resumer may have committed while this transaction waited on Job.
+        workflow=await session.scalar(select(CopyWorkflow).where(CopyWorkflow.id==workflow.id)
+            .with_for_update().execution_options(populate_existing=True))
         now=await session.scalar(select(func.clock_timestamp()))
         if workflow.state not in ('WAITING','RESUMING'): return None
         if workflow.state=='RESUMING' and workflow.lease_expires_at and workflow.lease_expires_at>now: return None

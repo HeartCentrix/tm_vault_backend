@@ -208,3 +208,44 @@ async def test_partition_cannot_finish_between_mail_carry_claim_and_copy_registr
     async with store.factory.begin() as db:
         row = (await db.execute(text(sql), {'sid': str(scope.snapshot_id)})).first()
         assert row.new_status == 'COMPLETED'
+
+
+async def test_competing_resumer_reloads_workflow_after_parent_lock_wait(store, monkeypatch):
+    import asyncio
+    module = api()
+    monkeypatch.setenv('COPY_WORK_ENABLED', 'true')
+    monkeypatch.setattr(module, 'async_session_factory', store.factory)
+    scope = await store.new_scope()
+    with module.copy_collection(scope.snapshot_id):
+        delegated = await module.defer_current_copy('CHAT_CARRY', {})
+        await module.seal_current_copy({'resume_kind': 'user_content'})
+    async with store.factory.begin() as db:
+        await db.execute(update(models.CopyWorkTask).where(models.CopyWorkTask.id == delegated.task_id)
+            .values(state='COMPLETED'))
+    original = module._lock_parents
+    read_before_lock, winner_committed = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def pause_first(db, workflow, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            read_before_lock.set()
+            await winner_committed.wait()
+        return await original(db, workflow, **kwargs)
+
+    monkeypatch.setattr(module, '_lock_parents', pause_first)
+    loser = asyncio.create_task(module.begin_resume(store.factory, delegated.workflow_id, uuid4()))
+    try:
+        await asyncio.wait_for(read_before_lock.wait(), 2)
+        owner = uuid4()
+        winner = await module.begin_resume(store.factory, delegated.workflow_id, owner)
+        winner_committed.set()
+        assert await asyncio.wait_for(loser, 2) is None
+        async with store.factory() as db:
+            live = await db.get(models.CopyWorkflow, winner.id)
+            assert live.lease_owner_id == owner and live.generation == winner.generation
+    finally:
+        if not loser.done():
+            loser.cancel()
+        await asyncio.gather(loser, return_exceptions=True)
