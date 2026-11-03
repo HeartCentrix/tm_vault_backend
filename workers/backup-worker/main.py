@@ -1722,8 +1722,8 @@ class VersionListCoordinator:
     further reduces the *number* of files that need listing; this
     coordinator makes the listing itself fast.
 
-    Memory: bounded by batch_size pending Futures. No background tasks
-    outlive a flush.
+    Memory: bounded by batch_size pending Futures. Each flush owns its
+    waiters; cancelling the last waiter cancels and joins its provider work.
     """
 
     def __init__(
@@ -1740,53 +1740,85 @@ class VersionListCoordinator:
         self._pending: List[Tuple[str, "asyncio.Future"]] = []
         self._lock = asyncio.Lock()
         self._timer_task: Optional["asyncio.Task"] = None
+        self._flush_tasks: Dict["asyncio.Task", List[Tuple[str, "asyncio.Future"]]] = {}
 
     async def get_versions(self, file_id: str) -> List[Dict[str, Any]]:
         loop = asyncio.get_running_loop()
         fut: "asyncio.Future" = loop.create_future()
-        flush_now: Optional[List[Tuple[str, "asyncio.Future"]]] = None
-        async with self._lock:
-            self._pending.append((file_id, fut))
-            if len(self._pending) >= self._batch_size:
-                flush_now = self._pending
-                self._pending = []
-                self._timer_task = None
-            elif self._timer_task is None or self._timer_task.done():
-                self._timer_task = asyncio.create_task(self._wait_and_flush())
-        if flush_now is not None:
-            asyncio.create_task(self._flush(flush_now))
-        return await fut
+        obsolete_timer = None
+        try:
+            async with self._lock:
+                self._pending.append((file_id, fut))
+                if len(self._pending) >= self._batch_size:
+                    batch, self._pending = self._pending, []
+                    obsolete_timer, self._timer_task = self._timer_task, None
+                    if obsolete_timer is not None:
+                        obsolete_timer.cancel()
+                    self._start_flush(batch)
+                elif self._timer_task is None or self._timer_task.done():
+                    self._timer_task = asyncio.create_task(self._wait_and_flush())
+                    self._timer_task.add_done_callback(self._finish_task)
+            return await fut
+        finally:
+            # A cancelled caller must not leave queued or in-flight work with
+            # no remaining consumer. Live siblings still own their flush.
+            fut.cancel()
+            join = [obsolete_timer] if obsolete_timer is not None else []
+            async with self._lock:
+                self._pending = [(fid, waiter) for fid, waiter in self._pending if waiter is not fut]
+                if not self._pending and self._timer_task is not None:
+                    timer, self._timer_task = self._timer_task, None
+                    timer.cancel()
+                    join.append(timer)
+                for task, batch in self._flush_tasks.items():
+                    if all(waiter.done() for _, waiter in batch):
+                        if not task.done():
+                            task.cancel()
+                        join.append(task)
+            if join:
+                await asyncio.gather(*join, return_exceptions=True)
+
+    def _start_flush(self, batch):
+        task = asyncio.create_task(self._flush(batch))
+        self._flush_tasks[task] = batch
+        task.add_done_callback(self._finish_task)
+
+    def _finish_task(self, task):
+        # A done callback also runs when cancellation prevents the coroutine
+        # from starting. Transfer its outcome rather than losing its waiters.
+        if task is self._timer_task:
+            batch, self._pending = self._pending, []
+            self._timer_task = None
+        else:
+            batch = self._flush_tasks.pop(task, [])
+        error = None if task.cancelled() else task.exception()
+        for _, fut in batch:
+            if fut.done():
+                continue
+            if task.cancelled():
+                fut.cancel()
+            else:
+                fut.set_exception(error if error is not None else RuntimeError("version-list flush ended without a result"))
 
     async def _wait_and_flush(self):
-        try:
-            await asyncio.sleep(self._max_wait_ms / 1000.0)
-        except asyncio.CancelledError:
-            return
-        flush_now: Optional[List[Tuple[str, "asyncio.Future"]]] = None
+        await asyncio.sleep(self._max_wait_ms / 1000.0)
         async with self._lock:
-            if self._pending:
-                flush_now = self._pending
-                self._pending = []
+            if self._timer_task is asyncio.current_task() and self._pending:
+                batch, self._pending = self._pending, []
                 self._timer_task = None
-        if flush_now is not None:
-            asyncio.create_task(self._flush(flush_now))
+                self._start_flush(batch)
 
     async def _flush(self, batch: List[Tuple[str, "asyncio.Future"]]):
+        from shared.provider_admission import ProviderDeferred
+        from shared.provider_runtime import ProviderBudgetExhausted
+
         file_ids = [fid for fid, _ in batch]
         try:
             results = await self._gc.list_file_versions_batch(self._drive_id, file_ids)
-        except Exception as e:
-            # Whole batch blew up — fall every waiter back to a single-shot
-            # call so we never deadlock a backup on a batched failure.
-            for fid, fut in batch:
-                if fut.done():
-                    continue
-                try:
-                    versions = await self._gc.list_file_versions(self._drive_id, fid)
-                    fut.set_result(versions)
-                except Exception as e2:
-                    fut.set_exception(e2)
-            return
+        except (ProviderDeferred, ProviderBudgetExhausted):
+            raise
+        except Exception:
+            results = {}
         # Resolve per-file; fall back to single-shot for any None (batch
         # retry budget exhausted for that sub-request).
         for fid, fut in batch:
@@ -1796,10 +1828,14 @@ class VersionListCoordinator:
             if versions is None:
                 try:
                     versions = await self._gc.list_file_versions(self._drive_id, fid)
+                except (ProviderDeferred, ProviderBudgetExhausted):
+                    raise
                 except Exception as e3:
-                    fut.set_exception(e3)
+                    if not fut.done():
+                        fut.set_exception(e3)
                     continue
-            fut.set_result(versions or [])
+            if not fut.done():
+                fut.set_result(versions or [])
 
 
 async def _fetch_prior_file_etag_map(
