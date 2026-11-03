@@ -125,8 +125,13 @@ async def test_mail_cursor_checkpoints_stay_staged_until_no_copy_capture_is_drai
         assert snapshot.extra_data["copy_mail_cursor_states"] == {}
 
 
-@pytest.mark.parametrize("failed", [False, True])
-async def test_partition_mail_union_is_queued_once_before_any_terminal_snapshot_write(store, monkeypatch, bw, failed):
+@pytest.mark.parametrize("failed,retained_item,expected", [
+    (False, False, models.SnapshotStatus.COMPLETED),
+    (True, False, models.SnapshotStatus.FAILED),
+    (True, True, models.SnapshotStatus.PARTIAL),
+])
+async def test_partition_mail_union_is_queued_once_before_any_terminal_snapshot_write(
+        store, monkeypatch, bw, failed, retained_item, expected):
     scope, pid = await prepare(store, monkeypatch, bw, partition=True)
     async with store.factory.begin() as session:
         resource = await session.get(models.Resource, store.resource)
@@ -134,6 +139,10 @@ async def test_partition_mail_union_is_queued_once_before_any_terminal_snapshot_
         partition = await session.get(models.SnapshotPartition, pid)
         partition.status = "COMPLETED"
         partition.partition_type = "MAIL_FOLDERS"
+        if retained_item:
+            session.add(models.SnapshotItem(snapshot_id=scope.snapshot_id, tenant_id=store.tenant,
+                external_id="captured", item_type="EMAIL", name="captured", content_size=7, backend_id=store.backend))
+            partition.files_uploaded, partition.bytes_uploaded = 1, 7
         partition.payload = {"carry_forward": {
             "resumed_any": True, "excluded_paths": [], "tombstoned_ids": ["deleted-message"],
             "drained_keys": ["inbox"], "all_folders_fallback": False,
@@ -164,7 +173,58 @@ async def test_partition_mail_union_is_queued_once_before_any_terminal_snapshot_
     assert await worker.resume_copy_workflow(workflows[0].id)
     async with store.factory() as session:
         snapshot = await session.get(models.Snapshot, scope.snapshot_id)
-        assert snapshot.status == (models.SnapshotStatus.FAILED if failed else models.SnapshotStatus.COMPLETED)
+        workflow = await session.get(models.CopyWorkflow, workflows[0].id)
+        job = await session.get(models.Job, snapshot.job_id)
+        assert snapshot.status == expected
+        assert snapshot.extra_data["mail_carry_forward_pending"] is False
+        assert workflow.state == ("PARTIAL" if failed else "COMPLETED")
+        assert not workflow.parent_settle_pending and workflow.lease_owner_id is None
+        assert job.status == (models.JobStatus.FAILED if expected == models.SnapshotStatus.FAILED
+            else models.JobStatus.COMPLETED)
+        if failed:
+            assert snapshot.extra_data["copy_required_failed"] is True
+            assert snapshot.extra_data["degraded_reason"] == "required database copy did not complete"
+        if retained_item:
+            assert await session.scalar(select(models.SnapshotItem.id)
+                .where(models.SnapshotItem.snapshot_id == snapshot.id, models.SnapshotItem.external_id == "captured"))
+
+
+async def test_replaced_union_resume_cannot_clear_pending_carry(store, monkeypatch, bw):
+    scope, pid = await prepare(store, monkeypatch, bw, partition=True)
+    async with store.factory.begin() as session:
+        (await session.get(models.Resource, store.resource)).type = models.ResourceType.USER_MAIL
+        partition = await session.get(models.SnapshotPartition, pid)
+        partition.status, partition.partition_type = "COMPLETED", "MAIL_FOLDERS"
+        partition.payload = {"carry_forward": {"resumed_any": True, "excluded_paths": [],
+            "tombstoned_ids": [], "drained_keys": ["inbox"], "all_folders_fallback": False}}
+    worker = bw.BackupWorker.__new__(bw.BackupWorker)
+    worker.worker_id = "synthetic-stale-union-worker"
+    worker.flush_version_rows = AsyncMock(return_value=0)
+    assert await worker._finalize_partitioned_snapshot(scope.snapshot_id) is None
+    async with store.factory.begin() as session:
+        workflow = await session.scalar(select(models.CopyWorkflow))
+        workflow_id = workflow.id
+        await session.execute(update(models.CopyWorkTask).values(state="FAILED"))
+    publish = worker._publish_copy_mail_state
+    replacement_owner = uuid4()
+
+    async def replace_after_publish(snapshot, *, failed=False):
+        await publish(snapshot, failed=failed)
+        async with store.factory.begin() as session:
+            workflow = await session.get(models.CopyWorkflow, workflow_id)
+            workflow.generation += 1
+            workflow.lease_owner_id = replacement_owner
+
+    monkeypatch.setattr(worker, "_publish_copy_mail_state", replace_after_publish)
+    with pytest.raises(bw.ChatCatalogueWorkLeaseMoved):
+        await worker.resume_copy_workflow(workflow_id)
+    async with store.factory() as session:
+        snapshot = await session.get(models.Snapshot, scope.snapshot_id)
+        workflow = await session.get(models.CopyWorkflow, workflow_id)
+        assert snapshot.status == models.SnapshotStatus.IN_PROGRESS
+        assert snapshot.extra_data["mail_carry_forward_pending"] is True
+        assert snapshot.extra_data["copy_required_failed"] is True
+        assert workflow.lease_owner_id == replacement_owner
 
 
 @pytest.mark.parametrize("partitioned", [False, True])

@@ -5113,8 +5113,9 @@ class BackupWorker:
                 failed = lossy
             elif continuation.get("resume_kind") == "partition_union":
                 await self._publish_copy_mail_state(snapshot, failed=failed)
-                if not failed:
-                    await self._patch_snapshot_extra_data(snapshot.id, {"mail_carry_forward_pending": False})
+                # Settled failures retain their evidence and must also release the carry barrier.
+                if not await self._patch_snapshot_extra_data(snapshot.id, {"mail_carry_forward_pending": False}):
+                    raise ChatCatalogueWorkLeaseMoved("copy resume could not release the union carry barrier")
                 from shared.copy_workflow import settling_copy_parent
                 with settling_copy_parent():
                     await self._finalize_partitioned_snapshot(snapshot.id, tenant, resource, job.id)
