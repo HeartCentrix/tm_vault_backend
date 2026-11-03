@@ -28,6 +28,8 @@ _fixture = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_fixture)
 store = _fixture.store
 
+from test_graph_admission_redis import redis_client
+
 pytestmark = pytest.mark.integration
 
 
@@ -576,3 +578,76 @@ async def test_completed_download_context_closes_before_immutable_upload(store, 
     monkeypatch.setattr(adapters.storage,'upload_from_file',upload)
     _, result = await run_capture(store,adapters)
     assert result.outcome == 'complete' and len(adapters.storage.uploads)==2
+
+
+async def test_local_slot_wait_preserves_staged_chat_and_same_capture(store, adapters, redis_client):
+    from shared.provider_admission import ScopedProviderAdmission, AdmissionLimits, ProviderRequestContext
+    limiter = ScopedProviderAdmission(redis_client, limits=AdmissionLimits(tenant_concurrency=1), namespace=uuid4().hex)
+    context = ProviderRequestContext('tenant', 'app', 'teams', 'chat')
+    adapters.source.messages = [message()]
+    original = adapters.source.iter_message_pages
+    waiting, release, occupied = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    async def hold():
+        async with limiter.admit(context, wait_budget=0):
+            occupied.set()
+            await release.wait()
+    async def pages(chat_id):
+        async for page in original(chat_id):
+            yield page
+        if adapters.source.passes == 1:
+            waiting.set()
+            async with limiter.admit(context, wait_budget=0):
+                pass
+    adapters.source.iter_message_pages = pages
+    holder = asyncio.create_task(hold())
+    await occupied.wait()
+    capture = asyncio.create_task(run_capture(store, adapters))
+    try:
+        await asyncio.wait_for(waiting.wait(), 3)
+        await asyncio.sleep(.05)
+        assert not capture.done()
+        async with store.factory() as session:
+            assert await session.scalar(select(func.count()).select_from(ChatCaptureAttempt)) == 1
+            assert await session.scalar(select(func.count()).select_from(SnapshotItem)) == 1
+        release.set()
+        _, result = await asyncio.wait_for(capture, 5)
+        assert result.outcome == 'complete'
+        assert adapters.source.passes == 2
+        async with store.factory() as session:
+            assert await session.scalar(select(func.count()).select_from(ChatCaptureAttempt)) == 1
+    finally:
+        release.set()
+        for task in (holder,capture):
+            if not task.done(): task.cancel()
+        await asyncio.gather(holder,capture,return_exceptions=True)
+
+
+async def test_same_exact_file_version_across_messages_downloaded_once(store, adapters):
+    adapters.source.messages = [dict(message(attached=True),id=f'message-{i}') for i in range(3)]
+    _, result = await run_capture(store, adapters)
+    assert result.outcome == 'complete' and result.item_count == 6
+    assert adapters.source.downloads == 1
+    assert len(adapters.storage.uploads) == 1
+
+
+async def test_file_reuse_never_assumes_untagged_contents_unchanged(store, adapters):
+    adapters.source.messages = [dict(message(attached=True),id=f'message-{i}') for i in range(2)]
+    adapters.source.etag = adapters.source.ctag = None
+    _, result = await run_capture(store, adapters)
+    assert result.outcome == 'complete'
+    assert adapters.source.downloads == 4
+
+
+async def test_cached_file_still_checks_missing_stored_content(store, adapters):
+    adapters.source.messages = [dict(message(attached=True),id=f'message-{i}') for i in range(2)]
+    original = adapters.source.resolve_file
+    calls = 0
+    async def resolve(url):
+        nonlocal calls
+        calls += 1
+        if calls == 3:  # first download refresh is call2; next reference loses its blob
+            adapters.storage.objects.clear()
+        return await original(url)
+    adapters.source.resolve_file = resolve
+    _, result = await run_capture(store, adapters)
+    assert result.outcome == 'partial'

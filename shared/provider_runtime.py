@@ -21,6 +21,7 @@ _UNIT = ContextVar('provider_unit', default=None)
 _PREPAID_STORAGE = ContextVar('prepaid_storage_bytes', default=None)
 _TRANSFER = ContextVar('provider_logical_transfer', default=None)
 _RECEIPT = ContextVar('provider_receipt_drain', default=None)
+_LIVE_WAIT = ContextVar('provider_live_wait', default=None)
 _DRAIN_EXPIRED = 'provider_concurrency_drain_expired'
 CONCURRENCY_DRAIN_SECONDS = 300
 
@@ -155,6 +156,20 @@ def current_unit():
 
 
 @asynccontextmanager
+async def provider_live_wait_scope():
+    """Keep bounded chat observations alive through local admission contention."""
+    execution, unit = current_execution(), current_unit()
+    remaining = ((unit.deadline_at - datetime.now(timezone.utc)).total_seconds()
+                 if unit else 1800)
+    marker = _LIVE_WAIT.set((execution, time.monotonic() + max(0, remaining)))
+    try:
+        check_provider_turn()
+        yield
+    finally:
+        _LIVE_WAIT.reset(marker)
+
+
+@asynccontextmanager
 async def provider_transfer_scope(*, timeout=None, implicit=False):
     """Keep one admitted file alive across range gaps, storage and buffered receipts."""
     execution, task = current_execution(), asyncio.current_task()
@@ -262,6 +277,14 @@ async def _drain_congestion(execution):
 async def wait_provider_concurrency(error):
     """Continue the same Redis grant attempt while already-admitted transfers drain."""
     execution = current_execution()
+    live = _LIVE_WAIT.get()
+    if error.reason != 'concurrency':
+        return False
+    if live is not None and live[0] is execution:
+        check_provider_turn()
+        await asyncio.sleep(min(error.retry_after, max(0, live[1] - time.monotonic())))
+        check_provider_turn()
+        return True
     if execution is None:
         return False
     if execution.congestion is None:
@@ -282,6 +305,9 @@ def check_provider_turn():
     execution = _EXECUTION.get()
     if execution and execution.deferred:
         raise ProviderTurnDeferred(execution.deferred)
+    live = _LIVE_WAIT.get()
+    if live is not None and live[0] is execution and time.monotonic() >= live[1]:
+        raise ProviderBudgetExhausted('provider unit original deadline exhausted')
 
 
 def defer_provider(error):

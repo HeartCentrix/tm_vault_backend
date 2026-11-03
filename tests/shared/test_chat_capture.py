@@ -1,7 +1,7 @@
 """Source-observation accounting stays bounded and matches repository identity."""
 import asyncio
 from contextlib import asynccontextmanager, suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import gc
 import importlib
 import os
@@ -172,7 +172,7 @@ async def cancelled_capture(monkeypatch, request):
     selected = scope()
     lease = SimpleNamespace(observation_hash_version=1)
     execution = SimpleNamespace(claim=object(), deferred=None) if request.param else None
-    unit = SimpleNamespace(created_at=datetime.now(timezone.utc), reconciliations=0, key="chat") if request.param else None
+    unit = SimpleNamespace(created_at=datetime.now(timezone.utc), deadline_at=datetime.now(timezone.utc)+timedelta(minutes=5), reconciliations=0, key="chat") if request.param else None
     state = SimpleNamespace(entered=asyncio.Event(), started=asyncio.Event(), release=asyncio.Event(),
         cancelled=asyncio.Event(), finished=asyncio.Event(), committed=[], rolled_back=[], errors=[],
         failure=None, late_failure=None, capture=capture)
