@@ -21435,13 +21435,10 @@ class BackupWorker:
     # cursor while missing bytes remain in the queue.
     #
     # _onedrive_retry_consumer_loop (background asyncio task spawned
-    # from start()) polls the table on a fixed interval, claims rows
-    # whose next_retry_at has elapsed via SELECT FOR UPDATE SKIP
-    # LOCKED, and re-attempts each file. On success the file is
-    # upserted into snapshot_items pointing at the ORIGINAL snapshot;
-    # on retryable failure attempt_count++ and next_retry_at slides
-    # forward (exponential); after MAX_ATTEMPTS the row is marked
-    # FAILED_PERMANENT for operator review.
+    # from start()) repairs terminal snapshots after foreground writers stop.
+    # Every claim consumes one finite attempt and fences its heartbeat and
+    # publication. Proven receipts are reused; repair never promotes snapshot
+    # completion or advances its cursor.
 
     async def _enqueue_onedrive_retry(
         self,
@@ -21455,9 +21452,9 @@ class BackupWorker:
     ) -> None:
         """Producer side: stamp a row into onedrive_file_retries so the
         background consumer can pick the file back up. Idempotent on
-        (snapshot_id, file_external_id): a second failure on the same
-        file refreshes last_error + bumps next_retry_at but does NOT
-        zero attempt_count (so a flapping file doesn't retry forever).
+        (snapshot_id, file_external_id): only an unexhausted PENDING row
+        may be refreshed. Active or terminal rows are never reopened,
+        and the attempt budget is never reset.
 
         Permanent statuses (404/410/423) are recorded with
         status=FAILED_PERMANENT immediately — the consumer's
@@ -21518,6 +21515,9 @@ class BackupWorker:
                         "status": stmt.excluded.status,
                         "updated_at": func.now(),
                     },
+                    where=(OneDriveFileRetry.status == "PENDING") & (
+                        OneDriveFileRetry.attempt_count < max(1, int(os.getenv("ONEDRIVE_RETRY_MAX_ATTEMPTS", "8")))
+                    ),
                 )
                 await s.execute(stmt)
                 await s.commit()
@@ -21530,15 +21530,9 @@ class BackupWorker:
     async def _onedrive_retry_consumer_loop(self) -> None:
         """Background poller: drains onedrive_file_retries.
 
-        Runs forever (until the asyncio loop is cancelled). Each tick:
-          1. Claim up to BATCH rows via SELECT … FOR UPDATE SKIP LOCKED
-             where status=PENDING AND next_retry_at <= NOW().
-          2. Mark them IN_PROGRESS so peers don't double-process.
-          3. For each row, rebuild graph_client + call backup_single_file
-             with the saved file_payload.
-          4. Success → mark RESCUED, upsert SnapshotItem under the
-             original snapshot_id. Failure → bump attempt_count, slide
-             next_retry_at, or mark FAILED_PERMANENT after MAX_ATTEMPTS.
+        Each tick atomically claims eligible terminal-snapshot work, consumes
+        one attempt per claim, and repairs under that immutable generation.
+        Receipt reuse and the RESCUED transition share the publication fence.
 
         The loop is best-effort: any DB / Graph error is caught and
         logged, then the next tick continues. We never let this loop
@@ -21573,355 +21567,166 @@ class BackupWorker:
                 )
             await asyncio.sleep(poll_interval_s)
 
-    async def _drain_onedrive_retry_batch(
-        self, *, batch_size: int, max_attempts: int,
-    ) -> None:
-        """One tick of the retry consumer. Reclaims stale IN_PROGRESS
-        rows (worker died mid-retry), then claims up to ``batch_size``
-        ready PENDING rows and processes them with bounded parallelism.
-        """
-        from sqlalchemy import text as _sqltext
-        from shared.models import OneDriveFileRetry
-        # Reaper: any IN_PROGRESS row whose updated_at hasn't moved
-        # in stall_minutes is presumed orphaned (worker crashed
-        # between claim and terminal-update). Flip it back to
-        # PENDING with attempt_count++ so a flapping payload still
-        # hits max_attempts and doesn't loop forever. Logs the count
-        # so operators see when reclaiming is happening; a healthy
-        # cluster should reclaim 0 per tick.
-        #
-        # 5-minute default is safe because _retry_one_onedrive_file
-        # heartbeats updated_at every 60s while a rescue is in
-        # flight — so updated_at silence > 5 min implies the
-        # worker is dead, not slow. Without heartbeating we'd need
-        # 6h+ to cover the per-file timeout (a legitimate huge-file
-        # rescue can take that long). Tunable via
-        # ONEDRIVE_RETRY_STALL_MINUTES if operators want a tighter
-        # window on a known-healthy fleet.
-        stall_minutes = int(
-            os.getenv("ONEDRIVE_RETRY_STALL_MINUTES", "5"),
-        )
-        try:
-            async with async_session_factory() as s:
-                reaped = (await s.execute(
-                    _sqltext(
-                        "UPDATE onedrive_file_retries "
-                        "   SET status = 'PENDING', "
-                        "       attempt_count = attempt_count + 1, "
-                        "       last_error = COALESCE(last_error, '') "
-                        "                  || ' / reclaimed from stale IN_PROGRESS', "
-                        "       updated_at = NOW(), "
-                        "       next_retry_at = NOW() "
-                        " WHERE status = 'IN_PROGRESS' "
-                        "   AND updated_at < NOW() - (:m || ' minutes')::interval "
-                        "RETURNING id"
-                    ),
-                    {"m": str(stall_minutes)},
-                )).all()
-                await s.commit()
-            if reaped:
-                print(
-                    f"[{self.worker_id}] [ONEDRIVE_RETRY] reaper "
-                    f"reclaimed {len(reaped)} stale IN_PROGRESS row(s)"
-                )
-        except Exception as e:
-            print(
-                f"[{self.worker_id}] [ONEDRIVE_RETRY] reaper failed: "
-                f"{type(e).__name__}: {e}"
-            )
-        claimed_ids: List[uuid.UUID] = []
-        async with async_session_factory() as s:
-            rows = (await s.execute(
-                _sqltext(
-                    "UPDATE onedrive_file_retries "
-                    "   SET status = 'IN_PROGRESS', updated_at = NOW() "
-                    " WHERE id IN ( "
-                    "   SELECT id FROM onedrive_file_retries "
-                    "    WHERE status = 'PENDING' "
-                    "      AND next_retry_at <= NOW() "
-                    "    ORDER BY next_retry_at ASC "
-                    "    LIMIT :lim "
-                    "    FOR UPDATE SKIP LOCKED "
-                    " ) "
-                    "RETURNING id"
-                ),
-                {"lim": batch_size},
-            )).all()
-            claimed_ids = [r.id for r in rows]
-            await s.commit()
-        if not claimed_ids:
+    async def _drain_onedrive_retry_batch(self, *, batch_size: int, max_attempts: int) -> None:
+        from shared.onedrive_retry import claim_retries, RetryOwnershipLost
+        from shared.provider_admission import ProviderDeferred
+        from shared.provider_runtime import ProviderBudgetExhausted, ProviderTurnDeferred
+
+        max_attempts = max(1, int(max_attempts))
+        lease_seconds = max(3.0, float(os.getenv("ONEDRIVE_RETRY_STALL_MINUTES", "5")) * 60)
+        concurrency = max(1, int(os.getenv("ONEDRIVE_RETRY_CONCURRENCY", "8")))
+        async with async_session_factory() as session:
+            claims, reaped = await claim_retries(session, limit=batch_size,
+                max_attempts=max_attempts, lease_seconds=lease_seconds)
+            await session.commit()
+        if reaped:
+            print(f"[{self.worker_id}] [ONEDRIVE_RETRY] settled {reaped} expired/exhausted claims")
+        if not claims:
             return
-        # Bounded parallelism. Each retry picks its own fresh app via
-        # multi_app_manager.get_next_app(), so concurrent retries spread
-        # across the 20-app pool's rate-limit buckets — they don't
-        # contend for a single app's budget. Default 8 matches the
-        # main path's ONEDRIVE_BACKUP_FILE_CONCURRENCY so the consumer
-        # can keep up with the producer at steady state.
-        retry_concurrency = int(
-            os.getenv("ONEDRIVE_RETRY_CONCURRENCY", "8"),
-        )
-        sem = asyncio.Semaphore(max(1, retry_concurrency))
-        print(
-            f"[{self.worker_id}] [ONEDRIVE_RETRY] claimed "
-            f"{len(claimed_ids)} file(s) for retry "
-            f"(concurrency={retry_concurrency})"
-        )
+        retry_slot = asyncio.Semaphore(concurrency)
 
-        async def _bounded(rid: uuid.UUID) -> None:
-            from shared.provider_runtime import execution_budget
-            async with sem, execution_budget().permit():
-                try:
-                    await self._retry_one_onedrive_file(
-                        retry_id=rid, max_attempts=max_attempts,
-                    )
-                except Exception as e:
-                    # Re-mark PENDING so the next tick picks it up
-                    # rather than stranding the row as IN_PROGRESS.
-                    # attempt_count++ guards against an infinite loop
-                    # on a poisoned payload.
-                    print(
-                        f"[{self.worker_id}] [ONEDRIVE_RETRY] {rid} "
-                        f"handler raised: {type(e).__name__}: {e}"
-                    )
-                    try:
-                        async with async_session_factory() as s:
-                            await s.execute(
-                                _sqltext(
-                                    "UPDATE onedrive_file_retries "
-                                    "   SET status = 'PENDING', "
-                                    "       attempt_count = attempt_count + 1, "
-                                    "       last_error = :err, "
-                                    "       next_retry_at = NOW() + INTERVAL '5 minutes', "
-                                    "       updated_at = NOW() "
-                                    " WHERE id = :id"
-                                ),
-                                {
-                                    "id": rid,
-                                    "err": (
-                                        f"{type(e).__name__}: {e}"
-                                    )[:1000],
-                                },
-                            )
-                            await s.commit()
-                    except Exception:
-                        pass
-
-        await asyncio.gather(
-            *(_bounded(r) for r in claimed_ids),
-            return_exceptions=True,
-        )
-
-    async def _retry_one_onedrive_file(
-        self, *, retry_id: uuid.UUID, max_attempts: int,
-    ) -> None:
-        """Process one IN_PROGRESS retry row. Reconstructs the context
-        (tenant + resource + snapshot + graph_client), calls
-        backup_single_file with the saved payload, and updates the
-        row's terminal status. The snapshot row's rollup gets re-
-        derived from snapshot_items by the standard reconcile path —
-        no need to bump per-file counters here.
-        """
-        from sqlalchemy import text as _sqltext
-        from shared.models import (
-            OneDriveFileRetry, Snapshot as _Snap,
-            Resource as _Res, Tenant as _Ten, SnapshotStatus,
-        )
-        async with async_session_factory() as s:
-            row = await s.get(OneDriveFileRetry, retry_id)
-            if row is None:
-                return
-            # Cancel-aware: if the parent snapshot was deleted /
-            # cancelled / failed while this row was in queue, mark
-            # FAILED_PERMANENT so the loop stops re-trying it. There
-            # is no SnapshotStatus.CANCELED — cancel is signalled by
-            # the job, but we conservatively bail on FAILED +
-            # PENDING_DELETION here so a deleting snapshot doesn't
-            # get its child snapshot_items resurrected.
-            snap = await s.get(_Snap, row.snapshot_id)
-            if snap is None or snap.status in (
-                SnapshotStatus.FAILED, SnapshotStatus.PENDING_DELETION,
-            ):
-                await s.execute(
-                    _sqltext(
-                        "UPDATE onedrive_file_retries "
-                        "   SET status = 'FAILED_PERMANENT', "
-                        "       last_error = COALESCE(last_error, '') "
-                        "                  || ' / parent snapshot gone or cancelled', "
-                        "       updated_at = NOW() "
-                        " WHERE id = :id"
-                    ),
-                    {"id": retry_id},
-                )
-                await s.commit()
-                return
-            resource = await s.get(_Res, row.resource_id)
-            tenant = await s.get(_Ten, row.tenant_id)
-            file_payload = dict(row.file_payload or {})
-            attempt = int(row.attempt_count or 0) + 1
-            snapshot_for_call = snap
-        if not resource or not tenant or not file_payload:
-            async with async_session_factory() as s:
-                await s.execute(
-                    _sqltext(
-                        "UPDATE onedrive_file_retries "
-                        "   SET status = 'FAILED_PERMANENT', "
-                        "       last_error = 'missing resource/tenant/payload', "
-                        "       updated_at = NOW() "
-                        " WHERE id = :id"
-                    ),
-                    {"id": retry_id},
-                )
-                await s.commit()
-            return
-        # Build a Graph client scoped to this tenant. Re-using
-        # self._graph_for is not safe across the long lifetime of
-        # the consumer loop — connections age out. Pay the per-tick
-        # ~1 ms cost of a fresh client; the win is durability.
-        graph_client = await self._build_graph_client_for(tenant)
-        # IMPORTANT: We do NOT call backup_single_file here.
-        # backup_single_file is the legacy SharePoint server-side-copy
-        # path; its _create_file_snapshot_item writes
-        # item_type="FILE", but the OneDrive partition path's
-        # pre-INSERTed rows use item_type="ONEDRIVE_FILE". Calling
-        # it would leave the original ONEDRIVE_FILE row with
-        # blob_path=NULL and create a parallel FILE row — a
-        # data-consistency hazard. _rescue_onedrive_file_into_snapshot
-        # streams the file and UPDATEs the existing ONEDRIVE_FILE row
-        # in-place, matching the main path's
-        # _useronedrive_backup_files._process_one semantics.
-        #
-        # Heartbeat: while the rescue is in flight (could be minutes
-        # for a multi-GB file), bump updated_at every HEARTBEAT_S
-        # seconds so the reaper's stall threshold detects DEAD
-        # workers, not slow streams. Drops the safe reaper window
-        # from 30 min to 5 min — crashed workers' rows get reclaimed
-        # 6× faster without false-reclaiming legitimate huge-file
-        # rescues.
-        heartbeat_s = int(
-            os.getenv("ONEDRIVE_RETRY_HEARTBEAT_S", "60"),
-        )
-        stop_hb_evt = asyncio.Event()
-
-        async def _heartbeat() -> None:
-            while not stop_hb_evt.is_set():
-                try:
-                    await asyncio.wait_for(
-                        stop_hb_evt.wait(), timeout=heartbeat_s,
-                    )
-                    # Event fired — exit cleanly.
-                    return
-                except asyncio.TimeoutError:
-                    pass
-                try:
-                    async with async_session_factory() as _hbs:
-                        await _hbs.execute(
-                            _sqltext(
-                                "UPDATE onedrive_file_retries "
-                                "   SET updated_at = NOW() "
-                                " WHERE id = :id "
-                                "   AND status = 'IN_PROGRESS'"
-                            ),
-                            {"id": retry_id},
-                        )
-                        await _hbs.commit()
-                except Exception:
-                    # Heartbeat is best-effort; a DB blip here
-                    # just delays one ping, doesn't break the
-                    # rescue.
-                    pass
-
-        hb_task = asyncio.create_task(_heartbeat())
-        try:
-            ok, err_text = await self._rescue_onedrive_file_into_snapshot(
-                tenant=tenant, resource=resource,
-                snapshot=snapshot_for_call,
-                file_payload=file_payload, graph_client=graph_client,
-            )
-            success = ok
-            if success:
-                err_text = ""
-        except Exception as e:
-            success = False
-            err_text = f"{type(e).__name__}: {e}"
-        finally:
-            stop_hb_evt.set()
+        async def run(retry_id, attempt):
             try:
-                await asyncio.wait_for(hb_task, timeout=2.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                if not hb_task.done():
-                    hb_task.cancel()
+                await self._retry_one_onedrive_file(retry_id=retry_id, attempt=attempt,
+                    max_attempts=max_attempts, lease_seconds=lease_seconds, retry_slot=retry_slot)
+            except RetryOwnershipLost:
+                return
+            except (ProviderDeferred, ProviderBudgetExhausted, ProviderTurnDeferred):
+                raise
+            except Exception as exc:
+                await self._release_onedrive_retry(retry_id=retry_id, attempt=attempt,
+                    max_attempts=max_attempts, lease_seconds=lease_seconds,
+                    error=type(exc).__name__)
+                print(f"[{self.worker_id}] [ONEDRIVE_RETRY] attempt failed: {type(exc).__name__}")
+
+        tasks = [asyncio.create_task(run(row.id, row.attempt_count)) for row in claims]
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+        except asyncio.CancelledError:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            # Includes tasks cancelled before their coroutine ever started.
+            try:
+                from shared.onedrive_retry import release_retry
+                async with async_session_factory() as session:
+                    for row in claims:
+                        await release_retry(session, retry_id=row.id, attempt=row.attempt_count,
+                            max_attempts=max_attempts, lease_seconds=lease_seconds,
+                            error="retry batch cancelled")
+                    await session.commit()
+            except Exception:
+                pass  # The reaper settles unreachable claims without refunding attempts.
+            raise
+
+    async def _release_onedrive_retry(self, *, retry_id, attempt, max_attempts,
+                                      lease_seconds, error, permanent=False):
+        from shared.onedrive_retry import release_retry
+        err_class = _classify_onedrive_file_error(error)
+        permanent = permanent or err_class == "permanent" or error.startswith((
+            "source_version_", "missing_snapshot_item", "source_identity_", "no_download_url"))
+        delay = min(3600, (120 if err_class == "throttle" else 60) * (2 ** min(attempt - 1, 6)))
+        async with async_session_factory() as session:
+            await release_retry(session, retry_id=retry_id, attempt=attempt,
+                max_attempts=max_attempts, lease_seconds=lease_seconds,
+                error=error, permanent=permanent, delay_seconds=delay)
+            await session.commit()
+
+    async def _retry_one_onedrive_file(self, *, retry_id, attempt: int,
+                                       max_attempts: int, lease_seconds: float, retry_slot) -> None:
+        from shared.onedrive_retry import owned_retry, renew_retry, RetryOwnershipLost
+        from shared.provider_admission import ProviderDeferred
+        from shared.provider_runtime import execution_budget, ProviderBudgetExhausted, ProviderTurnDeferred
+
+        async with async_session_factory() as session:
+            row, snapshot, _job = await owned_retry(session, retry_id=retry_id,
+                attempt=attempt, lease_seconds=lease_seconds)
+            resource = await session.get(Resource, row.resource_id)
+            tenant = await session.get(Tenant, row.tenant_id)
+            file_payload = dict(row.file_payload or {})
+            drive_id = row.drive_id
+        if resource is None or tenant is None or not file_payload:
+            await self._release_onedrive_retry(retry_id=retry_id, attempt=attempt,
+                max_attempts=max_attempts, lease_seconds=lease_seconds,
+                error="source_identity_missing", permanent=True)
+            return
+
+        transfer = heartbeat = graph_client = None
+        lost = asyncio.Event()
+        interval = max(0.1, min(float(os.getenv("ONEDRIVE_RETRY_HEARTBEAT_S", "60")), lease_seconds / 3))
+
+        async def renew():
+            async with async_session_factory() as session:
+                state = await renew_retry(session, retry_id=retry_id, attempt=attempt,
+                                          lease_seconds=lease_seconds)
+                await session.commit()
+                return state
+
+        async def maintain_owner():
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    state = await asyncio.wait_for(renew(), timeout=lease_seconds / 3)
+                except Exception:
+                    state = None
+                if state == "RESCUED":
+                    return
+                if state != "IN_PROGRESS":
+                    lost.set()
+                    transfer.cancel()
+                    return
+
+        async def capture():
+            # Heartbeats already run while a claimed item waits for either
+            # local concurrency or the process-wide execution budget.
+            async with retry_slot, execution_budget().permit():
+                return await self._rescue_onedrive_file_into_snapshot(
+                    tenant=tenant, resource=resource, snapshot=snapshot,
+                    file_payload=file_payload, graph_client=graph_client,
+                    retry_id=retry_id, attempt=attempt, lease_seconds=lease_seconds,
+                    drive_id=drive_id)
+
+        async def release(error):
+            await self._release_onedrive_retry(retry_id=retry_id, attempt=attempt,
+                max_attempts=max_attempts, lease_seconds=lease_seconds, error=error)
+
+        try:
+            graph_client = await self._build_graph_client_for(tenant)
+            transfer = asyncio.create_task(capture())
+            heartbeat = asyncio.create_task(maintain_owner())
+            timeout = settings.ONEDRIVE_BACKUP_FILE_TIMEOUT_SECONDS
+            ok, error = await asyncio.wait_for(transfer, timeout=timeout) if timeout > 0 else await transfer
+            if ok:
+                print(f"[{self.worker_id}] [ONEDRIVE_RETRY] {retry_id} RESCUED on attempt {attempt}")
+            else:
+                await release(error)
+        except asyncio.CancelledError:
+            try:
+                await release("retry cancelled")
+            except Exception:
+                pass  # An unreachable DB leaves this finite claim for the reaper.
+            if lost.is_set():
+                raise RetryOwnershipLost("OneDrive retry heartbeat lost ownership") from None
+            raise
+        except (ProviderDeferred, ProviderBudgetExhausted, ProviderTurnDeferred):
+            try:
+                await release("provider control flow interrupted retry")
             except Exception:
                 pass
-        if success:
-            async with async_session_factory() as s:
-                await s.execute(
-                    _sqltext(
-                        "UPDATE onedrive_file_retries "
-                        "   SET status = 'RESCUED', "
-                        "       attempt_count = :n, "
-                        "       last_error = NULL, "
-                        "       last_error_class = NULL, "
-                        "       updated_at = NOW() "
-                        " WHERE id = :id"
-                    ),
-                    {"id": retry_id, "n": attempt},
-                )
-                await s.commit()
-            print(
-                f"[{self.worker_id}] [ONEDRIVE_RETRY] {retry_id} RESCUED "
-                f"on attempt {attempt} ({file_payload.get('name', '?')})"
-            )
-            return
-        # Retry failed. Decide whether to keep trying.
-        err_class = _classify_onedrive_file_error(err_text)
-        if err_class == "permanent" or attempt >= max_attempts:
-            async with async_session_factory() as s:
-                await s.execute(
-                    _sqltext(
-                        "UPDATE onedrive_file_retries "
-                        "   SET status = 'FAILED_PERMANENT', "
-                        "       attempt_count = :n, "
-                        "       last_error = :err, "
-                        "       last_error_class = :cls, "
-                        "       updated_at = NOW() "
-                        " WHERE id = :id"
-                    ),
-                    {
-                        "id": retry_id, "n": attempt,
-                        "err": err_text[:1000], "cls": err_class,
-                    },
-                )
-                await s.commit()
-            print(
-                f"[{self.worker_id}] [ONEDRIVE_RETRY] {retry_id} "
-                f"FAILED_PERMANENT after {attempt} attempts: {err_text[:120]}"
-            )
-            return
-        # Schedule next attempt with capped exponential backoff —
-        # 2m, 4m, 8m, 16m, 32m, capped at 60m. Throttles get a
-        # longer base than stream drops because Graph buckets refill
-        # on a coarser cadence than CDN connections do.
-        base = 120.0 if err_class == "throttle" else 60.0
-        delay_s = min(3600.0, base * (2 ** (attempt - 1)))
-        async with async_session_factory() as s:
-            await s.execute(
-                _sqltext(
-                    "UPDATE onedrive_file_retries "
-                    "   SET status = 'PENDING', "
-                    "       attempt_count = :n, "
-                    "       last_error = :err, "
-                    "       last_error_class = :cls, "
-                    "       next_retry_at = NOW() + (:d || ' seconds')::interval, "
-                    "       updated_at = NOW() "
-                    " WHERE id = :id"
-                ),
-                {
-                    "id": retry_id, "n": attempt,
-                    "err": err_text[:1000], "cls": err_class,
-                    "d": str(int(delay_s)),
-                },
-            )
-            await s.commit()
+            raise
+        finally:
+            tasks = [task for task in (transfer, heartbeat) if task is not None]
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if graph_client is not None:
+                await graph_client.aclose()
 
     async def _build_graph_client_for(self, tenant: Tenant) -> "GraphClient":
         """Build a GraphClient scoped to ``tenant`` for the retry
@@ -21938,129 +21743,111 @@ class BackupWorker:
         )
 
     async def _rescue_onedrive_file_into_snapshot(
-        self,
-        *,
-        tenant: Tenant,
-        resource: Resource,
-        snapshot: Snapshot,
-        file_payload: Dict[str, Any],
-        graph_client: "GraphClient",
+        self, *, tenant: Tenant, resource: Resource, snapshot: Snapshot,
+        file_payload: Dict[str, Any], graph_client: "GraphClient",
+        retry_id, attempt: int, lease_seconds: float, drive_id: Optional[str],
     ) -> Tuple[bool, str]:
-        """Stream a single OneDrive file's bytes and UPDATE its
-        existing ONEDRIVE_FILE row in-place. Returns (success, err).
+        """Repair one terminal snapshot without reopening its completion/cursor."""
+        from shared.backup_checkpoint import file_receipt_matches, file_source_conflicts
+        from shared.onedrive_retry import owned_retry, RetryOwnershipLost
 
-        Why not call backup_single_file? That entry point writes a
-        FRESH SnapshotItem with item_type="FILE" via
-        _create_file_snapshot_item. The OneDrive main path
-        (_useronedrive_backup_files) pre-INSERTs rows with
-        item_type="ONEDRIVE_FILE" and later UPDATEs them. A retry
-        consumer using backup_single_file would leave the original
-        ONEDRIVE_FILE row stranded with blob_path=NULL and produce
-        a duplicate FILE row — a data-consistency hazard. This
-        helper mirrors the main path's UPDATE semantics so the
-        rescued bytes land on the SAME row the snapshot tracks.
-        """
         file_id = file_payload.get("id")
-        if not file_id:
-            return False, "missing_file_id"
-        file_name = file_payload.get("name") or "?"
-        drive_id = (
-            file_payload.get("_drive_id")
-            or (file_payload.get("parentReference") or {}).get("driveId")
-            or resource.external_id
-        )
-        if not drive_id:
-            return False, "missing_drive_id"
-        # Step 1: resolve a fresh download URL. The one we tried
-        # originally may have expired; Graph URLs live ~1 hour.
-        try:
-            download_url, real_size, qxh = await graph_client.get_download_url(
-                drive_id, file_id,
-            )
-        except RuntimeError as e:
-            msg = str(e)
-            if "no_download_url" in msg.lower() or "downloadurl" in msg.lower():
-                # Cloud-native (Whiteboard / OneNote) — never
-                # downloadable. Mark FAILED_PERMANENT in caller.
-                return False, "no_download_url"
-            return False, f"get_download_url: {msg}"
-        except Exception as e:
-            return False, f"get_download_url: {type(e).__name__}: {e}"
+        drive_id = drive_id or file_payload.get("_drive_id") or (file_payload.get("parentReference") or {}).get("driveId")
+        if not file_id or not drive_id:
+            return False, "source_identity_missing"
+
+        async def owned_item(session):
+            retry, live, _job = await owned_retry(session, retry_id=retry_id,
+                attempt=attempt, lease_seconds=lease_seconds)
+            if (live.id != snapshot.id or live.resource_id != resource.id
+                or retry.tenant_id != tenant.id or retry.file_external_id != file_id
+                or (retry.drive_id and retry.drive_id != drive_id)):
+                raise RetryOwnershipLost("OneDrive retry source identity moved")
+            item = await session.scalar(select(SnapshotItem).where(
+                SnapshotItem.snapshot_id == snapshot.id, SnapshotItem.tenant_id == tenant.id,
+                SnapshotItem.external_id == file_id, SnapshotItem.item_type == "ONEDRIVE_FILE",
+                SnapshotItem.is_deleted.is_(False)).with_for_update())
+            return retry, item
+
+        def reusable(item):
+            return file_receipt_matches(source=(item.extra_data or {}).get("onedrive_download_source"),
+                current=file_payload, drive_id=drive_id, blob_path=item.blob_path,
+                content_size=item.content_size)
+
+        def source_conflicts(item):
+            return any(file_source_conflicts(source, file_payload, drive_id=drive_id)
+                for source in ((item.extra_data or {}).get("raw"),
+                               (item.extra_data or {}).get("onedrive_download_source")) if source)
+
+        def rescued(retry, item):
+            retry.status = "RESCUED"
+            retry.last_error = retry.last_error_class = None
+            retry.rescued_snapshot_item_id = item.id
+            retry.updated_at = datetime.now(timezone.utc)
+
+        # A committed proof is enough to reuse the exact queued source version.
+        # Check before even resolving another signed URL or constructing a key.
+        async with async_session_factory() as session:
+            retry, item = await owned_item(session)
+            if item is None:
+                return False, "missing_snapshot_item"
+            if source_conflicts(item):
+                return False, "source_version_changed_in_snapshot"
+            if reusable(item):
+                rescued(retry, item)
+                await session.commit()
+                return True, ""
+
+        download_url, real_size, qxh, descriptor = await graph_client.get_download_url(
+            drive_id, file_id, include_source_metadata=True)
+        if not download_url:
+            return False, "no_download_url"
         if real_size <= 0:
             real_size = int(file_payload.get("size") or 0)
-        # Step 2: stream to backend.
-        shard = azure_storage_manager.get_shard_for_resource(
-            str(resource.id), str(tenant.id),
-        )
-        container = azure_storage_manager.get_container_name(
-            str(tenant.id), "files",
-        )
-        blob_path = azure_storage_manager.build_blob_path(
-            str(tenant.id), str(resource.id), str(snapshot.id), file_id,
-        )
-        try:
-            upload_result = await self._stream_graph_to_backend(
-                download_url=download_url,
-                expected_size=real_size,
-                container=container,
-                blob_path=blob_path,
-                shard=shard,
-                file_name=file_name,
-                metadata={
-                    "source_item_id": file_id,
-                    "source_drive_id": drive_id,
-                    "original-name": file_name,
-                    "quickxor": qxh or "",
-                    "rescue": "true",
-                },
-                graph_client=graph_client,
-            )
-        except Exception as e:
-            return False, f"stream: {type(e).__name__}: {e}"
+        # Each finite claim gets its own target. A changed source or stale
+        # writer cannot overwrite a previously published object's bytes.
+        blob_path = azure_storage_manager.build_blob_path(str(tenant.id), str(resource.id),
+            str(snapshot.id), file_id, timestamp=f"retry-{retry_id}-attempt-{attempt}")
+        if not file_receipt_matches(source=descriptor, current=file_payload,
+                drive_id=drive_id, blob_path=blob_path, content_size=real_size):
+            return False, "source_version_changed_or_unproven"
+
+        shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
+        container = azure_storage_manager.get_container_name(str(tenant.id), "files")
+        upload_result = await self._stream_graph_to_backend(download_url=download_url,
+            expected_size=real_size, container=container, blob_path=blob_path, shard=shard,
+            file_name=file_payload.get("name") or "?", metadata={
+                "source_item_id": file_id, "source_drive_id": drive_id,
+                "original-name": file_payload.get("name") or "?", "quickxor": qxh or "",
+                "rescue": "true", "retry-attempt": str(attempt),
+            }, graph_client=graph_client)
         if not upload_result.get("success"):
-            return False, f"upload: {upload_result.get('error') or 'failed'}"
-        sha256 = upload_result.get("content_sha256") or ""
-        # Step 3: UPDATE the existing ONEDRIVE_FILE row in-place.
-        # Mirrors the flusher SQL in _useronedrive_backup_files — we
-        # patch blob_path / content_size / content_hash on the row
-        # the partition-walk phase pre-INSERTed. Match on item_type
-        # so a hypothetical FILE row from the legacy path isn't
-        # touched. If no row matches we still return success — the
-        # bytes are in storage; the inventory layer will reconcile.
-        from sqlalchemy import text as _sqltext
-        import json as _json
-        extra_patch = {
-            "raw": file_payload,
-            "sha256": sha256,
-            "quickxor": qxh,
-            "rescued_at": datetime.utcnow().isoformat() + "Z",
-        }
-        try:
-            async with async_session_factory() as s:
-                await s.execute(
-                    _sqltext(
-                        "UPDATE snapshot_items SET "
-                        "  blob_path = :bp, "
-                        "  content_size = CAST(:sz AS bigint), "
-                        "  content_hash = :sh, "
-                        "  content_checksum = :sh, "
-                        "  metadata = CAST(:ex AS json) "
-                        " WHERE snapshot_id = CAST(:snap_id AS uuid) "
-                        "   AND external_id = :ext_id "
-                        "   AND item_type = 'ONEDRIVE_FILE'"
-                    ),
-                    {
-                        "bp": blob_path,
-                        "sz": real_size,
-                        "sh": sha256,
-                        "ex": _json.dumps(extra_patch, default=str),
-                        "snap_id": str(snapshot.id),
-                        "ext_id": file_id,
-                    },
-                )
-                await s.commit()
-        except Exception as e:
-            return False, f"row_update: {type(e).__name__}: {e}"
+            return False, "stream_upload_failed"
+        _url, _size, _hash, after = await graph_client.get_download_url(
+            drive_id, file_id, include_source_metadata=True)
+        if not file_receipt_matches(source=descriptor, current=after, drive_id=drive_id,
+                blob_path=blob_path, content_size=real_size):
+            return False, "source_version_changed_or_unproven_after_stream"
+
+        # Publish the proven blob and terminal retry state atomically. A lost
+        # owner cannot write either, and a missing target row is never success.
+        async with async_session_factory() as session:
+            retry, item = await owned_item(session)
+            if item is None:
+                return False, "missing_snapshot_item_after_stream"
+            if source_conflicts(item):
+                return False, "source_version_changed_in_snapshot"
+            if not reusable(item):
+                sha256 = upload_result.get("content_sha256") or ""
+                item.blob_path = blob_path
+                item.content_size = real_size
+                item.content_hash = item.content_checksum = sha256
+                item.extra_data = {**(item.extra_data or {}), "raw": file_payload,
+                    "sha256": sha256, "quickxor": qxh,
+                    "onedrive_download_source": descriptor,
+                    "rescued_at": datetime.now(timezone.utc).isoformat()}
+            rescued(retry, item)
+            await session.commit()
         return True, ""
 
     # ==================== Server-Side Copy for Files ====================
