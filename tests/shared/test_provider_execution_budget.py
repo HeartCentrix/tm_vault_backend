@@ -84,3 +84,43 @@ async def test_prepaid_storage_cannot_spend_retained_metadata_allowance(monkeypa
         with pytest.raises(ValueError):
             async with budget.bytes(100, includes_storage=invalid): pass
     assert budget.used_bytes == 0
+
+
+@pytest.mark.parametrize('live, reason, expected', [
+    (True, 'rate', True), (True, 'concurrency', True),
+    (True, 'cooldown', False), (False, 'rate', False),
+])
+async def test_live_provider_wait_keeps_internal_rate_wait_but_not_cooldown(live, reason, expected):
+    from shared import provider_runtime as runtime
+    from shared.provider_admission import ProviderDeferred
+    execution = runtime.ProviderExecution(None, None)
+    marker = runtime._EXECUTION.set(execution)
+    try:
+        error = ProviderDeferred(None, .001, reason=reason)
+        if live:
+            async with runtime.provider_live_wait_scope():
+                result = await runtime.wait_provider_concurrency(error)
+        else:
+            result = await runtime.wait_provider_concurrency(error)
+        assert result is expected
+        assert execution.congestion is None
+        assert execution.deferred is None
+    finally:
+        runtime._EXECUTION.reset(marker)
+
+
+async def test_child_task_cannot_consume_its_parents_prepared_attempt():
+    from datetime import datetime, timedelta, timezone
+    from shared import provider_runtime as runtime
+    now = datetime.now(timezone.utc)
+    unit = runtime.UnitExecution('chat', 'chat', now + timedelta(minutes=1), now, 0, remaining=3)
+    execution_marker = runtime._EXECUTION.set(runtime.ProviderExecution(None, None))
+    unit_marker = runtime._UNIT.set(unit)
+    try:
+        async with runtime.provider_attempt_scope():
+            await asyncio.create_task(runtime.account_provider_attempt())
+            await runtime.account_provider_attempt()
+        assert unit.remaining == 1
+    finally:
+        runtime._UNIT.reset(unit_marker)
+        runtime._EXECUTION.reset(execution_marker)

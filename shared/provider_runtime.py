@@ -18,6 +18,7 @@ from shared.provider_admission import ProviderDeferred
 logger = logging.getLogger(__name__)
 _EXECUTION = ContextVar('provider_execution', default=None)
 _UNIT = ContextVar('provider_unit', default=None)
+_ATTEMPT = ContextVar('provider_prepared_attempt', default=None)
 _PREPAID_STORAGE = ContextVar('prepaid_storage_bytes', default=None)
 _TRANSFER = ContextVar('provider_logical_transfer', default=None)
 _RECEIPT = ContextVar('provider_receipt_drain', default=None)
@@ -136,6 +137,14 @@ class UnitExecution:
     created_at: datetime
     reconciliations: int
     remaining: int = 0
+
+
+@dataclass
+class PreparedAttempt:
+    execution: ProviderExecution
+    unit: UnitExecution
+    owner_task: object
+    consumed: bool = False
 
 
 @dataclass(eq=False)
@@ -277,17 +286,15 @@ async def _drain_congestion(execution):
 
 
 async def wait_provider_concurrency(error, *, wait=None, withdraw=None):
-    """Continue the same Redis grant attempt while already-admitted transfers drain."""
+    """Keep live admission waits in-turn; otherwise drain local concurrency."""
     execution = current_execution()
     live = _LIVE_WAIT.get()
-    if error.reason != 'concurrency':
-        return False
-    if live is not None and live[0] is execution:
+    if live is not None and live[0] is execution and error.reason in ('concurrency', 'rate'):
         check_provider_turn()
         await (wait or asyncio.sleep)(min(error.retry_after, max(0, live[1] - time.monotonic())))
         check_provider_turn()
         return True
-    if execution is None:
+    if error.reason != 'concurrency' or execution is None:
         return False
     if not _can_drain(execution) and withdraw is not None:
         # This task now waits for sibling receipts, not for a network grant.
@@ -356,36 +363,60 @@ async def unit_scope(unit_key, kind, *, checkpoint=None, deadline_at=None):
         _UNIT.reset(token)
 
 
-async def account_provider_attempt(context=None):
-    """Reserve up to16 transmissions before I/O; crash loses unused allowance.
+@asynccontextmanager
+async def provider_attempt_scope(context=None):
+    """Prepare durable allowance before admission; return it if no send starts.
 
-    Counts are conservative consumed reservations, never reset by redelivery.
-    Each grant uses a short independent transaction, not a pinned HTTP session.
+    Reservations remain crash-conservative. Concurrent requests each hold one
+    allowance, so consuming an admitted attempt never needs a DB transaction.
     """
     check_provider_turn()
     execution, unit = _EXECUTION.get(), _UNIT.get()
     if execution is None:
+        yield
         return
-    if unit is None:
-        # Enumeration outside a more precise stable unit is independently durable.
-        if execution.planning_unit is None:
-            async with unit_scope('planning', 'planning') as planning:
-                execution.planning_unit = planning
-        token = _UNIT.set(execution.planning_unit)
-        try:
-            await account_provider_attempt(context)
-        finally:
-            _UNIT.reset(token)
-        return
-    if datetime.now(timezone.utc) >= unit.deadline_at:
-        raise ProviderBudgetExhausted('provider unit original deadline exhausted')
     async with execution.attempt_lock:
+        check_provider_turn()
+        if unit is None:
+            if execution.planning_unit is None:
+                async with unit_scope('planning', 'planning') as planning:
+                    execution.planning_unit = planning
+            unit = execution.planning_unit
+        if datetime.now(timezone.utc) >= unit.deadline_at:
+            raise ProviderBudgetExhausted('provider unit original deadline exhausted')
         if unit.remaining == 0:
             await run_db_transaction(execution.factory, lambda session:
                 work.record_unit_checkpoint(session, execution.claim, unit_key=unit.key,
                     kind=unit.kind, attempts=16))
             unit.remaining = 16
+        check_provider_turn()
         unit.remaining -= 1
+    attempt = PreparedAttempt(execution, unit, asyncio.current_task())
+    marker = _ATTEMPT.set(attempt)
+    try:
+        yield
+    finally:
+        if not attempt.consumed:
+            unit.remaining += 1
+        _ATTEMPT.reset(marker)
+
+
+async def account_provider_attempt(context=None):
+    """Consume prepared allowance before HTTP; standalone callers reserve as needed."""
+    check_provider_turn()
+    execution = _EXECUTION.get()
+    if execution is None:
+        return
+    attempt = _ATTEMPT.get()
+    if (attempt is not None and attempt.execution is execution
+            and attempt.owner_task is asyncio.current_task() and not attempt.consumed):
+        if datetime.now(timezone.utc) >= attempt.unit.deadline_at:
+            raise ProviderBudgetExhausted('provider unit original deadline exhausted')
+        attempt.consumed = True
+        return
+    # Standalone callers retain durable accounting without an HTTP adapter.
+    async with provider_attempt_scope(context):
+        await account_provider_attempt(context)
 
 
 async def checkpoint_unit(*, receipt_id=None, state='COMPLETED', reconciliations=0):

@@ -56,7 +56,7 @@ def identity_request(owner, url):
 def request_context(owner, url, *, operation=None):
     parsed = _target(url)
     host, path = parsed.hostname.lower(), parsed.path
-    workload, resource = 'directory', None
+    workload, resource, paced_chat = 'directory', None, False
     if host == 'graph.microsoft.com':
         parts = [unquote(p) for p in path.split('/') if p]
         if not parts or parts[0] not in ('v1.0', 'beta'):
@@ -71,6 +71,11 @@ def request_context(owner, url, *, operation=None):
             workload = 'teams'
             i = parts.index('chats')
             resource = 'chat:' + parts[i+1] if len(parts) > i+1 else None
+            if getattr(owner, 'provider_chat_pacing', False):
+                if len(parts) == 3 and parts[0] == 'users' and i == 2:
+                    resource, paced_chat = 'user_chats:' + parts[1], True
+                elif len(parts) > i+1 and parts[i+1] not in ('getAllMessages', 'getAllRetainedMessages'):
+                    paced_chat = True
         elif 'channels' in parts or (parts and parts[0] == 'teams'):
             workload = 'teams'
             resource = 'team:' + parts[1] if len(parts) > 1 else None
@@ -113,13 +118,13 @@ def request_context(owner, url, *, operation=None):
             operation.tenant_id != owner.tenant_id or operation.app_id != owner.client_id):
             raise ValueError('provider operation identity does not match credential owner')
         return operation
-    return ProviderRequestContext(owner.tenant_id, owner.client_id, workload, resource)
+    return ProviderRequestContext(owner.tenant_id, owner.client_id, workload, resource, paced_chat=paced_chat)
 
 
 @asynccontextmanager
 async def admitted(limiter, context, **kwargs):
-    from shared.provider_runtime import provider_request_scope, provider_transfer_scope
-    async with provider_request_scope(), provider_transfer_scope(implicit=True):
+    from shared.provider_runtime import provider_attempt_scope, provider_request_scope, provider_transfer_scope
+    async with provider_request_scope(), provider_transfer_scope(implicit=True), provider_attempt_scope(context):
         async with _admitted(limiter, context, **kwargs):
             yield
 
@@ -172,7 +177,8 @@ class AdmittedHttpClient:
             raise ProviderDeferred(context, delay, stage='provider_throttle')
 
     async def _batch(self, method, url, **kwargs):
-        from shared.provider_runtime import account_provider_attempt, provider_request_scope, provider_transfer_scope
+        from shared.provider_runtime import (account_provider_attempt, provider_attempt_scope,
+            provider_request_scope, provider_transfer_scope)
         context = request_context(self.owner, url)
         payload = kwargs.get('json')
         entries = payload.get('requests') if isinstance(payload, dict) else None
@@ -192,7 +198,7 @@ class AdmittedHttpClient:
             sub = request_context(self.owner, 'https://graph.microsoft.com/v1.0' + route)
             requests[item['id']] = sub
             costs.append((sub, 1))
-        async with provider_request_scope(), provider_transfer_scope(implicit=True):
+        async with provider_request_scope(), provider_transfer_scope(implicit=True), provider_attempt_scope(context):
             async with self.limiter.admit_many(costs):
                 await account_provider_attempt(context)
                 kwargs['follow_redirects'] = False
