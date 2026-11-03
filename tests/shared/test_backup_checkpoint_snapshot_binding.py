@@ -11,12 +11,10 @@ snapshot. The snapshot still flipped COMPLETED and the deltaLink still
 promoted, so unchanged files never re-entered the delta stream: silently
 unrestorable files, permanently.
 
-Pins the binding contract; the worker-side consumption (discard + re-download)
-is asserted by source inspection so this stays a pure unit test.
+Pins legacy identity and current source-version matching. Worker behavior is
+covered by worker unit tests and PostgreSQL resume tests.
 """
 from __future__ import annotations
-
-import pathlib
 
 from shared.backup_checkpoint import BackupCheckpoint
 
@@ -60,40 +58,34 @@ def test_legacy_payload_without_snapshot_id_is_not_resumable():
     ) is False
 
 
-def test_worker_gates_resume_on_identity_and_checkpoints_only_landed_rows():
-    """Two properties the worker must hold.
+def test_version_matching_requires_a_durable_blob_and_current_source():
+    from shared.backup_checkpoint import file_receipt_matches
+    source = {"id": "f", "size": 10, "eTag": "v1", "parentReference": {"driveId": "d"}}
+    values = dict(source=source, current=source, drive_id="d", blob_path="saved/blob", content_size=10)
+    assert file_receipt_matches(**values)
+    assert not file_receipt_matches(**{**values, "blob_path": None})
+    assert not file_receipt_matches(**{**values, "blob_path": ""})
+    assert not file_receipt_matches(**{**values, "content_size": 9})
+    assert not file_receipt_matches(**{**values, "drive_id": "other"})
+    assert not file_receipt_matches(**{**values, "current": {**source, "eTag": "v2"}})
+    assert not file_receipt_matches(**{**values, "source": {"id": "f", "size": 10}})
 
-    1. Resume is gated on the checkpoint's full identity (belongs_to), so a
-       checkpoint written against a now-dead snapshot is discarded and its
-       files are re-downloaded rather than skipped into metadata-only rows.
-    2. A file is only recorded as done AFTER its blob_path row update has
-       landed, and only when the UPDATE actually matched a row on THIS
-       snapshot. The unmatched case is loud and deliberately left out of the
-       checkpoint — bytes exist in storage but nothing points at them, so a
-       resume must redo those files instead of skipping them. (This is the
-       deployed lineage's design; it is strictly stronger than ordering a
-       whole-batch flush before the checkpoint commit, which could still
-       checkpoint ids whose row never matched.)
-    """
-    src = (
-        pathlib.Path(__file__).resolve().parents[2]
-        / "workers" / "backup-worker" / "main.py"
-    ).read_text()
-    i = src.find("# Load existing checkpoint (resume path).")
-    assert i != -1, "OneDrive checkpoint load site moved"
-    block = src[i:i + 2400]
-    assert "belongs_to(" in block, (
-        "resume must be gated on the checkpoint's identity triple"
-    )
-    assert "snapshot_id=str(snapshot.id)" in block, (
-        "a fresh checkpoint must record which snapshot it describes"
-    )
 
-    j = src.find("checkpoint.record_file_done(")
-    assert j != -1, "record_file_done call site moved"
-    region = src[max(0, j - 2500): j + 1500]
-    assert "_unmatched" in region, (
-        "ids whose blob_path UPDATE matched no row must be excluded from the "
-        "checkpoint, not silently marked done"
-    )
-    assert "not checkpointed" in region
+def test_content_only_version_needs_matching_metadata_too():
+    from shared.backup_checkpoint import file_receipt_matches
+    source = {"id": "f", "name": "original", "size": 10, "cTag": "content-v1"}
+    values = dict(source=source, current=source, drive_id="d", blob_path="saved/blob", content_size=10)
+    assert file_receipt_matches(**values)
+    assert not file_receipt_matches(**{**values, "current": {**source, "name": "renamed"}})
+    assert not file_receipt_matches(**{**values, "current": {**source, "cTag": "content-v2"}})
+
+
+def test_unknown_versions_never_skip_and_hash_fallback_is_content_bound():
+    from shared.backup_checkpoint import file_receipt_matches
+    source = {"id": "f", "name": "file", "size": 10}
+    values = dict(source=source, current=source, drive_id="d", blob_path="saved/blob", content_size=10)
+    assert not file_receipt_matches(**values)
+    source = {**source, "file": {"hashes": {"sha256Hash": "a"}}}
+    assert file_receipt_matches(**{**values, "source": source, "current": source})
+    assert not file_receipt_matches(**{**values, "source": source,
+        "current": {**source, "file": {"hashes": {"sha256Hash": "b"}}}})

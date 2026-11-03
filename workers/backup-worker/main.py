@@ -13127,6 +13127,7 @@ class BackupWorker:
                             async with self._onedrive_backup_semaphore:
                                 _uploaded, att_bytes = await self._useronedrive_backup_files(
                                     graph_client, resource, snapshot, tenant, drive_id, file_items,
+                                    expected_job_token=message.get("_job_lease_token"),
                                 )
 
                 if att_items and resource.type == ResourceType.USER_CHATS:
@@ -18897,6 +18898,7 @@ class BackupWorker:
                     ):
                         uploaded, uploaded_bytes = await self._useronedrive_backup_files(
                             graph_client, resource, snapshot, tenant, drive_id, file_items,
+                            expected_job_token=message.get("_job_lease_token"),
                         )
                         waiting = await self._seal_copy_handoff(snapshot, {
                             "resume_kind": "partition", "partition_id": str(partition_id),
@@ -20476,23 +20478,26 @@ class BackupWorker:
         tenant: Tenant,
         drive_id: str,
         file_items: List[Dict[str, Any]],
+        *,
+        expected_job_token: Optional[int] = None,
     ) -> Tuple[int, int]:
         """Download OneDrive files to blob and update the already-persisted
         ONEDRIVE_FILE snapshot-item rows with blob_path + real content_size
         + sha256.
 
         v2 path (ONEDRIVE_BACKUP_V2_ENABLED=true): no per-run cap. Downloads
-        run under a semaphore of ONEDRIVE_BACKUP_FILE_CONCURRENCY. A
-        BackupCheckpoint commits to Job.result.backup_checkpoint every N
-        files / M bytes so a worker crash resumes from the last commit.
+        run under a semaphore of ONEDRIVE_BACKUP_FILE_CONCURRENCY.
+        Committed, version-matching snapshot-item rows are the resume
+        receipts, isolated from sibling resources and concurrent shards.
 
         Legacy path: retains the 50-file / 500-MB slice from the v1
         implementation — partial-backup semantics pick remaining files up
         on the next run via the delta token.
         """
-        from sqlalchemy import update as sa_update
-        from shared.backup_checkpoint import BackupCheckpoint
-        from shared.models import Job as _Job
+        from shared.backup_checkpoint import BackupCheckpoint, file_receipt_matches
+        from shared.models import Job as _Job, SnapshotPartition as _Partition
+        from shared.provider_work import current_claim, _owned
+        from shared.copy_workflow import verify_copy_resume
 
         v2_enabled = settings.ONEDRIVE_BACKUP_V2_ENABLED
         max_files = None if v2_enabled else self.LEGACY_USER_ONEDRIVE_MAX_FILES
@@ -20500,60 +20505,87 @@ class BackupWorker:
         per_file_timeout = settings.ONEDRIVE_BACKUP_FILE_TIMEOUT_SECONDS
         file_concurrency = settings.ONEDRIVE_BACKUP_FILE_CONCURRENCY if v2_enabled else 1
 
-        # Sort smallest-first so the legacy cap captures the most files per
-        # run; in v2 ordering is cosmetic (everything downloads).
+        # Delta pages may repeat an id; the last observation is authoritative.
+        current_files = {str(item["id"]): item for item in file_items if item.get("id")}
+        # Sort smallest-first so the legacy cap captures the most files.
         ordered = sorted(
-            (f for f in file_items if f.get("id")),
+            current_files.values(),
             key=lambda f: int(f.get("size") or 0),
         )
 
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
         container = azure_storage_manager.get_container_name(str(tenant.id), "files")
 
-        # Load existing checkpoint (resume path). The slot is job-scoped and
-        # one Job id fans out across every resource of a bulk trigger, so a
-        # payload found here may belong to a sibling resource, another
-        # drive, or a previous attempt's snapshot.
-        #
-        # Its "done" set describes ONE snapshot's rows: after a swept /
-        # OOM-killed attempt the redelivered job gets a NEW snapshot, and
-        # replaying the old set there skipped every already-downloaded file
-        # while its new row kept blob_path NULL forever (the blobs of the
-        # dead attempt are reaped with it) — the snapshot still completed
-        # and the cursor still advanced, so those files became permanently
-        # unrestorable. Only resume a checkpoint bound to THIS
-        # (resource, drive, snapshot); otherwise start clean and
-        # re-download (cheap by comparison).
-        cp_payload = None
-        if snapshot.job_id:
-            async with async_session_factory() as _s0:
-                snap_job = await _s0.get(_Job, snapshot.job_id)
-                if snap_job and isinstance(snap_job.result, dict):
-                    cp_payload = snap_job.result.get("backup_checkpoint")
+        # Capture ownership before source I/O; a retry may not adopt a new owner.
+        provider_claim = current_claim()
+        partition_record = _PARTITION_LEASE_CTX.get()
+        if partition_record and partition_record.get("snapshot_id") != str(snapshot.id):
+            partition_record = None
+        expected_snapshot_token = getattr(snapshot, "lease_token", None)
+
+        async def _owned_snapshot(session):
+            nonlocal expected_job_token
+            if not await verify_copy_resume(session):
+                raise ChatCatalogueWorkLeaseMoved("OneDrive copy ownership moved")
+            if provider_claim is not None:
+                _, job, live, partition = await _owned(session, provider_claim, share_job=True)
+            else:
+                # Shared bulk Job reads do not serialize unrelated resources.
+                job = await session.get(_Job, snapshot.job_id,
+                    with_for_update={"read": True}, populate_existing=True)
+                live = await session.get(Snapshot, snapshot.id,
+                    with_for_update=True, populate_existing=True)
+                partition = await session.get(_Partition, uuid.UUID(partition_record["partition_id"]),
+                    with_for_update={"read": True}, populate_existing=True) if partition_record else None
+            if (job is None or live is None or str(live.id) != str(snapshot.id)
+                or str(live.job_id) != str(snapshot.job_id)
+                or str(live.resource_id) != str(resource.id) or str(job.tenant_id) != str(tenant.id)
+                or job.status not in (JobStatus.RUNNING, JobStatus.QUEUED, JobStatus.PENDING, JobStatus.RETRYING)
+                or live.status != SnapshotStatus.IN_PROGRESS or (live.extra_data or {}).get("cancelled_at")):
+                raise ChatCatalogueWorkLeaseMoved("OneDrive source ownership is no longer active")
+            if partition_record:
+                lease = partition_record["lease"]
+                if (partition is None or str(partition.snapshot_id) != str(snapshot.id)
+                    or str(partition.job_id) != str(snapshot.job_id) or partition.status != "IN_PROGRESS"
+                    or partition.lease_token != lease.token
+                    or (lease.owner_id and str(partition.lease_owner_id) != lease.owner_id)):
+                    partition_record["stolen"] = True
+                    raise ChatCatalogueWorkLeaseMoved("OneDrive partition lease ownership moved")
+            elif expected_snapshot_token is not None and live.lease_token != expected_snapshot_token:
+                raise ChatCatalogueWorkLeaseMoved("OneDrive snapshot lease ownership moved")
+            if expected_job_token is None:
+                expected_job_token = job.lease_token
+            elif not partition_record and job.lease_token != expected_job_token:
+                raise ChatCatalogueWorkLeaseMoved("OneDrive job lease ownership moved")
+            return live
+
+        # Load existing checkpoint (resume path). Rows are authoritative even
+        # when a legacy job checkpoint was evicted by a sibling. Only the source
+        # identity committed with the blob can vouch for bytes; mutable raw
+        # metadata and unstamped legacy rows cannot prove a downloaded version.
         checkpoint = BackupCheckpoint.empty(
             resource_id=str(resource.id), drive_id=drive_id,
             snapshot_id=str(snapshot.id),
         )
-        if isinstance(cp_payload, dict) and cp_payload:
-            _resumed = BackupCheckpoint.from_dict(cp_payload)
-            # belongs_to validates the whole identity triple (resource AND
-            # drive AND snapshot); a snapshot-id-only check would still
-            # honour a sibling resource's payload off the shared job slot.
-            if _resumed.belongs_to(
-                resource_id=str(resource.id), drive_id=drive_id,
-                snapshot_id=str(snapshot.id),
-            ):
-                checkpoint = _resumed
-            else:
-                print(
-                    f"[{self.worker_id}] [USER_ONEDRIVE] ignoring "
-                    f"checkpoint for resource={_resumed.resource_id} "
-                    f"drive={_resumed.drive_id} "
-                    f"snapshot={_resumed.snapshot_id or 'legacy/none'} — "
-                    f"this run is resource={resource.id} "
-                    f"drive={drive_id} snapshot={snapshot.id}; "
-                    f"re-downloading from zero to avoid metadata-only rows"
-                )
+        async with async_session_factory() as session:
+            await _owned_snapshot(session)
+            for id_chunk in iter_hydration_chunks(list(current_files)):
+                receipts = (await session.execute(select(
+                    SnapshotItem.external_id, SnapshotItem.blob_path,
+                    SnapshotItem.content_size, SnapshotItem.extra_data,
+                ).where(
+                    SnapshotItem.snapshot_id == snapshot.id,
+                    SnapshotItem.tenant_id == tenant.id,
+                    SnapshotItem.item_type == "ONEDRIVE_FILE",
+                    SnapshotItem.external_id.in_(id_chunk),
+                    SnapshotItem.blob_path.is_not(None), SnapshotItem.blob_path != "",
+                    SnapshotItem.is_deleted.is_(False),
+                ))).all()
+                for external_id, blob_path, size, metadata in receipts:
+                    downloaded_source = (metadata or {}).get("onedrive_download_source")
+                    if file_receipt_matches(source=downloaded_source, current=current_files[external_id],
+                            drive_id=drive_id, blob_path=blob_path, content_size=size):
+                        checkpoint.record_file_done(external_id=external_id, size=size)
 
         file_sem = asyncio.Semaphore(file_concurrency)
         state = {"uploaded_count": 0, "bytes_uploaded": 0}
@@ -20790,10 +20822,9 @@ class BackupWorker:
                     if not updates:
                         return 0
                     pending = list(updates)
-                    updates.clear()
                     backlog_high_evt.clear()
-                    committed_count = state["uploaded_count"]
-                    committed_bytes = state["bytes_uploaded"]
+                    committed_count = checkpoint.files_done_count + len(pending)
+                    committed_bytes = checkpoint.bytes_done + sum(row[2] for row in pending)
 
                 import json as _json
                 from sqlalchemy import text as _sqltext
@@ -20801,6 +20832,7 @@ class BackupWorker:
                 # these may advance the checkpoint — see below.
                 matched_ext_ids: set = set()
                 async with async_session_factory() as session:
+                    snap = await _owned_snapshot(session)
                     BATCH = 500
                     for i in range(0, len(pending), BATCH):
                         chunk = pending[i:i + BATCH]
@@ -20844,6 +20876,8 @@ class BackupWorker:
                                 AS v(ext_id, blob_path, sz, sh, ex)
                             WHERE si.snapshot_id = CAST(:snap_id AS uuid)
                               AND si.external_id = v.ext_id
+                              AND si.item_type = 'ONEDRIVE_FILE'
+                              AND si.is_deleted = false
                             RETURNING si.external_id
                         """)
                         # RETURNING, not rowcount: we need to know WHICH
@@ -20857,50 +20891,25 @@ class BackupWorker:
                         matched_ext_ids.update(
                             str(_r) for _r in _res.scalars().all()
                         )
-                    # Bump the snapshot row so the Recovery UI shows
-                    # live progress instead of sitting at 0 until
-                    # completion.
-                    snap = await session.get(Snapshot, snapshot.id)
-                    if snap is not None:
-                        snap.item_count = committed_count
-                        snap.new_item_count = committed_count
-                        snap.bytes_total = committed_bytes
-                        snap.bytes_added = committed_bytes
+                    unmatched = {row[0] for row in pending} - matched_ext_ids
+                    if unmatched:
+                        raise RuntimeError(
+                            f"OneDrive required blob rows missing: {len(unmatched)} on snapshot {snapshot.id}"
+                        )
+                    # Shard/resume progress must not decrease a sibling's counters.
+                    # Final settlement reconciles the full inventory from the DB.
+                    snap.item_count = max(snap.item_count or 0, committed_count)
+                    snap.new_item_count = max(snap.new_item_count or 0, state["uploaded_count"])
+                    snap.bytes_total = max(snap.bytes_total or 0, committed_bytes)
+                    snap.bytes_added = max(snap.bytes_added or 0, state["bytes_uploaded"])
                     await session.commit()
-                # Durable-after-persist: a file counts as done ONLY once its
-                # blob_path UPDATE is committed AND matched its row.
-                # Recording it at upload time (the old behaviour) meant an
-                # OOM-kill between a checkpoint commit and this flush left
-                # the resumed run skipping files whose rows have no
-                # blob_path — unrestorable items inside a COMPLETED
-                # snapshot with a promoted deltaLink. Redoing a download is
-                # always the cheaper failure.
-                _unmatched = []
-                for _ext_id, _bp, _size, _sh, _ex in pending:
-                    if _ext_id not in matched_ext_ids:
-                        _unmatched.append(_ext_id)
-                        continue
-                    checkpoint.record_file_done(
-                        external_id=_ext_id, size=_size,
-                    )
-                if _unmatched:
-                    # Loud: the bytes are in storage but no row on this
-                    # snapshot points at them, so the snapshot is short
-                    # those items. Left OUT of the checkpoint so a resume
-                    # re-does them instead of skipping them.
-                    print(
-                        f"[{self.worker_id}] [USER_ONEDRIVE] WARNING: "
-                        f"{len(_unmatched)} blob_path UPDATE(s) matched no "
-                        f"snapshot_items row on snapshot {snapshot.id} "
-                        f"(first 20: {_unmatched[:20]}) — not checkpointed"
-                    )
-                if v2_enabled and checkpoint.should_commit(
-                    every_files=settings.ONEDRIVE_BACKUP_CHECKPOINT_EVERY_FILES,
-                    every_bytes=settings.ONEDRIVE_BACKUP_CHECKPOINT_EVERY_BYTES,
-                ):
-                    await self._commit_backup_checkpoint(
-                        snapshot.job_id, checkpoint,
-                    )
+                # Drop buffered links only after their transaction committed.
+                # On failure the final flush retries them; failure there aborts
+                # the handler instead of certifying metadata-only rows.
+                async with state_lock:
+                    del updates[:len(pending)]
+                for external_id, _bp, size, _sha, _extra in pending:
+                    checkpoint.record_file_done(external_id=external_id, size=size)
                 print(
                     f"[{self.worker_id}] [USER_ONEDRIVE] "
                     f"{resource.display_name}: "
@@ -21152,6 +21161,9 @@ class BackupWorker:
 
                 extra_patch = {
                     "raw": f,
+                    "onedrive_download_source": {key: f[key] for key in (
+                        "id", "name", "size", "eTag", "cTag", "parentReference", "file",
+                    ) if key in f},
                     "sha256": sha256,
                     "quickxor": qxh,
                     "blobbed_at": datetime.utcnow().isoformat() + "Z",
@@ -21184,26 +21196,19 @@ class BackupWorker:
         # backlog cap is hit, committing blob_paths + live-bumping
         # snap counters so the UI shows progress in real time.
         flusher_task = asyncio.create_task(_periodic_flusher())
+        download_tasks = [asyncio.create_task(_process_one(f)) for f in ordered]
         try:
-            await asyncio.gather(*(_process_one(f) for f in ordered))
+            await asyncio.gather(*download_tasks)
         finally:
-            # Signal, wait, and do a final flush to catch any residual.
+            # Stop producers before the final drain, including provider deferral.
+            for task in download_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*download_tasks, return_exceptions=True)
             flush_done_evt.set()
-            backlog_high_evt.set()  # unblock a waiting flusher fast
-            try:
-                await flusher_task
-            except Exception:
-                pass
-            try:
-                await _flush_updates()
-            except Exception as fe:
-                print(
-                    f"[{self.worker_id}] [USER_ONEDRIVE] final flush "
-                    f"failed: {type(fe).__name__}: {fe}"
-                )
-
-        if v2_enabled:
-            await self._commit_backup_checkpoint(snapshot.job_id, checkpoint)
+            backlog_high_evt.set()
+            await flusher_task
+            await _flush_updates()
 
         print(
             f"[{self.worker_id}] [USER_ONEDRIVE] blobbed {state['uploaded_count']}/{len(ordered)} files "
@@ -21848,20 +21853,6 @@ class BackupWorker:
         except Exception as e:
             return False, f"row_update: {type(e).__name__}: {e}"
         return True, ""
-
-    async def _commit_backup_checkpoint(self, job_id, checkpoint) -> None:
-        """Merge the current BackupCheckpoint into Job.result.backup_checkpoint."""
-        if not job_id:
-            return
-        from shared.models import Job as _Job
-        async with async_session_factory() as s:
-            j = await s.get(_Job, job_id)
-            if j is not None:
-                r = dict(j.result or {})
-                r["backup_checkpoint"] = checkpoint.to_dict()
-                j.result = r
-                await s.commit()
-                checkpoint.mark_committed()
 
     # ==================== Server-Side Copy for Files ====================
 

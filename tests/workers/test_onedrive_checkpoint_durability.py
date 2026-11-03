@@ -1,33 +1,11 @@
-"""Regression: the job-scoped OneDrive BackupCheckpoint must never let a
-resumed run skip a file whose blob_path was not committed.
-
-Bug (found 2026-07-31, wave-1 audit of workers/backup-worker/main.py):
-
-  (a) identity — the checkpoint is read blindly from
-      Job.result.backup_checkpoint and BackupCheckpoint.from_dict never
-      checks that the payload belongs to THIS resource / drive / snapshot.
-      One Job id covers every resource of a bulk fan-out (all children get
-      the parent job id), so sibling resources share the single
-      `backup_checkpoint` slot — and a run against a *new* snapshot (the
-      prior one FAILED) would honour ids that only exist as rows on the
-      OLD snapshot.
-
-  (b) durability — `checkpoint.record_file_done()` fired the moment a blob
-      landed, while the matching `snapshot_items.blob_path` UPDATE was
-      still buffered in the in-memory `updates` list. A checkpoint commit
-      between the two (cadence is every 500 files / 1 GiB) plus an
-      OOM-kill before the batch flush left the resumed run skipping those
-      files: their rows exist with NO blob_path, the run can still
-      finalize COMPLETED and promote the deltaLink. Unrestorable baseline.
-
-Fix: validate checkpoint identity before honouring it, and advance the
-checkpoint only AFTER the blob_path UPDATEs commit (redoing a few
-downloads is always cheaper than an unrestorable snapshot).
-"""
+"""Resume only committed snapshot rows; required persistence cannot fail silently."""
 from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
+
+import pytest
 import os
 import pathlib
 import sys
@@ -58,27 +36,32 @@ DRIVE_ID = "drive-A"
 OTHER_DRIVE_ID = "drive-B"
 
 FILES = [
-    {"id": "f1", "name": "one.docx", "size": 1024},
-    {"id": "f2", "name": "two.xlsx", "size": 1024},
-    {"id": "f3", "name": "three.pdf", "size": 1024},
+    {"id": "f1", "name": "one.docx", "size": 1024, "eTag": "v1"},
+    {"id": "f2", "name": "two.xlsx", "size": 1024, "eTag": "v1"},
+    {"id": "f3", "name": "three.pdf", "size": 1024, "eTag": "v1"},
 ]
 
 
 # ─────────────────────────── fakes ────────────────────────────
 
 class FakeDB:
-    """Tracks which external_ids have a *committed* blob_path row, plus a
-    log of (checkpoint contents, committed ids) at each checkpoint commit.
+    """Tracks committed blob paths and their downloaded-source receipts.
 
     `rows` models which external_ids actually have a snapshot_items row on
     this snapshot — the bulk UPDATE only matches those. None = all of them.
     """
 
-    def __init__(self, job_result, rows=None):
-        self.persisted: set = set()
+    def __init__(self, job_result, rows=None, receipts=()):
+        self.persisted = set(receipts)
         self.rows = None if rows is None else set(rows)
-        self.job = types.SimpleNamespace(id=JOB_ID, result=job_result)
-        self.checkpoint_commits: list = []   # [(files_done_ext_ids, persisted)]
+        self.receipts = {item["id"]: (item["id"], "saved/blob", item["size"],
+                                     {"raw": item, "onedrive_download_source": item})
+                         for item in FILES if item["id"] in receipts}
+        self.job = types.SimpleNamespace(id=JOB_ID, result=job_result, tenant_id=TENANT_ID,
+                                         status=_bw.JobStatus.RUNNING, lease_token=1)
+        self.snapshot = types.SimpleNamespace(id=SNAPSHOT_ID, job_id=JOB_ID, resource_id=RESOURCE_ID,
+            status=_bw.SnapshotStatus.IN_PROGRESS, extra_data={}, lease_token=1,
+            item_count=len(receipts), new_item_count=0, bytes_total=1024 * len(receipts), bytes_added=0)
 
     def row_exists(self, ext_id) -> bool:
         return self.rows is None or ext_id in self.rows
@@ -93,8 +76,12 @@ class FakeScalars:
 
 
 class FakeResult:
-    def __init__(self, matched=()):
+    def __init__(self, matched=(), rows=()):
         self.matched = list(matched)
+        self.rows = list(rows)
+
+    def all(self):
+        return self.rows
 
     def scalar_one_or_none(self):
         return None
@@ -118,27 +105,29 @@ class FakeSession:
 
     async def execute(self, stmt, params=None):
         # The blob_path bulk UPDATE binds one :eN param per external_id.
+        if getattr(stmt, "is_select", False):
+            return FakeResult(rows=self.db.receipts.values())
         matched = []
         for key, val in (params or {}).items():
             if key.startswith("e") and key[1:].isdigit():
                 if self.db.row_exists(val):
-                    self.staged.append(val)
+                    index = key[1:]
+                    self.staged.append((val, params[f"bp{index}"], params[f"sz{index}"],
+                                        json.loads(params[f"ex{index}"])))
                     matched.append(val)
         return FakeResult(matched)
 
-    async def get(self, model, pk):
+    async def get(self, model, pk, **kwargs):
         name = getattr(model, "__name__", "")
         if name == "Job":
             return self.db.job
         if name == "Snapshot":
-            return types.SimpleNamespace(
-                item_count=0, new_item_count=0,
-                bytes_total=0, bytes_added=0,
-            )
+            return self.db.snapshot
         return None
 
     async def commit(self):
-        self.db.persisted.update(self.staged)
+        self.db.persisted.update(row[0] for row in self.staged)
+        self.db.receipts.update((row[0], row) for row in self.staged)
         self.staged.clear()
 
     async def rollback(self):
@@ -176,8 +165,8 @@ def _run(coro):
 
 
 def _make_worker(monkeypatch, *, job_result, checkpoint_every_files=500,
-                 rows=None):
-    db = FakeDB(job_result, rows=rows)
+                 rows=None, receipts=()):
+    db = FakeDB(job_result, rows=rows, receipts=receipts)
     graph = FakeGraph()
 
     monkeypatch.setattr(_bw, "azure_storage_manager", _storage())
@@ -212,16 +201,9 @@ def _make_worker(monkeypatch, *, job_result, checkpoint_every_files=500,
     async def _retry(**kwargs):
         raise AssertionError(f"unexpected retry enqueue: {kwargs.get('err_text')}")
 
-    async def _commit_cp(job_id, checkpoint):
-        db.checkpoint_commits.append(
-            (set(checkpoint.files_done_ext_ids), set(db.persisted)),
-        )
-        checkpoint.mark_committed()
-
     w._snapshot_still_live = _still_live
     w._stream_graph_to_backend = _stream
     w._enqueue_onedrive_retry = _retry
-    w._commit_backup_checkpoint = _commit_cp
     return w, graph, db
 
 
@@ -229,7 +211,7 @@ async def _run_backup(w, graph, *, drive_id=DRIVE_ID, files=None):
     resource = types.SimpleNamespace(
         id=RESOURCE_ID, display_name="jrue OneDrive", extra_data={},
     )
-    snapshot = types.SimpleNamespace(id=SNAPSHOT_ID, job_id=JOB_ID)
+    snapshot = types.SimpleNamespace(id=SNAPSHOT_ID, job_id=JOB_ID, lease_token=1)
     tenant = types.SimpleNamespace(id=TENANT_ID)
     return await w._useronedrive_backup_files(
         graph, resource, snapshot, tenant, drive_id,
@@ -300,87 +282,45 @@ def test_legacy_checkpoint_without_snapshot_id_is_not_honored(monkeypatch):
     assert db.persisted == {"f1", "f2", "f3"}
 
 
-def test_matching_checkpoint_still_resumes(monkeypatch):
-    # Guard against over-fixing: a checkpoint for this exact
-    # (resource, drive, snapshot) must still skip the finished file.
-    w, graph, db = _make_worker(
-        monkeypatch,
-        job_result={"backup_checkpoint": _cp_payload(done=("f1",))},
-    )
+def test_matching_durable_rows_resume_without_job_checkpoint(monkeypatch):
+    w, graph, db = _make_worker(monkeypatch, job_result={}, receipts={"f1"})
     uploaded, _ = _run(_run_backup(w, graph))
     assert uploaded == 2
-    assert db.persisted == {"f2", "f3"}
+    assert db.persisted == {"f1", "f2", "f3"}
     assert "f1" not in graph.download_url_calls
 
 
-# ─── (b) durability: never checkpoint ahead of the committed rows ───
-
-def test_checkpoint_never_runs_ahead_of_committed_blob_paths(monkeypatch):
-    # Cadence of 1 file makes every commit boundary observable; the
-    # blob_path UPDATEs stay buffered until the final flush.
-    w, graph, db = _make_worker(
-        monkeypatch, job_result={}, checkpoint_every_files=1,
-    )
-    _run(_run_backup(w, graph))
-
-    assert db.checkpoint_commits, "expected at least one checkpoint commit"
-    for done_ids, persisted in db.checkpoint_commits:
-        assert done_ids <= persisted, (
-            f"checkpoint recorded {sorted(done_ids - persisted)} as done "
-            f"before their blob_path UPDATE was committed — a crash here "
-            f"makes the resumed run skip blob-less rows"
-        )
+def test_matching_legacy_checkpoint_cannot_vouch_for_metadata_only_rows(monkeypatch):
+    w, graph, db = _make_worker(monkeypatch, job_result={"backup_checkpoint": _cp_payload()})
+    uploaded, _ = _run(_run_backup(w, graph))
+    assert uploaded == 3
+    assert db.persisted == {"f1", "f2", "f3"}
 
 
-def test_final_checkpoint_covers_every_persisted_file(monkeypatch):
-    w, graph, db = _make_worker(
-        monkeypatch, job_result={}, checkpoint_every_files=1,
-    )
+def test_downloads_do_not_mutate_shared_job_result(monkeypatch):
+    result = {"sibling_progress": 42}
+    w, graph, db = _make_worker(monkeypatch, job_result=result, checkpoint_every_files=1)
     uploaded, byte_count = _run(_run_backup(w, graph))
     assert (uploaded, byte_count) == (3, 3072)
     assert db.persisted == {"f1", "f2", "f3"}
-    assert db.checkpoint_commits[-1][0] == {"f1", "f2", "f3"}
+    assert db.job.result == {"sibling_progress": 42}
 
 
-def test_file_whose_snapshot_row_is_missing_is_not_recorded_done(monkeypatch):
-    # "Committed" is not the same as "matched a row". The bulk UPDATE is
-    # keyed on (snapshot_id, external_id); if that row doesn't exist the
-    # statement affects nothing, commits happily, and the blob becomes
-    # invisible to restore. Recording it done anyway makes the resumed run
-    # skip it forever — the same silent-loss shape this file exists to stop.
-    w, graph, db = _make_worker(
-        monkeypatch, job_result={}, checkpoint_every_files=1,
-        rows={"f1", "f3"},          # f2 has no snapshot_items row
-    )
-    _run(_run_backup(w, graph))
-
-    assert db.persisted == {"f1", "f3"}
-    for done_ids, _persisted in db.checkpoint_commits:
-        assert "f2" not in done_ids, (
-            "f2's blob_path UPDATE matched no row, so nothing on this "
-            "snapshot points at its blob — a resume must re-do it"
-        )
-    assert db.checkpoint_commits[-1][0] == {"f1", "f3"}
+def test_missing_snapshot_row_aborts_instead_of_certifying_uploaded_bytes(monkeypatch):
+    w, graph, db = _make_worker(monkeypatch, job_result={}, rows={"f1", "f3"})
+    with pytest.raises(RuntimeError, match="required blob rows missing"):
+        _run(_run_backup(w, graph))
+    assert db.persisted == set()
 
 
-def test_failed_flush_leaves_files_out_of_the_checkpoint(monkeypatch):
-    # The whole point of the ordering: if the row UPDATE never commits,
-    # the file must NOT be recorded done, so the next run re-uploads it.
-    w, graph, db = _make_worker(
-        monkeypatch, job_result={}, checkpoint_every_files=1,
-    )
+def test_failed_flush_cannot_return_success(monkeypatch):
+    w, graph, db = _make_worker(monkeypatch, job_result={})
 
     class ExplodingSession(FakeSession):
         async def commit(self):
             raise RuntimeError("simulated PG failure during flush")
 
-    monkeypatch.setattr(
-        _bw, "async_session_factory", lambda: ExplodingSession(db),
-    )
-    _run(_run_backup(w, graph))
+    monkeypatch.setattr(_bw, "async_session_factory", lambda: ExplodingSession(db))
+    with pytest.raises(RuntimeError, match="simulated PG failure"):
+        _run(_run_backup(w, graph))
     assert db.persisted == set()
-    for done_ids, _persisted in db.checkpoint_commits:
-        assert done_ids == set(), (
-            "files whose blob_path UPDATE failed must not be recorded as "
-            f"done, got {sorted(done_ids)}"
-        )
