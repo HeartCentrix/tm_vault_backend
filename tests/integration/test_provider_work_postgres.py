@@ -445,3 +445,23 @@ async def test_summary_distinguishes_cooldown_ready_running_and_expired(store):
         row = summaries[str(receipt.job_id)]
         assert [row[key] for key in keys] == [int(index == n) for n in range(4)]
     assert summaries[str(receipts[3].job_id)]['state'] == 'WAITING'
+
+async def test_sibling_checkpoints_do_not_exclusively_lock_shared_job(store):
+    from sqlalchemy import text
+    first_scope = await store.new_scope()
+    second_scope = await store.new_scope()
+    async with store.factory.begin() as db:
+        new_resource = models.Resource(id=uuid4(), tenant_id=store.tenant, type=models.ResourceType.USER_MAIL, external_id=str(uuid4()), display_name="Sibling")
+        db.add(new_resource)
+        await db.flush()
+        job_id = await db.scalar(select(models.Snapshot.job_id).where(models.Snapshot.id == first_scope.snapshot_id))
+        await db.execute(update(models.Snapshot).where(models.Snapshot.id == second_scope.snapshot_id).values(job_id=job_id, resource_id=new_resource.id))
+        for scope in (first_scope, second_scope):
+            await work.ensure_work(db, snapshot_id=scope.snapshot_id, snapshot_token=0, job_token=0, continuation={'kind':'single'})
+    first, second = await claim(store), await claim(store)
+    assert first.job_id == second.job_id
+    async with store.factory.begin() as a:
+        await work.record_unit_checkpoint(a, first, unit_key='one', kind='mail')
+        async with store.factory.begin() as b:
+            await b.execute(text("SET LOCAL lock_timeout='250ms'"))
+            await work.record_unit_checkpoint(b, second, unit_key='two', kind='mail')

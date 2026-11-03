@@ -104,11 +104,11 @@ def _receipt(row):
         row.snapshot_lease_token, row.job_lease_token)
 
 
-async def _parents(session, snapshot_id, partition_id=None, *, skip_locked=False):
+async def _parents(session, snapshot_id, partition_id=None, *, skip_locked=False, share_job=False):
     hint = await session.get(Snapshot, _uuid(snapshot_id))
     if hint is None:
         raise ProviderWorkConflict('provider snapshot removed')
-    job = await session.scalar(select(Job).where(Job.id == hint.job_id).with_for_update(skip_locked=skip_locked)
+    job = await session.scalar(select(Job).where(Job.id == hint.job_id).with_for_update(skip_locked=skip_locked, read=share_job)
         .execution_options(populate_existing=True))
     snapshot = await session.scalar(select(Snapshot).where(Snapshot.id == hint.id).with_for_update(skip_locked=skip_locked)
         .execution_options(populate_existing=True))
@@ -181,8 +181,8 @@ async def ensure_work(session, *, snapshot_id, snapshot_token, job_token, partit
     return _receipt(row)
 
 
-async def _owned(session, claim, *, allow_terminal=False):
-    job, snapshot, partition = await _parents(session, claim.snapshot_id, claim.partition_id)
+async def _owned(session, claim, *, allow_terminal=False, share_job=False):
+    job, snapshot, partition = await _parents(session, claim.snapshot_id, claim.partition_id, share_job=share_job)
     row = await session.scalar(select(ProviderWork).where(ProviderWork.id == claim.work_id).with_for_update()
         .execution_options(populate_existing=True))
     leaf = partition or snapshot
@@ -321,7 +321,7 @@ async def claim_due_work(session, *, owner_id, lease_seconds=120, _clamp_rounds=
 
 
 async def renew_work(session, claim, *, lease_seconds=120):
-    row, _, snapshot, partition = await _owned(session, claim, allow_terminal=True)
+    row, _, snapshot, partition = await _owned(session, claim, allow_terminal=True, share_job=True)
     expiry = await session.scalar(select(func.clock_timestamp())) + timedelta(seconds=lease_seconds)
     row.lease_expires_at = (partition or snapshot).lease_expires_at = expiry
     return claim
@@ -329,7 +329,8 @@ async def renew_work(session, claim, *, lease_seconds=120):
 
 async def record_unit_checkpoint(session, claim, *, unit_key, kind, state='PENDING', checkpoint=None,
         receipt_id=None, source_version=None, attempts=0, waited_s=0, reconciliations=0, deadline_at=None):
-    await _owned(session, claim, allow_terminal=state in ('COMPLETED', 'FAILED'))
+    # Checkpoints do not mutate the shared job; siblings can validate it together.
+    await _owned(session, claim, allow_terminal=state in ('COMPLETED', 'FAILED'), share_job=True)
     if (not unit_key or len(unit_key) > 128 or state not in ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED')
         or type(attempts) is not int or attempts < 0 or not math.isfinite(waited_s) or waited_s < 0
         or type(reconciliations) is not int or reconciliations < 0):
