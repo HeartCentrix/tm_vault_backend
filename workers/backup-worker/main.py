@@ -4542,7 +4542,8 @@ class BackupWorker:
             "BACKUP_WORKER_DEDICATED_ONLY", _default_dedicated
         ).lower() in ("true", "1", "yes")
         if dedicated_only:
-            queues = [(self._backup_queue_name, 20)]
+            prefetch_env = "BACKUP_HEAVY_PREFETCH" if _is_heavy_replica else "BACKUP_NORMAL_PREFETCH"
+            queues = [(self._backup_queue_name, max(1, int(os.getenv(prefetch_env, "20"))))]
             print(
                 f"[{self.worker_id}] BACKUP_WORKER_DEDICATED_ONLY=true — "
                 f"consuming ONLY {self._backup_queue_name}"
