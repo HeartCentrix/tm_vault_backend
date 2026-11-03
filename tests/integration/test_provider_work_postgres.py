@@ -427,3 +427,21 @@ async def test_lost_lease_interrupts_turn_without_removing_worker_capacity(store
     await enqueue(store)
     runner.resume_callback = AsyncMock(return_value={'completed': True})
     assert (await runner.run_once())['completed']
+
+async def test_summary_distinguishes_cooldown_ready_running_and_expired(store):
+    from shared.provider_observability import provider_work_summaries
+    receipts = [await enqueue(store) for _ in range(4)]
+    now = datetime.now(timezone.utc)
+    states = [dict(state='WAITING', next_eligible_at=now + timedelta(minutes=5)),
+              dict(state='WAITING', next_eligible_at=now - timedelta(seconds=10)),
+              dict(state='RESUMING', lease_expires_at=now + timedelta(minutes=5)),
+              dict(state='RESUMING', lease_expires_at=now - timedelta(seconds=10))]
+    async with store.factory.begin() as db:
+        for receipt, values in zip(receipts, states):
+            await db.execute(update(models.ProviderWork).where(models.ProviderWork.id == receipt.work_id).values(**values))
+        summaries = await provider_work_summaries(db, job_ids=[r.job_id for r in receipts])
+    keys = ('cooldown_leaves', 'ready_leaves', 'running_leaves', 'expired_lease_leaves')
+    for index, receipt in enumerate(receipts):
+        row = summaries[str(receipt.job_id)]
+        assert [row[key] for key in keys] == [int(index == n) for n in range(4)]
+    assert summaries[str(receipts[3].job_id)]['state'] == 'WAITING'
