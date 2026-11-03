@@ -102,21 +102,15 @@ async def _acquire_advisory_lock_forever(dsn: str) -> asyncpg.Connection:
 async def consume() -> None:
     lock_conn = await _acquire_advisory_lock_forever(_dsn())
 
-    # Self-heal: make sure the storage seed + NOTIFY triggers + seaweedfs
-    # buckets exist before we start consuming. Toggle-worker is the right
-    # place because it has aioboto3 available (the seeder's bucket create
-    # step needs it) and because this is the process that actually toggles.
+    connection = None
     try:
-        from shared.database import engine
-        from shared.storage_bootstrap import ensure_storage_bootstrap
-        await ensure_storage_bootstrap(engine)
-    except Exception as exc:
-        log.warning("storage bootstrap at worker startup failed: %s", exc)
+        # Honor DB_SCHEMA_MODE: runtime boots verify; explicit bootstrap seeds
+        # storage and installs triggers without rewriting them on every restart.
+        from shared.database import init_db
+        await init_db()
+        await router.load(db_dsn=_dsn())
 
-    await router.load(db_dsn=_dsn())
-
-    connection = await aio_pika.connect_robust(_rmq_url())
-    try:
+        connection = await aio_pika.connect_robust(_rmq_url())
         channel = await connection.channel()
         queue = await channel.declare_queue(QUEUE_NAME, durable=True)
         log.info("toggle worker ready, consuming %s", QUEUE_NAME)
@@ -131,7 +125,8 @@ async def consume() -> None:
                         log.exception("orchestrator crashed: %s", e)
     finally:
         await lock_conn.close()
-        await connection.close()
+        if connection is not None:
+            await connection.close()
         await router.close()
 
 

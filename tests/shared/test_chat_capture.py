@@ -1,6 +1,11 @@
 """Source-observation accounting stays bounded and matches repository identity."""
+import asyncio
+from contextlib import asynccontextmanager, suppress
+from datetime import datetime, timezone
+import gc
 import importlib
 import os
+from types import SimpleNamespace
 from uuid import uuid4
 
 os.environ.setdefault("ALLOW_DEV_JWT_SECRETS", "true")
@@ -156,3 +161,150 @@ def test_mismatch_diagnostics_distinguish_missing_and_changed_keys_without_paylo
         assert detail["only_first"] == detail["only_second"] == detail["changed"] == 1
         assert len(detail["sample_keys"]) == 3
         assert "secret" not in str(detail)
+
+
+@pytest.fixture(params=[False, True], ids=["abort", "suspend"])
+async def cancelled_capture(monkeypatch, request):
+    """Exercise real capture/transaction ownership around a blocked DB adapter."""
+    from shared import chat_capture as capture, provider_runtime
+    from shared.provider_work import ProviderWorkConflict
+
+    selected = scope()
+    lease = SimpleNamespace(observation_hash_version=1)
+    execution = SimpleNamespace(claim=object(), deferred=None) if request.param else None
+    unit = SimpleNamespace(created_at=datetime.now(timezone.utc), reconciliations=0, key="chat") if request.param else None
+    state = SimpleNamespace(entered=asyncio.Event(), started=asyncio.Event(), release=asyncio.Event(),
+        cancelled=asyncio.Event(), finished=asyncio.Event(), committed=[], rolled_back=[], errors=[],
+        failure=None, late_failure=None, capture=capture)
+
+    @asynccontextmanager
+    async def session_factory():
+        pending = []
+
+        @asynccontextmanager
+        async def transaction():
+            try:
+                yield
+            except BaseException:
+                state.rolled_back.extend(pending)
+                raise
+            else:
+                state.committed.extend(pending)
+
+        yield SimpleNamespace(begin=transaction, pending=pending)
+
+    async def begin(session, **kwargs):
+        return lease
+
+    async def cleanup(session, **kwargs):
+        assert kwargs["lease"] is lease
+        if request.param:
+            assert kwargs["claim"] is execution.claim and kwargs["unit_key"] == unit.key
+        else:
+            assert kwargs["reason"] == "capture cancelled before verification"
+        session.pending.append("suspended" if request.param else "aborted")
+        state.started.set()
+        try:
+            await state.release.wait()
+            if state.failure is not None:
+                raise state.failure
+        except asyncio.CancelledError:
+            state.cancelled.set()
+            if state.late_failure is not None:
+                # A driver can fail while unwinding an interrupted transaction.
+                await state.release.wait()
+                raise state.late_failure
+            raise
+        finally:
+            state.finished.set()
+
+    async def pages(chat_id):
+        state.entered.set()
+        await asyncio.Event().wait()
+        yield []
+
+    @asynccontextmanager
+    async def pinned(client, *, principal_id):
+        yield SimpleNamespace(permission_scope_hash=selected.permission_scope_hash, iter_message_pages=pages)
+
+    monkeypatch.setattr(capture, "pinned_chat_source", pinned)
+    monkeypatch.setattr(capture.catalogue, "begin_capture", begin)
+    monkeypatch.setattr(capture.catalogue, "suspend_capture", cleanup)
+    monkeypatch.setattr(capture.catalogue, "abort_capture", cleanup)
+    monkeypatch.setattr(provider_runtime, "current_execution", lambda: execution)
+    monkeypatch.setattr(provider_runtime, "current_unit", lambda: unit)
+    state.conflict = ProviderWorkConflict("provider work ownership changed")
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda loop, context: state.errors.append(context))
+    state.task = asyncio.create_task(capture.capture_chat_inventory(scope=selected,
+        graph_client=object(), storage=object(), session_factory=session_factory))
+    await asyncio.wait_for(state.entered.wait(), 1)
+    try:
+        yield state
+    finally:
+        state.task.cancel()
+        state.release.set()
+        with suppress(asyncio.CancelledError):
+            await state.task
+        await asyncio.sleep(0)
+        gc.collect()
+        loop.set_exception_handler(previous_handler)
+
+
+@pytest.mark.parametrize("conflict", [False, True], ids=["success", "ownership_changed"])
+async def test_capture_cleanup_preserves_cancellation_after_transaction_result(cancelled_capture, conflict):
+    state = cancelled_capture
+    state.failure = state.conflict if conflict else None
+    state.task.cancel("original cancellation")
+    await asyncio.wait_for(state.started.wait(), 1)
+    state.release.set()
+    with pytest.raises(asyncio.CancelledError) as error:
+        await state.task
+    assert error.value.args == ("original cancellation",)
+    assert bool(state.committed) is not conflict
+    assert bool(state.rolled_back) is conflict
+    assert not state.errors
+
+
+async def test_repeated_capture_cancel_stops_cleanup_and_retrieves_late_failure(cancelled_capture):
+    state = cancelled_capture
+    state.late_failure = state.conflict
+    state.task.cancel("original cancellation")
+    await asyncio.wait_for(state.started.wait(), 1)
+    state.task.cancel("second cancellation")
+    with pytest.raises(asyncio.CancelledError) as error:
+        await state.task
+    # The owner may exit while rollback is still running, but the write must stop.
+    was_cancelled = state.cancelled.is_set()
+    state.failure = state.conflict
+    state.release.set()
+    await asyncio.wait_for(state.finished.wait(), 1)
+    await asyncio.sleep(0)
+    gc.collect()
+    assert not state.errors
+    assert was_cancelled
+    assert error.value.args == ("original cancellation",)
+    assert not state.committed
+    assert state.rolled_back
+
+
+async def test_capture_cancel_cleanup_has_bounded_wait(cancelled_capture, monkeypatch):
+    from shared.lease import run_bounded
+
+    state = cancelled_capture
+
+    async def short_bound(coro, timeout_s):
+        return await run_bounded(coro, timeout_s=0.01)
+
+    monkeypatch.setattr(state.capture, "run_bounded", short_bound, raising=False)
+    state.task.cancel("original cancellation")
+    await asyncio.wait_for(state.started.wait(), 1)
+    done, _ = await asyncio.wait({state.task}, timeout=0.5)
+    assert state.task in done, "capture cleanup exceeded its bounded wait"
+    with pytest.raises(asyncio.CancelledError) as error:
+        await state.task
+    assert error.value.args == ("original cancellation",)
+    assert state.cancelled.is_set()
+    assert not state.committed
+    assert state.rolled_back

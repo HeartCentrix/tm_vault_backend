@@ -25,6 +25,7 @@ from shared.chat_capture_graph import StrictChatGraphSource, effective_capture_s
 from shared.chat_capture_storage import upload_capture_content, verify_catalogue_content
 from shared.chat_content_stream import spool_chat_content
 from shared.db_retry import run_catalogue_transaction
+from shared.lease import run_bounded
 from shared.provider_read import _identifier
 from shared.models import ChatCaptureAttempt, ChatInventory, ChatInventoryItem, ChatItemVersion, SnapshotChatInventory, SnapshotItem
 
@@ -478,13 +479,14 @@ async def capture_chat_inventory(*, scope, graph_client, storage, session_factor
                         due = execution.deferred.next_eligible_at if execution.deferred else datetime.now(timezone.utc)
                         await catalogue.suspend_capture(session, lease=keeper.lease, claim=execution.claim,
                             unit_key=unit.key, next_eligible_at=due)
-                    with suppress(Exception):
-                        await asyncio.shield(run_catalogue_transaction(session_factory, suspend_cancelled))
+                    # Bound DB cleanup and preserve the first cancellation on repeated shutdown signals.
+                    with suppress(Exception, asyncio.CancelledError):
+                        await run_bounded(run_catalogue_transaction(session_factory, suspend_cancelled), timeout_s=10)
                     raise
                 async def abort(session):
                     await catalogue.abort_capture(session, lease=keeper.lease, reason="capture cancelled before verification")
-                with suppress(Exception):
-                    await asyncio.shield(run_catalogue_transaction(session_factory, abort))
+                with suppress(Exception, asyncio.CancelledError):
+                    await run_bounded(run_catalogue_transaction(session_factory, abort), timeout_s=10)
                 raise
             finally:
                 renewer.cancel()
