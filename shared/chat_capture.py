@@ -13,6 +13,7 @@ import os
 import re
 import sqlite3
 import tempfile
+import time
 from uuid import UUID
 from weakref import WeakKeyDictionary
 
@@ -327,10 +328,20 @@ async def _binary(*, scope, keeper, factory, storage, source_client, item_type,
                 file_versions.popitem(last=False)
         return captured
 
+    marks, started = {}, time.monotonic()
+    def mark(name):
+        marks[name] = round((time.monotonic() - started - sum(marks.values())) * 1000)
+    def report(item):
+        total = round((time.monotonic() - started) * 1000)
+        if total >= 1000:
+            logger.info("chat_binary_timing attempt_id=%s type=%s size=%s total_ms=%s %s", keeper.lease.attempt_id, item_type,
+                        item.content.size if item.content else None, total, " ".join(f"{k}_ms={v}" for k, v in marks.items()))
+        return remember(item)
     retained = await _retained(scope=scope, keeper=keeper, factory=factory, storage=storage,
         item_type=item_type, graph_id=graph_id, parent_id=parent_id, payload=payload, source=source, stage=stage)
+    mark("retained_lookup")
     if retained is not None:
-        return remember(retained)
+        return report(retained)
     opened = source_client.open_file(raw) if file else source_client.open_hosted(scope.chat_id, parent_id, graph_id)
     async with AsyncExitStack() as spools:
         async with opened as (chunks, expected_size, content_type):
@@ -338,19 +349,23 @@ async def _binary(*, scope, keeper, factory, storage, source_client, item_type,
                 payload.setdefault("captured_content_type", content_type)
             spooled = await spools.enter_async_context(
                 spool_chat_content(keeper.guard(chunks), expected_size=expected_size))
+        mark("download")
         # Verified EOF closes the provider response before refresh/upload work.
         if file:
             refreshed = await source_client.refresh_file(source["source_drive_id"], source["source_item_id"])
             if _file_source(refreshed) != source:
                 raise ChatSourceMovement("required file changed during download")
+            mark("refresh")
         retained = await _retained(scope=scope, keeper=keeper, factory=factory, storage=storage,
             item_type=item_type, graph_id=graph_id, parent_id=parent_id, payload=payload,
             source=source, checksum=spooled.sha256, stage=stage)
+        mark("retained_checksum")
         if retained is not None:
-            return remember(retained)
+            return report(retained)
         if stage:
             content = await upload_capture_content(scope=scope, lease=keeper.lease,
                 spooled=spooled, storage=storage, session_factory=factory, **source)
+            mark("upload")
         else:
             # Reconciliation hashes semantic bytes; this location is never
             # persisted, uploaded or used for reads.
@@ -359,7 +374,8 @@ async def _binary(*, scope, keeper, factory, storage, source_client, item_type,
         item = CapturedChatItem(item_type, graph_id, parent_id, payload, content)
         if stage:
             await _stage(factory, keeper, [item])
-        return remember(item)
+            mark("stage")
+        return report(item)
 
 async def _observe(*, scope, keeper, factory, storage, source, ledger, observation,
                    exclude_message=None, folder_path=None):

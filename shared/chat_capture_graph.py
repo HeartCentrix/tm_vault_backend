@@ -11,6 +11,8 @@ import base64
 from contextlib import asynccontextmanager
 import hashlib
 import json
+import logging
+import time
 from typing import AsyncIterator
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit
 from weakref import WeakValueDictionary
@@ -161,6 +163,15 @@ class StrictChatGraphSource:
         return token
 
     async def _pace(self, url: str):
+        started = time.monotonic()
+        try:
+            await self._pace_inner(url)
+        finally:
+            waited = time.monotonic() - started
+            if waited >= 1:
+                logging.getLogger(__name__).info("chat_pace_wait ms=%d path=%s", waited * 1000, urlsplit(url).path[:120])
+
+    async def _pace_inner(self, url: str):
         from shared.graph_rate_limiter import graph_rate_limiter
         await graph_rate_limiter.acquire(reason="chat_catalogue_capture")
         policy = self._pacing_policy

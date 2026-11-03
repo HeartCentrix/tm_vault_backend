@@ -4,7 +4,9 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 import inspect
+import logging
 import os
+import time
 from uuid import UUID, uuid4
 
 from sqlalchemy import func, select
@@ -119,7 +121,12 @@ async def upload_capture_content(*, scope, lease, spooled, storage, session_fact
     if str(store.backend_id) != str(scope.backend_id):
         raise ChatStorageCaptureError("selected catalogue backend differs from capture scope")
     container = catalogue_container(scope.tenant_id)
+    phases, clock = {}, time.monotonic()
+    def phase(name):
+        nonlocal clock
+        now = time.monotonic(); phases[name] = round((now - clock) * 1000); clock = now
     await store.ensure_container(container)
+    phase("ensure_container")
     for retry in range(3):
         object_id = uuid4()
         path = f"chat-catalogue/v1/{scope.tenant_id}/{object_id}"
@@ -135,6 +142,7 @@ async def upload_capture_content(*, scope, lease, spooled, storage, session_fact
                 quiescent_after=deadline + timedelta(seconds=UPLOAD_QUIESCENCE_SECONDS)))
             return required
         encryption_required = await run_catalogue_transaction(session_factory, reserve)
+        phase("reserve")
         try:
             metadata = {"tenant_id": str(scope.tenant_id), "sha256": spooled.sha256,
                         "plaintext_size": str(spooled.size), "chat_catalogue_format": "1"}
@@ -144,14 +152,17 @@ async def upload_capture_content(*, scope, lease, spooled, storage, session_fact
                 kwargs["tenant_id"] = str(scope.tenant_id)
             info = await asyncio.wait_for(store.upload_from_file(
                 container, path, spooled.path, spooled.size, **kwargs), UPLOAD_TIMEOUT_SECONDS)
+            phase("upload")
             if (str(info.backend_id), info.container, info.path) != (str(scope.backend_id), container, path):
                 raise ChatStorageCaptureError("upload receipt differs from the owned object location")
             key_id, frame_version = await _stored_encryption(store, container, path,
                 encryption_required=encryption_required)
+            phase("stored_encryption")
             descriptor = ChatContentDescriptor(object_id, scope.backend_id, container,
                 path, spooled.sha256, spooled.size, key_id, frame_version, None,
                 source_drive_id, source_item_id, source_etag, source_ctag)
             await verify_catalogue_content(storage, descriptor)
+            phase("verify")
             if key_id is not None:
                 from shared.crypto import runtime
                 if runtime.verify_readback_enabled():
@@ -173,6 +184,10 @@ async def upload_capture_content(*, scope, lease, spooled, storage, session_fact
                 obj.uploaded_bytes = spooled.size
                 obj.state = "LIVE"
             await run_catalogue_transaction(session_factory, make_live)
+            phase("make_live")
+            if sum(phases.values()) >= 1000:
+                logging.getLogger(__name__).info("chat_upload_timing size=%s %s", spooled.size,
+                                                 " ".join(f"{k}_ms={v}" for k, v in phases.items()))
             return descriptor
         except (asyncio.CancelledError, ChatCatalogueConflict, SQLAlchemyError):
             raise
