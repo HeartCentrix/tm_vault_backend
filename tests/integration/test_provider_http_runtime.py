@@ -282,3 +282,57 @@ async def test_started_transmission_keeps_its_attempt_charge(store, redis_client
                 assert len(sent) == 2
                 assert unit.remaining == 14
                 assert await redis_client.zcard(limiter.prefix + 'active') == 0
+
+
+async def test_cancelled_allowance_refund_survives_concurrent_database_refill(store, redis_client):
+    await enqueue(store)
+    owner = await claim(store)
+    limiter, sent, at_parent = admission(redis_client), [], asyncio.Event()
+
+    def trace(conn, cursor, statement, parameters, context, executemany):
+        if 'FROM jobs' in statement and 'FOR SHARE' in statement:
+            at_parent.set()
+
+    async def transport(request):
+        sent.append(request)
+        return httpx.Response(200)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as raw:
+        client = AdmittedHttpClient(raw, OWNER, limiter=limiter)
+        async with execution_scope(store, owner):
+            async with runtime.unit_scope('chat', 'chat') as unit, runtime.provider_live_wait_scope():
+                for _ in range(15):
+                    await client.get(URL)
+                assert unit.remaining == 1
+                tasks = []
+                event.listen(store.engine.sync_engine, 'before_cursor_execute', trace)
+                try:
+                    async with limiter.admit(ProviderRequestContext('tenant', 'holder', 'sharepoint'), wait_budget=0):
+                        queued = asyncio.create_task(client.get(URL))
+                        tasks.append(queued)
+                        async with asyncio.timeout(2):
+                            while not await redis_client.hlen(limiter.prefix + 'fair:pending'):
+                                await asyncio.sleep(.001)
+                        assert unit.remaining == 0
+                        async with store.factory.begin() as blocker:
+                            await blocker.scalar(select(models.Job).where(models.Job.id == owner.job_id).with_for_update())
+                            refilling = asyncio.create_task(client.get(URL))
+                            tasks.append(refilling)
+                            await asyncio.wait_for(at_parent.wait(), 2)
+                            queued.cancel()
+                            with pytest.raises(asyncio.CancelledError):
+                                await queued
+                            assert unit.remaining == 1
+                            assert len(sent) == 15
+                    assert (await asyncio.wait_for(refilling, 3)).status_code == 200
+                    assert len(sent) == 16
+                    assert unit.remaining == 16
+                    async with store.factory() as db:
+                        assert await db.scalar(select(models.ProviderWorkUnit.attempts).where(
+                            models.ProviderWorkUnit.work_id == owner.work_id)) == 32
+                    assert await redis_client.zcard(limiter.prefix + 'active') == 0
+                finally:
+                    event.remove(store.engine.sync_engine, 'before_cursor_execute', trace)
+                    for task in tasks:
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)

@@ -388,7 +388,8 @@ async def provider_attempt_scope(context=None):
             await run_db_transaction(execution.factory, lambda session:
                 work.record_unit_checkpoint(session, execution.claim, unit_key=unit.key,
                     kind=unit.kind, attempts=16))
-            unit.remaining = 16
+            # Another prepared request can refund allowance during the DB wait.
+            unit.remaining += 16
         check_provider_turn()
         unit.remaining -= 1
     attempt = PreparedAttempt(execution, unit, asyncio.current_task())
