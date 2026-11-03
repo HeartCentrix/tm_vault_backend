@@ -30638,17 +30638,19 @@ class BackupWorker:
         Within a handler the client is still cached, so AAD doesn't see
         a token storm."""
         cache_key = f"{tenant.external_tenant_id}::{handler_key}"
-        existing = self.graph_clients.get(cache_key)
-        if existing:
-            return existing
-        app = multi_app_manager.get_next_app()
-        client = GraphClient(
-            client_id=app.client_id,
-            client_secret=app.client_secret,
-            tenant_id=tenant.external_tenant_id,
-        )
-        self.graph_clients[cache_key] = client
-        return client
+        # Preflight only at initial binding. Existing clients remain pinned:
+        # switching during pagination could change application access-policy scope.
+        locks = getattr(self, '_graph_client_creation_locks', None)
+        if locks is None:
+            locks = self._graph_client_creation_locks = {}
+        async with locks.setdefault(cache_key, asyncio.Lock()):
+            existing = self.graph_clients.get(cache_key)
+            if existing:
+                return existing
+            client = await GraphClient.from_pool(multi_app_manager, tenant.external_tenant_id)
+            if not multi_app_manager.is_credential_invalid(client.client_id, tenant.external_tenant_id):
+                self.graph_clients[cache_key] = client
+            return client
 
     def get_power_bi_client(self, tenant: Tenant) -> PowerBIClient:
         return PowerBIClient(

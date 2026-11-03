@@ -180,6 +180,7 @@ class MultiAppManager:
         else:
             self._current_index = 0
         self._lock = threading.Lock()
+        self._invalid_credentials = set()
         self._app_map: Dict[str, AppRegistry] = {
             app.client_id: app for app in self.apps
         }
@@ -188,7 +189,15 @@ class MultiAppManager:
     def app_count(self) -> int:
         return len(self.apps)
 
-    def get_next_app(self) -> AppRegistry:
+    def mark_invalid_credential(self, client_id: str, tenant_id: str):
+        # Credentials are immutable for this process; a rotation/restart rebuilds the pool.
+        with self._lock:
+            self._invalid_credentials.add((client_id, tenant_id))
+
+    def is_credential_invalid(self, client_id: str, tenant_id: str) -> bool:
+        return (client_id, tenant_id) in self._invalid_credentials
+
+    def get_next_app(self, *, tenant_id=None) -> AppRegistry:
         """Get the next app using round-robin with throttling awareness.
 
         Round-robin admits HEALTHY apps first; PROBATION apps are tried
@@ -209,7 +218,8 @@ class MultiAppManager:
             for _ in range(len(self.apps)):
                 app = self.apps[self._current_index % len(self.apps)]
                 self._current_index += 1
-                if not app.is_throttled and not app.in_probation:
+                if (not self.is_credential_invalid(app.client_id, tenant_id or app.tenant_id)
+                        and not app.is_throttled and not app.in_probation):
                     app.request_count += 1
                     app.last_request_time = time.time()
                     return app
@@ -218,13 +228,17 @@ class MultiAppManager:
             for _ in range(len(self.apps)):
                 app = self.apps[self._current_index % len(self.apps)]
                 self._current_index += 1
-                if not app.is_throttled:
+                if (not self.is_credential_invalid(app.client_id, tenant_id or app.tenant_id)
+                        and not app.is_throttled):
                     app.request_count += 1
                     app.last_request_time = time.time()
                     return app
             # All apps throttled → least-loaded fallback. Caller will
             # still hit the Retry-After sleep on its own.
-            return min(self.apps, key=lambda a: a.load_score)
+            valid = [a for a in self.apps if not self.is_credential_invalid(a.client_id, tenant_id or a.tenant_id)]
+            # An exhausted pool still supplies a client whose token path reports
+            # the credential error through existing backup failure handling.
+            return min(valid or self.apps, key=lambda a: a.load_score)
 
     def get_app_by_client_id(self, client_id: str) -> Optional[AppRegistry]:
         return self._app_map.get(client_id)

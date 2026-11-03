@@ -127,6 +127,10 @@ def _is_resync_gone(e: Exception) -> bool:
     return "resyncrequired" in msg or "410 gone" in msg
 
 
+class GraphCredentialInvalid(httpx.HTTPStatusError):
+    """A confirmed expired/invalid client secret, without provider error content."""
+
+
 class GraphClient:
     """Client for Microsoft Graph API calls with multi-app support"""
 
@@ -144,6 +148,7 @@ class GraphClient:
         self.power_bi_refresh_token = power_bi_refresh_token
         self._access_token: Optional[str] = None
         self._token_expiry: Optional[datetime] = None
+        self._credential_error = None
         # Persistent shared httpx.AsyncClient. Previously every Graph
         # call did `async with httpx.AsyncClient(...)` which forced a
         # fresh TCP + TLS handshake per request (~80-150ms on WAN to
@@ -154,6 +159,32 @@ class GraphClient:
         # don't need a running event loop at construction time.
         self._http: Optional[httpx.AsyncClient] = None
         self._http_lock = asyncio.Lock()
+
+    @classmethod
+    async def from_pool(cls, pool, tenant_id):
+        """Preflight a new credential owner; never migrate an active client.
+
+        Only confirmed invalid secrets permit another selection. Access errors,
+        consent errors and transient failures remain with the existing handler.
+        """
+        client = None
+        for _ in range(min(3, pool.app_count)):
+            app = pool.get_next_app(tenant_id=tenant_id)
+            client = cls(app.client_id, app.client_secret, tenant_id)
+            try:
+                await client._get_token()
+                return client
+            except GraphCredentialInvalid:
+                pool.mark_invalid_credential(app.client_id, tenant_id)
+                await client.aclose()
+                logger.warning("graph_app_preflight_rejected tenant_id=%s app_id=%s", tenant_id, app.client_id)
+            except Exception as error:
+                logger.warning("graph_app_preflight_failed tenant_id=%s app_id=%s error_type=%s",
+                               tenant_id, app.client_id, type(error).__name__)
+                return client
+        if client is None:
+            raise ValueError("Graph app pool is empty")
+        return client  # Handler reports failure; never manufacture an empty success.
 
     async def _get_shared_http(self) -> httpx.AsyncClient:
         """Return (lazy-create) the persistent httpx.AsyncClient.
@@ -371,6 +402,13 @@ class GraphClient:
         if self._access_token and self._token_expiry and datetime.utcnow() < self._token_expiry:
             return self._access_token
 
+        from shared.multi_app_manager import multi_app_manager
+        if self._credential_error is None and multi_app_manager.is_credential_invalid(self.client_id, self.tenant_id):
+            request = httpx.Request("POST", self.TOKEN_URL.format(tenant_id=self.tenant_id))
+            self._credential_error = GraphCredentialInvalid("Graph app credential is quarantined",
+                request=request, response=httpx.Response(401, request=request))
+        if self._credential_error is not None:
+            raise self._credential_error
         last_exc = None
         for attempt in range(1, 4):  # 3 attempts
             try:
@@ -384,6 +422,19 @@ class GraphClient:
                             "scope": "https://graph.microsoft.com/.default",
                         },
                     )
+                    if resp.status_code in (400, 401):
+                        try:
+                            error = resp.json()
+                        except ValueError:
+                            error = {}
+                        codes = error.get("error_codes", []) if isinstance(error, dict) else []
+                        if (isinstance(error, dict) and error.get("error") == "invalid_client"
+                                and isinstance(codes, list) and any(code in (7000222, 7000215) for code in codes)):
+                            multi_app_manager.mark_invalid_credential(self.client_id, self.tenant_id)
+                            self._credential_error = GraphCredentialInvalid("Graph app secret expired or invalid",
+                                request=resp.request, response=resp)
+                            logger.warning("graph_app_credential_invalid tenant_id=%s app_id=%s", self.tenant_id, self.client_id)
+                            raise self._credential_error
                     resp.raise_for_status()
                     data = resp.json()
                     self._access_token = data["access_token"]
