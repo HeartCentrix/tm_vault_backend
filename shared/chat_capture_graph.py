@@ -44,6 +44,8 @@ class ChatGraphError(RuntimeError):
 
 
 class _PinnedGraphClient(GraphClient):
+    provider_chat_pacing = True
+
     async def _try_migrate_app(self, throttled_app_id):
         return None, None
 
@@ -164,6 +166,9 @@ class StrictChatGraphSource:
         policy = self._pacing_policy
         await policy.stream_bucket.acquire()
         await policy.app_bucket.acquire()
+        if graph_rate_limiter.scoped_enabled:
+            # Shared admission paces the HTTP grant across replicas without a second local delay.
+            return
         parsed = urlsplit(url)
         if parsed.hostname != "graph.microsoft.com":
             return
@@ -304,6 +309,7 @@ class StrictChatGraphSource:
         headers = {"Accept-Encoding": "identity"}
         if graph:
             headers["Authorization"] = f"Bearer {token}"
+            headers["ConsistencyLevel"] = "eventual"
         redirects = 0
         attempt = 0
         while True:

@@ -37,8 +37,12 @@ async def test_renewal_failure_cancels_owner_and_logs_safe_reason(monkeypatch, c
             raise RuntimeError('https://private.invalid?access_token=secret-example')
         raise provider_work.ProviderWorkConflict('provider work ownership changed')
 
+    @asynccontextmanager
+    async def factory():
+        yield SimpleNamespace(begin=begin)
+
     monkeypatch.setattr(provider_work, 'renew_work', renew)
-    runner = ProviderWorkRunner(SimpleNamespace(begin=begin), None, None, renew_s=.01)
+    runner = ProviderWorkRunner(factory, None, None, renew_s=.01)
     claim = SimpleNamespace(work_id=uuid4(), snapshot_id=uuid4(), generation=3)
     execution = SimpleNamespace(claim=claim, lease_lost=False)
     owner = Mock()

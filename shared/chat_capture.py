@@ -2,15 +2,18 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import tempfile
 from uuid import UUID
+from weakref import WeakKeyDictionary
 
 from sqlalchemy import and_, delete, exists, or_, select
 from sqlalchemy.exc import SQLAlchemyError
@@ -28,6 +31,8 @@ from shared.db_retry import run_catalogue_transaction
 from shared.lease import run_bounded
 from shared.provider_read import _identifier
 from shared.models import ChatCaptureAttempt, ChatInventory, ChatInventoryItem, ChatItemVersion, SnapshotChatInventory, SnapshotItem
+
+logger = logging.getLogger(__name__)
 
 
 class ChatSourceMovement(RuntimeError):
@@ -47,6 +52,7 @@ class ChatObservationLedger:
         self.db.execute("CREATE TABLE observed (pass INTEGER, key TEXT, semantic TEXT, binary INTEGER, PRIMARY KEY(pass,key))")
         self.db.execute("CREATE TABLE expected (pass INTEGER, key TEXT, required INTEGER, PRIMARY KEY(pass,key))")
         self.db.execute("CREATE TABLE failures (pass INTEGER, phase TEXT, error_type TEXT, status INTEGER, graph_id TEXT, parent_graph_id TEXT, provider_code TEXT, provider_inner_code TEXT, provider_request_id TEXT)")
+        self.db.execute("CREATE TABLE source_messages (pass INTEGER, message_id TEXT, source_sha256 TEXT NOT NULL, PRIMARY KEY(pass,message_id))")
 
     def __enter__(self):
         return self
@@ -59,6 +65,21 @@ class ChatObservationLedger:
         key = qualified_chat_item_key(self.scope.chat_id, item_type, graph_id, parent_graph_id)
         self.db.execute("INSERT INTO expected VALUES (?,?,?) ON CONFLICT(pass,key) DO UPDATE SET required=MAX(required,excluded.required)",
                         (observation, key, int(required)))
+
+    def observe_message(self, observation, message):
+        # Overlapping pages need one observation per message, independently in each pass.
+        identifier = message.get("id")
+        if not isinstance(identifier, str) or not identifier:
+            raise ValueError("source message identity is missing")
+        source = hashlib.sha256(json.dumps(message, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False).encode()).hexdigest()
+        previous = self.db.execute("SELECT source_sha256 FROM source_messages WHERE pass=? AND message_id=?",
+            (observation, identifier)).fetchone()
+        if previous is not None and previous[0] == source:
+            return False
+        # A refreshed signed URL needs normal verification, not a forced reconciliation.
+        self.db.execute("INSERT OR REPLACE INTO source_messages VALUES (?,?,?)", (observation, identifier, source))
+        return True
 
     def record(self, observation, item):
         key = qualified_chat_item_key(self.scope.chat_id, item.item_type, item.graph_id, item.parent_graph_id)
@@ -128,6 +149,11 @@ class _Pass:
     complete: bool = False
     unresolved: int = 0
     conflicts: int = 0
+    pages: int = 0
+    messages: int = 0
+    hosted_lists: int = 0
+    duplicate_messages: int = 0
+    verified_binary: int = 0
 
 
 class _CaptureLeaseKeeper:
@@ -260,17 +286,40 @@ async def _retained(*, scope, keeper, factory, storage, item_type, graph_id, par
 
 
 async def _binary(*, scope, keeper, factory, storage, source_client, item_type,
-                  graph_id, parent_id, payload, stage):
+                  graph_id, parent_id, payload, stage, file_versions=None):
     file = item_type == "CHAT_ATTACHMENT"
     raw = await source_client.resolve_file(payload.get("contentUrl")) if file else None
     payload = dict(payload)
     if file and isinstance(raw.get("file"), dict) and isinstance(raw["file"].get("mimeType"), str):
         payload["captured_content_type"] = raw["file"]["mimeType"]
     source = _file_source(raw) if file else dict(source_drive_id=None, source_item_id=None, source_etag=None, source_ctag=None)
+    cache_key = tuple(source.items()) if file and (source['source_etag'] or source['source_ctag']) else None
+    if file_versions is not None and cache_key in file_versions:
+        content, content_type = file_versions[cache_key]
+        file_versions.move_to_end(cache_key)
+        keeper.check()
+        await verify_catalogue_content(storage, content)
+        if content_type:
+            payload.setdefault('captured_content_type', content_type)
+        captured = CapturedChatItem(item_type, graph_id, parent_id, payload, content)
+        if stage:
+            await _stage(factory, keeper, [captured])
+        return captured
+
+    def remember(captured):
+        # Only pinned, verified exact file versions; hosted content has no version tag.
+        if (file_versions is not None and cache_key is not None and captured.content is not None
+                and captured.content.object_id not in (None, UUID(int=0))):
+            file_versions[cache_key] = (captured.content, captured.payload.get('captured_content_type'))
+            file_versions.move_to_end(cache_key)
+            if len(file_versions) > 128:
+                file_versions.popitem(last=False)
+        return captured
+
     retained = await _retained(scope=scope, keeper=keeper, factory=factory, storage=storage,
         item_type=item_type, graph_id=graph_id, parent_id=parent_id, payload=payload, source=source, stage=stage)
     if retained is not None:
-        return retained
+        return remember(retained)
     opened = source_client.open_file(raw) if file else source_client.open_hosted(scope.chat_id, parent_id, graph_id)
     async with AsyncExitStack() as spools:
         async with opened as (chunks, expected_size, content_type):
@@ -287,7 +336,7 @@ async def _binary(*, scope, keeper, factory, storage, source_client, item_type,
             item_type=item_type, graph_id=graph_id, parent_id=parent_id, payload=payload,
             source=source, checksum=spooled.sha256, stage=stage)
         if retained is not None:
-            return retained
+            return remember(retained)
         if stage:
             content = await upload_capture_content(scope=scope, lease=keeper.lease,
                 spooled=spooled, storage=storage, session_factory=factory, **source)
@@ -299,11 +348,12 @@ async def _binary(*, scope, keeper, factory, storage, source_client, item_type,
         item = CapturedChatItem(item_type, graph_id, parent_id, payload, content)
         if stage:
             await _stage(factory, keeper, [item])
-        return item
+        return remember(item)
 
 async def _observe(*, scope, keeper, factory, storage, source, ledger, observation,
                    exclude_message=None, folder_path=None):
     stats = _Pass()
+    file_versions = OrderedDict()
     try:
         async for page in source.iter_message_pages(scope.chat_id):
             keeper.check()
@@ -313,6 +363,9 @@ async def _observe(*, scope, keeper, factory, storage, source, ledger, observati
                     parent = dict(raw)
                     if exclude_message is not None and exclude_message({**parent, "_chat_folder_path": folder_path}):
                         continue
+                    if not ledger.observe_message(observation, raw):
+                        stats.duplicate_messages += 1
+                        continue
                     identifier = parent.get("id")
                     native = parent.get("attachments") or []
                     valid = isinstance(native, list) and all(isinstance(a, dict) and isinstance(a.get("id"), str) and a["id"] for a in native)
@@ -321,6 +374,7 @@ async def _observe(*, scope, keeper, factory, storage, source, ledger, observati
                         stats.unresolved += 1
                     hosted, hosted_complete = [], True
                     try:
+                        stats.hosted_lists += 1
                         async for child in source.iter_hosted_contents(scope.chat_id, identifier):
                             hosted.append(child)
                     except asyncio.CancelledError:
@@ -340,6 +394,7 @@ async def _observe(*, scope, keeper, factory, storage, source, ledger, observati
                     if ledger.record(observation, parent_item) and observation == 0:
                         parents.append(parent_item)
                     prepared.append((identifier, attachments, hosted))
+                    stats.messages += 1
             finally:
                 # Parent rows must already exist before any child upload/link;
                 # interruption then leaves a readable partial message inventory.
@@ -357,8 +412,9 @@ async def _observe(*, scope, keeper, factory, storage, source, ledger, observati
                             else:
                                 captured = await _binary(scope=scope, keeper=keeper, factory=factory, storage=storage,
                                     source_client=source, item_type=kind, graph_id=child["id"], parent_id=identifier,
-                                    payload=child, stage=observation == 0)
-                                ledger.record(observation, captured)
+                                    payload=child, stage=observation == 0, file_versions=file_versions)
+                                if ledger.record(observation, captured):
+                                    stats.verified_binary += 1
                         except (asyncio.CancelledError, ChatSourceMovement, catalogue.ChatCatalogueConflict, catalogue.ChatCatalogueIntegrityError, SQLAlchemyError):
                             raise
                         except Exception as exc:
@@ -369,6 +425,12 @@ async def _observe(*, scope, keeper, factory, storage, source, ledger, observati
                             pending = []
             if pending:
                 await _stage(factory, keeper, pending)
+            stats.pages += 1
+            logger.info(
+                "chat_capture_progress attempt_id=%s observation=%s pages=%s messages_observed=%s "
+                "hosted_enumerations=%s duplicate_messages_skipped=%s verified_binary=%s unresolved=%s",
+                keeper.lease.attempt_id, observation + 1, stats.pages, stats.messages,
+                stats.hosted_lists, stats.duplicate_messages, stats.verified_binary, stats.unresolved)
         stats.complete = True
     except (asyncio.CancelledError, ChatSourceMovement, catalogue.ChatCatalogueConflict, catalogue.ChatCatalogueIntegrityError, SQLAlchemyError):
         raise
@@ -404,7 +466,34 @@ async def _source(client, principal_id):
             yield opened
 
 
+_CAPTURE_SLOTS = WeakKeyDictionary()
+
+
 async def capture_chat_inventory(*, scope, graph_client, storage, session_factory,
+                                 folder_path=None, exclude_message=None, scope_filter_hash=None) -> CaptureResult:
+    """Bound open chat ledgers and preserve their iterators across local waits."""
+    from shared.provider_runtime import provider_live_wait_scope, current_unit, ProviderBudgetExhausted
+    loop = asyncio.get_running_loop()
+    if loop not in _CAPTURE_SLOTS:
+        capacity = int(os.getenv('CHAT_CAPTURE_CONCURRENCY', '2'))
+        if not 1 <= capacity <= 64:
+            raise ValueError('chat capture concurrency must be between 1 and 64')
+        _CAPTURE_SLOTS[loop] = asyncio.Semaphore(capacity)
+    unit = current_unit()
+    remaining = max(0, (unit.deadline_at - datetime.now(timezone.utc)).total_seconds()) if unit else 1800
+    deadline = asyncio.timeout(remaining)
+    try:
+        async with deadline, provider_live_wait_scope(), _CAPTURE_SLOTS[loop]:
+            return await _capture_chat_inventory(scope=scope, graph_client=graph_client, storage=storage,
+                session_factory=session_factory, folder_path=folder_path,
+                exclude_message=exclude_message, scope_filter_hash=scope_filter_hash)
+    except TimeoutError:
+        if not deadline.expired():
+            raise
+        raise ProviderBudgetExhausted('chat capture original deadline exhausted') from None
+
+
+async def _capture_chat_inventory(*, scope, graph_client, storage, session_factory,
                                  folder_path=None, exclude_message=None, scope_filter_hash=None) -> CaptureResult:
     """Capture one target's observed chat coverage, with two bounded reconciliations."""
     from shared.config import settings

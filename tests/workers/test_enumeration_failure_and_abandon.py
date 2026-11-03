@@ -64,14 +64,8 @@ def test_backup_one_marks_snapshot_failed_on_enumeration_error():
     ][:1500]
 
 
-def test_prefetch_aborts_when_snapshot_terminal():
-    idx = _MAIN.find("url pre-fetch")
-    assert idx != -1
-    region = _MAIN[_MAIN.find("async def _useronedrive_backup_files"):]
-    assert "_snapshot_still_live(snapshot.id)" in region
-    assert "raise RunAbandoned" in region
-    # the non-fatal prefetch fallback must NOT swallow the abort
-    assert "except RunAbandoned:" in region
+# Terminal prefetch cancellation is exercised through the real worker in
+# tests/integration/test_onedrive_lazy_prefetch_postgres.py.
 
 
 def test_download_loop_periodic_liveness_check():

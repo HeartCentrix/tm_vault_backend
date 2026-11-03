@@ -12,7 +12,7 @@ from sqlalchemy.orm import aliased
 from sqlalchemy.dialects.postgresql import insert
 
 from shared.models import (CopyWorkflow, CopyWorkTask, CopyWorkInput, CopyWorkQueue, CopyWorkControl,
-                           Job, Resource, Snapshot, SnapshotPartition, SlaPolicy)
+                           Job, Resource, ResourceType, Snapshot, SnapshotPartition, SlaPolicy)
 
 ACTIVE_WORKFLOWS = ('DRAINING', 'WAITING', 'RESUMING')
 TERMINAL_TASKS = ('COMPLETED', 'FAILED', 'CANCELLED')
@@ -70,7 +70,6 @@ async def enqueue(session, request: CopyRequest) -> CopyWorkTask:
     snapshot, resource, job = await _parent(session, request.target_snapshot_id)
     if request.kind in {'CHAT_LABELS', 'CHAT_PRESENTATION'}:
         from shared.chat_presentation_work import validate_labels
-        from shared.models import ResourceType
         if (snapshot.extra_data or {}).get('chat_inventory_format') == 1:
             raise CopyWorkConflict('catalogue snapshots already own their captured chat labels')
         if request.kind == 'CHAT_LABELS':
@@ -187,7 +186,45 @@ async def enqueue(session, request: CopyRequest) -> CopyWorkTask:
                 .on_conflict_do_nothing(index_elements=['task_id','input_key','ordinal']))
     from shared.copy_executor import pin_intent_sources
     await pin_intent_sources(session, task)
+    if (request.kind == 'MAIL_CARRY' and task.state == 'READY' and resource.type == ResourceType.USER_MAIL
+        and (snapshot.extra_data or {}).get('mail_union_carry_claimed') is True
+        and task.params.get('_copy_source_fixed') is True and task.params.get('prior_snapshot_id') is None):
+        await _complete_bootstrap_mail_noop(session, task, snapshot)
     return task
+
+
+async def _complete_bootstrap_mail_noop(session, task, snapshot):
+    """No prior is safe only with this capture's bootstrap and folder coverage."""
+    extra = snapshot.extra_data or {}
+    task.state, task.error = 'FAILED', {'code': 'mail_bootstrap_coverage_unproven'}
+    if extra.get('cancelled_at'):
+        task.state, task.error = 'CANCELLED', {'code': 'copy_parent_cancelled'}
+        return
+    origin = extra.get('mail_bootstrap_origin') or {}
+    checkpoints = extra.get('copy_mail_checkpoint_tokens') or {}
+    if (not isinstance(origin, dict) or origin.get('cursor_free') is not True
+        or not isinstance(origin.get('folder_ids'), list) or not origin['folder_ids']
+        or not isinstance(checkpoints, dict)):
+        return
+    parts = list((await session.scalars(select(SnapshotPartition).where(
+        SnapshotPartition.snapshot_id == snapshot.id, SnapshotPartition.partition_type == 'MAIL_FOLDERS')
+        .with_for_update(read=True))).all())
+    required, planned = set(origin['folder_ids']), set()
+    for part in parts:
+        payload = part.payload or {}
+        cf = payload.get('carry_forward') or {}
+        if (part.status != 'COMPLETED' or part.job_id != snapshot.job_id
+            or part.resource_id != snapshot.resource_id or part.tenant_id != task.tenant_id
+            or not isinstance(cf, dict) or not cf or cf.get('all_folders_fallback')
+            or cf.get('tombstones_truncated') or cf.get('excluded_paths') is None):
+            return
+        planned.update(str(fid) for fid in payload.get('folder_ids', []) if fid)
+    if (not parts or not required.issubset(planned)
+        or not (required | planned).issubset({str(fid) for fid, token in checkpoints.items() if token})):
+        return
+    # Parent/partition locks and the frozen NULL source fence this zero-row
+    # completion. Snapshot status still follows the ordinary honesty checks.
+    task.state, task.prepared, task.error = 'COMPLETED', True, None
 
 
 async def align_ready_workflow(session, workflow_id) -> None:

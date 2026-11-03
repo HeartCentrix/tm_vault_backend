@@ -1,4 +1,5 @@
 """Only the version observed around the transfer can become a resume receipt."""
+from collections import Counter
 from copy import deepcopy
 import asyncio
 from unittest.mock import AsyncMock
@@ -84,13 +85,16 @@ async def test_verification_is_bounded_and_proven_resume_makes_no_graph_reads(st
     env = await setup_worker(store, bw, monkeypatch, items)
     batches = install_metadata(env, {i["id"]: i for i in items})
     assert await env.run() == (45, 45 * 1024)
-    assert len(batches) == 6
+    # Earlier durable flushes can split proof batches; each source is still
+    # read exactly once for its URL and once for its committed version proof.
+    assert Counter(key for batch in batches for key in batch) == Counter({item["id"]: 2 for item in items})
     assert max(map(len, batches)) <= 20
     async with store.factory() as session:
         rows = (await session.scalars(select(models.SnapshotItem).where(models.SnapshotItem.snapshot_id == env.scope.snapshot_id))).all()
         assert all(row.extra_data["onedrive_download_source"]["eTag"] == "version-1" for row in rows)
+    before_resume = deepcopy(batches)
     assert await env.run() == (0, 0)
-    assert len(batches) == 6
+    assert batches == before_resume
 
 
 @pytest.mark.parametrize("stage", ["prefetch", "serial", "stream", "verification"])

@@ -11,15 +11,18 @@ import time
 from uuid import uuid4
 from sqlalchemy import exists, func, select
 from shared import provider_work as work
+from shared.db_retry import run_db_transaction
 from shared.models import ProviderWork, ProviderWorkUnit, Snapshot, SnapshotPartition
 from shared.provider_admission import ProviderDeferred
 
 logger = logging.getLogger(__name__)
 _EXECUTION = ContextVar('provider_execution', default=None)
 _UNIT = ContextVar('provider_unit', default=None)
+_ATTEMPT = ContextVar('provider_prepared_attempt', default=None)
 _PREPAID_STORAGE = ContextVar('prepaid_storage_bytes', default=None)
 _TRANSFER = ContextVar('provider_logical_transfer', default=None)
 _RECEIPT = ContextVar('provider_receipt_drain', default=None)
+_LIVE_WAIT = ContextVar('provider_live_wait', default=None)
 _DRAIN_EXPIRED = 'provider_concurrency_drain_expired'
 CONCURRENCY_DRAIN_SECONDS = 300
 
@@ -136,6 +139,14 @@ class UnitExecution:
     remaining: int = 0
 
 
+@dataclass
+class PreparedAttempt:
+    execution: ProviderExecution
+    unit: UnitExecution
+    owner_task: object
+    consumed: bool = False
+
+
 @dataclass(eq=False)
 class ProviderTransfer:
     execution: ProviderExecution
@@ -151,6 +162,20 @@ def current_execution():
 
 def current_unit():
     return _UNIT.get()
+
+
+@asynccontextmanager
+async def provider_live_wait_scope():
+    """Keep bounded source preparation alive through local admission contention."""
+    execution, unit = current_execution(), current_unit()
+    remaining = ((unit.deadline_at - datetime.now(timezone.utc)).total_seconds()
+                 if unit else 1800)
+    marker = _LIVE_WAIT.set((execution, time.monotonic() + max(0, remaining)))
+    try:
+        check_provider_turn()
+        yield
+    finally:
+        _LIVE_WAIT.reset(marker)
 
 
 @asynccontextmanager
@@ -206,7 +231,7 @@ def _can_drain(execution):
         bool(transfer and transfer.execution is execution and transfer.active))
 
 
-async def before_provider_admission():
+async def before_provider_admission(*, withdraw=None):
     check_provider_turn()
     execution = current_execution()
     if execution is None or execution.congestion is None:
@@ -215,6 +240,8 @@ async def before_provider_admission():
         if time.monotonic() >= execution.drain_deadline:
             raise ProviderTurnDeferred(execution.congestion)
         return
+    if withdraw is not None:
+        await withdraw()
     await asyncio.shield(execution.drain_task)
     raise ProviderTurnDeferred(execution.deferred or execution.congestion)
 
@@ -258,11 +285,21 @@ async def _drain_congestion(execution):
         _TRANSFER.reset(marker)
 
 
-async def wait_provider_concurrency(error):
-    """Continue the same Redis grant attempt while already-admitted transfers drain."""
+async def wait_provider_concurrency(error, *, wait=None, withdraw=None):
+    """Keep live admission waits in-turn; otherwise drain local concurrency."""
     execution = current_execution()
-    if execution is None:
+    live = _LIVE_WAIT.get()
+    if live is not None and live[0] is execution and error.reason in ('concurrency', 'rate'):
+        check_provider_turn()
+        await (wait or asyncio.sleep)(min(error.retry_after, max(0, live[1] - time.monotonic())))
+        check_provider_turn()
+        return True
+    if error.reason != 'concurrency' or execution is None:
         return False
+    if not _can_drain(execution) and withdraw is not None:
+        # This task now waits for sibling receipts, not for a network grant.
+        # Leaving it queued would block the receipt requests that release the turn.
+        await withdraw()
     if execution.congestion is None:
         execution.congestion = error
         deadlines = [time.monotonic() + CONCURRENCY_DRAIN_SECONDS]
@@ -273,7 +310,7 @@ async def wait_provider_concurrency(error):
         execution.drain_deadline = min(deadlines)
         execution.drain_task = asyncio.create_task(_drain_congestion(execution))
     await before_provider_admission()
-    await asyncio.sleep(min(error.retry_after, max(0, execution.drain_deadline - time.monotonic())))
+    await (wait or asyncio.sleep)(min(error.retry_after, max(0, execution.drain_deadline - time.monotonic())))
     return True
 
 
@@ -281,6 +318,9 @@ def check_provider_turn():
     execution = _EXECUTION.get()
     if execution and execution.deferred:
         raise ProviderTurnDeferred(execution.deferred)
+    live = _LIVE_WAIT.get()
+    if live is not None and live[0] is execution and time.monotonic() >= live[1]:
+        raise ProviderBudgetExhausted('provider unit original deadline exhausted')
 
 
 def defer_provider(error):
@@ -310,9 +350,9 @@ async def unit_scope(unit_key, kind, *, checkpoint=None, deadline_at=None):
         yield None
         return
     check_provider_turn()
-    async with execution.factory.begin() as session:
-        unit = await work.record_unit_checkpoint(session, execution.claim, unit_key=unit_key, kind=kind,
-            checkpoint=checkpoint, deadline_at=deadline_at)
+    unit = await run_db_transaction(execution.factory, lambda session:
+        work.record_unit_checkpoint(session, execution.claim, unit_key=unit_key, kind=kind,
+            checkpoint=checkpoint, deadline_at=deadline_at))
     state = UnitExecution(unit.unit_key, unit.kind, unit.deadline_at, unit.created_at, unit.reconciliations)
     if datetime.now(timezone.utc) >= state.deadline_at:
         raise ProviderBudgetExhausted('provider unit original deadline exhausted')
@@ -323,46 +363,71 @@ async def unit_scope(unit_key, kind, *, checkpoint=None, deadline_at=None):
         _UNIT.reset(token)
 
 
-async def account_provider_attempt(context=None):
-    """Reserve up to16 transmissions before I/O; crash loses unused allowance.
+@asynccontextmanager
+async def provider_attempt_scope(context=None):
+    """Prepare durable allowance before admission; return it if no send starts.
 
-    Counts are conservative consumed reservations, never reset by redelivery.
-    Each grant uses a short independent transaction, not a pinned HTTP session.
+    Reservations remain crash-conservative. Concurrent requests each hold one
+    allowance, so consuming an admitted attempt never needs a DB transaction.
     """
     check_provider_turn()
     execution, unit = _EXECUTION.get(), _UNIT.get()
     if execution is None:
+        yield
         return
-    if unit is None:
-        # Enumeration outside a more precise stable unit is independently durable.
-        if execution.planning_unit is None:
-            async with unit_scope('planning', 'planning') as planning:
-                execution.planning_unit = planning
-        token = _UNIT.set(execution.planning_unit)
-        try:
-            await account_provider_attempt(context)
-        finally:
-            _UNIT.reset(token)
-        return
-    if datetime.now(timezone.utc) >= unit.deadline_at:
-        raise ProviderBudgetExhausted('provider unit original deadline exhausted')
     async with execution.attempt_lock:
+        check_provider_turn()
+        if unit is None:
+            if execution.planning_unit is None:
+                async with unit_scope('planning', 'planning') as planning:
+                    execution.planning_unit = planning
+            unit = execution.planning_unit
+        if datetime.now(timezone.utc) >= unit.deadline_at:
+            raise ProviderBudgetExhausted('provider unit original deadline exhausted')
         if unit.remaining == 0:
-            async with execution.factory.begin() as session:
-                await work.record_unit_checkpoint(session, execution.claim, unit_key=unit.key,
-                    kind=unit.kind, attempts=16)
-            unit.remaining = 16
+            await run_db_transaction(execution.factory, lambda session:
+                work.record_unit_checkpoint(session, execution.claim, unit_key=unit.key,
+                    kind=unit.kind, attempts=16))
+            # Another prepared request can refund allowance during the DB wait.
+            unit.remaining += 16
+        check_provider_turn()
         unit.remaining -= 1
+    attempt = PreparedAttempt(execution, unit, asyncio.current_task())
+    marker = _ATTEMPT.set(attempt)
+    try:
+        yield
+    finally:
+        if not attempt.consumed:
+            unit.remaining += 1
+        _ATTEMPT.reset(marker)
+
+
+async def account_provider_attempt(context=None):
+    """Consume prepared allowance before HTTP; standalone callers reserve as needed."""
+    check_provider_turn()
+    execution = _EXECUTION.get()
+    if execution is None:
+        return
+    attempt = _ATTEMPT.get()
+    if (attempt is not None and attempt.execution is execution
+            and attempt.owner_task is asyncio.current_task() and not attempt.consumed):
+        if datetime.now(timezone.utc) >= attempt.unit.deadline_at:
+            raise ProviderBudgetExhausted('provider unit original deadline exhausted')
+        attempt.consumed = True
+        return
+    # Standalone callers retain durable accounting without an HTTP adapter.
+    async with provider_attempt_scope(context):
+        await account_provider_attempt(context)
 
 
 async def checkpoint_unit(*, receipt_id=None, state='COMPLETED', reconciliations=0):
     execution, unit = _EXECUTION.get(), _UNIT.get()
     if execution is None or unit is None:
         return
-    async with execution.factory.begin() as session:
-        row = await work.record_unit_checkpoint(session, execution.claim, unit_key=unit.key,
-            kind=unit.kind, state=state, receipt_id=receipt_id, reconciliations=reconciliations)
-        unit.reconciliations = row.reconciliations
+    row = await run_db_transaction(execution.factory, lambda session:
+        work.record_unit_checkpoint(session, execution.claim, unit_key=unit.key,
+            kind=unit.kind, state=state, receipt_id=receipt_id, reconciliations=reconciliations))
+    unit.reconciliations = row.reconciliations
 
 
 async def other_provider_work_waiting():
@@ -424,8 +489,8 @@ class ProviderWorkRunner:
             while True:
                 await asyncio.sleep(self.renew_s)
                 async with self.budget.permit(control=True):
-                    async with self.factory.begin() as session:
-                        await work.renew_work(session, execution.claim)
+                    await run_db_transaction(self.factory, lambda session:
+                        work.renew_work(session, execution.claim))
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -441,8 +506,8 @@ class ProviderWorkRunner:
         entered = time.monotonic()
         async with self.budget.permit():
             admitted = time.monotonic()
-            async with self.factory.begin() as session:
-                claim = await work.claim_due_work(session, owner_id=self.owner_id)
+            claim = await run_db_transaction(self.factory, lambda session:
+                work.claim_due_work(session, owner_id=self.owner_id))
             if claim is None:
                 return None
             started = time.monotonic()
@@ -464,8 +529,8 @@ class ProviderWorkRunner:
                             if handed.state in work.TERMINAL and handed.last_reason == 'copy_handoff':
                                 return {'copy_waiting': True}
                         await checkpoint_unit()
-                    async with self.factory.begin() as session:
-                        await work.finish_work(session, claim)
+                    await run_db_transaction(self.factory, lambda session:
+                        work.finish_work(session, claim))
                 renewer.cancel()
                 await asyncio.gather(renewer, return_exceptions=True)
                 await self.settle_once(claim.work_id)
@@ -476,8 +541,8 @@ class ProviderWorkRunner:
             except ProviderBudgetExhausted:
                 await _join_provider_tasks(execution)
                 with work.work_scope(claim):
-                    async with self.factory.begin() as session:
-                        await work.fail_exhausted_work(session, claim)
+                    await run_db_transaction(self.factory, lambda session:
+                        work.fail_exhausted_work(session, claim))
                 renewer.cancel()
                 await asyncio.gather(renewer, return_exceptions=True)
                 await self.settle_once(claim.work_id)
@@ -490,9 +555,9 @@ class ProviderWorkRunner:
                 # Only an owned nonterminal leaf can be released; user cancellation
                 # wins under the same parent locks. A hard crash is lease-recovered.
                 with suppress(work.ProviderWorkConflict):
-                    async with self.factory.begin() as session:
-                        await work.suspend_current_work(session, claim,
-                            next_eligible_at=datetime.now(timezone.utc), reason='worker_interrupted')
+                    await run_db_transaction(self.factory, lambda session:
+                        work.suspend_current_work(session, claim,
+                            next_eligible_at=datetime.now(timezone.utc), reason='worker_interrupted'))
                 if execution.lease_lost and not self._closing:
                     return {'provider_lease_lost': True}
                 raise
@@ -515,9 +580,9 @@ class ProviderWorkRunner:
         execution.defer(error)
         await _join_provider_tasks(execution)
         error, claim = execution.deferred, execution.claim
-        async with self.factory.begin() as session:
-            await work.suspend_current_work(session, claim, next_eligible_at=error.next_eligible_at,
-                reason=getattr(error, 'stage', 'provider_wait'))
+        await run_db_transaction(self.factory, lambda session:
+            work.suspend_current_work(session, claim, next_eligible_at=error.next_eligible_at,
+                reason=getattr(error, 'stage', 'provider_wait')))
         logger.info('provider_turn_deferred work_id=%s snapshot_id=%s stage=%s reason=%s scope=%s retry_after_s=%s next_eligible_at=%s',
             claim.work_id, claim.snapshot_id, getattr(error, 'stage', 'provider_wait'),
             getattr(error, 'reason', None), getattr(error, 'scope', None),
@@ -539,8 +604,8 @@ class ProviderWorkRunner:
 
     async def settle_once(self, work_id=None):
         async with self.budget.permit(control=True):
-            async with self.factory.begin() as session:
-                claim = await work.claim_parent_settlement(session, owner_id=self.owner_id, work_id=work_id)
+            claim = await run_db_transaction(self.factory, lambda session:
+                work.claim_parent_settlement(session, owner_id=self.owner_id, work_id=work_id))
             if claim is None:
                 return False
             try:
@@ -549,8 +614,8 @@ class ProviderWorkRunner:
                     async with asyncio.timeout(60):
                         await self.settle_callback(claim.work_id)
             finally:
-                async with self.factory.begin() as session:
-                    await work.release_parent_settlement(session, claim)
+                await run_db_transaction(self.factory, lambda session:
+                    work.release_parent_settlement(session, claim))
             return True
 
     async def _settle(self):

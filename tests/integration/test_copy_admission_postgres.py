@@ -640,3 +640,51 @@ async def test_shutdown_release_keeps_legacy_unreserved_claim_behavior(store):
         task = await db.get(models.CopyWorkTask, task_id)
         assert task.state == 'READY' and task.attempts == 9
         assert task.lease_owner_id is task.lease_expires_at is None
+
+
+@pytest.mark.parametrize('parent_kind', ['job', 'snapshot', 'partition'])
+async def test_busy_parent_defers_without_settlement_relocking_or_spending_execution(store, parent_kind):
+    target, task_id, current = await queued(store, partition=parent_kind == 'partition')
+    for _ in range(4):
+        async with store.factory.begin() as holder:
+            snap = await holder.get(models.Snapshot, target.snapshot_id)
+            if parent_kind == 'job':
+                await holder.get(models.Job, snap.job_id, with_for_update=True)
+            elif parent_kind == 'snapshot':
+                await holder.get(models.Snapshot, snap.id, with_for_update=True, populate_existing=True)
+            else:
+                workflow = await holder.get(models.CopyWorkflow,
+                    (await holder.get(models.CopyWorkTask, task_id)).workflow_id)
+                await holder.get(models.SnapshotPartition, workflow.partition_id, with_for_update=True)
+            result = await asyncio.wait_for(api().run_batch(store.factory, current), timeout=3)
+            assert result.status == 'DEFERRED' and result.query_seconds == 0
+            async with store.factory() as db:
+                task = await db.get(models.CopyWorkTask, task_id)
+                assert task.state == 'READY' and task.attempts == 0 and not task.prepared
+                assert task.error == {'code': 'copy_lock_timeout', 'sqlstate': '55P03', 'phase': 'ownership'}
+                assert task.lease_owner_id is task.lease_expires_at is None
+        async with store.factory.begin() as db:
+            (await db.get(models.CopyWorkTask, task_id)).ready_at = await db.scalar(select(func.clock_timestamp()))
+        async with store.factory.begin() as db:
+            current = await copy_work.claim(db, owner_id=uuid4())
+            assert current is not None
+    assert (await api().run_batch(store.factory, current)).status == 'COMPLETED'
+
+
+@pytest.mark.parametrize('sqlstate', ['57014', '40P01', '40001'])
+async def test_transient_abort_before_copy_does_not_consume_execution_failures(store, monkeypatch, sqlstate):
+    module = api()
+    _, task_id, current = await queued(store)
+    async def abort_admission(db, *args):
+        await db.execute(text(f"DO $$ BEGIN RAISE EXCEPTION USING ERRCODE='{sqlstate}'; END $$"))
+    monkeypatch.setattr(module, '_physical_guards', abort_admission)
+    for _ in range(4):
+        result = await module.run_batch(store.factory, current)
+        assert result.status == 'DEFERRED' and result.query_seconds == 0
+        async with store.factory.begin() as db:
+            task = await db.get(models.CopyWorkTask, task_id)
+            assert task.attempts == 0 and 'execution_failures' not in task.error
+            assert task.error['sqlstate'] == sqlstate and task.error['phase'] == 'admission'
+            task.ready_at = await db.scalar(select(func.clock_timestamp()))
+        async with store.factory.begin() as db:
+            current = await copy_work.claim(db, owner_id=uuid4())

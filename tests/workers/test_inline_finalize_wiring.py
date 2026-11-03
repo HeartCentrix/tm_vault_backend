@@ -18,6 +18,7 @@ the promotion are exercised together:
 from __future__ import annotations
 
 import ast
+from contextlib import nullcontext
 import asyncio
 import importlib.util
 import os
@@ -80,6 +81,13 @@ class _Session:
     def __init__(self, resource):
         self._resource = resource
         self.commits = 0
+        self.no_autoflush = nullcontext()
+
+    async def scalar(self, statement):
+        return uuid.uuid4()
+
+    async def refresh(self, instance, attribute_names):
+        pass
 
     async def get(self, model, _pk):
         if getattr(model, "__name__", "") == "Resource":

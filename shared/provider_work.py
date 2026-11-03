@@ -35,6 +35,7 @@ class ProviderClaim:
     parent_token: int
     snapshot_token: int
     job_token: int
+    weight: int = 1
 
 
 def enabled():
@@ -101,23 +102,26 @@ def _bounded(value):
 def _receipt(row):
     return ProviderClaim(row.id, row.snapshot_id, row.partition_id, row.job_id,
         row.lease_owner_id, row.generation, row.parent_lease_token,
-        row.snapshot_lease_token, row.job_lease_token)
+        row.snapshot_lease_token, row.job_lease_token, row.weight)
 
 
 async def _parents(session, snapshot_id, partition_id=None, *, skip_locked=False, share_job=False):
     hint = await session.get(Snapshot, _uuid(snapshot_id))
     if hint is None:
         raise ProviderWorkConflict('provider snapshot removed')
-    job = await session.scalar(select(Job).where(Job.id == hint.job_id).with_for_update(skip_locked=skip_locked, read=share_job)
+    # Keys never change here. Allow child FK checks while a writer waits on its leaf.
+    job = await session.scalar(select(Job).where(Job.id == hint.job_id)
+        .with_for_update(skip_locked=skip_locked, read=share_job, key_share=not share_job)
         .execution_options(populate_existing=True))
     if job is None:
         raise ProviderWorkConflict('provider parent locked or removed')
-    snapshot = await session.scalar(select(Snapshot).where(Snapshot.id == hint.id).with_for_update(skip_locked=skip_locked)
+    snapshot = await session.scalar(select(Snapshot).where(Snapshot.id == hint.id)
+        .with_for_update(skip_locked=skip_locked, key_share=True)
         .execution_options(populate_existing=True))
     if snapshot is None:
         raise ProviderWorkConflict('provider parent locked or removed')
     partition = await session.scalar(select(SnapshotPartition).where(SnapshotPartition.id == _uuid(partition_id))
-        .with_for_update(skip_locked=skip_locked).execution_options(populate_existing=True)) if partition_id else None
+        .with_for_update(skip_locked=skip_locked, key_share=True).execution_options(populate_existing=True)) if partition_id else None
     if partition_id and partition is None:
         raise ProviderWorkConflict('provider parent locked or removed')
     return job, snapshot, partition
@@ -130,7 +134,7 @@ def _active(job, snapshot, partition):
 
 async def ensure_work(session, *, snapshot_id, snapshot_token, job_token, partition_id=None,
                       partition_token=None, weight=None, policy_id=None, continuation=None):
-    job, snapshot, partition = await _parents(session, snapshot_id, partition_id)
+    job, snapshot, partition = await _parents(session, snapshot_id, partition_id, share_job=True)
     resource = await session.get(Resource, snapshot.resource_id)
     leaf = partition or snapshot
     if (not _active(job, snapshot, partition) or resource is None or resource.tenant_id != job.tenant_id
@@ -185,7 +189,7 @@ async def ensure_work(session, *, snapshot_id, snapshot_token, job_token, partit
     return _receipt(row)
 
 
-async def _owned(session, claim, *, allow_terminal=False, share_job=False):
+async def _owned(session, claim, *, allow_terminal=False, share_job=True):
     job, snapshot, partition = await _parents(session, claim.snapshot_id, claim.partition_id, share_job=share_job)
     row = await session.scalar(select(ProviderWork).where(ProviderWork.id == claim.work_id).with_for_update()
         .execution_options(populate_existing=True))
@@ -373,7 +377,7 @@ async def suspend_current_work(session, claim, *, next_eligible_at, reason, cont
     hint = await session.get(ProviderWork, claim.work_id)
     if hint and hint.state == 'WAITING' and hint.suspension_generation == claim.generation:
         return _receipt(hint)
-    row, job, snapshot, partition = await _owned(session, claim)
+    row, job, snapshot, partition = await _owned(session, claim, share_job=False)
     leaf = partition or snapshot
     job.result = {**(job.result or {}), 'provider_phase': 'WAITING', 'provider_next_eligible_at': next_eligible_at.isoformat()}
     snapshot.extra_data = {**(snapshot.extra_data or {}), 'provider_phase': 'WAITING', 'provider_next_eligible_at': next_eligible_at.isoformat()}
@@ -426,7 +430,8 @@ async def finish_work(session, claim, *, state='COMPLETED'):
 async def fail_exhausted_work(session, claim):
     """Settle a spent original budget once, retaining already durable content."""
     from shared.models import CopyWorkflow, SnapshotItem, SnapshotStatus
-    row, _, snapshot, partition = await _owned(session, claim, allow_terminal=True)
+    # Copy cancellation below also writes Job.result; do not upgrade a shared lock.
+    row, _, snapshot, partition = await _owned(session, claim, allow_terminal=True, share_job=False)
     await session.execute(update(ProviderWorkUnit).where(ProviderWorkUnit.work_id == row.id,
         ProviderWorkUnit.state.in_(('PENDING', 'RUNNING'))).values(state='FAILED'))
     # A never-sealed copy drain cannot outlive its failed source capture.
@@ -495,7 +500,7 @@ async def finish_parent_settlement(session, work_id):
     hint = await session.get(ProviderWork, _uuid(work_id))
     if hint is None:
         return False
-    job, snapshot, _ = await _parents(session, hint.snapshot_id, hint.partition_id)
+    job, snapshot, _ = await _parents(session, hint.snapshot_id, hint.partition_id, share_job=True)
     row = await session.scalar(select(ProviderWork).where(ProviderWork.id == hint.id).with_for_update()
         .execution_options(populate_existing=True))
     settlement = _SETTLING.get()

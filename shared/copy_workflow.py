@@ -281,11 +281,12 @@ async def defer_current_copy(kind, params, lane='giant'):
 
 async def _lock_parents(session, workflow, *, shared=False):
     # Same order as API cancellation: job -> snapshot -> partition -> workflow.
-    job=await session.scalar(select(Job).where(Job.id==workflow.job_id).with_for_update(read=shared))
-    snapshot=await session.scalar(select(Snapshot).where(Snapshot.id==workflow.target_snapshot_id).with_for_update(read=shared))
+    # Parent keys are immutable here; child FK checks must not join this lock chain.
+    job=await session.scalar(select(Job).where(Job.id==workflow.job_id).with_for_update(read=shared, key_share=not shared))
+    snapshot=await session.scalar(select(Snapshot).where(Snapshot.id==workflow.target_snapshot_id).with_for_update(read=shared, key_share=not shared))
     partition=None
     if workflow.partition_id:
-        partition=await session.scalar(select(SnapshotPartition).where(SnapshotPartition.id==workflow.partition_id).with_for_update(read=shared))
+        partition=await session.scalar(select(SnapshotPartition).where(SnapshotPartition.id==workflow.partition_id).with_for_update(read=shared, key_share=not shared))
     return job,snapshot,partition
 
 
@@ -442,7 +443,9 @@ async def begin_resume(factory, workflow_id, owner_id):
         workflow=await session.get(CopyWorkflow,_uuid(workflow_id))
         if workflow is None: return None
         job,snapshot,partition=await _lock_parents(session,workflow)
-        workflow=await session.scalar(select(CopyWorkflow).where(CopyWorkflow.id==workflow.id).with_for_update())
+        # Another resumer may have committed while this transaction waited on Job.
+        workflow=await session.scalar(select(CopyWorkflow).where(CopyWorkflow.id==workflow.id)
+            .with_for_update().execution_options(populate_existing=True))
         now=await session.scalar(select(func.clock_timestamp()))
         if workflow.state not in ('WAITING','RESUMING'): return None
         if workflow.state=='RESUMING' and workflow.lease_expires_at and workflow.lease_expires_at>now: return None

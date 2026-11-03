@@ -285,3 +285,39 @@ async def test_preauthenticated_archive_import_is_metered_without_auth_or_replay
     assert len(sent) == 1
     assert limiter.events[0][1].workload == 'exchange'
     assert limiter.events[0][1].tenant_id == 'verified-tenant'
+
+
+@pytest.mark.parametrize('path, resource', [
+    ('/v1.0/chats/chat-A/messages', 'chat:chat-A'),
+    ('/v1.0/chats/chat-A/members', 'chat:chat-A'),
+    ('/beta/users/user-A/chats', 'user_chats:user-A'),
+])
+def test_pinned_chat_routes_opt_into_shared_pacing(path, resource):
+    from types import SimpleNamespace
+    from shared.provider_http import request_context
+    owner = SimpleNamespace(tenant_id='tenant', client_id='app', provider_chat_pacing=True)
+    context = request_context(owner, 'https://graph.microsoft.com' + path)
+    assert context.workload == 'teams'
+    assert context.resource == resource
+    assert context.paced_chat
+
+
+@pytest.mark.parametrize('path', [
+    '/v1.0/users/user-A/chats/getAllMessages',
+    '/v1.0/users/user-A/chats/getAllRetainedMessages',
+    '/v1.0/teams/team-A/channels/channel-A/messages',
+    '/v1.0/users/user-A/messages',
+])
+def test_unrelated_routes_do_not_get_pinned_chat_pacing(path):
+    from types import SimpleNamespace
+    from shared.provider_http import request_context
+    owner = SimpleNamespace(tenant_id='tenant', client_id='app', provider_chat_pacing=True)
+    context = request_context(owner, 'https://graph.microsoft.com' + path)
+    assert not getattr(context, 'paced_chat', False)
+
+
+def test_regular_chat_clients_keep_existing_admission_context():
+    from shared.provider_http import request_context
+    context = request_context(Owner(), 'https://graph.microsoft.com/v1.0/chats/chat-A/messages')
+    assert context.resource == 'chat:chat-A'
+    assert not getattr(context, 'paced_chat', False)

@@ -5012,10 +5012,13 @@ class BackupWorker:
                 snapshot = await self.create_snapshot(resource, leaf_message, job_id)
                 if snapshot.status != SnapshotStatus.IN_PROGRESS:
                     continue
+                # Commit the one-time status transition before taking leaf
+                # locks. Sibling intake only needs shared parent validation.
                 async with async_session_factory.begin() as session:
-                    job = await session.get(Job, job_id, with_for_update=True)
-                    if job.status in (JobStatus.QUEUED, JobStatus.PENDING):
-                        job.status = JobStatus.RUNNING
+                    await session.execute(sa_update(Job).where(Job.id == job_id,
+                        Job.status.in_((JobStatus.QUEUED, JobStatus.PENDING)),
+                        Job.lease_token == original_job_token).values(status=JobStatus.RUNNING))
+                async with async_session_factory.begin() as session:
                     await provider_work.ensure_work(session, snapshot_id=snapshot.id,
                         snapshot_token=snapshot.lease_token, job_token=original_job_token,
                         continuation={'message': leaf_message})
@@ -5259,7 +5262,7 @@ class BackupWorker:
         return waiting
 
     async def _load_mail_folder_deltas(
-        self, resource_id: uuid.UUID,
+        self, resource_id: uuid.UUID, *, read_result: Optional[Dict[str, bool]] = None,
     ) -> Dict[str, str]:
         """Read all per-folder delta tokens for one mailbox resource.
 
@@ -5268,8 +5271,11 @@ class BackupWorker:
         single SELECT against the new `mail_folder_delta` table.
         Returns `{folder_id: delta_token}` — same shape as the old
         dict so call sites don't need to change. Empty dict if the
-        resource has no rows yet (first run / pre-migration).
+        resource has no rows yet (first run / pre-migration). `read_result`
+        distinguishes a successful empty read from the compatibility fallback.
         """
+        if read_result is not None:
+            read_result["ok"] = False
         try:
             async with async_session_factory() as session:
                 rows = (await session.execute(
@@ -5282,6 +5288,8 @@ class BackupWorker:
                     ),
                     {"rid": str(resource_id)},
                 )).fetchall()
+            if read_result is not None:
+                read_result["ok"] = True
             return {str(r[0]): str(r[1]) for r in rows if r[1]}
         except Exception as e:
             # Table may not exist on a stale deploy; fail open with
@@ -7182,6 +7190,9 @@ class BackupWorker:
                     if live.started_at:
                         live.duration_secs = int((live.completed_at - live.started_at).total_seconds())
                 else:
+                    # Parent locks are already held. Persist owned degradation
+                    # markers before settlement reloads the authoritative state.
+                    await session.flush()
                     await self._settle_inline_snapshot_finalize(session, live, resource)
                 await session.flush()
                 status = live.status
@@ -7372,8 +7383,9 @@ class BackupWorker:
                                 f"[{self.worker_id}] [USER_MAIL] resource re-read "
                                 f"failed (using pre-hook mirror): {_rr_err}"
                             )
+                    _mail_cursor_read: Dict[str, bool] = {}
                     _new_table_tokens = await self._load_mail_folder_deltas(
-                        resource.id,
+                        resource.id, read_result=_mail_cursor_read,
                     )
                     _legacy_tokens = dict(
                         _ed_fresh.get("mail_delta_tokens_by_folder", {}) or {},
@@ -7381,6 +7393,10 @@ class BackupWorker:
                     mail_existing_tokens: Dict[str, str] = {
                         **_legacy_tokens, **_new_table_tokens,
                     }
+                    mail_existing_tokens = await self._record_mail_bootstrap_origin(
+                        snapshot, mail_existing_tokens, folder_tree.keys(),
+                        cursor_read_ok=_mail_cursor_read.get("ok") is True,
+                    )
                     mail_new_tokens: Dict[str, str] = {}
                     # Folders whose drain finished cleanly AND whose pages
                     # all persisted. ONLY these may have their fingerprint
@@ -16890,6 +16906,23 @@ class BackupWorker:
         )
         return "snapshot_failed"
 
+    async def _lock_snapshot_settlement_parent(self, session, snapshot_id) -> bool:
+        """Acquire Job -> Snapshot before caller counters can autoflush."""
+        from shared.copy_workflow import verify_copy_resume
+        with session.no_autoflush:
+            # Copy settlement needs an exclusive parent fence; take it before
+            # the shared validation lock to avoid a concurrent lock upgrade.
+            if not await verify_copy_resume(session):
+                return False
+            job_id = await session.scalar(select(Snapshot.job_id).where(Snapshot.id == snapshot_id))
+            if job_id is None:
+                return False
+            job = await session.scalar(select(Job.id).where(Job.id == job_id).with_for_update(read=True))
+            if job is None:
+                return False
+            return await session.scalar(select(Snapshot.id).where(Snapshot.id == snapshot_id)
+                .with_for_update(key_share=True)) is not None
+
     async def _settle_inline_snapshot_finalize(
         self, session, snap, resource,
     ) -> str:
@@ -16912,9 +16945,13 @@ class BackupWorker:
 
         Wiring pinned by tests/workers/test_inline_finalize_wiring.py.
         """
-        from shared.copy_workflow import has_pending_copy, verify_copy_resume
-        if not await verify_copy_resume(session):
-            raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before terminal write")
+        from shared.copy_workflow import has_pending_copy
+        if not await self._lock_snapshot_settlement_parent(session, snap.id):
+            raise ChatCatalogueWorkLeaseMoved("snapshot settlement parent ownership moved")
+        with session.no_autoflush:
+            # A concurrent finalizer/cleanup may have won while we waited.
+            # Refresh status without discarding this caller's pending counters.
+            await session.refresh(snap, attribute_names=["status", "extra_data"])
         if await has_pending_copy(session, snapshot_id=snap.id):
             return "deferred_copy"
         from shared.chat_presentation import presentation_ready
@@ -17423,6 +17460,42 @@ class BackupWorker:
             },
         )
         return "COMPLETED"
+
+    async def _record_mail_bootstrap_origin(
+        self, snapshot, existing_tokens, folder_ids, *, cursor_read_ok=False,
+    ):
+        """Retain the baseline; a bootstrap resumes only this snapshot's cursors."""
+        if snapshot is None:
+            return existing_tokens
+        origin = {"cursor_free": cursor_read_ok is True and not bool(existing_tokens),
+                  "folder_ids": sorted({str(fid) for fid in folder_ids if fid})}
+        async with async_session_factory() as session:
+            from shared.copy_workflow import verify_copy_resume
+            if not await verify_copy_resume(session):
+                raise ChatCatalogueWorkLeaseMoved("copy ownership moved before mail baseline")
+            await session.execute(text("""
+                UPDATE snapshots SET extra_data = (COALESCE(extra_data::jsonb, '{}'::jsonb)
+                    || jsonb_build_object('mail_bootstrap_origin', CAST(:origin AS jsonb)))::json
+                WHERE id = CAST(:sid AS uuid) AND resource_id = CAST(:rid AS uuid)
+                  AND status = 'IN_PROGRESS' AND lease_token = :token
+                  AND extra_data->>'cancelled_at' IS NULL
+                  AND NOT (COALESCE(extra_data::jsonb, '{}'::jsonb) ? 'mail_bootstrap_origin')
+                  AND NOT EXISTS (SELECT 1 FROM snapshot_items si WHERE si.snapshot_id = snapshots.id
+                                  AND si.item_type IN ('EMAIL', 'EMAIL_ATTACHMENT'))
+                  AND NOT EXISTS (SELECT 1 FROM snapshot_partitions sp WHERE sp.snapshot_id = snapshots.id
+                                  AND sp.partition_type = 'MAIL_FOLDERS')
+                  AND EXISTS (SELECT 1 FROM jobs j WHERE j.id = snapshots.job_id
+                              AND j.status::text IN ('RUNNING', 'QUEUED', 'PENDING', 'RETRYING'))
+            """), {"sid": str(snapshot.id), "rid": str(snapshot.resource_id),
+                    "token": snapshot.lease_token, "origin": json.dumps(origin)})
+            extra = await session.scalar(select(Snapshot.extra_data).where(Snapshot.id == snapshot.id)) or {}
+            await session.commit()
+        recorded = extra.get("mail_bootstrap_origin") or {}
+        if isinstance(recorded, dict) and recorded.get("cursor_free") is True:
+            # Global cursors may belong to a different job that finished after
+            # fanout; untouched folders must still bootstrap into this snapshot.
+            return dict(extra.get("copy_mail_checkpoint_tokens") or {})
+        return existing_tokens
 
     async def _record_shard_carry_inputs(
         self,
@@ -18141,8 +18214,8 @@ class BackupWorker:
                 return None
         copy_guard = pending_copy_sql(snapshot_expr="s.id")
         async with async_session_factory() as session:
-            if not await verify_copy_resume(session):
-                raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before snapshot settlement")
+            if not await self._lock_snapshot_settlement_parent(session, snapshot_id):
+                raise ChatCatalogueWorkLeaseMoved("parent ownership moved before snapshot settlement")
             row = (await session.execute(
                 text(
                     f"""
@@ -18357,8 +18430,8 @@ class BackupWorker:
         # `_backup_user_content_parallel`'s finalize block. Idempotent —
         # safe on both winning-flip and preempted-by-REAPER paths.
         async with async_session_factory() as session:
-            if not await verify_copy_resume(session):
-                raise ChatCatalogueWorkLeaseMoved("copy resume ownership moved before counter reconciliation")
+            if not await self._lock_snapshot_settlement_parent(session, snapshot_id):
+                raise ChatCatalogueWorkLeaseMoved("parent ownership moved before counter reconciliation")
             CHILD_ITEM_TYPES = (
                 "CHAT_ATTACHMENT",
                 "EMAIL_ATTACHMENT",
@@ -18379,7 +18452,7 @@ class BackupWorker:
             # claim — either we commit first (claim's recheck then skips
             # the terminal row) or the claim commits first (we see
             # PENDING_DELETION below and skip). No interleave window.
-            snap = await session.get(Snapshot, snapshot_id, with_for_update=True)
+            snap = await session.get(Snapshot, snapshot_id, with_for_update={"key_share": True})
             if snap is not None and snap.status == SnapshotStatus.PENDING_DELETION:
                 # A sweeper claimed this snapshot for teardown while the
                 # partitions drained. Writing COMPLETED over the claim
@@ -18576,6 +18649,9 @@ class BackupWorker:
                             f"rewind error: {type(_lrw_err).__name__}: {_lrw_err}"
                         )
 
+            # Release the shared parent fence even when teardown skipped the
+            # snapshot, before the bulk finalizer can update that same Job.
+            await session.commit()
             # Bubble the new bytes up to the parent Job so the
             # Activity row reflects this snapshot's work. On the
             # preempted path REAPER already rolled the parent up
@@ -20634,7 +20710,8 @@ class BackupWorker:
         from shared.copy_workflow import verify_copy_resume
         from shared.provider_admission import ProviderDeferred
         from shared.provider_runtime import (ProviderBudgetExhausted, ProviderTurnDeferred,
-            provider_transfer_scope, provider_drain_callback, provider_receipt_scope)
+            provider_transfer_scope, provider_drain_callback, provider_receipt_scope,
+            provider_live_wait_scope)
 
         v2_enabled = settings.ONEDRIVE_BACKUP_V2_ENABLED
         max_files = None if v2_enabled else self.LEGACY_USER_ONEDRIVE_MAX_FILES
@@ -20736,122 +20813,60 @@ class BackupWorker:
         state_lock = asyncio.Lock()
         total_files = len(ordered)
 
-        # ---- $batch download-URL pre-fetch ----
-        # Bundle /drives/{}/items/{} GETs 20-at-a-time so the serial
-        # per-file call to Graph happens once per ~20 files instead
-        # of once per file. At 10k files / ~200 ms per GET that's
-        # ~33 min of URL-fetching wire-time collapsed to ~1.5 min,
-        # without changing per-request Graph cost. If $batch errors
-        # or returns an empty URL for an item, the per-file path
-        # falls back to the original single get_download_url call
-        # so nothing regresses.
+        # Resolve URLs only when a file consumer needs its batch. Waiting on
+        # every partition URL first discarded ready work on provider deferral.
+        pending_ids = [f["id"] for f in ordered
+                       if not checkpoint.is_done(f["id"]) and int(f.get("size") or 0) > 0]
+        batch_positions = {key: index // 20 for index, key in enumerate(pending_ids)}
+        prefetch_concurrency = max(1, min(file_concurrency,
+            int(os.getenv("ONEDRIVE_PREFETCH_CONCURRENCY", "16"))))
+        prefetch_sem = asyncio.Semaphore(prefetch_concurrency)
+        url_batches: Dict[int, asyncio.Task] = {}
+        resolved_batches = 0
         print(
             f"[{self.worker_id}] [USER_ONEDRIVE] {resource.display_name}: "
-            f"{total_files} files queued; pre-fetching download URLs "
-            f"in $batch groups of 20",
+            f"{len(pending_ids)}/{total_files} files pending; resolving URL batches on demand",
         )
-        batch_url_map: Dict[str, tuple] = {}
-        try:
-            ordered_ids = [f["id"] for f in ordered if f.get("id") and not checkpoint.is_done(f["id"])]
-            BATCH_SIZE = 20
-            # Parallel fan-out: previously this loop awaited each batch
-            # call before issuing the next, so 540 URLs took ~10 min
-            # whenever the chats handler was co-running and hogging
-            # Graph budget (each batch sat in the rate-limiter queue
-            # behind every chat message). Firing batches concurrently
-            # under a bounded semaphore lets pre-fetch claim its fair
-            # share of the Graph budget and finish in ~30-60s even with
-            # chats running.
-            #
-            # Default raised from 6 to 16: the original 6 assumed a
-            # single Graph app's 10 RPS ceiling. With the multi-app
-            # pool (12 apps observed rotating in prod) the per-tenant
-            # effective ceiling is ~40+ RPS, so 16 concurrent batches
-            # × ~1s wire still leaves headroom for the chats handler
-            # to fan out in parallel. Field measurement showed fast
-            # tenants saturating at 22 URL/s with concurrency=14;
-            # bumping to 16 captures that headroom for the median
-            # tenant. Throttled tenants are bounded by Graph budget
-            # not local concurrency — they'll see no harm. Operators
-            # can still tune via ONEDRIVE_PREFETCH_CONCURRENCY.
-            prefetch_concurrency = int(os.getenv(
-                "ONEDRIVE_PREFETCH_CONCURRENCY", "16"
-            ))
-            sem = asyncio.Semaphore(prefetch_concurrency)
-            _prefetch_t0 = time.monotonic()
-            total_batches = (len(ordered_ids) + BATCH_SIZE - 1) // BATCH_SIZE
-            done_batches = {"n": 0}
-            progress_lock = asyncio.Lock()
-            # Liveness abort: when the snapshot this prefetch serves is
-            # failed/cancelled under us (stale sweep, operator cancel),
-            # stop immediately. A swept run's consumer once kept
-            # resolving 49k URLs for 16.8h under 429 retry-after-300
-            # storms, starving every live backup on the app pool.
-            abandoned = {"flag": False}
 
-            async def _one_batch(sub_ids: List[str], batch_idx: int):
-                if abandoned["flag"]:
-                    return
-                async with sem:
-                    if abandoned["flag"]:
-                        return
+        async def _fetch_url_batch(batch_index):
+            nonlocal resolved_batches
+            ids = pending_ids[batch_index * 20:(batch_index + 1) * 20]
+            async with prefetch_sem, provider_live_wait_scope():
+                if not await self._snapshot_still_live(snapshot.id):
+                    raise RunAbandoned(f"snapshot {snapshot.id} went terminal before URL resolution")
+                started = time.monotonic()
+                try:
                     partial = await graph_client.get_download_urls_batch(
-                        drive_id, sub_ids, include_source_metadata=True,
-                    )
-                async with progress_lock:
-                    batch_url_map.update(partial)
-                    done_batches["n"] += 1
-                    # Progress every 10 batches (~200 URLs) — keeps
-                    # large drives visible without log spam.
-                    if done_batches["n"] % 10 == 0 or done_batches["n"] == total_batches:
-                        print(
-                            f"[{self.worker_id}] [USER_ONEDRIVE] "
-                            f"url pre-fetch: "
-                            f"{min(done_batches['n'] * BATCH_SIZE, len(ordered_ids))}/"
-                            f"{len(ordered_ids)} URLs resolved",
-                        )
-                        if not await self._snapshot_still_live(snapshot.id):
-                            abandoned["flag"] = True
+                        drive_id, ids, include_source_metadata=True)
+                except ProviderWorkConflict as exc:
+                    raise ChatCatalogueWorkLeaseMoved("OneDrive provider ownership moved") from exc
+                except (ChatCatalogueWorkLeaseMoved, ProviderDeferred, ProviderBudgetExhausted):
+                    raise
+                except Exception as exc:
+                    print(f"[{self.worker_id}] [USER_ONEDRIVE] URL batch failed "
+                          f"({type(exc).__name__}); resolving missing URLs per file")
+                    partial = {}
+                resolved_batches += 1
+                if resolved_batches == 1 or resolved_batches % 10 == 0:
+                    print(f"[{self.worker_id}] [USER_ONEDRIVE] URL batch ready "
+                          f"({len(partial)}/{len(ids)} entries, {time.monotonic() - started:.1f}s; "
+                          f"{resolved_batches} batches resolved)")
+                # Missing results remain placeholders until each consumer has
+                # taken its fallback, so a partial batch is not fetched again.
+                return {key: partial.get(key) for key in ids}
 
-            batch_tasks = [
-                _one_batch(ordered_ids[i:i + BATCH_SIZE], i // BATCH_SIZE)
-                for i in range(0, len(ordered_ids), BATCH_SIZE)
-            ]
-            prefetch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
-            for result in prefetch_results:
-                if isinstance(result, ProviderWorkConflict):
-                    raise ChatCatalogueWorkLeaseMoved("OneDrive provider ownership moved") from result
-                if isinstance(result, (ProviderDeferred, ProviderBudgetExhausted,
-                                       ProviderTurnDeferred, asyncio.CancelledError)):
-                    raise result
-            if abandoned["flag"]:
-                raise RunAbandoned(
-                    f"snapshot {snapshot.id} went terminal during URL "
-                    f"pre-fetch ({done_batches['n']}/{total_batches} batches)"
-                )
-            print(
-                f"[{self.worker_id}] [USER_ONEDRIVE] url pre-fetch "
-                f"done ({len(batch_url_map)}/{len(ordered_ids)} "
-                f"urls in {time.monotonic() - _prefetch_t0:.1f}s, "
-                f"concurrency={prefetch_concurrency})",
-            )
-        except RunAbandoned:
-            # NOT the non-fatal case — the run itself is dead. Propagate
-            # so the caller stops instead of "falling back" into 49k
-            # doomed serial fetches.
-            raise
-        except ChatCatalogueWorkLeaseMoved:
-            raise
-        except (ProviderDeferred, ProviderBudgetExhausted):
-            raise
-        except Exception as exc:
-            # Non-fatal — per-file path re-fetches as needed.
-            print(
-                f"[{self.worker_id}] [USER_ONEDRIVE] batch URL "
-                f"pre-fetch failed: {type(exc).__name__}: {exc}; "
-                f"falling back to serial get_download_url",
-            )
-            batch_url_map = {}
+        async def _download_url_for(file_id):
+            batch_index = batch_positions[file_id]
+            task = url_batches.get(batch_index)
+            if task is None:
+                task = asyncio.create_task(_fetch_url_batch(batch_index))
+                url_batches[batch_index] = task
+            # One cancelled file must not cancel metadata shared by siblings.
+            results = await asyncio.shield(task)
+            result = results.pop(file_id)
+            if not results:
+                del url_batches[batch_index]
+            return result
 
         # Large-file threshold for parallel chunk download. Configurable
         # so operators can tune per environment.
@@ -21185,7 +21200,7 @@ class BackupWorker:
                 # Prefer the pre-fetched $batch URL; only fall back to
                 # a serial GET if $batch returned nothing for this file
                 # (or the batch call failed entirely).
-                batch_hit = batch_url_map.get(file_id)
+                batch_hit = await _download_url_for(file_id)
                 if batch_hit and batch_hit[0]:
                     download_url, real_size, qxh, descriptor = batch_hit
                     if real_size <= 0:
@@ -21401,7 +21416,19 @@ class BackupWorker:
         # snap counters so the UI shows progress in real time.
         with provider_drain_callback(_flush_updates):
             flusher_task = asyncio.create_task(_periodic_flusher())
-            download_tasks = [asyncio.create_task(_process_one(f)) for f in ordered]
+            remaining_files = iter(ordered)
+
+            async def _download_worker():
+                for item in remaining_files:
+                    batch_index = batch_positions.get(item["id"])
+                    if batch_index is not None and batch_index not in url_batches:
+                        # Commit ready bytes before another metadata request can
+                        # put this turn into a real provider cooldown.
+                        await _flush_updates()
+                    await _process_one(item)
+
+            download_tasks = [asyncio.create_task(_download_worker())
+                              for _ in range(min(file_concurrency, len(ordered)))]
             try:
                 await asyncio.gather(*download_tasks)
             finally:
@@ -21411,6 +21438,11 @@ class BackupWorker:
                     if not task.done():
                         task.cancel()
                 await asyncio.gather(*download_tasks, return_exceptions=True)
+                for task in url_batches.values():
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*url_batches.values(), return_exceptions=True)
+                url_batches.clear()
                 flush_done_evt.set()
                 backlog_high_evt.set()
                 await flusher_task
@@ -31651,12 +31683,12 @@ class BackupWorker:
         }
         _incoming_extra = dict(snapshot.extra_data or {})
 
-        from shared.copy_workflow import has_pending_copy, verify_copy_resume
+        from shared.copy_workflow import has_pending_copy
         from shared.db_retry import run_with_db_retry as _db_retry
 
         async def _attempt() -> bool:
             async with async_session_factory() as s:
-                if not await verify_copy_resume(s):
+                if not await self._lock_snapshot_settlement_parent(s, _sid):
                     return False
                 if await has_pending_copy(s, snapshot_id=_sid):
                     return False
@@ -31672,7 +31704,7 @@ class BackupWorker:
                         Snapshot.duration_secs,
                     )
                     .where(Snapshot.id == _sid)
-                    .with_for_update()
+                    .with_for_update(key_share=True)
                 )).first()
                 if row is None:
                     print(
