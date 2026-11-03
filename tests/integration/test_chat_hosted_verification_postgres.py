@@ -12,10 +12,19 @@ from shared.models import Snapshot, SnapshotItem
 
 pytestmark = pytest.mark.integration
 
+HOSTED_REF = '<img src="https://graph.microsoft.com/v1.0/chats/chat/messages/message/hostedContents/image/$value">'
+
+
+def referencing(**changes):
+    """A message whose body references hosted content; the listing itself is patched per test."""
+    value = message(hosted=True)
+    del value["_hosted"]
+    return dict(value, **changes)
+
 
 async def test_overlapping_pages_observe_each_message_once_per_independent_pass(store, adapters, caplog):
     caplog.set_level(logging.INFO, logger='shared.chat_capture')
-    messages = [dict(message(), id=str(i)) for i in range(1000)]
+    messages = [referencing(id=str(i)) for i in range(1000)]
     adapters.source.messages = messages + deepcopy(messages)
     listed = []
     original = adapters.source.iter_hosted_contents
@@ -40,7 +49,7 @@ async def test_overlapping_pages_observe_each_message_once_per_independent_pass(
 
 @pytest.mark.parametrize('tag', [None, '', 7, 'stable'])
 async def test_message_version_never_skips_independent_hosted_observation(store, adapters, tag):
-    adapters.source.messages = [dict(message(), etag=tag)]
+    adapters.source.messages = [referencing(etag=tag)]
     calls = []
 
     async def hosted(chat, mid):
@@ -75,7 +84,7 @@ async def test_nonempty_hosted_content_is_still_independently_checked(store, ada
 
 
 async def test_failed_hosted_list_remains_partial_and_second_pass_rechecks(store, adapters):
-    adapters.source.messages = [dict(message(), etag='stable')]
+    adapters.source.messages = [referencing(etag='stable')]
     calls = []
 
     async def hosted(chat, mid):
@@ -90,9 +99,9 @@ async def test_failed_hosted_list_remains_partial_and_second_pass_rechecks(store
     assert result.outcome == 'partial' and calls == ['message', 'message']
 
 
-@pytest.mark.parametrize('field,value', [('etag', 'v2'), ('body', {'content': 'edited'})])
+@pytest.mark.parametrize('field,value', [('etag', 'v2'), ('body', {'contentType': 'html', 'content': 'edited' + HOSTED_REF})])
 async def test_changed_parent_reconciles_new_observations(store, adapters, field, value):
-    adapters.source.messages = [dict(message(), etag='v1')]
+    adapters.source.messages = [referencing(etag='v1')]
     calls = []
 
     def movement(observation):
@@ -115,7 +124,7 @@ async def test_changed_parent_reconciles_new_observations(store, adapters, field
 
 
 async def test_hosted_visibility_change_with_same_parent_version_is_reconciled(store, adapters):
-    adapters.source.messages = [dict(message(), etag='stable')]
+    adapters.source.messages = [referencing(etag='stable')]
     calls = []
 
     async def hosted(chat, mid):

@@ -253,7 +253,7 @@ async def defer_current_copy(kind, params, lane='giant'):
         async def register(session):
             pointer=await session.get(Snapshot,target)
             if pointer is None: raise CopyWorkConflict('copy source capture parent disappeared')
-            job=await session.get(Job,pointer.job_id,with_for_update={'read':True},populate_existing=True)
+            job=await session.get(Job,pointer.job_id,with_for_update={'read':True,'key_share':True},populate_existing=True)
             snapshot=await session.get(Snapshot,target,with_for_update={'read':True},populate_existing=True)
             partition=await session.get(SnapshotPartition,capture.partition_id,
                 with_for_update={'read':True},populate_existing=True) if capture.partition_id else None
@@ -282,7 +282,8 @@ async def defer_current_copy(kind, params, lane='giant'):
 async def _lock_parents(session, workflow, *, shared=False):
     # Same order as API cancellation: job -> snapshot -> partition -> workflow.
     # Parent keys are immutable here; child FK checks must not join this lock chain.
-    job=await session.scalar(select(Job).where(Job.id==workflow.job_id).with_for_update(read=shared, key_share=not shared))
+    # The job row is validated, never written here: KEY SHARE never blocks sibling progress writes.
+    job=await session.scalar(select(Job).where(Job.id==workflow.job_id).with_for_update(read=True, key_share=True))
     snapshot=await session.scalar(select(Snapshot).where(Snapshot.id==workflow.target_snapshot_id).with_for_update(read=shared, key_share=not shared))
     partition=None
     if workflow.partition_id:

@@ -63,7 +63,7 @@ async def owned_retry(session, *, retry_id, attempt, lease_seconds):
         .join(Job, Job.id == Snapshot.job_id)
         .join(OneDriveFileRetry, OneDriveFileRetry.snapshot_id == Snapshot.id)
         .where(OneDriveFileRetry.id == retry_id)
-        .with_for_update(read=True, of=(Job, Snapshot)))).first()
+        .with_for_update(read=True, key_share=True, of=(Job, Snapshot)))).first()
     if parents is None:
         raise RetryOwnershipLost("OneDrive retry parent disappeared")
     found = await session.scalar(text(f"""

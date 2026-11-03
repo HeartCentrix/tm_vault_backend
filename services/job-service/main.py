@@ -837,7 +837,7 @@ async def _job_rollup_bulk(db: AsyncSession, job_ids: List[UUID]) -> Dict[str, D
             COUNT(*) FILTER (WHERE status='COMPLETED')     AS done,
             COUNT(*) FILTER (WHERE status='FAILED')        AS failed,
             COUNT(*) FILTER (WHERE status='IN_PROGRESS')   AS inflight,
-            COALESCE(SUM(item_count)  FILTER (WHERE status IN ('COMPLETED','PARTIAL')), 0) AS items,
+            COALESCE(SUM(item_count)  FILTER (WHERE status IN ('COMPLETED','PARTIAL','IN_PROGRESS')), 0) AS items,
             COALESCE(SUM(bytes_added) FILTER (WHERE status IN ('COMPLETED','PARTIAL')), 0) AS bytes
         FROM snapshots
         WHERE job_id = ANY(:jids)
@@ -1151,7 +1151,10 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
     In-flight workers poll `_is_job_cancelled()` between items and
     raise early, so the window between "cancel issued" and "no more new
     blobs written" is bounded by one item, not one resource."""
-    job = (await db.execute(select(Job).where(Job.id == _parse_uuid(job_id, "job_id")))).scalar_one_or_none()
+    # FOR UPDATE: in-flight writers hold KEY SHARE on the parent, so cancellation
+    # waits for their commit instead of racing it.
+    job = (await db.execute(select(Job).where(Job.id == _parse_uuid(job_id, "job_id"))
+                            .with_for_update())).scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 

@@ -207,7 +207,7 @@ async def test_resource_capture_uses_full_source_and_records_complete_scope(stor
 async def test_exclusions_filter_messages_and_children_in_both_observations(store, source_adapter):
     scope = await legacy_scope(store)
     source_adapter.source.messages["chat-alpha"] = [
-        {"id": "kept", "body": {"content": "kept"}},
+        {"id": "kept", "body": {"content": "kept <img src=\"https://graph.microsoft.com/v1.0/chats/chat-alpha/messages/kept/hostedContents/aWQ9/$value\">"}},
         {"id": "excluded", "body": {"content": "excluded"}, "attachments": [
             {"id": "never-download", "contentType": "reference", "contentUrl": "https://invalid.example/file"}]}]
     filtered = []

@@ -39,6 +39,7 @@ def message(body="original", *, attached=False, hosted=False):
         value["attachments"] = [{"id": "attachment", "name": "file.pdf", "contentType": "reference", "contentUrl": "https://tenant.sharepoint.com/file.pdf"}]
     if hosted:
         value["_hosted"] = [{"id": "image", "contentType": "image/png"}]
+        value["body"] = {"contentType": "html", "content": body + '<img src="https://graph.microsoft.com/v1.0/chats/chat/messages/message/hostedContents/image/$value">'}
     return value
 
 
@@ -52,6 +53,7 @@ class Source:
         self.data = b"PDF"
         self.etag, self.ctag = "etag-v1", "ctag-v1"
         self.fail_file = self.fail_page = self.cancel_page = False
+        self.hosted_lists = 0
         self.cancel_file = False
         self.movement = None
 
@@ -68,6 +70,7 @@ class Source:
             yield []
 
     async def iter_hosted_contents(self, chat_id, message_id):
+        self.hosted_lists += 1
         value = next((m for m in self.messages if m["id"] == message_id), {})
         for child in value.get("_hosted", []):
             yield deepcopy(child)
@@ -166,6 +169,13 @@ async def run_capture(store, adapters, **changes):
     return scope, result
 
 
+async def test_only_messages_referencing_hosted_content_are_listed(store, adapters):
+    adapters.source.messages = [message(), dict(message(hosted=True), id="with-image")]
+    _, result = await run_capture(store, adapters)
+    assert result.outcome == "complete" and result.item_count == 3  # two messages + the referenced image
+    assert adapters.source.hosted_lists == 2  # the referencing message, once per observation pass
+
+
 async def test_initial_then_unchanged_reuses_immutable_inventory(store, adapters):
     first_scope, first = await run_capture(store, adapters)
     second_scope, second = await run_capture(store, adapters)
@@ -192,7 +202,7 @@ async def test_old_body_edit_preserves_previous_snapshot_payload(store, adapters
             SnapshotItem.item_type == "TEAMS_CHAT_MESSAGE"))).all())
         rows = await materialize_chat_items(session, rows)
         bodies = {r.snapshot_id: r.extra_data["raw"]["body"]["content"] for r in rows}
-    assert bodies[old_scope.snapshot_id] == "original"
+    assert bodies[old_scope.snapshot_id] == message(hosted=True)["body"]["content"]
     assert bodies[new_scope.snapshot_id] == "edited old message"
 
 
@@ -545,7 +555,7 @@ async def test_required_encryption_intent_is_not_lost_if_runtime_changes_during_
 async def test_hosted_order_noise_does_not_restart_v2_capture(store, adapters, monkeypatch, version, expected_passes, outcome):
     from shared.config import settings
     monkeypatch.setattr(settings, "CHAT_OBSERVATION_HASH_VERSION", version)
-    adapters.source.messages = [message()]
+    adapters.source.messages = [message(hosted=True)]
 
     async def hosted(chat_id, message_id):
         children = [{"id": "a", "contentType": "image/png"}, {"id": "b", "contentType": "image/png"}]

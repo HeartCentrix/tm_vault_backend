@@ -58,7 +58,7 @@ async def test_checkpoint_wait_leaves_tenant_slot_available(store, redis_client,
     limiter, sent, at_parent = admission(redis_client), [], asyncio.Event()
 
     def trace(conn, cursor, statement, parameters, context, executemany):
-        if 'FROM jobs' in statement and 'FOR SHARE' in statement:
+        if 'FROM jobs' in statement and ('FOR SHARE' in statement or 'FOR KEY SHARE' in statement):
             at_parent.set()
 
     async def transport(request):
@@ -163,7 +163,7 @@ async def test_redirect_refill_releases_previous_hop_before_checkpoint(store, re
     limiter, sent, at_parent = admission(redis_client), [], asyncio.Event()
 
     def trace(conn, cursor, statement, parameters, context, executemany):
-        if 'FROM jobs' in statement and 'FOR SHARE' in statement:
+        if 'FROM jobs' in statement and ('FOR SHARE' in statement or 'FOR KEY SHARE' in statement):
             at_parent.set()
 
     async def transport(request):
@@ -206,7 +206,7 @@ async def test_stopped_checkpoint_cannot_transmit_after_wait(store, redis_client
     limiter, sent, at_parent = admission(redis_client), [], asyncio.Event()
 
     def trace(conn, cursor, statement, parameters, context, executemany):
-        if 'FROM jobs' in statement and 'FOR SHARE' in statement:
+        if 'FROM jobs' in statement and ('FOR SHARE' in statement or 'FOR KEY SHARE' in statement):
             at_parent.set()
 
     async def transport(request):
@@ -290,7 +290,7 @@ async def test_cancelled_allowance_refund_survives_concurrent_database_refill(st
     limiter, sent, at_parent = admission(redis_client), [], asyncio.Event()
 
     def trace(conn, cursor, statement, parameters, context, executemany):
-        if 'FROM jobs' in statement and 'FOR SHARE' in statement:
+        if 'FROM jobs' in statement and ('FOR SHARE' in statement or 'FOR KEY SHARE' in statement):
             at_parent.set()
 
     async def transport(request):

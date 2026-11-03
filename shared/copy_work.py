@@ -93,7 +93,7 @@ async def enqueue(session, request: CopyRequest) -> CopyWorkTask:
             raise CopyWorkConflict('copy partition is no longer active')
     # Serialize source choice without a parent/cancellation lock-order cycle.
     # NO KEY UPDATE on the workflow remains compatible with child FK checks.
-    job = await session.scalar(select(Job).where(Job.id == job.id).with_for_update(read=True)
+    job = await session.scalar(select(Job).where(Job.id == job.id).with_for_update(read=True, key_share=True)
                                .execution_options(populate_existing=True))
     snapshot = await session.scalar(select(Snapshot).where(Snapshot.id == snapshot.id).with_for_update(read=True)
                                     .execution_options(populate_existing=True))

@@ -16917,7 +16917,7 @@ class BackupWorker:
             job_id = await session.scalar(select(Snapshot.job_id).where(Snapshot.id == snapshot_id))
             if job_id is None:
                 return False
-            job = await session.scalar(select(Job.id).where(Job.id == job_id).with_for_update(read=True))
+            job = await session.scalar(select(Job.id).where(Job.id == job_id).with_for_update(read=True, key_share=True))
             if job is None:
                 return False
             return await session.scalar(select(Snapshot.id).where(Snapshot.id == snapshot_id)
@@ -20751,7 +20751,7 @@ class BackupWorker:
             else:
                 # Shared bulk Job reads do not serialize unrelated resources.
                 job = await session.get(_Job, snapshot.job_id,
-                    with_for_update={"read": True}, populate_existing=True)
+                    with_for_update={"read": True, "key_share": True}, populate_existing=True)
                 live = await session.get(Snapshot, snapshot.id,
                     with_for_update=True, populate_existing=True)
                 partition = await session.get(_Partition, uuid.UUID(partition_record["partition_id"]),

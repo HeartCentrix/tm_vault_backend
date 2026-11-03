@@ -593,7 +593,7 @@ class _StoreFacade:
                 "method": "direct_upload",
             }
         except Exception as e:
-            return {"success": False, "error": str(e), "method": "direct_upload"}
+            return {"success": False, "error": f"{type(e).__name__}: {e}", "method": "direct_upload"}
 
     async def upload_blob_from_file(self, container_name, blob_path, file_path,
                                      file_size=0, overwrite=True, metadata=None):
@@ -612,7 +612,7 @@ class _StoreFacade:
                 "method": "stream_upload",
             }
         except Exception as e:
-            return {"success": False, "error": str(e), "method": "stream_upload"}
+            return {"success": False, "error": f"{type(e).__name__}: {e}", "method": "stream_upload"}
 
     async def upload_blob_stream(
         self, container_name, blob_path, byte_stream, total_size,
@@ -642,7 +642,7 @@ class _StoreFacade:
             }
         except Exception as e:
             return {
-                "success": False, "error": str(e),
+                "success": False, "error": f"{type(e).__name__}: {e}",
                 "method": "stream_multipart",
             }
 

@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import logging
+import os
+import time
 from uuid import UUID
 
 from sqlalchemy import func, or_, select
@@ -35,7 +37,7 @@ async def lock_chat_catalogue_snapshot(session, *, snapshot_id, snapshot_lease_t
     hint = await session.get(Snapshot, snapshot_id)
     if hint is None:
         raise ChatCatalogueWorkLeaseMoved("capture snapshot was removed")
-    job = await session.scalar(select(Job).where(Job.id == hint.job_id).with_for_update(read=True)
+    job = await session.scalar(select(Job).where(Job.id == hint.job_id).with_for_update(read=True, key_share=True)
         .execution_options(populate_existing=True))
     snapshot = await session.scalar(select(Snapshot).where(Snapshot.id == snapshot_id)
         .with_for_update().execution_options(populate_existing=True))
@@ -67,7 +69,7 @@ async def adopt_chat_catalogue(session, *, resource_id, snapshot_id, writer_enab
         raise ChatCatalogueAdoptionError("capture snapshot no longer belongs to the resource")
     # Match catalogue lock order: job -> snapshot -> resource. An opposite
     # resource/snapshot order can deadlock with a live capture's shared locks.
-    job = await session.scalar(select(Job).where(Job.id == hint.job_id).with_for_update(read=True))
+    job = await session.scalar(select(Job).where(Job.id == hint.job_id).with_for_update(read=True, key_share=True))
     snapshot = await session.scalar(select(Snapshot).where(Snapshot.id == snapshot_id)
         .with_for_update().execution_options(populate_existing=True))
     resource = await session.scalar(select(Resource).where(Resource.id == resource_id)
@@ -287,6 +289,9 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
             if allowed != set((partition.payload or {}).get("chat_ids") or []):
                 raise ChatCatalogueAdoptionError("chat partition allowlist differs from its claimed scope")
     started = datetime.now(timezone.utc)
+    # Yielding costs a re-claim and a full chat re-list; keep a fresh turn
+    # productive for at least this long before fair checkpoints apply.
+    turn_started, min_turn_s = time.monotonic(), float(os.getenv("CHAT_TURN_MIN_SECONDS", "60"))
     errors, completed, planned, selected = [], 0, 0, set()
     try:
         async with pinned_chat_source(graph_client, principal_id=principal) as source:
@@ -363,7 +368,8 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                     else:
                         errors.append(result.failure_reason or "chat capture has incomplete coverage")
                     processed += 1
-                    if cid not in published and await other_provider_work_waiting():
+                    if (cid not in published and time.monotonic() - turn_started >= min_turn_s
+                            and await other_provider_work_waiting()):
                         yield_requested = True
             workers = [asyncio.create_task(worker()) for _ in range(min(concurrency, len(keys)))]
             try:

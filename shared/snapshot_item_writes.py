@@ -68,7 +68,8 @@ async def _locked_parents(session, snapshot_id, job_id, partition_id):
     from shared.models import Job, Snapshot, SnapshotPartition
     from shared.chat_catalogue import ChatCatalogueWorkLeaseMoved
     await session.execute(text("SET LOCAL lock_timeout='2s'"))
-    job = await session.get(Job, job_id, with_for_update={"read": True}, populate_existing=True)
+    # KEY SHARE: sibling progress/lease UPDATEs flow; cancellation (FOR UPDATE) still waits.
+    job = await session.get(Job, job_id, with_for_update={"read": True, "key_share": True}, populate_existing=True)
     snapshot = await session.get(Snapshot, snapshot_id, with_for_update={"read": True}, populate_existing=True)
     partition = await session.get(SnapshotPartition, partition_id, with_for_update={"read": True},
                                   populate_existing=True) if partition_id else None

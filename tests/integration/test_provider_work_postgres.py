@@ -349,6 +349,7 @@ async def test_chat_fair_checkpoint_keeps_published_receipt_and_finishes_active_
         await work.ensure_work(db, snapshot_id=scope.snapshot_id, snapshot_token=0, job_token=0)
     # The DB fairness decision is separately exercised by the sustained-arrivals test.
     monkeypatch.setattr('shared.provider_runtime.other_provider_work_waiting', AsyncMock(return_value=True))
+    monkeypatch.setenv('CHAT_TURN_MIN_SECONDS', '0')  # pin per-chat checkpoint behaviour
     async def resume(owner):
         return await source_adapter.run(scope, concurrency=2,
             snapshot_lease_token=owner.snapshot_token, job_lease_token=owner.job_token)

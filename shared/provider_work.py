@@ -109,9 +109,10 @@ async def _parents(session, snapshot_id, partition_id=None, *, skip_locked=False
     hint = await session.get(Snapshot, _uuid(snapshot_id))
     if hint is None:
         raise ProviderWorkConflict('provider snapshot removed')
-    # Keys never change here. Allow child FK checks while a writer waits on its leaf.
+    # The job row is only validated here, never written: KEY SHARE keeps sibling
+    # progress/lease UPDATEs flowing while cancellation (FOR UPDATE) still waits.
     job = await session.scalar(select(Job).where(Job.id == hint.job_id)
-        .with_for_update(skip_locked=skip_locked, read=share_job, key_share=not share_job)
+        .with_for_update(skip_locked=skip_locked, read=True, key_share=True)
         .execution_options(populate_existing=True))
     if job is None:
         raise ProviderWorkConflict('provider parent locked or removed')

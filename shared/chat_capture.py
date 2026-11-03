@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import tempfile
 from uuid import UUID
@@ -37,6 +38,16 @@ logger = logging.getLogger(__name__)
 
 class ChatSourceMovement(RuntimeError):
     """The same source membership/version could not be reconciled."""
+
+
+_HOSTED_CONTENT_REFERENCE = re.compile(r"/messages/[^/\"'<>\s]+/hostedContents/[^/\"'<>\s]+/\$value")
+
+
+def message_references_hosted_content(message) -> bool:
+    """Graph addresses hosted content only by its ``$value`` URL (inline image
+    ``src``, card/code-snippet ``contentUrl``); a message without that URL has
+    nothing to list, so the per-message ``/hostedContents`` request is skipped."""
+    return bool(_HOSTED_CONTENT_REFERENCE.search(json.dumps(message, default=str)))
 
 
 class ChatObservationLedger:
@@ -373,15 +384,16 @@ async def _observe(*, scope, keeper, factory, storage, source, ledger, observati
                     if not valid:
                         stats.unresolved += 1
                     hosted, hosted_complete = [], True
-                    try:
-                        stats.hosted_lists += 1
-                        async for child in source.iter_hosted_contents(scope.chat_id, identifier):
-                            hosted.append(child)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        ledger.failure(observation, "hosted_list", exc, identifier)
-                        hosted_complete, stats.unresolved = False, stats.unresolved + 1
+                    if message_references_hosted_content(raw):
+                        try:
+                            stats.hosted_lists += 1
+                            async for child in source.iter_hosted_contents(scope.chat_id, identifier):
+                                hosted.append(child)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            ledger.failure(observation, "hosted_list", exc, identifier)
+                            hosted_complete, stats.unresolved = False, stats.unresolved + 1
                     parent["hostedContents"] = hosted
                     manifest = []
                     for kind, values in (("CHAT_ATTACHMENT", attachments), ("CHAT_HOSTED_CONTENT", hosted)):
