@@ -8170,6 +8170,11 @@ class BackupWorker:
                             *[_drain_one_folder(fid) for fid in mail_folder_ids],
                             return_exceptions=True,
                         )
+                        from shared.provider_runtime import check_provider_turn
+                        check_provider_turn()
+                        for r in results:
+                            if isinstance(r, BaseException) and not isinstance(r, Exception):
+                                raise r
                         for r in results:
                             if isinstance(r, list):
                                 out.extend(r)
