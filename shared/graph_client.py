@@ -7008,7 +7008,9 @@ class GraphClient:
         `(None, 0, None)` entries rather than aborting the whole batch,
         so one bad file doesn't poison the drive's URL map.
         """
-        from shared.graph_batch import BatchRequest
+        from shared.graph_batch import BatchReadError, BatchRequest
+        from shared.provider_admission import ProviderDeferred
+        from shared.provider_runtime import ProviderBudgetExhausted
         if not item_ids:
             return {}
         reqs = [
@@ -7021,6 +7023,15 @@ class GraphClient:
         out: Dict[str, Tuple[Optional[str], int, Optional[str]]] = {}
         try:
             responses = await self.batch(reqs)
+        except (ProviderDeferred, ProviderBudgetExhausted):
+            raise
+        except BatchReadError as exc:
+            responses = exc.responses
+            print(
+                f"[GraphClient] get_download_urls_batch incomplete: "
+                f"{exc.stage}; retained {len(responses)}/{len(reqs)} responses; "
+                f"unresolved items fall back to per-item get_download_url",
+            )
         except Exception as exc:
             # Batch call itself failed — fall back to per-item GETs
             # so throughput degrades gracefully instead of erroring
