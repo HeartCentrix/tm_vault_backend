@@ -144,7 +144,11 @@ def settling_copy_parent():
     # not block each other's last-finisher transaction; active copies still do.
     token = _PARENT_SETTLEMENT.set(True)
     try:
-        yield
+        # Provider receipts also await this parent write. Only active provider
+        # work must block it; completed receipts would create a circular wait.
+        from shared.provider_work import settling_parent
+        with settling_parent():
+            yield
     finally:
         _PARENT_SETTLEMENT.reset(token)
 

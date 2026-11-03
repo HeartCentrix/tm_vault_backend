@@ -150,3 +150,33 @@ async def test_stale_source_capture_cannot_adopt_replacement_before_first_intent
             await module.defer_current_copy('CHAT_CARRY',{})
     async with store.factory() as db:
         assert not list((await db.scalars(select(models.CopyWorkflow).where(models.CopyWorkflow.target_snapshot_id==target.snapshot_id))).all())
+
+
+async def test_copy_parent_settlement_ignores_completed_provider_receipts_but_not_active_work(store, monkeypatch):
+    from shared import provider_work
+    from sqlalchemy import text
+    module = api()
+    monkeypatch.setenv('COPY_WORK_ENABLED', 'true')
+    monkeypatch.setenv('PROVIDER_WORK_ENABLED', 'true')
+    monkeypatch.setattr(provider_work, 'guards_enabled', lambda: True)
+    scope = await store.new_scope()
+    async with store.factory.begin() as db:
+        receipt = await provider_work.ensure_work(db, snapshot_id=scope.snapshot_id,
+            snapshot_token=0, job_token=0, continuation={})
+        row = await db.get(models.ProviderWork, receipt.work_id)
+        row.state = 'COMPLETED'
+        row.parent_settle_pending = True
+    async with store.factory() as db:
+        assert await module.has_pending_copy(db, snapshot_id=scope.snapshot_id)
+        with module.settling_copy_parent():
+            assert not await module.has_pending_copy(db, snapshot_id=scope.snapshot_id)
+            predicate = module.pending_copy_sql(snapshot_expr="'" + str(scope.snapshot_id) + "'::uuid")
+            assert await db.scalar(text('SELECT ' + predicate))
+        assert await module.has_pending_copy(db, snapshot_id=scope.snapshot_id)
+    async with store.factory.begin() as db:
+        (await db.get(models.ProviderWork, receipt.work_id)).state = 'WAITING'
+    async with store.factory() as db:
+        with module.settling_copy_parent():
+            assert await module.has_pending_copy(db, snapshot_id=scope.snapshot_id)
+            predicate = module.pending_copy_sql(snapshot_expr="'" + str(scope.snapshot_id) + "'::uuid")
+            assert not await db.scalar(text('SELECT ' + predicate))
