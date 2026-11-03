@@ -23080,6 +23080,8 @@ class BackupWorker:
         from shared.range_download import strong_etag, validate_range
         from shared.provider_read import ProviderReadError
         import shutil
+        from shared.storage.async_file import open_spool_file
+        from shared.storage.file_upload import finish_io
         from shared.provider_runtime import execution_budget
         budget = execution_budget()
         if max_attempts < 1 or chunk_size < 1:
@@ -23111,7 +23113,7 @@ class BackupWorker:
                         # Resume requires a strong version proof. Without it,
                         # restart the private spool instead of mixing versions.
                         bytes_received, hasher = 0, hashlib.sha256()
-                        with open(tmp_path, "wb"):
+                        async with open_spool_file(tmp_path, "wb"):
                             pass
                     progress_before = bytes_received
 
@@ -23133,7 +23135,7 @@ class BackupWorker:
                                       f"source changed — restarting from 0")
                                 bytes_received = 0
                                 hasher = hashlib.sha256()
-                                with open(tmp_path, "wb"):
+                                async with open_spool_file(tmp_path, "wb"):
                                     pass  # truncate
                                 continue
 
@@ -23195,7 +23197,7 @@ class BackupWorker:
                                       f"resetting and writing from byte 0")
                                 bytes_received = 0
                                 hasher = hashlib.sha256()
-                                with open(tmp_path, "wb"):
+                                async with open_spool_file(tmp_path, "wb"):
                                     pass
 
                             if resp.status_code == 206 and expected_size > 0:
@@ -23208,17 +23210,17 @@ class BackupWorker:
 
                             # ----- Stream chunks to disk -----
                             mode = "ab" if bytes_received > 0 else "wb"
-                            with open(tmp_path, mode) as f:
+                            async with open_spool_file(tmp_path, mode) as f:
                                 async for chunk in resp.aiter_bytes(chunk_size=chunk_size):
                                     if not chunk:
                                         continue
                                     if expected_size > 0 and bytes_received + len(chunk) > expected_size:
                                         raise ProviderReadError("download_length_exceeded")
                                     if bytes_received >= space_check:
-                                        if shutil.disk_usage(tmp_path).free < len(chunk) + 256 * 1024 * 1024:
+                                        if (await finish_io(asyncio.to_thread(shutil.disk_usage, tmp_path))).free < len(chunk) + 256 * 1024 * 1024:
                                             raise ProviderReadError('download_spool_capacity', retry_after=30)
                                         space_check = bytes_received + 4 * 1024 * 1024
-                                    f.write(chunk)
+                                    await finish_io(asyncio.to_thread(f.write, chunk))
                                     hasher.update(chunk)
                                     bytes_received += len(chunk)
 
