@@ -112,11 +112,17 @@ async def check_rabbitmq_and_queues() -> Dict[str, Dict[str, Any]]:
     by_name = {q["name"]: q for q in queues}
     no_consumer = [
         name for name in CRITICAL_QUEUES
-        if name in by_name and (by_name[name].get("consumers") or 0) == 0
+        if name in by_name and by_name[name].get("consumers") == 0
     ]
     dlq_nonempty = [
         q["name"] for q in queues
         if q["name"].endswith(".dlq") and (q.get("messages") or 0) > 0
+    ]
+
+    metrics_unavailable = [
+        q["name"] for q in queues
+        if (q["name"] in CRITICAL_QUEUES and q.get("consumers") is None)
+        or (q["name"].endswith(".dlq") and q.get("messages") is None)
     ]
 
     rabbitmq = {"status": HEALTHY, "detail": f"connected; {len(queues)} queues"}
@@ -129,11 +135,18 @@ async def check_rabbitmq_and_queues() -> Dict[str, Dict[str, Any]]:
     if dlq_nonempty:
         q_status = worst([q_status, DEGRADED])
         bits.append(f"{len(dlq_nonempty)} dead-letter queue(s) with messages: {', '.join(dlq_nonempty)}")
+    if metrics_unavailable:
+        q_status = worst([q_status, DEGRADED])
+        bits.append(
+            f"queue metrics unavailable for {len(metrics_unavailable)} queue(s): "
+            f"{', '.join(metrics_unavailable)}; check RabbitMQ management statistics"
+        )
     queues_comp = {
         "status": q_status,
         "detail": "; ".join(bits) if bits else "all critical queues have consumers; DLQs empty",
         "no_consumer": no_consumer,
         "dlq_nonempty": dlq_nonempty,
+        "metrics_unavailable": metrics_unavailable,
     }
     return {"rabbitmq": rabbitmq, "queues": queues_comp}
 
