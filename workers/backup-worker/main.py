@@ -1819,8 +1819,12 @@ class VersionListCoordinator:
             raise
         except Exception:
             results = {}
-        # Resolve per-file; fall back to single-shot for any None (batch
-        # retry budget exhausted for that sub-request).
+        # Publish every confirmed response before any fallback can defer.
+        for fid, fut in batch:
+            versions = results.get(fid)
+            if not fut.done() and versions is not None:
+                fut.set_result(versions)
+        # Fall back only for unresolved subrequests.
         for fid, fut in batch:
             if fut.done():
                 continue

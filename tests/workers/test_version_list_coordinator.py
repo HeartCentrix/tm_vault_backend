@@ -198,7 +198,8 @@ async def test_ordinary_batch_failure_keeps_bounded_per_item_fallback(coordinato
     assert all(task.done() for task in created)
 
 
-async def test_fallback_deferral_preserves_already_confirmed_result(coordinator):
+@pytest.mark.parametrize("order", [("a", "b", "c"), ("b", "a", "c")])
+async def test_fallback_deferral_preserves_already_confirmed_result(coordinator, order):
     Coordinator, created, _ = coordinator
     error = control_error("turn_defer")
     singles = []
@@ -212,10 +213,10 @@ async def test_fallback_deferral_preserves_already_confirmed_result(coordinator)
 
     coord = Coordinator(SimpleNamespace(list_file_versions_batch=batch, list_file_versions=single),
                         "drive", batch_size=3, max_wait_ms=10000)
-    waiters = [asyncio.create_task(coord.get_versions(id_)) for id_ in ("a", "b", "c")]
-    first, second, third = await completed_results(waiters)
+    waiters = [asyncio.create_task(coord.get_versions(id_)) for id_ in order]
+    result = dict(zip(order, await completed_results(waiters)))
 
-    assert first == [{"id": "version-a"}] and second is error and third is error
+    assert result["a"] == [{"id": "version-a"}] and result["b"] is error and result["c"] is error
     assert singles == ["b"]
     assert all(task.done() for task in created)
 
