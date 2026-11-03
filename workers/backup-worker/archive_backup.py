@@ -1807,6 +1807,7 @@ async def _run_durable_archive(graph_client, resource, snapshot, tenant, *, work
     from shared.archive_capture import ArchiveCapture, ArchiveConflict, archive_final_gate, canonical_base
     from shared.archive_provider import export_items, export_items_spooled, export_base, ArchiveExportOversize
     from shared.provider_read import ProviderReadError
+    from shared.provider_runtime import provider_transfer_scope
     from shared.copy_workflow import seal_current_copy
     if factory is None:
         from shared.database import async_session_factory
@@ -1889,9 +1890,14 @@ async def _run_durable_archive(graph_client, resource, snapshot, tenant, *, work
             ids = [row['external_id'] for row in chunk]
             url = url or chunk[0]['location'][:-len('/folders')] + '/exportItems'
             try:
-                async with export_items_spooled(graph_client, url, ids,
-                        timeout=settings.ARCHIVE_IMPORT_TIMEOUT_S) as response:
-                    await persist_response(chunk, response, url, hops)
+                async with provider_transfer_scope():
+                    async with export_items_spooled(graph_client, url, ids,
+                            timeout=settings.ARCHIVE_IMPORT_TIMEOUT_S) as response:
+                        redirects = await persist_response(chunk, response, url, hops)
+                    # Release this response's spool budget before reserving another.
+                    del response
+                    for target, rows in redirects.items():
+                        await process(rows, target, hops + 1)
             except (ProviderReadError, ValueError, httpx.HTTPError) as exc:
                 await ledger.fail_items(ids, getattr(exc, 'stage', 'export_failed'))
 
@@ -1902,7 +1908,7 @@ async def _run_durable_archive(graph_client, resource, snapshot, tenant, *, work
             for entry in response['value']:
                 if not isinstance(entry, dict) or entry.get('itemId') not in ids or entry.get('itemId') in entries:
                     await ledger.fail_items(ids, 'invalid_export_identity')
-                    return
+                    return {}
                 entries[entry['itemId']] = entry
             pairs, redirects = [], {}
             for row in chunk:
@@ -1937,11 +1943,8 @@ async def _run_durable_archive(graph_client, resource, snapshot, tenant, *, work
                 missing = [item['id'] for item, _ in pairs if item['id'] not in received]
                 if missing:
                     await ledger.fail_items(missing, 'missing_storage_receipt')
-            # Drop bodies before following redirects within this same worker.
-            del response, entries, pairs
-            for target, rows in redirects.items():
-                await process(rows, target, hops + 1)
             mark_progress()
+            return redirects
 
         async def export_worker():
             while chunk := await ledger.export_batch(byte_budget=byte_limit):
