@@ -7387,6 +7387,10 @@ class BackupWorker:
                     mail_existing_tokens: Dict[str, str] = {
                         **_legacy_tokens, **_new_table_tokens,
                     }
+                    if not (message or {}).get("partitionFilter"):
+                        await self._record_mail_bootstrap_origin(
+                            snapshot, mail_existing_tokens, folder_tree.keys(),
+                        )
                     mail_new_tokens: Dict[str, str] = {}
                     # Folders whose drain finished cleanly AND whose pages
                     # all persisted. ONLY these may have their fingerprint
@@ -17450,6 +17454,33 @@ class BackupWorker:
             },
         )
         return "COMPLETED"
+
+    async def _record_mail_bootstrap_origin(self, snapshot, existing_tokens, folder_ids):
+        """Retain the cursor baseline before any shard/page can write this capture."""
+        if snapshot is None:
+            return
+        origin = {"cursor_free": not bool(existing_tokens),
+                  "folder_ids": sorted({str(fid) for fid in folder_ids if fid})}
+        async with async_session_factory() as session:
+            from shared.copy_workflow import verify_copy_resume
+            if not await verify_copy_resume(session):
+                raise ChatCatalogueWorkLeaseMoved("copy ownership moved before mail baseline")
+            await session.execute(text("""
+                UPDATE snapshots SET extra_data = (COALESCE(extra_data::jsonb, '{}'::jsonb)
+                    || jsonb_build_object('mail_bootstrap_origin', CAST(:origin AS jsonb)))::json
+                WHERE id = CAST(:sid AS uuid) AND resource_id = CAST(:rid AS uuid)
+                  AND status = 'IN_PROGRESS' AND lease_token = :token
+                  AND extra_data->>'cancelled_at' IS NULL
+                  AND NOT (COALESCE(extra_data::jsonb, '{}'::jsonb) ? 'mail_bootstrap_origin')
+                  AND NOT EXISTS (SELECT 1 FROM snapshot_items si WHERE si.snapshot_id = snapshots.id
+                                  AND si.item_type IN ('EMAIL', 'EMAIL_ATTACHMENT'))
+                  AND NOT EXISTS (SELECT 1 FROM snapshot_partitions sp WHERE sp.snapshot_id = snapshots.id
+                                  AND sp.partition_type = 'MAIL_FOLDERS')
+                  AND EXISTS (SELECT 1 FROM jobs j WHERE j.id = snapshots.job_id
+                              AND j.status::text IN ('RUNNING', 'QUEUED', 'PENDING', 'RETRYING'))
+            """), {"sid": str(snapshot.id), "rid": str(snapshot.resource_id),
+                    "token": snapshot.lease_token, "origin": json.dumps(origin)})
+            await session.commit()
 
     async def _record_shard_carry_inputs(
         self,
