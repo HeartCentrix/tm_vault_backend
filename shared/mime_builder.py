@@ -10,7 +10,7 @@ import base64
 from dataclasses import dataclass
 from email.message import EmailMessage
 from email.policy import SMTP
-from email.utils import format_datetime, formataddr, parsedate_to_datetime
+from email.utils import encode_rfc2231, format_datetime, formataddr, parsedate_to_datetime
 from typing import AsyncIterator, Iterable, List, Optional
 
 
@@ -26,6 +26,21 @@ class AttachmentRef:
     content_type: str
     data_bytes: Optional[bytes] = None
     data_stream: Optional[AsyncIterator[bytes]] = None
+    content_id: Optional[str] = None
+    inline: bool = False
+
+
+def _disposition(att: "AttachmentRef") -> str:
+    """Content-Disposition (+ Content-ID) lines; non-ASCII or quoted names use RFC 2231."""
+    name = att.name or "attachment"
+    if name.isascii() and '"' not in name and "\\" not in name:
+        fname = f'filename="{name}"'
+    else:
+        fname = "filename*=" + encode_rfc2231(name, "utf-8")
+    lines = f"Content-Disposition: {'inline' if att.inline else 'attachment'}; {fname}\r\n"
+    if att.content_id:
+        lines += f"Content-ID: <{att.content_id.strip('<>')}>\r\n"
+    return lines
 
 
 def _format_addr(entry: dict) -> str:
@@ -214,8 +229,8 @@ async def build_eml_streaming(
             f"--{boundary}\r\n"
             f"Content-Type: {maintype_sub}\r\n"
             f"Content-Transfer-Encoding: {cte}\r\n"
-            f'Content-Disposition: attachment; filename="{att.name}"\r\n\r\n'
-        ).encode("ascii")
+            f"{_disposition(att)}\r\n"
+        ).encode("ascii", "replace")
 
         if att.data_bytes is not None:
             yield (att.data_bytes if is_message else base64.b64encode(att.data_bytes)) + b"\r\n"

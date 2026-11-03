@@ -227,7 +227,8 @@ class MailPstWriter(PstWriterBase):
                     if item_att is not None:
                         inline_atts.append(item_att)
                     continue
-                if not blob_path:
+                inline_b64 = ed.get("inline_b64")
+                if not blob_path and not inline_b64:
                     print(f"[mail.collect] DROP no_blob_path att={_att_name}", flush=True)
                     continue
                 # referenceAttachment can't roundtrip via contentBytes —
@@ -237,49 +238,10 @@ class MailPstWriter(PstWriterBase):
                 if kind and "fileattachment" not in kind:
                     print(f"[mail.collect] DROP non_file_kind={kind} att={_att_name}", flush=True)
                     continue
-                # Route by the attachment's own backend_id rather than the
-                # orchestrator-passed `shard`. The orchestrator passes the
-                # currently-active default shard, but a snapshot taken on
-                # SeaweedFS (then later toggled to Azure, or vice versa)
-                # still has its bytes on the original backend; the
-                # SnapshotItem.backend_id column is the source of truth.
-                # azure_storage_manager.get_shard_for_item resolves to the
-                # correct backend's shard via shared.storage.router.
-                from shared.azure_storage import azure_storage_manager
-                from mail_fetch import _normalize_containers, _download_first_hit
-                att_shard = azure_storage_manager.get_shard_for_item(att)
-                # Build candidate list: orchestrator's source_container
-                # (which may itself be a sequence) + any per-item override
-                # the dedup-relocation pass stamped on the row. Walking the
-                # list is required because cross-snapshot dedup can hand us
-                # a blob_path anchored in a sibling resource's workload
-                # container (e.g. MAILBOX-era "backup-mailbox-<tenant>")
-                # while the active container is "backup-email-<tenant>".
-                item_extra = list(getattr(att, "_source_container_candidates", None) or ())
-                legacy_fb = getattr(att, "_mailbox_fallback_container", None)
-                if legacy_fb:
-                    item_extra.append(legacy_fb)
-                container_candidates = _normalize_containers(source_container, item_extra)
-                print(
-                    f"[mail.collect] att={_att_name} "
-                    f"backend_id={getattr(att,'backend_id','?')} "
-                    f"shard={type(att_shard).__name__} "
-                    f"containers={list(container_candidates)} "
-                    f"path_len={len(blob_path)}",
-                    flush=True,
-                )
-                try:
-                    data, hit_container = await _download_first_hit(
-                        att_shard, container_candidates, blob_path,
-                    )
-                except Exception as exc:
-                    print(f"[mail.collect] DOWNLOAD_EXC att={_att_name}: {type(exc).__name__}: {exc}", flush=True)
-                    continue
-                print(
-                    f"[mail.collect] att={_att_name} "
-                    f"download_returned={'None' if data is None else f'{len(data)} bytes from {hit_container}'}",
-                    flush=True,
-                )
+                if inline_b64:
+                    data = base64.b64decode(inline_b64)
+                else:
+                    data = await self._download_file_attachment(att, blob_path, source_container)
                 if not data:
                     continue
                 if len(data) > MAX_ATTACHMENT_BYTES:
@@ -316,3 +278,50 @@ class MailPstWriter(PstWriterBase):
                 msg_json["hasAttachments"] = True
 
         return msg_json
+
+    async def _download_file_attachment(self, att, blob_path, source_container):
+        _att_name = getattr(att, "name", "?")
+        # Route by the attachment's own backend_id rather than the
+        # orchestrator-passed `shard`. The orchestrator passes the
+        # currently-active default shard, but a snapshot taken on
+        # SeaweedFS (then later toggled to Azure, or vice versa)
+        # still has its bytes on the original backend; the
+        # SnapshotItem.backend_id column is the source of truth.
+        # azure_storage_manager.get_shard_for_item resolves to the
+        # correct backend's shard via shared.storage.router.
+        from shared.azure_storage import azure_storage_manager
+        from mail_fetch import _normalize_containers, _download_first_hit
+        att_shard = azure_storage_manager.get_shard_for_item(att)
+        # Build candidate list: orchestrator's source_container
+        # (which may itself be a sequence) + any per-item override
+        # the dedup-relocation pass stamped on the row. Walking the
+        # list is required because cross-snapshot dedup can hand us
+        # a blob_path anchored in a sibling resource's workload
+        # container (e.g. MAILBOX-era "backup-mailbox-<tenant>")
+        # while the active container is "backup-email-<tenant>".
+        item_extra = list(getattr(att, "_source_container_candidates", None) or ())
+        legacy_fb = getattr(att, "_mailbox_fallback_container", None)
+        if legacy_fb:
+            item_extra.append(legacy_fb)
+        container_candidates = _normalize_containers(source_container, item_extra)
+        print(
+            f"[mail.collect] att={_att_name} "
+            f"backend_id={getattr(att,'backend_id','?')} "
+            f"shard={type(att_shard).__name__} "
+            f"containers={list(container_candidates)} "
+            f"path_len={len(blob_path)}",
+            flush=True,
+        )
+        try:
+            data, hit_container = await _download_first_hit(
+                att_shard, container_candidates, blob_path,
+            )
+        except Exception as exc:
+            print(f"[mail.collect] DOWNLOAD_EXC att={_att_name}: {type(exc).__name__}: {exc}", flush=True)
+            return None
+        print(
+            f"[mail.collect] att={_att_name} "
+            f"download_returned={'None' if data is None else f'{len(data)} bytes from {hit_container}'}",
+            flush=True,
+        )
+        return data

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import email
+import email.policy
 import json
 import pathlib
 import sys
@@ -50,16 +51,19 @@ class _Att:
     """SnapshotItem-like EMAIL_ATTACHMENT row."""
 
     def __init__(self, kind, *, blob_path=None, inline_b64=None,
-                 name="thing", content_type="application/json"):
+                 name="thing", content_type="application/json",
+                 is_inline=False, content_id=None):
         self.name = name
         self.blob_path = blob_path
         self.backend_id = "be"
         self.extra_data = {
             "attachment_kind": kind,
             "content_type": content_type,
-            "is_inline": False,
+            "is_inline": is_inline,
             "inline_b64": inline_b64,
         }
+        if content_id:
+            self.extra_data["content_id"] = content_id
 
 
 class _Item:
@@ -202,3 +206,71 @@ async def test_eml_reference_attachment_skipped(monkeypatch):
     item = _Item([_Att("#microsoft.graph.referenceAttachment", blob_path="ref/blob")])
     _msg, eml_bytes = await _folder_task(item)._build_eml_for_item(item)
     assert b"message/rfc822" not in eml_bytes
+
+
+def _attachment_parts(eml_bytes):
+    parsed = email.message_from_bytes(eml_bytes, policy=email.policy.default)
+    return [p for p in parsed.walk()
+            if not p.is_multipart() and p.get_content_disposition() in ("attachment", "inline")]
+
+
+async def test_eml_file_attachment_from_blob(monkeypatch):
+    _patch_common(monkeypatch, b"%PDF-1.4 real file bytes")
+    att = _Att("#microsoft.graph.fileAttachment", blob_path="file/blob",
+               name="doc.pdf", content_type="application/pdf")
+    item = _Item([att])
+    _msg, eml_bytes = await _folder_task(item)._build_eml_for_item(item)
+
+    parts = _attachment_parts(eml_bytes)
+    assert [(p.get_filename(), p.get_content_type()) for p in parts] == [("doc.pdf", "application/pdf")]
+    assert parts[0].get_payload(decode=True) == b"%PDF-1.4 real file bytes"
+
+
+async def test_eml_inline_image_keeps_content_id(monkeypatch):
+    _patch_common(monkeypatch, None)
+    png = b"\x89PNG\r\n\x1a\n inline image"
+    att = _Att("#microsoft.graph.fileAttachment", inline_b64=base64.b64encode(png).decode(),
+               name="image001.png", content_type="image/png", is_inline=True,
+               content_id="image001.png@01DC")
+    item = _Item([att])
+    _msg, eml_bytes = await _folder_task(item)._build_eml_for_item(item)
+
+    parts = _attachment_parts(eml_bytes)
+    assert len(parts) == 1
+    assert parts[0].get_content_disposition() == "inline"
+    assert parts[0]["Content-ID"] == "<image001.png@01DC>"
+    assert parts[0].get_payload(decode=True) == png
+
+
+async def test_eml_non_ascii_filename(monkeypatch):
+    _patch_common(monkeypatch, b"bytes")
+    name = 'Résumé "final" 履歴書.docx'
+    att = _Att("#microsoft.graph.fileAttachment", blob_path="file/blob", name=name,
+               content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    item = _Item([att])
+    _msg, eml_bytes = await _folder_task(item)._build_eml_for_item(item)
+
+    parts = _attachment_parts(eml_bytes)
+    assert [p.get_filename() for p in parts] == [name]
+    assert parts[0].get_payload(decode=True) == b"bytes"
+
+
+async def test_eml_unresolved_file_attachment_skipped(monkeypatch):
+    _patch_common(monkeypatch, None)
+    att = _Att("#microsoft.graph.fileAttachment", name="lost.pdf", content_type="application/pdf")
+    item = _Item([att])
+    _msg, eml_bytes = await _folder_task(item)._build_eml_for_item(item)
+    assert _attachment_parts(eml_bytes) == []
+
+
+async def test_pst_inline_b64_file_attachment_included(monkeypatch):
+    _patch_common(monkeypatch, None)
+    from pst_writers.mail import MailPstWriter
+
+    att = _Att("#microsoft.graph.fileAttachment", inline_b64=base64.b64encode(b"tiny").decode(),
+               name="tiny.png", content_type="image/png", is_inline=True, content_id="tiny@x")
+    msg_json = await MailPstWriter()._collect_graph_item(_Item([att]), _FakeShard(), "src-c")
+
+    atts = msg_json["attachments"]
+    assert [(a["name"], a["contentId"], a["isInline"]) for a in atts] == [("tiny.png", "tiny@x", True)]
+    assert base64.b64decode(atts[0]["contentBytes"]) == b"tiny"

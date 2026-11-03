@@ -2534,8 +2534,8 @@ class RestoreWorker:
         # ... legacy body continues below unchanged
         # v2 mail export — feature-flagged. Accepts mixed EMAIL + EMAIL_ATTACHMENT
         # selections (e.g. "Download all" with workloads=["Mail"] pulls both
-        # types). EMAIL_ATTACHMENT rows are skipped — their bytes already get
-        # inlined into the parent EML via _build_eml_for_item.
+        # types). EMAIL_ATTACHMENT rows are not exported on their own — their
+        # bytes are embedded in the parent EML via _build_eml_for_item.
         from shared.config import settings as _mail_export_settings
         # ARCHIVE_ITEM rides the mail path: enrichment stores the Graph message
         # JSON inline on extra_data.raw (exactly like USER_MAIL), and
@@ -2578,15 +2578,12 @@ class RestoreWorker:
             and _email_items
             and all(getattr(it, "item_type", None) in _MAIL_V2_TYPES for it in items)
         ):
-            # Stamp itemAttachment (mail-in-mail) siblings onto their parent
-            # EMAIL rows so the EML/MBOX builder can embed nested emails as
-            # message/rfc822 parts. Built from the EMAIL_ATTACHMENT rows already
-            # in the selection (mixed EMAIL+EMAIL_ATTACHMENT, e.g. "Download
-            # all"). fileAttachment rows are ignored by that path — they keep
-            # their existing channel — and referenceAttachment stays skipped.
-            # ponytail: covers whole-mailbox exports (attachment rows present);
-            # add an EMAIL_ATTACHMENT pre-fetch (like export_as_pst) if granular
-            # email-only selections must embed itemAttachments too.
+            # Stamp EMAIL_ATTACHMENT siblings onto their parent EMAIL rows so
+            # the EML/MBOX builder embeds file attachments (inline images keep
+            # their Content-ID) and nested emails (message/rfc822).
+            # referenceAttachment stays skipped. "Download all" selections carry
+            # the attachment rows; email-only selections get them pre-fetched
+            # from the picked snapshots, as export_as_pst does.
             _eml_att_index: Dict[str, List] = {}
             for _it in items:
                 if getattr(_it, "item_type", None) != "EMAIL_ATTACHMENT":
@@ -2595,6 +2592,24 @@ class RestoreWorker:
                 _parent = _ed.get("parent_item_id")
                 if _parent:
                     _eml_att_index.setdefault(_parent, []).append(_it)
+            _att_snapshot_ids = [str(s) for s in (
+                (message or {}).get("snapshotIds") or (spec or {}).get("snapshot_ids") or [])]
+            if not _eml_att_index and _att_snapshot_ids:
+                _wanted = {getattr(_it, "external_id", None) for _it in _email_items}
+                async for _batch in self.stream_snapshot_items_by_group(
+                    async_session_factory,
+                    snapshot_ids=_att_snapshot_ids,
+                    item_ids=[],
+                    folder_paths=None,
+                    excluded_item_ids=None,
+                    item_types={"EMAIL_ATTACHMENT", "ARCHIVE_ATTACHMENT"},
+                ):
+                    for _att in _batch:
+                        _parent = (getattr(_att, "extra_data", None) or {}).get("parent_item_id")
+                        if _parent in _wanted:
+                            _eml_att_index.setdefault(_parent, []).append(_att)
+                print(f"[{self.worker_id}] v2 path: pre-fetched "
+                      f"{sum(map(len, _eml_att_index.values()))} attachment rows", flush=True)
             if _eml_att_index:
                 for _it in _email_items:
                     _it._email_attachment_items = _eml_att_index.get(_it.external_id, [])

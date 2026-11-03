@@ -207,10 +207,9 @@ async def gather_item_attachments(
     parent's EML/MBOX.
 
     ``email_att_rows`` are the rich ``EMAIL_ATTACHMENT`` SnapshotItem-like
-    siblings stamped on the parent EMAIL as ``_email_attachment_items``.  Only
-    ``itemAttachment`` rows are handled here — ``fileAttachment`` keeps riding
-    the existing ``attachment_blob_paths`` -> :func:`gather_attachments`
-    channel unchanged, and ``referenceAttachment`` stays skipped.
+    siblings stamped on the parent EMAIL as ``_email_attachment_items``.
+    ``fileAttachment`` rows become ordinary (or inline, with Content-ID) parts
+    via :func:`_file_attachment_ref`; ``referenceAttachment`` stays skipped.
 
     The nested email's stored JSON bytes come from ``blob_path`` (downloaded via
     the same ``_download_first_hit`` machinery used for file attachments) or,
@@ -236,7 +235,11 @@ async def gather_item_attachments(
         ed = getattr(att, "extra_data", None) or {}
         kind = (ed.get("attachment_kind") or "").lower()
         if "itemattachment" not in kind:
-            continue  # fileAttachment / referenceAttachment handled elsewhere
+            if not kind or "fileattachment" in kind:
+                ref = await _file_attachment_ref(att, ed, source_container, max_bytes)
+                if ref is not None:
+                    out.append(ref)
+            continue  # referenceAttachment: a link, no bytes to embed
         name = getattr(att, "name", "?")
         try:
             blob_path = getattr(att, "blob_path", None)
@@ -275,6 +278,52 @@ async def gather_item_attachments(
                 name, type(exc).__name__, exc,
             )
     return out
+
+
+async def _file_attachment_ref(att, ed: dict, source_container: ContainerCandidates,
+                               max_bytes: int) -> Optional[AttachmentRef]:
+    """A stored ``fileAttachment`` row as an :class:`AttachmentRef`. Bytes come
+    from ``extra_data.inline_b64`` (small attachments) or the row's own backend
+    via ``blob_path``. Rows the backup could not resolve carry neither and are
+    skipped; the backup already marked that snapshot PARTIAL."""
+    import base64 as _b64
+
+    name = getattr(att, "name", None) or "attachment"
+    raw: Optional[bytes] = None
+    try:
+        if ed.get("inline_b64"):
+            raw = _b64.b64decode(ed["inline_b64"])
+        elif getattr(att, "blob_path", None):
+            from shared.azure_storage import azure_storage_manager
+            extra = list(getattr(att, "_source_container_candidates", None) or ())
+            if getattr(att, "_mailbox_fallback_container", None):
+                extra.append(att._mailbox_fallback_container)
+            raw, _hit = await _download_first_hit(
+                azure_storage_manager.get_shard_for_item(att),
+                _normalize_containers(source_container, extra),
+                att.blob_path,
+            )
+    except Exception as exc:
+        logger.warning("file attachment %s: %s: %s", name, type(exc).__name__, exc)
+        return None
+    if not raw:
+        logger.warning("file attachment %s: no stored bytes, skipped", name)
+        return None
+    if len(raw) > max_bytes:
+        logger.warning("file attachment %s: %d bytes over export cap %d", name, len(raw), max_bytes)
+        return AttachmentRef(
+            name=f"{name}.SKIPPED.txt", content_type="text/plain",
+            data_bytes=(f"[Attachment '{name}' was {len(raw)} bytes, over the "
+                        f"PST_MAX_ATTACHMENT_BYTES export cap of {max_bytes}.]").encode("utf-8"),
+        )
+    cid = str(ed.get("content_id") or ed.get("contentId") or "").strip("<>")
+    return AttachmentRef(
+        name=name,
+        content_type=ed.get("content_type") or "application/octet-stream",
+        data_bytes=raw,
+        content_id=cid or None,
+        inline=bool(ed.get("is_inline")),
+    )
 
 
 async def gather_attachments(
