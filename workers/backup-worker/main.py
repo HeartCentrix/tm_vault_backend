@@ -7114,10 +7114,13 @@ class BackupWorker:
                     job_lease_token=result.get("_job_lease_token"))
                 if live.status != SnapshotStatus.IN_PROGRESS:
                     return await catalogue_snapshot_result(session, snapshot.id)
-                live.item_count = result["item_count"]
-                live.new_item_count = result["new_item_count"]
-                live.bytes_total = result["bytes_total"]
-                live.bytes_added = result["bytes_added"]
+                # Sibling publications may have advanced this snapshot since
+                # result was read. The partition finalizer owns final deltas.
+                if not result.get("partitioned"):
+                    live.item_count = result["item_count"]
+                    live.new_item_count = result["new_item_count"]
+                    live.bytes_total = result["bytes_total"]
+                    live.bytes_added = result["bytes_added"]
                 if result["outcome"] != "complete":
                     reason = result.get("failure_reason") or "chat capture has incomplete coverage"
                     live.extra_data = {**(live.extra_data or {}),
@@ -11404,7 +11407,7 @@ class BackupWorker:
                                         snap = await _s2.get(
                                             Snapshot, snapshot.id,
                                         )
-                                        if snap is not None:
+                                        if snap is not None and (snap.extra_data or {}).get("chat_inventory_format") != 1:
                                             snap.item_count = _persisted_total
                                             snap.new_item_count = _persisted_total
                                             snap.bytes_total = _persisted_bytes

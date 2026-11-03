@@ -5,6 +5,7 @@ import asyncio
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 from uuid import UUID
 
 from sqlalchemy import func, or_, select
@@ -177,6 +178,25 @@ async def catalogue_snapshot_result(session, snapshot_id, *, force_recount=False
         "failed": snapshot.status == SnapshotStatus.FAILED}
 
 
+async def refresh_catalogue_progress(session, scope):
+    """Refresh after publication commits, never while holding capture SHARE locks."""
+    snapshot = await lock_chat_catalogue_snapshot(session, snapshot_id=scope.snapshot_id,
+        snapshot_lease_token=scope.snapshot_lease_token, job_lease_token=scope.job_lease_token,
+        partition_id=scope.partition_id, partition_lease_token=scope.partition_lease_token)
+    if snapshot.status != SnapshotStatus.IN_PROGRESS:
+        return
+    primary_count, logical_bytes = (await session.execute(select(
+        func.coalesce(func.sum(ChatInventory.evidence["primary_item_count"].as_integer()), 0),
+        func.coalesce(func.sum(ChatInventory.logical_bytes), 0),
+    ).join(SnapshotChatInventory, SnapshotChatInventory.inventory_id == ChatInventory.id)
+        .where(SnapshotChatInventory.snapshot_id == scope.snapshot_id))).one()
+    # Legacy inventories without a primary summary contribute a lower bound;
+    # final settlement still reconciles their complete physical inventory.
+    snapshot.item_count = max(int(snapshot.item_count or 0), int(primary_count))
+    snapshot.bytes_total = max(int(snapshot.bytes_total or 0), int(logical_bytes))
+    await session.flush()
+
+
 async def _published_chat(session, scope):
     row = (await session.execute(select(SnapshotChatInventory, ChatInventory, ChatCaptureAttempt)
         .join(ChatInventory, ChatInventory.id == SnapshotChatInventory.inventory_id)
@@ -288,15 +308,19 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                 scope = chat_scope(cid)
                 async with session_factory() as session:
                     previous = await _published_chat(session, scope)
-                if previous is not None:
-                    async with unit_scope('chat:' + hashlib.sha256(cid.encode()).hexdigest(), 'chat'):
-                        await checkpoint_unit(receipt_id=str(previous.inventory_id),
-                            state='COMPLETED' if previous.outcome == 'complete' else 'FAILED')
-                    return previous
                 async with unit_scope('chat:' + hashlib.sha256(cid.encode()).hexdigest(), 'chat'):
-                    result = await capture_chat_inventory(scope=scope, graph_client=source, storage=storage,
-                        session_factory=session_factory, folder_path=_folder(chats[cid]),
-                        exclude_message=exclude_message, scope_filter_hash=scope_filter_hash)
+                    result = previous
+                    if result is None:
+                        result = await capture_chat_inventory(scope=scope, graph_client=source, storage=storage,
+                            session_factory=session_factory, folder_path=_folder(chats[cid]),
+                            exclude_message=exclude_message, scope_filter_hash=scope_filter_hash)
+                    try:
+                        await run_catalogue_transaction(session_factory,
+                            lambda session: refresh_catalogue_progress(session, scope))
+                    except Exception as exc:
+                        # Progress is advisory; a failed refresh cannot undo a
+                        # durable publication or replay Graph/storage work.
+                        logging.getLogger(__name__).warning("chat live progress refresh failed (%s)", type(exc).__name__)
                     await checkpoint_unit(receipt_id=str(result.inventory_id),
                         state='COMPLETED' if result.outcome == 'complete' else 'FAILED')
                     return result

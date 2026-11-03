@@ -418,7 +418,7 @@ async def _staged(session, inventory, scope):
         .where(ChatInventoryItem.inventory_id == inventory.id).order_by(ChatInventoryItem.logical_key)
     rows = await session.stream(statement.execution_options(yield_per=25))
     expected, observations, representations, coverage, parents_to_check = set(), {}, [], [], []
-    logical_bytes = durable = 0
+    logical_bytes = durable = primary_item_count = 0
     async for row in rows:
         key, version = row[0], row[1]
         item = _captured(version)
@@ -444,6 +444,7 @@ async def _staged(session, inventory, scope):
         expected.add((key, version.id))
         representations.append((key, version.version_sha256))
         logical_bytes += size
+        primary_item_count += int(item.item_type not in {"CHAT_ATTACHMENT", "CHAT_HOSTED_CONTENT"})
         # Coverage needs child IDs and classifications, never body/card bytes.
         payload = {}
         if item.item_type in _MESSAGE_TYPES:
@@ -470,6 +471,7 @@ async def _staged(session, inventory, scope):
             raise ChatCatalogueIntegrityError("snapshot link parent, type, visibility or logical size differs")
     required, gaps = _coverage(scope, coverage)
     return SimpleNamespace(expected=expected, item_count=len(expected), logical_bytes=logical_bytes,
+        primary_item_count=primary_item_count,
         source_hash=_digest([f"chat-source-inventory-v{inventory.observation_hash_version}", authentication_context_fingerprint(scope), sorted(observations.items())]),
         representation_hash=_digest(representations), durable=durable, required=required, gaps=gaps, objects=objects)
 
@@ -569,7 +571,7 @@ async def publish_inventory(session, *, lease: CaptureLease) -> CaptureResult:
     inventory.logical_bytes = staged.logical_bytes
     inventory.evidence = {**(attempt.evidence or {}), "validation_gaps": gaps,
         "persisted_required_content_count": required, "persisted_durable_content_count": durable,
-        "persisted_membership_sha256": source_hash}
+        "persisted_membership_sha256": source_hash, "primary_item_count": staged.primary_item_count}
     inventory.failure_reason = reason
     await session.flush()
     chosen = inventory
@@ -596,6 +598,8 @@ async def publish_inventory(session, *, lease: CaptureLease) -> CaptureResult:
                 .where(ChatInventoryItem.inventory_id == chosen.id))).all())
             if retained != expected:
                 raise ChatCatalogueIntegrityError("reusable inventory membership differs")
+            if (chosen.evidence or {}).get("primary_item_count") != staged.primary_item_count:
+                chosen.evidence = {**(chosen.evidence or {}), "primary_item_count": staged.primary_item_count}
             attempt.reused_inventory = True
             attempt.staged_inventory_id = chosen.id
             await session.flush()
