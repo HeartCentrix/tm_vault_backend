@@ -156,3 +156,89 @@ async def test_batch_costs_are_atomic_and_include_all_workloads(redis_client):
     assert float(await redis_client.hget(keys[-1], 'tokens')) == 10
     async with admission.admit(mail, cost=10, wait_budget=0):
         pass
+
+
+async def test_new_request_cannot_jump_an_eligible_queued_request(redis_client):
+    from uuid import uuid4
+    module = importlib.import_module('shared.provider_admission')
+    admission = module.ScopedProviderAdmission(redis_client,
+        limits=module.AdmissionLimits(global_concurrency=1, tenant_concurrency=1), namespace=uuid4().hex)
+    context = scope(module)
+    started, release = asyncio.Event(), asyncio.Event()
+    order = []
+    async def request(name):
+        started.set()
+        async with admission.admit(context, wait_budget=3):
+            order.append(name)
+    async with admission.admit(context, wait_budget=0):
+        waiting=asyncio.create_task(request('queued'))
+        await started.wait()
+        await asyncio.sleep(.02)
+    try:
+        await request('new')
+        await waiting
+    finally:
+        if not waiting.done(): waiting.cancel()
+        await asyncio.gather(waiting,return_exceptions=True)
+    assert order == ['queued','new']
+
+
+async def test_backlogged_workloads_and_all_sla_weights_make_progress(redis_client):
+    from collections import Counter
+    from types import SimpleNamespace
+    from uuid import uuid4
+    from shared import provider_runtime as runtime
+    module = importlib.import_module('shared.provider_admission')
+    admission = module.ScopedProviderAdmission(redis_client,
+        limits=module.AdmissionLimits(global_concurrency=1,tenant_concurrency=1,rate=10000,burst=10000),
+        namespace=uuid4().hex)
+    served=[]
+    async def requests(workload, weight):
+        marker=runtime._EXECUTION.set(runtime.ProviderExecution(None, SimpleNamespace(weight=weight)))
+        try:
+            async with runtime.provider_live_wait_scope():
+                for _ in range(12):
+                    async with admission.admit(scope(module,workload=workload),wait_budget=0):
+                        served.append((workload,weight))
+                        await asyncio.sleep(.001)
+        finally: runtime._EXECUTION.reset(marker)
+    await asyncio.wait_for(asyncio.gather(*(requests(w,p) for w in ['teams','exchange','sharepoint']
+        for p in [8,4,2,1])),15)
+    first=Counter(served[:60])
+    assert len(first)==12, 'a workload or SLA weight starved while peers progressed'
+    assert sum(n for (w,p),n in first.items() if p==8)>sum(n for (w,p),n in first.items() if p==1)
+    _, slots, _ = admission._keys(scope(module))
+    assert await redis_client.zcard(slots[0]) == 0
+
+
+async def test_ineligible_waiter_does_not_block_other_workloads_and_cancel_cleans_queue(redis_client):
+    from uuid import uuid4
+    module=importlib.import_module('shared.provider_admission')
+    admission=module.ScopedProviderAdmission(redis_client,
+        limits=module.AdmissionLimits(tenant_concurrency=2),namespace=uuid4().hex)
+    blocked=scope(module,workload='exchange')
+    await admission.cooldown(blocked,1)
+    async def wait_mail():
+        async with admission.admit(blocked,wait_budget=3): pass
+    task=asyncio.create_task(wait_mail())
+    try:
+        async with asyncio.timeout(1):
+            while not await redis_client.hlen(admission.prefix+'fair:pending'):
+                await asyncio.sleep(.001)
+        async with admission.admit(scope(module,workload='teams'),wait_budget=0): pass
+    finally:
+        task.cancel()
+        await asyncio.gather(task,return_exceptions=True)
+    assert await redis_client.hlen(admission.prefix+'fair:pending')==0
+    assert await redis_client.zcard(admission.prefix+'fair:expiry')==0
+
+
+async def test_expired_waiter_is_removed_without_starving_live_requests(redis_client):
+    import json
+    from uuid import uuid4
+    module=importlib.import_module('shared.provider_admission')
+    admission=module.ScopedProviderAdmission(redis_client,namespace=uuid4().hex)
+    await redis_client.hset(admission.prefix+'fair:pending','dead',json.dumps({'invalid':'expired'}))
+    await redis_client.zadd(admission.prefix+'fair:expiry',{'dead':0})
+    async with admission.admit(scope(module),wait_budget=0): pass
+    assert await redis_client.hlen(admission.prefix+'fair:pending')==0

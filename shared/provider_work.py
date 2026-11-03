@@ -35,6 +35,7 @@ class ProviderClaim:
     parent_token: int
     snapshot_token: int
     job_token: int
+    weight: int = 1
 
 
 def enabled():
@@ -101,7 +102,7 @@ def _bounded(value):
 def _receipt(row):
     return ProviderClaim(row.id, row.snapshot_id, row.partition_id, row.job_id,
         row.lease_owner_id, row.generation, row.parent_lease_token,
-        row.snapshot_lease_token, row.job_lease_token)
+        row.snapshot_lease_token, row.job_lease_token, row.weight)
 
 
 async def _parents(session, snapshot_id, partition_id=None, *, skip_locked=False, share_job=False):

@@ -274,7 +274,7 @@ async def _drain_congestion(execution):
         _TRANSFER.reset(marker)
 
 
-async def wait_provider_concurrency(error):
+async def wait_provider_concurrency(error, *, wait=None, withdraw=None):
     """Continue the same Redis grant attempt while already-admitted transfers drain."""
     execution = current_execution()
     live = _LIVE_WAIT.get()
@@ -282,11 +282,15 @@ async def wait_provider_concurrency(error):
         return False
     if live is not None and live[0] is execution:
         check_provider_turn()
-        await asyncio.sleep(min(error.retry_after, max(0, live[1] - time.monotonic())))
+        await (wait or asyncio.sleep)(min(error.retry_after, max(0, live[1] - time.monotonic())))
         check_provider_turn()
         return True
     if execution is None:
         return False
+    if not _can_drain(execution) and withdraw is not None:
+        # This task now waits for sibling receipts, not for a network grant.
+        # Leaving it queued would block the receipt requests that release the turn.
+        await withdraw()
     if execution.congestion is None:
         execution.congestion = error
         deadlines = [time.monotonic() + CONCURRENCY_DRAIN_SECONDS]
@@ -297,7 +301,7 @@ async def wait_provider_concurrency(error):
         execution.drain_deadline = min(deadlines)
         execution.drain_task = asyncio.create_task(_drain_congestion(execution))
     await before_provider_admission()
-    await asyncio.sleep(min(error.retry_after, max(0, execution.drain_deadline - time.monotonic())))
+    await (wait or asyncio.sleep)(min(error.retry_after, max(0, execution.drain_deadline - time.monotonic())))
     return True
 
 
