@@ -267,6 +267,13 @@ async def run_batch(factory, claim: CopyClaim, *, batch_size=512,
             state = first_db_sqlstate(exc)
             logger.warning('copy_batch_failed task_id=%s generation=%s sqlstate=%s phase=%s error_type=%s',
                 claim.task_id, claim.generation, state, phase, type(exc).__name__)
+            if phase != 'execution' and state in {'55P03', '57014', '40P01', '40001'}:
+                code = {'55P03': 'copy_lock_timeout', '57014': 'copy_statement_timeout',
+                        '40P01': 'copy_deadlock', '40001': 'copy_serialization_failure'}[state]
+                status = await _settle(factory, claim, status='DEFERRED',
+                    error={'code': code, 'sqlstate': state, 'phase': phase}, spend_attempt=False,
+                    queued_seconds=monotonic() - admission_started, execution_s=query_seconds)
+                return BatchResult(status, claim.task_id, query_seconds=query_seconds)
             if state == '57014' and attempt < 3:
                 continue
             if state in {'40P01', '40001'}:

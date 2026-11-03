@@ -669,3 +669,22 @@ async def test_busy_parent_defers_without_settlement_relocking_or_spending_execu
             current = await copy_work.claim(db, owner_id=uuid4())
             assert current is not None
     assert (await api().run_batch(store.factory, current)).status == 'COMPLETED'
+
+
+@pytest.mark.parametrize('sqlstate', ['57014', '40P01', '40001'])
+async def test_transient_abort_before_copy_does_not_consume_execution_failures(store, monkeypatch, sqlstate):
+    module = api()
+    _, task_id, current = await queued(store)
+    async def abort_admission(db, *args):
+        await db.execute(text(f"DO $$ BEGIN RAISE EXCEPTION USING ERRCODE='{sqlstate}'; END $$"))
+    monkeypatch.setattr(module, '_physical_guards', abort_admission)
+    for _ in range(4):
+        result = await module.run_batch(store.factory, current)
+        assert result.status == 'DEFERRED' and result.query_seconds == 0
+        async with store.factory.begin() as db:
+            task = await db.get(models.CopyWorkTask, task_id)
+            assert task.attempts == 0 and 'execution_failures' not in task.error
+            assert task.error['sqlstate'] == sqlstate and task.error['phase'] == 'admission'
+            task.ready_at = await db.scalar(select(func.clock_timestamp()))
+        async with store.factory.begin() as db:
+            current = await copy_work.claim(db, owner_id=uuid4())
