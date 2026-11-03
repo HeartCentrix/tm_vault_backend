@@ -32,7 +32,7 @@ async def test_inline_settlement_locks_job_before_dirty_snapshot_flush(store, mo
         finally:
             event.remove(store.engine.sync_engine, 'before_cursor_execute', record)
     first_write = next(i for i, sql in enumerate(statements) if sql.startswith('update snapshots'))
-    parent_locks = [i for i, sql in enumerate(statements) if 'from jobs' in sql and 'for share' in sql]
+    parent_locks = [i for i, sql in enumerate(statements) if 'from jobs' in sql and ('for share' in sql or 'for key share' in sql)]
     assert parent_locks and parent_locks[0] < first_write, 'Dirty counters must not invert Job -> Snapshot order'
     async with store.factory() as db:
         saved = await db.get(models.Snapshot, scope.snapshot_id)

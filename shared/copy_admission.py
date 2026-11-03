@@ -75,9 +75,9 @@ async def _owned(session, claim, *, lock_parents=True):
             CopyWorkTask.workflow_id == CopyWorkflow.id).where(CopyWorkTask.id == claim.task_id))).first()
     if pointers is None:
         raise _Stale
-    parent_lock = {'read': True, 'nowait': True} if lock_parents else None
+    parent_lock = {'read': True, 'key_share': True, 'nowait': True} if lock_parents else None
     job = await session.get(Job, pointers.job_id,
-        with_for_update={**parent_lock, 'key_share': True} if parent_lock else None, populate_existing=True)
+        with_for_update=parent_lock, populate_existing=True)
     snapshot = await session.get(Snapshot, pointers.target_snapshot_id,
         with_for_update=parent_lock, populate_existing=True)
     partition = await session.get(SnapshotPartition, pointers.partition_id,

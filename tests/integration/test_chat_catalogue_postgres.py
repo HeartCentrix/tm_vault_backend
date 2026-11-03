@@ -452,6 +452,8 @@ async def test_different_chats_under_same_job_stage_concurrently_and_cancellatio
     async def cancel():
         async with store.factory.begin() as session:
             snapshot = await session.get(models.Snapshot, first_scope.snapshot_id)
+            # Mirrors job-service cancellation: FOR UPDATE waits for KEY SHARE validators.
+            await session.scalar(select(models.Job.id).where(models.Job.id == snapshot.job_id).with_for_update())
             await session.execute(update(models.Job).where(models.Job.id == snapshot.job_id).values(status=models.JobStatus.CANCELLED))
     async with store.factory.begin() as blocker:
         await blocker.scalar(select(models.ChatInventory).where(models.ChatInventory.id == first.staged_inventory_id).with_for_update())
@@ -459,7 +461,7 @@ async def test_different_chats_under_same_job_stage_concurrently_and_cancellatio
         await wait_for_lock("chat_inventories")
         assert (await asyncio.wait_for(store.stage(second, [message()]), timeout=1)).staged_items == 1
         cancelling = asyncio.create_task(cancel())
-        await wait_for_lock("UPDATE jobs")
+        await wait_for_lock("FOR UPDATE")
         assert not cancelling.done()
     await staging
     await cancelling

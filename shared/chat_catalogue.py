@@ -69,7 +69,9 @@ def _scope(attempt):
 
 
 async def _locked(session, model, *conditions, shared=False):
-    return await session.scalar(select(model).where(*conditions).with_for_update(read=shared)
+    # shared=True is validation only: FOR KEY SHARE lets progress/lease UPDATEs on
+    # the parent rows flow while cancellation (FOR UPDATE) still waits for us.
+    return await session.scalar(select(model).where(*conditions).with_for_update(read=shared, key_share=shared)
                                 .execution_options(populate_existing=True))
 
 

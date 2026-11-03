@@ -95,11 +95,11 @@ async def enqueue(session, request: CopyRequest) -> CopyWorkTask:
     # NO KEY UPDATE on the workflow remains compatible with child FK checks.
     job = await session.scalar(select(Job).where(Job.id == job.id).with_for_update(read=True, key_share=True)
                                .execution_options(populate_existing=True))
-    snapshot = await session.scalar(select(Snapshot).where(Snapshot.id == snapshot.id).with_for_update(read=True)
+    snapshot = await session.scalar(select(Snapshot).where(Snapshot.id == snapshot.id).with_for_update(read=True, key_share=True)
                                     .execution_options(populate_existing=True))
     if partition_id:
         partition = await session.scalar(select(SnapshotPartition).where(SnapshotPartition.id == partition_id)
-            .with_for_update(read=True).execution_options(populate_existing=True))
+            .with_for_update(read=True, key_share=True).execution_options(populate_existing=True))
     if (job.status.value not in ('RUNNING', 'QUEUED', 'PENDING', 'RETRYING')
         or snapshot.status.value != 'IN_PROGRESS' or (partition_id and partition.status != 'IN_PROGRESS')):
         raise CopyWorkConflict('copy parent no longer permits source registration')

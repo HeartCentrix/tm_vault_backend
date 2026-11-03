@@ -39,8 +39,10 @@ async def lock_chat_catalogue_snapshot(session, *, snapshot_id, snapshot_lease_t
         raise ChatCatalogueWorkLeaseMoved("capture snapshot was removed")
     job = await session.scalar(select(Job).where(Job.id == hint.job_id).with_for_update(read=True, key_share=True)
         .execution_options(populate_existing=True))
+    # NO KEY UPDATE: this transaction writes non-key snapshot columns and must not
+    # block KEY SHARE validators of concurrent captures.
     snapshot = await session.scalar(select(Snapshot).where(Snapshot.id == snapshot_id)
-        .with_for_update().execution_options(populate_existing=True))
+        .with_for_update(key_share=True).execution_options(populate_existing=True))
     if snapshot is None or (snapshot.extra_data or {}).get("chat_inventory_format") != 1:
         raise ChatCatalogueWorkLeaseMoved("capture snapshot format or ownership changed")
     if snapshot.status in {SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL, SnapshotStatus.FAILED}:
@@ -49,7 +51,7 @@ async def lock_chat_catalogue_snapshot(session, *, snapshot_id, snapshot_lease_t
         raise ChatCatalogueWorkLeaseMoved("capture snapshot or parent job is no longer active")
     if partition_id is not None:
         partition = await session.scalar(select(SnapshotPartition).where(SnapshotPartition.id == partition_id)
-            .with_for_update(read=True).execution_options(populate_existing=True))
+            .with_for_update(read=True, key_share=True).execution_options(populate_existing=True))
         if (partition is None or partition.snapshot_id != snapshot_id or partition.resource_id != snapshot.resource_id or
                 partition.status != "IN_PROGRESS" or partition_lease_token is None or
                 int(partition.lease_token or 0) != partition_lease_token):
@@ -71,9 +73,9 @@ async def adopt_chat_catalogue(session, *, resource_id, snapshot_id, writer_enab
     # resource/snapshot order can deadlock with a live capture's shared locks.
     job = await session.scalar(select(Job).where(Job.id == hint.job_id).with_for_update(read=True, key_share=True))
     snapshot = await session.scalar(select(Snapshot).where(Snapshot.id == snapshot_id)
-        .with_for_update().execution_options(populate_existing=True))
+        .with_for_update(key_share=True).execution_options(populate_existing=True))
     resource = await session.scalar(select(Resource).where(Resource.id == resource_id)
-        .with_for_update().execution_options(populate_existing=True))
+        .with_for_update(key_share=True).execution_options(populate_existing=True))
     if resource is None or snapshot is None or resource.type != ResourceType.USER_CHATS:
         raise ChatCatalogueAdoptionError("capture resource is missing or is not USER_CHATS")
     resource_format = (resource.extra_data or {}).get("chat_inventory_format")
@@ -112,7 +114,7 @@ async def adopt_chat_catalogue(session, *, resource_id, snapshot_id, writer_enab
             raise ChatCatalogueAdoptionError("legacy snapshot items, partitions or another legacy run prevent catalogue adoption")
     if partition_id is not None:
         partition = await session.scalar(select(SnapshotPartition).where(SnapshotPartition.id == partition_id)
-            .with_for_update(read=True))
+            .with_for_update(read=True, key_share=True))
         if (partition is None or partition.snapshot_id != snapshot_id or partition.resource_id != resource_id or
                 partition.tenant_id != resource.tenant_id or partition.partition_type != "CHATS" or
                 partition.status != "IN_PROGRESS"):

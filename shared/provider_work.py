@@ -116,13 +116,14 @@ async def _parents(session, snapshot_id, partition_id=None, *, skip_locked=False
         .execution_options(populate_existing=True))
     if job is None:
         raise ProviderWorkConflict('provider parent locked or removed')
+    # Leaf rows are validated here; writers UPDATE afterwards (implicit NO KEY UPDATE).
     snapshot = await session.scalar(select(Snapshot).where(Snapshot.id == hint.id)
-        .with_for_update(skip_locked=skip_locked, key_share=True)
+        .with_for_update(skip_locked=skip_locked, read=True, key_share=True)
         .execution_options(populate_existing=True))
     if snapshot is None:
         raise ProviderWorkConflict('provider parent locked or removed')
     partition = await session.scalar(select(SnapshotPartition).where(SnapshotPartition.id == _uuid(partition_id))
-        .with_for_update(skip_locked=skip_locked, key_share=True).execution_options(populate_existing=True)) if partition_id else None
+        .with_for_update(skip_locked=skip_locked, read=True, key_share=True).execution_options(populate_existing=True)) if partition_id else None
     if partition_id and partition is None:
         raise ProviderWorkConflict('provider parent locked or removed')
     return job, snapshot, partition

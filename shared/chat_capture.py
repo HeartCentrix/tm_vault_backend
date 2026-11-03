@@ -208,6 +208,16 @@ def _metadata_only(attachment):
         content_type in {"messageReference", "forwardedMessageReference", "meetingReference"})
 
 
+def stable_attachment_identity(attachment):
+    """Graph mints a new ``id`` for card/reference attachments on every read, which
+    made two identical observations look like source movement. Their identity is
+    their content; file attachments keep the Graph id their download needs."""
+    if not _metadata_only(attachment):
+        return attachment["id"]
+    body = {k: v for k, v in attachment.items() if k != "id"}
+    return "card:" + hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()[:40]
+
+
 def _file_source(item):
     parent = item.get("parentReference")
     drive, identifier = (parent.get("driveId") if isinstance(parent, dict) else None), item.get("id")
@@ -329,8 +339,9 @@ async def _binary(*, scope, keeper, factory, storage, source_client, item_type,
         return captured
 
     marks, started = {}, time.monotonic()
+    last = [started]
     def mark(name):
-        marks[name] = round((time.monotonic() - started - sum(marks.values())) * 1000)
+        now = time.monotonic(); marks[name] = round((now - last[0]) * 1000); last[0] = now
     def report(item):
         total = round((time.monotonic() - started) * 1000)
         if total >= 1000:
@@ -396,7 +407,9 @@ async def _observe(*, scope, keeper, factory, storage, source, ledger, observati
                     identifier = parent.get("id")
                     native = parent.get("attachments") or []
                     valid = isinstance(native, list) and all(isinstance(a, dict) and isinstance(a.get("id"), str) and a["id"] for a in native)
-                    attachments = native if valid else []
+                    attachments = [{**a, "id": stable_attachment_identity(a)} for a in native] if valid else []
+                    if valid and native:
+                        parent["attachments"] = attachments
                     if not valid:
                         stats.unresolved += 1
                     hosted, hosted_complete = [], True

@@ -661,3 +661,14 @@ async def test_cached_file_still_checks_missing_stored_content(store, adapters):
     adapters.source.resolve_file = resolve
     _, result = await run_capture(store, adapters)
     assert result.outcome == 'partial'
+
+
+async def test_card_attachment_with_volatile_graph_id_is_stable_across_passes(store, adapters):
+    """Graph returns a fresh attachment id for Adaptive Card attachments on every read (seen on Divyansh's chats)."""
+    def card(identity):
+        return {"id": identity, "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": '{"type":"AdaptiveCard","body":[{"type":"TextBlock","text":"same card"}]}'}
+    adapters.source.movement = lambda passes: [dict(message(), attachments=[card(f"volatile-{passes}")])]
+    _, result = await run_capture(store, adapters)
+    assert result.outcome == "complete" and result.item_count == 2
+    assert adapters.source.passes == 2

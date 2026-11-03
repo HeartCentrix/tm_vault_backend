@@ -20753,9 +20753,9 @@ class BackupWorker:
                 job = await session.get(_Job, snapshot.job_id,
                     with_for_update={"read": True, "key_share": True}, populate_existing=True)
                 live = await session.get(Snapshot, snapshot.id,
-                    with_for_update=True, populate_existing=True)
+                    with_for_update={"key_share": True}, populate_existing=True)
                 partition = await session.get(_Partition, uuid.UUID(partition_record["partition_id"]),
-                    with_for_update={"read": True}, populate_existing=True) if partition_record else None
+                    with_for_update={"read": True, "key_share": True}, populate_existing=True) if partition_record else None
             if (job is None or live is None or str(live.id) != str(snapshot.id)
                 or str(live.job_id) != str(snapshot.job_id)
                 or str(live.resource_id) != str(resource.id) or str(job.tenant_id) != str(tenant.id)

@@ -7,6 +7,7 @@ Validation only needs ``FOR KEY SHARE``: ordinary UPDATEs flow, and an
 explicit ``FOR UPDATE`` (cancellation) still waits for in-flight writers.
 """
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import text
@@ -84,3 +85,34 @@ async def test_cancellation_fence_still_waits_for_in_flight_writer(store, hold):
         blocked = await _lock_timed_out(store.factory, "SELECT id FROM jobs WHERE id=:id FOR UPDATE", {"id": job_id})
         await holder.rollback()
     assert blocked, f"{hold.__name__} no longer fences cancellation"
+
+
+async def hold_catalogue_scope(session, snapshot_id, job_id):
+    from shared.chat_catalogue import _lock_scope
+    from shared.chat_catalogue_identity import ChatCaptureScope
+    resource_id, tenant_id = (await session.execute(text(
+        "SELECT s.resource_id, j.tenant_id FROM snapshots s JOIN jobs j ON j.id = s.job_id WHERE s.id=:id"),
+        {"id": snapshot_id})).one()
+    await _lock_scope(session, ChatCaptureScope(snapshot_id, resource_id, tenant_id, "chat-alpha", "principal-alpha", "a" * 64, uuid4()))
+
+
+async def hold_provider_owned_parents(session, snapshot_id, job_id):
+    from shared.provider_work import _parents
+    await _parents(session, snapshot_id, share_job=True)
+
+
+# Settlement (lock_chat_catalogue_snapshot) writes snapshot columns, so it is a writer, not a validator.
+SNAPSHOT_HOLDERS = [hold_item_write_parents, hold_catalogue_scope, hold_provider_owned_parents]
+
+
+@pytest.mark.parametrize("hold", SNAPSHOT_HOLDERS, ids=lambda f: f.__name__)
+async def test_snapshot_validation_lock_does_not_block_snapshot_progress_update(store, hold):
+    """Live 2026-11-04 sample: chat reserve/make_live transactions waited ~2 s each on the snapshot row."""
+    scope = await store.new_scope()
+    job_id = await _job_id(store.factory, scope.snapshot_id)
+    async with store.factory() as holder:
+        await hold(holder, scope.snapshot_id, job_id)
+        blocked = await _lock_timed_out(store.factory,
+            "UPDATE snapshots SET item_count=7, lease_expires_at=NOW() WHERE id=:id", {"id": scope.snapshot_id})
+        await holder.rollback()
+    assert not blocked, f"{hold.__name__} still serializes snapshot progress writes"
