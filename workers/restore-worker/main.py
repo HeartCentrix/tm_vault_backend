@@ -3696,6 +3696,47 @@ class RestoreWorker:
         self._sp_default_drive_ids[site_id] = drive_id
         return drive_id
 
+    async def _upload_sharepoint_file_stream(
+        self, graph_client, item, site_id, target_path, file_name, stream_plan,
+    ):
+        container, total_size = stream_plan
+        drive_id = await self._sharepoint_default_drive_id(graph_client, site_id)
+        print(
+            f"[{self.worker_id}] [SP-RESTORE] streaming {file_name} "
+            f"({total_size} bytes) via uploadSession to drive {drive_id}",
+            flush=True,
+        )
+        # conflict_behavior="replace" matches the simple PUT's
+        # overwrite-at-path semantics in both conflict modes —
+        # SEPARATE_FOLDER already diverts via the path prefix.
+        async with self._sp_stream_semaphore:
+            result = await graph_client.upload_large_file_stream_to_drive(
+                drive_id=drive_id,
+                drive_path=target_path,
+                byte_iter=self._iter_sharepoint_blob_stream(
+                    item, container, settings.SHAREPOINT_RESTORE_CHUNK_BYTES,
+                ),
+                total_size=total_size,
+                chunk_size=settings.SHAREPOINT_RESTORE_CHUNK_BYTES,
+                conflict_behavior="replace",
+            )
+        if not result:
+            # A final chunk that resolved through the 416/409
+            # nextExpectedRanges resync (or a 202) returns {} —
+            # the file IS committed but ACL replay needs the real
+            # driveItem. Recover it by path.
+            result = await graph_client.get_drive_item_by_path(
+                drive_id, target_path,
+            )
+            if not result:
+                print(
+                    f"[{self.worker_id}] [SP-RESTORE] WARNING: streamed "
+                    f"{file_name} committed but driveItem lookup failed — "
+                    "skipping ACL replay for this item",
+                    flush=True,
+                )
+        return result
+
     async def _restore_file_to_sharepoint(
         self,
         graph_client: GraphClient,
@@ -3760,42 +3801,9 @@ class RestoreWorker:
         target_path = "/".join(parts)
 
         if stream_plan is not None:
-            container, total_size = stream_plan
-            drive_id = await self._sharepoint_default_drive_id(graph_client, site_id)
-            print(
-                f"[{self.worker_id}] [SP-RESTORE] streaming {file_name} "
-                f"({total_size} bytes) via uploadSession to drive {drive_id}",
-                flush=True,
+            result = await self._upload_sharepoint_file_stream(
+                graph_client, item, site_id, target_path, file_name, stream_plan,
             )
-            # conflict_behavior="replace" matches the simple PUT's
-            # overwrite-at-path semantics in both conflict modes —
-            # SEPARATE_FOLDER already diverts via the path prefix.
-            async with self._sp_stream_semaphore:
-                result = await graph_client.upload_large_file_stream_to_drive(
-                    drive_id=drive_id,
-                    drive_path=target_path,
-                    byte_iter=self._iter_sharepoint_blob_stream(
-                        item, container, settings.SHAREPOINT_RESTORE_CHUNK_BYTES,
-                    ),
-                    total_size=total_size,
-                    chunk_size=settings.SHAREPOINT_RESTORE_CHUNK_BYTES,
-                    conflict_behavior="replace",
-                )
-            if not result:
-                # A final chunk that resolved through the 416/409
-                # nextExpectedRanges resync (or a 202) returns {} —
-                # the file IS committed but ACL replay needs the real
-                # driveItem. Recover it by path.
-                result = await graph_client.get_drive_item_by_path(
-                    drive_id, target_path,
-                )
-                if not result:
-                    print(
-                        f"[{self.worker_id}] [SP-RESTORE] WARNING: streamed "
-                        f"{file_name} committed but driveItem lookup failed — "
-                        "skipping ACL replay for this item",
-                        flush=True,
-                    )
         else:
             # Quote each path segment exactly like the streaming helper
             # does (spaces / unicode / '#' / '%' in SharePoint filenames
@@ -4699,6 +4707,65 @@ class RestoreWorker:
 
     # ==================== OneNote Restore ====================
 
+    @staticmethod
+    def _onenote_page_bundles(items):
+        # Group by page external_id so we can attach content to its metadata entry.
+        pages_by_id: Dict[str, Dict[str, SnapshotItem]] = {}
+        for item in items:
+            if item.item_type == "ONENOTE_PAGE":
+                pages_by_id.setdefault(item.external_id, {})["page"] = item
+            elif item.item_type == "ONENOTE_PAGE_CONTENT":
+                # external_id is "{page_id}:content" — strip suffix
+                pid = item.external_id.rsplit(":", 1)[0]
+                pages_by_id.setdefault(pid, {})["content"] = item
+
+        return pages_by_id
+
+    async def _restore_onenote_pages(self, graph_client, user_id, items, sec_id_map, manual_actions):
+        restored, failed = 0, 0
+        for bundle in self._onenote_page_bundles(items).values():
+            page_item = bundle.get("page")
+            content_item = bundle.get("content")
+            if not page_item:
+                continue
+            meta = self._get_item_metadata(page_item)
+            raw = meta.get("raw", {})
+            title = raw.get("title") or page_item.name or "(Untitled)"
+            old_sec_id = meta.get("sectionId")
+            new_sec_id = sec_id_map.get(old_sec_id)
+            if not new_sec_id:
+                manual_actions.append(f"{title}: parent section not restored, skipping page.")
+                failed += 1
+                continue
+
+            # Build HTML body — prefer the captured content blob, else a title-only placeholder
+            html_bytes: Optional[bytes] = None
+            if content_item:
+                try:
+                    html_bytes = await self._load_snapshot_item_bytes(content_item, "onenote")
+                except Exception as exc:
+                    # Object-store read errors are per-page: they must not
+                    # unwind into restore_in_place and fail the whole job.
+                    manual_actions.append(f"{title}: page content blob unreadable — {str(exc)[:200]}")
+                    failed += 1
+                    continue
+            if not html_bytes:
+                html_bytes = (f"<html><head><title>{title}</title></head>"
+                              f"<body><h1>{title}</h1><p>(content not captured)</p></body></html>").encode()
+                manual_actions.append(f"{title}: no ONENOTE_PAGE_CONTENT captured; placeholder body used.")
+            try:
+                await graph_client._post(
+                    f"{graph_client.GRAPH_URL}/users/{user_id}/onenote/sections/{new_sec_id}/pages",
+                    html_bytes,
+                    headers={"Content-Type": "text/html"},
+                )
+                restored += 1
+            except Exception as exc:
+                manual_actions.append(f"{title}: page create failed — {str(exc)[:200]}")
+                failed += 1
+
+        return restored, failed
+
     async def _restore_onenote_items(
         self,
         session: AsyncSession,
@@ -4765,56 +4832,11 @@ class RestoreWorker:
                 failed += 1
 
         # Pass 3: pages — prefer ONENOTE_PAGE_CONTENT (HTML) over ONENOTE_PAGE (metadata)
-        # Group by page external_id so we can attach content to its metadata entry.
-        pages_by_id: Dict[str, Dict[str, SnapshotItem]] = {}
-        for item in items:
-            if item.item_type == "ONENOTE_PAGE":
-                pages_by_id.setdefault(item.external_id, {})["page"] = item
-            elif item.item_type == "ONENOTE_PAGE_CONTENT":
-                # external_id is "{page_id}:content" — strip suffix
-                pid = item.external_id.rsplit(":", 1)[0]
-                pages_by_id.setdefault(pid, {})["content"] = item
-
-        for page_id, bundle in pages_by_id.items():
-            page_item = bundle.get("page")
-            content_item = bundle.get("content")
-            if not page_item:
-                continue
-            meta = self._get_item_metadata(page_item)
-            raw = meta.get("raw", {})
-            title = raw.get("title") or page_item.name or "(Untitled)"
-            old_sec_id = meta.get("sectionId")
-            new_sec_id = sec_id_map.get(old_sec_id)
-            if not new_sec_id:
-                manual_actions.append(f"{title}: parent section not restored, skipping page.")
-                failed += 1
-                continue
-
-            # Build HTML body — prefer the captured content blob, else a title-only placeholder
-            html_bytes: Optional[bytes] = None
-            if content_item:
-                try:
-                    html_bytes = await self._load_snapshot_item_bytes(content_item, "onenote")
-                except Exception as exc:
-                    # Object-store read errors are per-page: they must not
-                    # unwind into restore_in_place and fail the whole job.
-                    manual_actions.append(f"{title}: page content blob unreadable — {str(exc)[:200]}")
-                    failed += 1
-                    continue
-            if not html_bytes:
-                html_bytes = (f"<html><head><title>{title}</title></head>"
-                              f"<body><h1>{title}</h1><p>(content not captured)</p></body></html>").encode()
-                manual_actions.append(f"{title}: no ONENOTE_PAGE_CONTENT captured; placeholder body used.")
-            try:
-                await graph_client._post(
-                    f"{graph_client.GRAPH_URL}/users/{user_id}/onenote/sections/{new_sec_id}/pages",
-                    html_bytes,
-                    headers={"Content-Type": "text/html"},
-                )
-                restored += 1
-            except Exception as exc:
-                manual_actions.append(f"{title}: page create failed — {str(exc)[:200]}")
-                failed += 1
+        pages_restored, pages_failed = await self._restore_onenote_pages(
+            graph_client, user_id, items, sec_id_map, manual_actions,
+        )
+        restored += pages_restored
+        failed += pages_failed
 
         # Inline resources — currently not auto-restored (see docstring)
         resource_count = sum(1 for i in items if i.item_type == "ONENOTE_RESOURCE")
