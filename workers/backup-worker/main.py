@@ -8001,18 +8001,17 @@ class BackupWorker:
                             local_out = [row for row in local_out if str(row[2]) not in _folder_tombstoned_ids]
                             if _mail_streaming_enabled:
                                 try:
-                                    async with _mail_persist_db_gate():
-                                        async with async_session_factory() as _deleted:
-                                            await _deleted.execute(text("""
-                                                DELETE FROM snapshot_items
-                                                WHERE snapshot_id = :sid
-                                                  AND (
-                                                    (item_type = 'EMAIL' AND external_id = ANY(:ids))
-                                                    OR (item_type = 'EMAIL_ATTACHMENT' AND
-                                                        COALESCE(parent_external_id, split_part(external_id, '::', 1)) = ANY(:ids))
-                                                  )
-                                            """), {"sid": snapshot.id, "ids": sorted(_folder_tombstoned_ids)})
-                                            await _deleted.commit()
+                                    async with _mail_persist_db_gate(), async_session_factory() as _deleted:
+                                        await _deleted.execute(text("""
+                                            DELETE FROM snapshot_items
+                                            WHERE snapshot_id = :sid
+                                              AND (
+                                                (item_type = 'EMAIL' AND external_id = ANY(:ids))
+                                                OR (item_type = 'EMAIL_ATTACHMENT' AND
+                                                    COALESCE(parent_external_id, split_part(external_id, '::', 1)) = ANY(:ids))
+                                              )
+                                        """), {"sid": snapshot.id, "ids": sorted(_folder_tombstoned_ids)})
+                                        await _deleted.commit()
                                 except Exception as _delete_err:
                                     _folder_walk_ok = False
                                     _folder_persisted_ok = False
@@ -22081,13 +22080,22 @@ class BackupWorker:
         # Idempotency: check if blob already exists with matching etag
         source_etag = (file_item.get("eTag") or "")[:64]
         existing_props = await shard.get_blob_properties(container, blob_path)
-        if existing_props:
-            existing_etag = (existing_props.get("metadata", {}) or {}).get("source_etag", "")
-            if existing_etag and existing_etag == source_etag:
-                return {"success": True, "size": existing_props.get("size", 0),
-                        "method": "skipped_already_present",
-                        "item_id": file_id, "file_name": file_name}
+        if (existing_props and source_etag
+                and (existing_props.get("metadata", {}) or {}).get("source_etag", "") == source_etag):
+            return {"success": True, "size": existing_props.get("size", 0),
+                    "method": "skipped_already_present",
+                    "item_id": file_id, "file_name": file_name}
 
+        return await self._stream_file_snapshot(
+            tenant, snapshot, file_item, graph_client, drive_id, file_id, file_name,
+            container, blob_path, shard, source_etag,
+        )
+
+    async def _stream_file_snapshot(self, tenant, snapshot, file_item, graph_client,
+                                    drive_id, file_id, file_name, container,
+                                    blob_path, shard, source_etag):
+        """Download, store and publish one file; clean the spool on every exit."""
+        file_size_hint = file_item.get("size", 0)
         metadata = {
             "source_item_id": file_id,
             "source_drive_id": drive_id or "",
@@ -22140,115 +22148,10 @@ class BackupWorker:
                 graph_client=graph_client,
             )
 
-            # Capture historical file versions — afi keeps every version. We cap
-            # at MAX_FILE_VERSIONS (default 3) to bound storage. Only runs on
-            # newly-streamed files AND only on Office filename extensions
-            # (VERSIONABLE_EXTS); other binary types either don't produce
-            # server-side versions or do so too rarely to justify the
-            # per-file /versions Graph call.
-            #
-            # Three-layer fast path (most → least expensive skip):
-            #
-            #   Layer 0 (NEW): filename extension not in VERSIONABLE_EXTS
-            #     → skip the whole version block; saves an entire Graph
-            #       round-trip per non-Office file.
-            #
-            #   Layer 1: fileSystemInfo.createdDateTime == lastModifiedDateTime
-            #     → file has never been edited → no prior versions possible.
-            #
-            #   Layer 2: prior snapshot's FILE row has identical eTag to this run
-            #     → file is byte-identical → version chain is identical → clone
-            #       FILE_VERSION rows from prior snapshot via SQL (no Graph at
-            #       all). Gated by VERSION_CARRY_FORWARD_ENABLED.
-            #
-            #   Layer 3: normal capture path with skip-set for any version_ids
-            #     already in the prior snapshot (avoids redundant downloads).
-            fs_info = file_item.get("fileSystemInfo") or {}
-            created_at = fs_info.get("createdDateTime") or file_item.get("createdDateTime")
-            modified_at = fs_info.get("lastModifiedDateTime") or file_item.get("lastModifiedDateTime")
-            never_edited = bool(created_at) and created_at == modified_at
-            if not never_edited and self._is_versionable_file(file_name):
-                # Lazy-load per-snapshot prior state. Cached on the snapshot
-                # object so all files for this resource share two indexed SQL
-                # queries (not 2*N).
-                if not hasattr(snapshot, "_prior_state_loaded"):
-                    try:
-                        # NOTE: this collects across the lifetime of the
-                        # snapshot — the first file pays for ALL files we'll
-                        # eventually process. To bound memory we cap at the
-                        # files we have observed so far + filled lazily on
-                        # next file. Simpler: pass a single file_id and grow.
-                        ps_id, etag_map, ver_map = await _fetch_prior_file_etag_map(
-                            resource_id=str(snapshot.resource_id),
-                            current_snapshot_id=str(snapshot.id),
-                            file_ids=[file_id],
-                        )
-                        snapshot._prior_state_loaded = True
-                        snapshot._prior_snap_id = ps_id
-                        snapshot._prior_etag_by_file = etag_map
-                        snapshot._prior_versions_by_file = ver_map
-                    except Exception as pe:
-                        # Best-effort: if the lookup fails we fall through to
-                        # the full capture path — no data loss, just no
-                        # carry-forward optimization.
-                        print(f"[{self.worker_id}]   [VERSIONS] prior-state lookup failed: {type(pe).__name__}: {pe}")
-                        snapshot._prior_state_loaded = True
-                        snapshot._prior_snap_id = None
-                        snapshot._prior_etag_by_file = {}
-                        snapshot._prior_versions_by_file = {}
-                else:
-                    # Grow the maps lazily as new file_ids arrive (the first
-                    # call only loaded for one file). Skip the DB roundtrip
-                    # entirely when we've already seen this file_id.
-                    if file_id not in snapshot._prior_etag_by_file \
-                       and file_id not in snapshot._prior_versions_by_file \
-                       and snapshot._prior_snap_id is not None:
-                        try:
-                            _, etag_map2, ver_map2 = await _fetch_prior_file_etag_map(
-                                resource_id=str(snapshot.resource_id),
-                                current_snapshot_id=str(snapshot.id),
-                                file_ids=[file_id],
-                            )
-                            snapshot._prior_etag_by_file.update(etag_map2)
-                            for k, v in ver_map2.items():
-                                snapshot._prior_versions_by_file.setdefault(k, set()).update(v)
-                        except Exception:
-                            pass
-
-                prior_etag = snapshot._prior_etag_by_file.get(file_id)
-                # Layer 2: carry-forward when eTag matches.
-                carry_forward_did_run = False
-                if self.VERSION_CARRY_FORWARD_ENABLED and prior_etag and prior_etag == source_etag \
-                        and snapshot._prior_snap_id:
-                    try:
-                        copied = await _carry_forward_prior_file_versions(
-                            target_snapshot_id=str(snapshot.id),
-                            prior_snap_id=snapshot._prior_snap_id,
-                            file_ids=[file_id],
-                        )
-                        from shared.copy_workflow import DeferredCopy
-                        if isinstance(copied, DeferredCopy):
-                            carry_forward_did_run = True
-                        elif copied:
-                            print(f"[{self.worker_id}]   [VERSIONS-CARRY] {file_name}: {copied} prior row(s) cloned (eTag unchanged)")
-                            carry_forward_did_run = True
-                    except Exception as cfe:
-                        print(f"[{self.worker_id}]   [VERSIONS-CARRY WARN] {file_name}: {type(cfe).__name__}: {cfe}")
-
-                # Layer 3: normal capture (with skip-set when available).
-                if not carry_forward_did_run:
-                    try:
-                        skip_set = snapshot._prior_versions_by_file.get(file_id, set())
-                        ver_count, ver_bytes = await self._backup_file_versions(
-                            graph_client, tenant, snapshot, drive_id, file_id, file_name,
-                            container, shard, current_etag=source_etag,
-                            skip_version_ids=skip_set if skip_set else None,
-                        )
-                        if ver_count:
-                            print(f"[{self.worker_id}]   [VERSIONS] {file_name}: {ver_count} prior version(s), {ver_bytes} bytes")
-                    except Exception as ve:
-                        # Version capture is best-effort — don't fail the file backup.
-                        print(f"[{self.worker_id}]   [VERSIONS WARN] {file_name}: {type(ve).__name__}: {ve}")
+            await self._capture_file_version_history(
+                graph_client, tenant, snapshot, drive_id, file_id, file_name,
+                file_item, container, shard, source_etag,
+            )
 
             return {"success": True, "size": size, "method": "streaming",
                     "blob_path": blob_path, "sha256": sha256,
@@ -22265,6 +22168,100 @@ class BackupWorker:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
+
+    async def _load_prior_file_version_state(self, snapshot, file_id):
+        """Cache prior versions per snapshot, expanding only for files observed this run."""
+        if not hasattr(snapshot, "_prior_state_loaded"):
+            try:
+                # NOTE: this collects across the lifetime of the
+                # snapshot — the first file pays for ALL files we'll
+                # eventually process. To bound memory we cap at the
+                # files we have observed so far + filled lazily on
+                # next file. Simpler: pass a single file_id and grow.
+                ps_id, etag_map, ver_map = await _fetch_prior_file_etag_map(
+                    resource_id=str(snapshot.resource_id),
+                    current_snapshot_id=str(snapshot.id),
+                    file_ids=[file_id],
+                )
+                snapshot._prior_state_loaded = True
+                snapshot._prior_snap_id = ps_id
+                snapshot._prior_etag_by_file = etag_map
+                snapshot._prior_versions_by_file = ver_map
+            except Exception as pe:
+                # Best-effort: if the lookup fails we fall through to
+                # the full capture path — no data loss, just no
+                # carry-forward optimization.
+                print(f"[{self.worker_id}]   [VERSIONS] prior-state lookup failed: {type(pe).__name__}: {pe}")
+                snapshot._prior_state_loaded = True
+                snapshot._prior_snap_id = None
+                snapshot._prior_etag_by_file = {}
+                snapshot._prior_versions_by_file = {}
+        else:
+            # Grow the maps lazily as new file_ids arrive (the first
+            # call only loaded for one file). Skip the DB roundtrip
+            # entirely when we've already seen this file_id.
+            if file_id not in snapshot._prior_etag_by_file \
+               and file_id not in snapshot._prior_versions_by_file \
+               and snapshot._prior_snap_id is not None:
+                try:
+                    _, etag_map2, ver_map2 = await _fetch_prior_file_etag_map(
+                        resource_id=str(snapshot.resource_id),
+                        current_snapshot_id=str(snapshot.id),
+                        file_ids=[file_id],
+                    )
+                    snapshot._prior_etag_by_file.update(etag_map2)
+                    for k, v in ver_map2.items():
+                        snapshot._prior_versions_by_file.setdefault(k, set()).update(v)
+                except Exception:
+                    pass
+
+
+    async def _reuse_prior_file_versions(self, snapshot, file_id, file_name, source_etag):
+        prior_etag = snapshot._prior_etag_by_file.get(file_id)
+        if not (self.VERSION_CARRY_FORWARD_ENABLED and prior_etag
+                and prior_etag == source_etag and snapshot._prior_snap_id):
+            return False
+        try:
+            copied = await _carry_forward_prior_file_versions(
+                target_snapshot_id=str(snapshot.id), prior_snap_id=snapshot._prior_snap_id,
+                file_ids=[file_id],
+            )
+            from shared.copy_workflow import DeferredCopy
+            if isinstance(copied, DeferredCopy):
+                return True
+            if copied:
+                print(f"[{self.worker_id}]   [VERSIONS-CARRY] {file_name}: {copied} prior row(s) cloned (eTag unchanged)")
+                return True
+        except Exception as cfe:
+            print(f"[{self.worker_id}]   [VERSIONS-CARRY WARN] {file_name}: {type(cfe).__name__}: {cfe}")
+        return False
+
+    async def _capture_file_version_history(self, graph_client, tenant, snapshot,
+                                            drive_id, file_id, file_name, file_item,
+                                            container, shard, source_etag):
+        """Reuse unchanged version rows; otherwise capture eligible Office versions."""
+        fs_info = file_item.get("fileSystemInfo") or {}
+        created_at = fs_info.get("createdDateTime") or file_item.get("createdDateTime")
+        modified_at = fs_info.get("lastModifiedDateTime") or file_item.get("lastModifiedDateTime")
+        never_edited = bool(created_at) and created_at == modified_at
+        if never_edited or not self._is_versionable_file(file_name):
+            return
+        await self._load_prior_file_version_state(snapshot, file_id)
+        if await self._reuse_prior_file_versions(snapshot, file_id, file_name, source_etag):
+            return
+        try:
+            skip_set = snapshot._prior_versions_by_file.get(file_id, set())
+            ver_count, ver_bytes = await self._backup_file_versions(
+                graph_client, tenant, snapshot, drive_id, file_id, file_name,
+                container, shard, current_etag=source_etag,
+                skip_version_ids=skip_set if skip_set else None,
+            )
+            if ver_count:
+                print(f"[{self.worker_id}]   [VERSIONS] {file_name}: {ver_count} prior version(s), {ver_bytes} bytes")
+        except Exception as ve:
+            # Version capture is best-effort — don't fail the file backup.
+            print(f"[{self.worker_id}]   [VERSIONS WARN] {file_name}: {type(ve).__name__}: {ve}")
+
 
     async def _create_file_snapshot_item(self, snapshot, tenant, file_id, file_name,
                                          content_size, blob_path, hashes, file_item,
@@ -28093,13 +28090,13 @@ class BackupWorker:
                 return {"item_count": 0, "bytes_added": 0, "new_delta_token": None, "note": "no_mailbox"}
             raise
         if backup_archive:
-            folder_trees["archive"] = await graph_client.get_mail_folder_tree(user_id, well_known_root="archive")
-            if folder_trees["archive"]:
-                print(f"[{self.worker_id}]   [ARCHIVE] Found {len(folder_trees['archive'])} folder(s)")
+            folder_trees["archive"] = await self._secondary_mail_folder_tree(
+                graph_client, user_id, "archive", "ARCHIVE",
+            )
         if backup_recoverable:
-            folder_trees["recoverable"] = await graph_client.get_mail_folder_tree(user_id, well_known_root="recoverableitemsroot")
-            if folder_trees["recoverable"]:
-                print(f"[{self.worker_id}]   [RECOVERABLE] Found {len(folder_trees['recoverable'])} folder(s)")
+            folder_trees["recoverable"] = await self._secondary_mail_folder_tree(
+                graph_client, user_id, "recoverableitemsroot", "RECOVERABLE",
+            )
 
         # Fetch messages from each source. Primary uses the existing /messages
         # top-level call (covers all primary folders in one paginated query);
@@ -28115,6 +28112,26 @@ class BackupWorker:
                 return {"item_count": 0, "bytes_added": 0, "new_delta_token": None, "note": "no_mailbox"}
             raise
 
+        items = await self._collect_fullwalk_mail_items(
+            graph_client, user_id, messages, folder_trees, backup_archive, backup_recoverable,
+        )
+        items = self._filter_fullwalk_mail_items(items, exclusions)
+
+        item_count, bytes_added, _persist_failed = await self._persist_tier1_mail_items(
+            graph_client, resource, snapshot, tenant, items,
+        )
+        new_delta = messages.get("@odata.deltaLink")
+        print(f"[{self.worker_id}] [BACKUP COMPLETE] Mailbox: {resource.display_name} — {item_count} items total, {bytes_added} bytes")
+        return {"item_count": item_count, "bytes_added": bytes_added, "new_delta_token": new_delta}
+
+    async def _secondary_mail_folder_tree(self, graph_client, user_id, root, label):
+        tree = await graph_client.get_mail_folder_tree(user_id, well_known_root=root)
+        if tree:
+            print(f"[{self.worker_id}]   [{label}] Found {len(tree)} folder(s)")
+        return tree
+
+    async def _collect_fullwalk_mail_items(self, graph_client, user_id, messages,
+                                           folder_trees, backup_archive, backup_recoverable):
         primary_items = messages.get("value", [])
         for m in primary_items:
             m["_source_mailbox"] = "primary"
@@ -28122,33 +28139,32 @@ class BackupWorker:
 
         items = list(primary_items)
 
-        async def _collect_from_secondary(source: str) -> int:
-            tree = folder_trees.get(source) or {}
-            if not tree:
-                return 0
-            collected = 0
-            for fid, path in tree.items():
-                folder_msgs = await graph_client.list_messages_in_folder(user_id, fid)
-                for m in folder_msgs:
-                    m["_source_mailbox"] = source
-                    m["_full_folder_path"] = path
-                items.extend(folder_msgs)
-                collected += len(folder_msgs)
-            return collected
-
         if backup_archive:
-            n = await _collect_from_secondary("archive")
+            n = await self._collect_secondary_mailbox(graph_client, user_id, folder_trees, items, "archive")
             print(f"[{self.worker_id}]   [ARCHIVE] Collected {n} messages from {len(folder_trees.get('archive') or {})} folder(s)")
         if backup_recoverable:
-            n = await _collect_from_secondary("recoverable")
+            n = await self._collect_secondary_mailbox(graph_client, user_id, folder_trees, items, "recoverable")
             print(f"[{self.worker_id}]   [RECOVERABLE] Collected {n} messages from {len(folder_trees.get('recoverable') or {})} folder(s)")
 
         print(f"[{self.worker_id}]   [EMAIL] Total {len(items)} messages to backup ({len(primary_items)} primary)")
+        return items
 
-        # SLA exclusions — filter before upload so excluded items never touch storage.
-        # Compile rules ONCE (pre-bucketed by type, regexes pre-compiled) and
-        # pass the compiled bundle into the hot loop. At ~10k mailbox items
-        # × ~50 rules this saves ~500K re.compile calls per backup.
+    async def _collect_secondary_mailbox(self, graph_client, user_id, folder_trees, items, source):
+        tree = folder_trees.get(source) or {}
+        if not tree:
+            return 0
+        collected = 0
+        for fid, path in tree.items():
+            folder_msgs = await graph_client.list_messages_in_folder(user_id, fid)
+            for m in folder_msgs:
+                m["_source_mailbox"] = source
+                m["_full_folder_path"] = path
+            items.extend(folder_msgs)
+            collected += len(folder_msgs)
+        return collected
+
+
+    def _filter_fullwalk_mail_items(self, items, exclusions):
         if exclusions:
             compiled_excl = self._compile_exclusions(exclusions)
             before = len(items)
@@ -28157,12 +28173,7 @@ class BackupWorker:
             if excluded:
                 print(f"[{self.worker_id}]   [EMAIL] Excluded {excluded}/{before} by SLA policy rules")
 
-        item_count, bytes_added, _persist_failed = await self._persist_tier1_mail_items(
-            graph_client, resource, snapshot, tenant, items,
-        )
-        new_delta = messages.get("@odata.deltaLink")
-        print(f"[{self.worker_id}] [BACKUP COMPLETE] Mailbox: {resource.display_name} — {item_count} items total, {bytes_added} bytes")
-        return {"item_count": item_count, "bytes_added": bytes_added, "new_delta_token": new_delta}
+        return items
 
     async def _persist_tier1_mail_items(
         self,
@@ -31604,24 +31615,24 @@ class BackupWorker:
         # session gets a chance.
         _sid = snapshot.id
         _intended = snapshot.status
-        _vals = dict(
-            status=snapshot.status,
+        _vals = {
+            "status": snapshot.status,
             # Power BI escalates INCREMENTAL->FULL mid-run; merge()
             # used to persist the flip implicitly.
-            type=snapshot.type,
-            completed_at=snapshot.completed_at,
-            duration_secs=snapshot.duration_secs,
-            item_count=snapshot.item_count,
-            new_item_count=snapshot.new_item_count,
-            bytes_added=snapshot.bytes_added,
-            bytes_total=snapshot.bytes_total,
-            delta_token=snapshot.delta_token,
+            "type": snapshot.type,
+            "completed_at": snapshot.completed_at,
+            "duration_secs": snapshot.duration_secs,
+            "item_count": snapshot.item_count,
+            "new_item_count": snapshot.new_item_count,
+            "bytes_added": snapshot.bytes_added,
+            "bytes_total": snapshot.bytes_total,
+            "delta_token": snapshot.delta_token,
             # Handlers stamp per-file bookkeeping here mid-run
             # (files_failed drives the PARTIAL derivation; OneDrive
             # keeps delta cursors in it) — merge() used to carry it
             # implicitly, the explicit UPDATE must too.
-            delta_tokens_json=snapshot.delta_tokens_json,
-        )
+            "delta_tokens_json": snapshot.delta_tokens_json,
+        }
         _incoming_extra = dict(snapshot.extra_data or {})
 
         from shared.copy_workflow import has_pending_copy, verify_copy_resume
@@ -32449,7 +32460,6 @@ class BackupWorker:
         → advance state. Mirrors the Tier-2 finalize idiom exactly so rollup /
         Activity / retention all treat archive like any other incremental."""
         from shared import archive_graph
-        from shared.azure_storage import upload_blob_with_dedup
         import archive_backup as ab
 
         await _raise_if_job_cancelled(job_id)
@@ -32470,77 +32480,15 @@ class BackupWorker:
         snapshot = await self.create_snapshot(resource, message, job_id, snapshot_type=snap_type)
 
         try:
-            # 1) Enumerate every folder + item (lightweight fields only; content
-            #    comes solely from exportItems). Folders listed concurrently.
-            folders = await archive_graph.list_archive_folders(graph_client, mailbox_id)
-            # Full nested folder paths ('Archive/Projects/2024') from the
-            # parentFolderId chain — displayName alone is only the leaf name, so
-            # this is what actually RETAINS the archive's folder hierarchy.
-            folder_paths = ab.build_folder_path_map(folders)
-            fsem = asyncio.Semaphore(int(os.getenv("ARCHIVE_FOLDER_CONCURRENCY", "8")))
-
-            async def _list(folder):
-                async with fsem:
-                    items = await archive_graph.list_archive_items(
-                        graph_client, mailbox_id, folder["id"],
-                    )
-                    return [(folder, it) for it in items]
-
-            pairs: List[tuple] = []
-            for chunk in await asyncio.gather(*[_list(f) for f in folders]):
-                pairs.extend(chunk)
-
+            pairs, folder_paths = await self._enumerate_archive_items(graph_client, mailbox_id)
             current_ck = {it["id"]: it.get("changeKey") for (_f, it) in pairs if it.get("id")}
             id_to_pair = {it["id"]: (f, it) for (f, it) in pairs if it.get("id")}
             changed_ids = archive_graph.select_changed([it for (_f, it) in pairs], prev)
 
-            # 2) Export changed items, store each opaque blob 1:1, build rows.
-            #    Bounded concurrency over <=20-id export batches keeps peak
-            #    memory O(concurrency * one batch of blobs), not O(mailbox).
-            container = azure_storage_manager.get_container_name(str(tenant.id), ab.ARCHIVE_WORKLOAD)
-            shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
-            esem = asyncio.Semaphore(int(os.getenv("ARCHIVE_EXPORT_CONCURRENCY", "8")))
-            rows: List[Dict[str, Any]] = []
-            stored_ck: Dict[str, str] = {}
-            bytes_total = 0
-            _lock = asyncio.Lock()
-
-            def _chunks(seq, n=archive_graph.EXPORT_BATCH_MAX):
-                for i in range(0, len(seq), n):
-                    yield seq[i:i + n]
-
-            async def _export_chunk(id_chunk):
-                nonlocal bytes_total
-                async with esem:
-                    async for item_id, blob, err in archive_graph.export_items(
-                        graph_client, mailbox_id, id_chunk,
-                    ):
-                        if err or not blob:
-                            if err:
-                                code = err.get("code") if isinstance(err, dict) else err
-                                print(f"[{self.worker_id}] [USER_ARCHIVE] export error item={item_id}: {code}")
-                            continue  # not stored -> keeps old key -> retried next run
-                        f, it = id_to_pair.get(item_id, ({}, {"id": item_id}))
-                        content_hash = _fast_hash_hex(blob)
-                        blob_path = azure_storage_manager.build_blob_path(
-                            str(tenant.id), str(resource.id), str(snapshot.id), item_id,
-                        )
-                        up = await upload_blob_with_dedup(
-                            tenant.id, content_hash, container, blob_path, blob, shard, max_retries=3,
-                        )
-                        blob_path = up.get("blob_path", blob_path)
-                        row = ab.build_archive_item_row(
-                            snapshot_id=snapshot.id, tenant_id=tenant.id, folder=f, item=it,
-                            blob_path=blob_path, content_hash=content_hash, blob_len=len(blob),
-                            mailbox_id=mailbox_id, graph_version=archive_graph.ARCHIVE_GRAPH_VERSION,
-                            folder_path=folder_paths.get(f.get("id")),
-                        )
-                        async with _lock:
-                            rows.append(row)
-                            stored_ck[item_id] = it.get("changeKey")
-                            bytes_total += len(blob)
-
-            await asyncio.gather(*[_export_chunk(c) for c in _chunks(changed_ids)])
+            rows, stored_ck, bytes_total = await self._export_archive_changes(
+                graph_client, tenant, resource, snapshot, mailbox_id,
+                changed_ids, id_to_pair, folder_paths,
+            )
 
             # 3) Persist SnapshotItem rows (SPARSE — only this run's changed
             #    items; the full catalog is reconstructed from the chain).
@@ -32584,33 +32532,7 @@ class BackupWorker:
         except Exception as e:
             es = f"{type(e).__name__}: {e}"
             if ab.is_skippable_error(es):
-                # No archive access — the app isn't consented in this tenant, or
-                # the mailbox is unlicensed / gone. SKIP gracefully: complete the
-                # snapshot as a benign 0-item run (NOT failed) so the backup job
-                # doesn't alarm, and record why. A later re-discovery / consent
-                # picks it up. (Mirrors the license_missing handling for mail.)
-                print(f"[{self.worker_id}] [USER_ARCHIVE] {resource.display_name}: "
-                      f"inaccessible — skipping gracefully ({es[:160]})")
-                try:
-                    async with async_session_factory() as session:
-                        snap = await session.get(Snapshot, snapshot.id)
-                        if snap:
-                            snap.item_count = 0
-                            snap.new_item_count = 0
-                            snap.bytes_total = 0
-                            snap.bytes_added = 0
-                            snap.status = await _coerce_snapshot_terminal_on_cancel(
-                                snap, SnapshotStatus.COMPLETED,
-                            )
-                            snap.completed_at = datetime.utcnow()
-                            _ed = dict(snap.extra_data or {})
-                            _ed["archive_skipped"] = True
-                            _ed["archive_skip_reason"] = es[:300]
-                            snap.extra_data = _ed
-                            await session.commit()
-                except Exception as _fin_err:
-                    print(f"[{self.worker_id}] [USER_ARCHIVE] skip-finalize warning: {_fin_err}")
-                return {"item_count": 0, "bytes_added": 0, "skipped": True}
+                return await self._skip_inaccessible_archive_snapshot(resource, snapshot, es)
             # Genuine / transient failure — fail the snapshot so it retries.
             async with async_session_factory() as session:
                 snap = await session.get(Snapshot, snapshot.id)
@@ -32618,6 +32540,128 @@ class BackupWorker:
                     await self.fail_snapshot(session, snap, es)
             raise
 
+
+    async def _skip_inaccessible_archive_snapshot(self, resource, snapshot, es):
+        # No archive access — the app isn't consented in this tenant, or
+        # the mailbox is unlicensed / gone. SKIP gracefully: complete the
+        # snapshot as a benign 0-item run (NOT failed) so the backup job
+        # doesn't alarm, and record why. A later re-discovery / consent
+        # picks it up. (Mirrors the license_missing handling for mail.)
+        print(f"[{self.worker_id}] [USER_ARCHIVE] {resource.display_name}: "
+              f"inaccessible — skipping gracefully ({es[:160]})")
+        try:
+            async with async_session_factory() as session:
+                snap = await session.get(Snapshot, snapshot.id)
+                if snap:
+                    snap.item_count = 0
+                    snap.new_item_count = 0
+                    snap.bytes_total = 0
+                    snap.bytes_added = 0
+                    snap.status = await _coerce_snapshot_terminal_on_cancel(
+                        snap, SnapshotStatus.COMPLETED,
+                    )
+                    snap.completed_at = datetime.utcnow()
+                    _ed = dict(snap.extra_data or {})
+                    _ed["archive_skipped"] = True
+                    _ed["archive_skip_reason"] = es[:300]
+                    snap.extra_data = _ed
+                    await session.commit()
+        except Exception as _fin_err:
+            print(f"[{self.worker_id}] [USER_ARCHIVE] skip-finalize warning: {_fin_err}")
+        return {"item_count": 0, "bytes_added": 0, "skipped": True}
+
+    async def _enumerate_archive_items(self, graph_client, mailbox_id):
+        from shared import archive_graph
+        import archive_backup as ab
+        # 1) Enumerate every folder + item (lightweight fields only; content
+        #    comes solely from exportItems). Folders listed concurrently.
+        folders = await archive_graph.list_archive_folders(graph_client, mailbox_id)
+        # Full nested folder paths ('Archive/Projects/2024') from the
+        # parentFolderId chain — displayName alone is only the leaf name, so
+        # this is what actually RETAINS the archive's folder hierarchy.
+        folder_paths = ab.build_folder_path_map(folders)
+        fsem = asyncio.Semaphore(int(os.getenv("ARCHIVE_FOLDER_CONCURRENCY", "8")))
+
+        async def _list(folder):
+            async with fsem:
+                items = await archive_graph.list_archive_items(
+                    graph_client, mailbox_id, folder["id"],
+                )
+                return [(folder, it) for it in items]
+
+        pairs: List[tuple] = []
+        for chunk in await asyncio.gather(*[_list(f) for f in folders]):
+            pairs.extend(chunk)
+
+        return pairs, folder_paths
+
+    async def _export_archive_changes(self, graph_client, tenant, resource, snapshot,
+                                       mailbox_id, changed_ids, id_to_pair, folder_paths):
+        from shared import archive_graph
+        import archive_backup as ab
+        # 2) Export changed items, store each opaque blob 1:1, build rows.
+        #    Bounded concurrency over <=20-id export batches keeps peak
+        #    memory O(concurrency * one batch of blobs), not O(mailbox).
+        container = azure_storage_manager.get_container_name(str(tenant.id), ab.ARCHIVE_WORKLOAD)
+        shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
+        esem = asyncio.Semaphore(int(os.getenv("ARCHIVE_EXPORT_CONCURRENCY", "8")))
+        rows: List[Dict[str, Any]] = []
+        stored_ck: Dict[str, str] = {}
+        bytes_total = 0
+        _lock = asyncio.Lock()
+
+        def _chunks(seq, n=archive_graph.EXPORT_BATCH_MAX):
+            for i in range(0, len(seq), n):
+                yield seq[i:i + n]
+
+        async def _export_chunk(id_chunk):
+            nonlocal bytes_total
+            async with esem:
+                async for item_id, blob, err in archive_graph.export_items(
+                    graph_client, mailbox_id, id_chunk,
+                ):
+                    if err or not blob:
+                        self._log_archive_export_error(item_id, err)
+                        continue  # not stored -> keeps old key -> retried next run
+                    row, change_key = await self._store_archive_export_row(
+                        tenant, resource, snapshot, mailbox_id, item_id, blob,
+                        id_to_pair, folder_paths, container, shard,
+                    )
+                    async with _lock:
+                        rows.append(row)
+                        stored_ck[item_id] = change_key
+                        bytes_total += len(blob)
+
+        await asyncio.gather(*[_export_chunk(c) for c in _chunks(changed_ids)])
+
+        return rows, stored_ck, bytes_total
+
+    def _log_archive_export_error(self, item_id, err):
+        if err:
+            code = err.get("code") if isinstance(err, dict) else err
+            print(f"[{self.worker_id}] [USER_ARCHIVE] export error item={item_id}: {code}")
+
+    async def _store_archive_export_row(self, tenant, resource, snapshot, mailbox_id,
+                                         item_id, blob, id_to_pair, folder_paths, container, shard):
+        from shared import archive_graph
+        from shared.azure_storage import upload_blob_with_dedup
+        import archive_backup as ab
+        f, it = id_to_pair.get(item_id, ({}, {"id": item_id}))
+        content_hash = _fast_hash_hex(blob)
+        blob_path = azure_storage_manager.build_blob_path(
+            str(tenant.id), str(resource.id), str(snapshot.id), item_id,
+        )
+        up = await upload_blob_with_dedup(
+            tenant.id, content_hash, container, blob_path, blob, shard, max_retries=3,
+        )
+        blob_path = up.get("blob_path", blob_path)
+        row = ab.build_archive_item_row(
+            snapshot_id=snapshot.id, tenant_id=tenant.id, folder=f, item=it,
+            blob_path=blob_path, content_hash=content_hash, blob_len=len(blob),
+            mailbox_id=mailbox_id, graph_version=archive_graph.ARCHIVE_GRAPH_VERSION,
+            folder_path=folder_paths.get(f.get("id")),
+        )
+        return row, it.get("changeKey")
 
     async def _load_archive_state(self, tenant: Tenant, resource: Resource) -> Optional[Dict[str, str]]:
         """Load the ``{item_id: changeKey}`` incremental cursor blob, or ``None``
