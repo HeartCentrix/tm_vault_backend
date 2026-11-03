@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import logging
 import os
+import time
 from uuid import uuid4
 from sqlalchemy import and_, exists, func, or_, select
 from shared import provider_work as work
@@ -287,11 +288,16 @@ class ProviderWorkRunner:
             owner_task.cancel()
 
     async def run_once(self):
+        entered = time.monotonic()
         async with self.budget.permit():
+            admitted = time.monotonic()
             async with self.factory.begin() as session:
                 claim = await work.claim_due_work(session, owner_id=self.owner_id)
             if claim is None:
                 return None
+            started = time.monotonic()
+            logger.info('provider_turn_started work_id=%s snapshot_id=%s job_id=%s generation=%s local_slot_wait_s=%.3f claim_transaction_s=%.3f',
+                claim.work_id, claim.snapshot_id, claim.job_id, claim.generation, admitted-entered, started-admitted)
             execution = ProviderExecution(self.factory, claim)
             token = _EXECUTION.set(execution)
             renewer = asyncio.create_task(self._renew(execution, asyncio.current_task()))
@@ -319,6 +325,8 @@ class ProviderWorkRunner:
                 async with self.factory.begin() as session:
                     await work.suspend_current_work(session, claim, next_eligible_at=error.next_eligible_at,
                         reason=getattr(error, 'stage', 'provider_wait'))
+                logger.info('provider_turn_deferred work_id=%s snapshot_id=%s stage=%s next_eligible_at=%s',
+                    claim.work_id, claim.snapshot_id, getattr(error, 'stage', 'provider_wait'), error.next_eligible_at)
                 return {'provider_waiting': True, 'provider_work_id': str(claim.work_id)}
             except ProviderBudgetExhausted:
                 await _join_provider_tasks(execution)
@@ -338,7 +346,13 @@ class ProviderWorkRunner:
                 if execution.lease_lost and not self._closing:
                     return {'provider_lease_lost': True}
                 raise
+            except Exception as error:
+                logger.warning('provider_turn_error work_id=%s snapshot_id=%s job_id=%s error_type=%s',
+                    claim.work_id, claim.snapshot_id, claim.job_id, type(error).__name__)
+                raise
             finally:
+                logger.info('provider_turn_ended work_id=%s snapshot_id=%s elapsed_s=%.3f',
+                    claim.work_id, claim.snapshot_id, time.monotonic()-started)
                 await _join_provider_tasks(execution)
                 renewer.cancel()
                 await asyncio.gather(renewer, return_exceptions=True)
