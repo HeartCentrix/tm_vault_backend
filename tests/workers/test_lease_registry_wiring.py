@@ -223,11 +223,12 @@ def test_write_snapshot_terminal_unregisters_even_when_the_write_is_lost(monkeyp
     snapshot = _bw.Snapshot(id=sid, status=_bw.SnapshotStatus.FAILED, extra_data={"error": "x"})
     import shared.db_retry as db_retry
     monkeypatch.setattr(db_retry, "run_with_db_retry", _retry_that_raises)
+    write = _worker()._write_snapshot_terminal(
+        None, snapshot,
+        allowed_from=(_bw.SnapshotStatus.IN_PROGRESS, _bw.SnapshotStatus.FAILED),
+    )
     with pytest.raises(ConnectionError):
-        _run(_worker()._write_snapshot_terminal(
-            None, snapshot,
-            allowed_from=(_bw.SnapshotStatus.IN_PROGRESS, _bw.SnapshotStatus.FAILED),
-        ))
+        _run(write)
     assert registered_ids("snapshots") == []
 
 

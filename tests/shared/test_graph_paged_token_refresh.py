@@ -378,8 +378,9 @@ def test_iter_pages_hardened_persistent_401_raises(monkeypatch):
         monkeypatch,
     )
 
+    drain = _drain(g._iter_pages_hardened("https://graph.microsoft.com/beta/x"))
     with pytest.raises(httpx.HTTPStatusError):
-        _run(_drain(g._iter_pages_hardened("https://graph.microsoft.com/beta/x")))
+        _run(drain)
 
 
 def test_iter_pages_delta_cursor_flows_per_stream_not_on_client(monkeypatch):

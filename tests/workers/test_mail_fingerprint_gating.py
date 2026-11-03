@@ -34,7 +34,8 @@ _MAIN_PATH = _REPO_ROOT / "workers" / "backup-worker" / "main.py"
 _spec = importlib.util.spec_from_file_location("bw_mail_fp_gate", _MAIN_PATH)
 _bw = importlib.util.module_from_spec(_spec)  # type: ignore[arg-type]
 sys.modules["bw_mail_fp_gate"] = _bw
-assert _spec and _spec.loader
+assert _spec
+assert _spec.loader
 try:
     _spec.loader.exec_module(_bw)  # type: ignore[union-attr]
 except Exception as exc:  # pragma: no cover - import guard

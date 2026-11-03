@@ -205,7 +205,8 @@ def test_internal_key_creates_an_alert_201_in_the_list_row_shape():
     assert body["message"] == body["description"] == _payload()["message"]
     assert body["createdAt"]
 
-    assert len(sess.added) == 1 and sess.flushes == 1
+    assert len(sess.added) == 1
+    assert sess.flushes == 1
     row = sess.added[0]
     assert isinstance(row, Alert)
     assert body["id"] == str(row.id)
@@ -284,7 +285,8 @@ def test_another_resource_in_the_same_tenant_gets_its_own_row():
     )
 
     assert r.status_code == 201, r.text
-    assert len(sess.added) == 1 and str(sess.added[0].resource_id) == other
+    assert len(sess.added) == 1
+    assert str(sess.added[0].resource_id) == other
 
 
 def test_tenant_wide_alert_without_a_resource_dedupes_on_null_keys():

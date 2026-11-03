@@ -552,7 +552,8 @@ async def test_stage_is_bounded_and_duplicate_delivery_reports_actual_successes(
         await store.stage(lease, items)
     staged = await store.stage(lease, items[:200])
     replay = await store.stage(lease, items[:200])
-    assert staged.staged_items == 200 and staged.new_versions == 200
+    assert staged.staged_items == 200
+    assert staged.new_versions == 200
     assert replay.staged_items == replay.new_versions == 0
 
 
@@ -595,8 +596,9 @@ async def test_hydration_reports_retired_objects_instead_of_serving_a_stale_desc
         await session.execute(update(models.ChatBlobObject).where(models.ChatBlobObject.id == binary.content.object_id).values(state="DELETING"))
     async with store.factory() as session:
         links = list((await session.scalars(select(models.SnapshotItem).where(models.SnapshotItem.snapshot_id == scope.snapshot_id))).all())
-        with pytest.raises(api().ChatCatalogueIntegrityError):
-            await api().materialize_chat_items(session, links)
+        catalogue = api()
+        with pytest.raises(catalogue.ChatCatalogueIntegrityError):
+            await catalogue.materialize_chat_items(session, links)
 
 
 async def test_simultaneous_publication_is_idempotent(store):
@@ -847,8 +849,9 @@ async def test_expired_staged_capture_can_be_replaced_without_touching_other_cha
     await store.stage(fresh, [message(replacement_body)])
     await store.observe(scope, fresh, [message(replacement_body)])
     assert (await store.publish(fresh)).outcome == "complete"
+    stale_items = [message("stale worker")]
     with pytest.raises(api().ChatCatalogueWorkLeaseMoved):
-        await store.stage(old, [message("stale worker")])
+        await store.stage(old, stale_items)
     async with store.factory() as session:
         assert (await session.get(models.SnapshotChatInventory, (scope.snapshot_id, other.chat_id))).inventory_id == other_result.inventory_id
         links = list((await session.scalars(select(models.SnapshotItem).where(models.SnapshotItem.snapshot_id == scope.snapshot_id))).all())

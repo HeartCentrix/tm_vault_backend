@@ -361,7 +361,8 @@ def test_union_carry_has_a_one_shot_claim_and_rewinds_on_failure():
     rw = rw[: rw.index("\n    async def ", 10)]
     assert "_persist_mail_delta_state(" in rw and "ok_token_keys=set()" in rw
     # eviction outcome is threaded back so a failed rewind is never reported as done
-    assert "evict_result" in rw and "fingerprint" in rw
+    assert "evict_result" in rw
+    assert "fingerprint" in rw
 
 
 def test_shard_records_drained_keys_and_caps_tombstones():

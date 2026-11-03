@@ -35,7 +35,8 @@ _MAIN_PATH = _REPO_ROOT / "workers" / "backup-worker" / "main.py"
 _spec = importlib.util.spec_from_file_location("bw_chat_honesty", _MAIN_PATH)
 _bw = importlib.util.module_from_spec(_spec)  # type: ignore[arg-type]
 sys.modules["bw_chat_honesty"] = _bw
-assert _spec and _spec.loader
+assert _spec
+assert _spec.loader
 try:
     _spec.loader.exec_module(_bw)  # type: ignore[union-attr]
 except Exception as exc:  # pragma: no cover - import guard
@@ -85,7 +86,8 @@ def test_timeout_cancelled_remaining_chats_reports_partial():
         items_persisted=9_100,
     )
     assert status is _bw.SnapshotStatus.PARTIAL
-    assert reason and "160" in reason
+    assert reason
+    assert "160" in reason
 
 
 def test_timeout_with_zero_items_and_zero_successes_is_failed():

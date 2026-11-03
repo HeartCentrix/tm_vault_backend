@@ -176,6 +176,8 @@ async def test_cancel_waits_for_started_disk_write_before_closing_file(tmp_path,
 async def test_spool_refuses_exhausted_disk_before_writing(tmp_path, monkeypatch):
     from types import SimpleNamespace
     monkeypatch.setattr('shutil.disk_usage',lambda path: SimpleNamespace(free=0))
-    with pytest.raises(api().ChatContentCaptureError,match='temporary space'):
-        async with api().spool_chat_content(chunks(b'abc'),directory=tmp_path): pass
+    stream = api().spool_chat_content(chunks(b'abc'), directory=tmp_path)
+    with pytest.raises(api().ChatContentCaptureError, match='temporary space'):
+        async with stream:
+            pass
     assert list(tmp_path.iterdir()) == []

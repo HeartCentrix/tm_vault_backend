@@ -273,7 +273,8 @@ def test_terminal_with_a_non_terminal_status_never_writes_a_status():
     s = _Session(resource=res)
     _stamp(s, res, status="IN_PROGRESS", terminal=True)
     (p,) = _resource_updates(s)
-    assert "last_backup_status" not in p and "last_backup_at" not in p
+    assert "last_backup_status" not in p
+    assert "last_backup_at" not in p
     assert "storage_bytes" in p
 
 

@@ -181,7 +181,8 @@ def test_walk_folders_still_walks_primary_only_archive():
     g.moved = set()
     items, failures = _walk(g)
     assert sorted(i["id"] for i in items) == ["i-aux1", "i-stay1"]
-    assert g.bad_requests == [] and failures == []
+    assert g.bad_requests == []
+    assert failures == []
 
 
 def test_walk_folders_tags_folder_paths():

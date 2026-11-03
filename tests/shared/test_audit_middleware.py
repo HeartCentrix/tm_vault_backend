@@ -165,8 +165,9 @@ def test_app_exception_propagates_and_is_audited(recorder):
     async def boom(scope, receive, send):
         raise RuntimeError("kaboom")
     app = mw.AuditMiddleware(boom, service_name="x")
+    scope = _scope(method="POST", path="/api/v1/tenants")
     with pytest.raises(RuntimeError, match="kaboom"):
-        _drive_sync(app, _scope(method="POST", path="/api/v1/tenants"))
+        _drive_sync(app, scope)
     assert len(recorder.events) == 1
     assert recorder.events[0]["outcome"] == "FAILURE"
     assert recorder.events[0]["details"]["status"] == 500

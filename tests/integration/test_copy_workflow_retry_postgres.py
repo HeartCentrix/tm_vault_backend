@@ -99,7 +99,8 @@ async def test_registration_lost_commit_ack_reuses_same_intent(store, monkeypatc
         await enabled.seal_current_copy({'resume_kind': 'user_content'})
     async with store.factory() as session:
         tasks = list((await session.scalars(select(models.CopyWorkTask))).all())
-        assert len(tasks) == 1 and tasks[0].id == deferred.task_id
+        assert len(tasks) == 1
+        assert tasks[0].id == deferred.task_id
 
 
 async def test_registration_exhaustion_latches_first_failure_across_later_success(store, monkeypatch, enabled):

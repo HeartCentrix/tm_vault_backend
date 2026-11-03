@@ -239,8 +239,10 @@ def test_resource_in_unentitled_tenant_rejected():
     parent = _entra_user(VICTIM, TENANT_B)
     chats = _user_chats(parent)
     sess = _FakeSession(resources=[parent, chats], tenants=[_tenant_a(), _tenant_b()])
+    token = _token(VICTIM, tenant_ids=[TENANT_A])
+    resource_id = str(chats.id)
     with pytest.raises(HTTPException) as exc:
-        _own(sess, _token(VICTIM, tenant_ids=[TENANT_A]), str(chats.id))
+        _own(sess, token, resource_id)
     assert exc.value.status_code == 403
 
 

@@ -65,7 +65,9 @@ async def test_single_wrapper_preserves_catalogue_logical_and_delta_counters(bw,
     returned = await worker._backup_user_content_single(object(), SimpleNamespace(id=uuid4()),
         SimpleNamespace(id=stored.id), object(), {"jobId": str(uuid4())})
     assert returned == result
-    assert stored.bytes_total == 100 and stored.bytes_added == 0 and stored.new_item_count == 0
+    assert stored.bytes_total == 100
+    assert stored.bytes_added == 0
+    assert stored.new_item_count == 0
     session.commit.assert_not_awaited()
 
 

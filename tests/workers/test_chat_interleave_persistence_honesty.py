@@ -169,7 +169,8 @@ async def test_finalizer_retries_network_only_and_preserves_persistence_failure_
     assert written['hc_drain_status'] == 'FAILED'
     assert written['status'] == pipeline.worker.SnapshotStatus.PARTIAL
     reason = written['extra_data']['failure_reason']
-    assert 'lost hostedContent' in reason and 'lost attachments' in reason
+    assert 'lost hostedContent' in reason
+    assert 'lost attachments' in reason
     if overflow:
         assert 'CHAT_INTERLEAVE_MAX_RETAINED_FAILURES' in reason
 

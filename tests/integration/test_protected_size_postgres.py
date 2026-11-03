@@ -841,7 +841,9 @@ async def test_real_serialization_conflict_retries_whole_page_without_delta_dupl
         expire_on_commit=False,
     )
     result = await refresh_once(factory, page_size=1)
-    assert injected and result["status"] == "retry" and result["sqlstate"] == "40001"
+    assert injected
+    assert result["status"] == "retry"
+    assert result["sqlstate"] == "40001"
     assert (await ledger.summary())["freshness"] == "stale"
     await ledger.sql("UPDATE resource_protected_bytes SET next_attempt='epoch'")
     await ledger.drain()

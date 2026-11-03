@@ -117,8 +117,9 @@ def test_require_admin_and_verified_user_helpers():
     assert e1.value.status_code == 500
 
     # regular user -> require_admin 403
+    request = Req({"roles": ["USER"]})
     with pytest.raises(HTTPException) as e2:
-        ae.require_admin(Req({"roles": ["USER"]}))
+        ae.require_admin(request)
     assert e2.value.status_code == 403
 
     # admin -> passes

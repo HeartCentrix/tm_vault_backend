@@ -116,13 +116,18 @@ async def test_guard_stops_stream_after_pin_renewal_fails(store, monkeypatch):
     async def content():
         yield b"must not be emitted"
 
-    with pytest.raises(RuntimeError, match="pin|lease|renew"):
-        async with api().catalogue_read_pin(store.factory, snapshot_ids=[scope.snapshot_id],
-                                           expires_seconds=1) as lease:
-            await asyncio.wait_for(failed.wait(), 2)
-            await asyncio.sleep(0)
-            async for _ in lease.guard(content()):
-                pytest.fail("data emitted without valid protection")
+    pin = api().catalogue_read_pin(store.factory, snapshot_ids=[scope.snapshot_id],
+                                   expires_seconds=1)
+    lease = await pin.__aenter__()
+    try:
+        await asyncio.wait_for(failed.wait(), 2)
+        await asyncio.sleep(0)
+        guarded_content = lease.guard(content())
+        with pytest.raises(RuntimeError, match="pin|lease|renew"):
+            await anext(guarded_content)
+    finally:
+        with pytest.raises(RuntimeError, match="pin|lease|renew"):
+            await pin.__aexit__(None, None, None)
 
 
 async def test_inventory_pin_rejects_a_retiring_member_object(store):

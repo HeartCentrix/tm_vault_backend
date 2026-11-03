@@ -86,9 +86,10 @@ async def test_batch_costs_are_atomic_and_include_all_workloads(redis_client):
     mail = scope(module, workload='exchange')
     files = scope(module, workload='sharepoint')
     await admission.cooldown(files, 600)
+    batch = admission.admit_many([(mail, 3), (files, 2)], wait_budget=0)
     with pytest.raises(module.ProviderDeferred):
-        async with admission.admit_many([(mail, 3), (files, 2)], wait_budget=0):
-            pytest.fail('partially granted a throttled mixed workload batch')
+        async with batch:
+            pass
     keys, _, _ = admission._keys(mail)
     assert float(await redis_client.hget(keys[-1], 'tokens')) == 10
     async with admission.admit(mail, cost=10, wait_budget=0):

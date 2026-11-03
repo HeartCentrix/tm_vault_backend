@@ -195,7 +195,8 @@ async def test_wave_dispatches_the_next_budget_and_records_the_remainder(wired):
     n = await sched.drain_policy_cycle(str(policy.id), now=NOW)
     assert n == 50 and len(_ids(session)) == 50
     spec = session.added[0].spec
-    assert spec["batch_id"] == "cycle-batch" and spec["wave"] == 2
+    assert spec["batch_id"] == "cycle-batch"
+    assert spec["wave"] == 2
     assert spec["triggered_by"] == "SCHEDULED" and spec["sla_policy_id"] == str(policy.id)
     assert len(spec["deferred_resource_ids"]) == 256
     assert spec["overlap_held_resource_ids"] == []

@@ -135,7 +135,8 @@ async def test_published_marker_without_its_receipt_cannot_be_read_as_complete(s
 async def test_first_presentation_capture_preserves_a_known_unmarked_carried_name(store, provenance, expected):
     old = await legacy(store, [('chat-a', 'chats/Planning', {})])
     async with store.factory.begin() as db:
-        (await db.get(models.Snapshot, old.snapshot_id)).status = models.SnapshotStatus.COMPLETED
+        snapshot = await db.get(models.Snapshot, old.snapshot_id)
+        snapshot.status = models.SnapshotStatus.COMPLETED
     current = await legacy(store, [])
     async with store.factory.begin() as db:
         carry = await enqueue(db, CopyRequest('CHAT_CARRY', 'giant', current.snapshot_id,

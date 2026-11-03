@@ -93,7 +93,7 @@ def test_group_larger_than_flush_threshold_exports_every_item(
 ):
     monkeypatch.setenv("PST_GROUP_FLUSH_AT", "10")
     monkeypatch.setattr(pst_export, "MailPstWriter", _RecordingWriter)
-    _RecordingWriter.calls = []
+    monkeypatch.setattr(_RecordingWriter, "calls", [])
 
     items = [_mk_item(i) for i in range(25)]
     checkpoints: list = []
@@ -121,7 +121,7 @@ def test_checkpoint_marks_group_completed_only_after_stream_end(
 ):
     monkeypatch.setenv("PST_GROUP_FLUSH_AT", "10")
     monkeypatch.setattr(pst_export, "MailPstWriter", _RecordingWriter)
-    _RecordingWriter.calls = []
+    monkeypatch.setattr(_RecordingWriter, "calls", [])
 
     items = [_mk_item(i) for i in range(25)]
     checkpoints: list = []
@@ -143,7 +143,7 @@ def test_small_group_keeps_clean_single_filename(monkeypatch, tmp_path):
     original (un-suffixed) filename."""
     monkeypatch.setenv("PST_GROUP_FLUSH_AT", "10")
     monkeypatch.setattr(pst_export, "MailPstWriter", _RecordingWriter)
-    _RecordingWriter.calls = []
+    monkeypatch.setattr(_RecordingWriter, "calls", [])
 
     items = [_mk_item(i) for i in range(4)]
     checkpoints: list = []

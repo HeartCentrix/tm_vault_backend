@@ -67,7 +67,8 @@ async def test_catalogue_single_intake_cannot_reactivate_terminal_or_cancelling_
         snapshot = await db.get(models.Snapshot, scope.snapshot_id)
         job_id = snapshot.job_id
         await db.execute(delete(models.Snapshot).where(models.Snapshot.id == snapshot.id))
-        (await db.get(models.Job, job_id)).status = status
+        job = await db.get(models.Job, job_id)
+        job.status = status
     monkeypatch.setattr(worker_module, "async_session_factory", store.factory)
     monkeypatch.setattr(worker_module.settings, "CHAT_CATALOGUE_WRITER_ENABLED", True)
     worker = worker_module.BackupWorker.__new__(worker_module.BackupWorker)

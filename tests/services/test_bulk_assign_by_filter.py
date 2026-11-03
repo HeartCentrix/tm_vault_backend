@@ -262,7 +262,8 @@ def test_neither_resource_ids_nor_filter_is_400(patched):
     with pytest.raises(HTTPException) as ei:
         _run(_mod.bulk_assign_policy(req, db))
     assert ei.value.status_code == 400
-    assert db.updates == [] and db.commit_count == 0
+    assert db.updates == []
+    assert db.commit_count == 0
 
 
 def test_empty_filter_types_is_400(patched):
@@ -290,7 +291,8 @@ def test_id_list_with_dry_run_is_400_and_writes_nothing(patched):
         _run(_mod.bulk_assign_policy(req, db))
     assert ei.value.status_code == 400
     assert row.sla_policy_id is None, "a 'preview' call must never assign"
-    assert db.updates == [] and db.commit_count == 0
+    assert db.updates == []
+    assert db.commit_count == 0
     assert patched.notify == 0 and patched.tier2 == []
 
 

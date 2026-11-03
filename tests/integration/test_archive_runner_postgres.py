@@ -133,4 +133,5 @@ async def test_page_commit_survives_process_cancel_without_false_completion(stor
     ledger = ArchiveCapture(store.factory, fence)
     await ledger.begin('https://graph.microsoft.com/beta/admin/exchange/mailboxes/MBX:Primary/folders', 'synthetic')
     scope = await ledger.claim_scope()
-    assert scope['phase'] == 'root' and scope['next_url'].endswith('?page=2')
+    assert scope['phase'] == 'root'
+    assert scope['next_url'].endswith('?page=2')

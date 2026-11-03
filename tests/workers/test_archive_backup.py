@@ -663,9 +663,8 @@ def test_baseline_selection_skips_rowless_snapshots():
     i = src.find("def _default_load_prev")
     j = src.find("async def", i + 10)
     block = src[i:j]
-    assert "EXISTS" in block and "ARCHIVE_ITEM" in block, (
-        "_default_load_prev must EXISTS-filter on ARCHIVE_ITEM rows"
-    )
+    assert "EXISTS" in block, "_default_load_prev must EXISTS-filter on ARCHIVE_ITEM rows"
+    assert "ARCHIVE_ITEM" in block, "_default_load_prev must EXISTS-filter on ARCHIVE_ITEM rows"
 
 
 def test_liveness_guard_aborts_when_snapshot_row_is_lost():
