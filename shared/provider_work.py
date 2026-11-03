@@ -9,7 +9,7 @@ import json
 import math
 import os
 from uuid import UUID, uuid4
-from sqlalchemy import delete, exists, func, select, update
+from sqlalchemy import case, delete, exists, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import aliased
 from shared.models import (Job, Snapshot, SnapshotPartition, Resource, SlaPolicy,
@@ -110,11 +110,15 @@ async def _parents(session, snapshot_id, partition_id=None, *, skip_locked=False
         raise ProviderWorkConflict('provider snapshot removed')
     job = await session.scalar(select(Job).where(Job.id == hint.job_id).with_for_update(skip_locked=skip_locked, read=share_job)
         .execution_options(populate_existing=True))
+    if job is None:
+        raise ProviderWorkConflict('provider parent locked or removed')
     snapshot = await session.scalar(select(Snapshot).where(Snapshot.id == hint.id).with_for_update(skip_locked=skip_locked)
         .execution_options(populate_existing=True))
+    if snapshot is None:
+        raise ProviderWorkConflict('provider parent locked or removed')
     partition = await session.scalar(select(SnapshotPartition).where(SnapshotPartition.id == _uuid(partition_id))
         .with_for_update(skip_locked=skip_locked).execution_options(populate_existing=True)) if partition_id else None
-    if job is None or snapshot is None or (partition_id and partition is None):
+    if partition_id and partition is None:
         raise ProviderWorkConflict('provider parent locked or removed')
     return job, snapshot, partition
 
@@ -221,10 +225,9 @@ async def claim_due_work(session, *, owner_id, lease_seconds=120, _clamp_rounds=
         .order_by(tq.virtual_finish, pq.virtual_finish, rq.virtual_finish, ProviderWork.queue_entered_at, ProviderWork.id)
         .limit(64))).all()
     for hint in candidates:
-        if (await session.scalar(select(func.count()).select_from(ProviderWork).where(running, ProviderWork.tenant_id == hint.tenant_id))) >= control.tenant_capacity:
-            continue
         try:
-            job, snapshot, partition = await _parents(session, hint.snapshot_id, hint.partition_id, skip_locked=True)
+            job, snapshot, partition = await _parents(session, hint.snapshot_id, hint.partition_id,
+                skip_locked=True, share_job=True)
         except ProviderWorkConflict:
             continue
         row = await session.scalar(select(ProviderWork).where(ProviderWork.id == hint.id).with_for_update(skip_locked=True)
@@ -312,9 +315,13 @@ async def claim_due_work(session, *, owner_id, lease_seconds=120, _clamp_rounds=
         row.parent_lease_token, row.snapshot_lease_token, row.job_lease_token = leaf.lease_token, snapshot.lease_token, job.lease_token
         if copy is not None:
             copy.parent_lease_token, copy.snapshot_lease_token, copy.job_lease_token = row.parent_lease_token, row.snapshot_lease_token, row.job_lease_token
-        for key in (row.tenant_queue_key, row.policy_queue_key, row.resource_queue_key):
-            queue = await session.get(ProviderWorkQueue, key)
-            queue.virtual_finish += 1 / queue.weight
+        keys = (row.tenant_queue_key, row.policy_queue_key, row.resource_queue_key)
+        # Match ensure_work's tenant -> policy -> resource lock order before charging.
+        await session.execute(select(ProviderWorkQueue.key).where(ProviderWorkQueue.key.in_(keys))
+            .order_by(case({key: index for index, key in enumerate(keys)}, value=ProviderWorkQueue.key))
+            .with_for_update())
+        await session.execute(update(ProviderWorkQueue).where(ProviderWorkQueue.key.in_(keys))
+            .values(virtual_finish=ProviderWorkQueue.virtual_finish + 1.0 / ProviderWorkQueue.weight))
         await session.flush()
         return _receipt(row)
     return None
