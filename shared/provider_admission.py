@@ -225,6 +225,9 @@ class ScopedProviderAdmission:
 
         try:
             while True:
+                from shared.provider_runtime import (before_provider_admission,
+                    provider_admission_granted, wait_provider_concurrency)
+                await before_provider_admission()
                 try:
                     granted, delay, clock, reason, denied = await self._grant_script(keys=[*buckets, *slots, cancelled], args=[
                         json.dumps([[self.limits.rate, self.limits.burst, costs[key]] for key in buckets]),
@@ -234,6 +237,13 @@ class ScopedProviderAdmission:
                 if int(granted) == -1:
                     raise ProviderDeferred(context, 1, stage='admission_cancelled')
                 if int(granted) == 1:
+                    if not provider_admission_granted():
+                        # Do not pin a racing new grant while older transfers need its slot.
+                        try:
+                            await self._release_script(keys=[*slots, cancelled], args=[token, self.limits.lease_seconds])
+                        except Exception:
+                            raise ProviderDeferred(context, 5, stage='coordinator_unavailable') from None
+                        await before_provider_admission()
                     break
                 delay = float(delay)
                 if delay <= 0 or not math.isfinite(delay):
@@ -241,8 +251,11 @@ class ScopedProviderAdmission:
                 if time.monotonic() - started + delay > wait_budget:
                     index = int(denied)
                     key = buckets[index - 1] if index > 0 else slots[-index - 1]
-                    raise ProviderDeferred(context, delay, server_time=float(clock),
+                    error = ProviderDeferred(context, delay, server_time=float(clock),
                         reason=reason.decode() if isinstance(reason, bytes) else reason, scope=scopes[key])
+                    if error.reason == 'concurrency' and await wait_provider_concurrency(error):
+                        continue
+                    raise error
                 await asyncio.sleep(delay)
             renewer = asyncio.create_task(renew())
             try:

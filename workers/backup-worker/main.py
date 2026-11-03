@@ -20633,7 +20633,8 @@ class BackupWorker:
         from shared.provider_work import current_claim, _owned, ProviderWorkConflict
         from shared.copy_workflow import verify_copy_resume
         from shared.provider_admission import ProviderDeferred
-        from shared.provider_runtime import ProviderBudgetExhausted, ProviderTurnDeferred
+        from shared.provider_runtime import (ProviderBudgetExhausted, ProviderTurnDeferred,
+            provider_transfer_scope, provider_drain_callback, provider_receipt_scope)
 
         v2_enabled = settings.ONEDRIVE_BACKUP_V2_ENABLED
         max_files = None if v2_enabled else self.LEGACY_USER_ONEDRIVE_MAX_FILES
@@ -20964,6 +20965,12 @@ class BackupWorker:
         flush_lock = asyncio.Lock()
 
         async def _flush_updates() -> int:
+            # A periodic flush may already own flush_lock when congestion is
+            # observed. Its proof reads must be allowed to finish too.
+            with provider_receipt_scope():
+                return await _flush_updates_inner()
+
+        async def _flush_updates_inner() -> int:
             """Drain `updates` atomically, bulk-UPDATE blob_paths,
             bump snapshot's live counters, and free the Python entries.
             Safe to call repeatedly (no-op on empty backlog). Wrapped
@@ -21174,7 +21181,7 @@ class BackupWorker:
                 str(tenant.id), str(resource.id), str(snapshot.id), file_id,
             )
 
-            async with file_sem:
+            async with file_sem, provider_transfer_scope(timeout=per_file_timeout):
                 # Prefer the pre-fetched $batch URL; only fall back to
                 # a serial GET if $batch returned nothing for this file
                 # (or the batch call failed entirely).
@@ -21392,20 +21399,22 @@ class BackupWorker:
         # pipeline. It wakes every `flush_interval_s` OR when the
         # backlog cap is hit, committing blob_paths + live-bumping
         # snap counters so the UI shows progress in real time.
-        flusher_task = asyncio.create_task(_periodic_flusher())
-        download_tasks = [asyncio.create_task(_process_one(f)) for f in ordered]
-        try:
-            await asyncio.gather(*download_tasks)
-        finally:
-            # Stop producers before the final drain, including provider deferral.
-            for task in download_tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*download_tasks, return_exceptions=True)
-            flush_done_evt.set()
-            backlog_high_evt.set()
-            await flusher_task
-            await _flush_updates()
+        with provider_drain_callback(_flush_updates):
+            flusher_task = asyncio.create_task(_periodic_flusher())
+            download_tasks = [asyncio.create_task(_process_one(f)) for f in ordered]
+            try:
+                await asyncio.gather(*download_tasks)
+            finally:
+                # Concurrency deferral reaches here only after admitted files
+                # and their receipt callback drain. Other aborts stop producers.
+                for task in download_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*download_tasks, return_exceptions=True)
+                flush_done_evt.set()
+                backlog_high_evt.set()
+                await flusher_task
+                await _flush_updates()
 
         if state["failed_count"]:
             raise EnumerationFailed(
