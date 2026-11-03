@@ -39,7 +39,17 @@ async def lifespan(app: FastAPI):
     from shared import core_metrics
     core_metrics.init()
     await init_db()
+    # Tier-2 prep on SLA assignment goes through message_bus.publish, which is a
+    # silent no-op until the bus is connected.
+    try:
+        await message_bus.connect()
+    except Exception as exc:
+        print(f"[resource-service] message_bus connect failed (non-fatal): {exc}")
     yield
+    try:
+        await message_bus.disconnect()
+    except Exception:
+        pass
     await close_db()
 
 

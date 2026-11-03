@@ -56,6 +56,7 @@ class Source:
         self.hosted_lists = 0
         self.cancel_file = False
         self.movement = None
+        self.fail_urls = set()
 
     async def iter_message_pages(self, chat_id):
         self.passes += 1
@@ -76,7 +77,7 @@ class Source:
             yield deepcopy(child)
 
     async def resolve_file(self, url):
-        if self.fail_file:
+        if self.fail_file or url in self.fail_urls:
             raise RuntimeError("source file unavailable")
         return {"id": "file", "parentReference": {"driveId": "drive"}, "eTag": self.etag,
                 "cTag": self.ctag, "size": len(self.data)}
@@ -271,8 +272,43 @@ async def test_movement_retries_new_generation_and_keeps_older_snapshot(store, a
 async def test_continuing_source_movement_is_bounded_partial(store, adapters):
     adapters.source.messages = [message()]
     adapters.source.movement = lambda n: [message(str(n))]
-    _, result = await run_capture(store, adapters)
+    scope, result = await run_capture(store, adapters)
     assert result.outcome == "partial" and adapters.source.passes == 6
+    async with store.factory() as session:
+        histories = list((await session.scalars(select(ChatCaptureAttempt.evidence_history).where(
+            ChatCaptureAttempt.snapshot_id == scope.snapshot_id, ChatCaptureAttempt.state == "FAILED"))).all())
+    reasons = [entry["observation_mismatch"]["movement_reason"] for history in histories for entry in history
+               if "observation_mismatch" in entry]
+    assert reasons == ["observation fingerprints differ"] * 2
+
+
+async def test_in_pass_conflict_records_its_reason(store, adapters):
+    """A ChatSourceMovement raised inside pass 1 used to leave only "only_first=N" behind,
+    which reads like an empty second pass (Railway + local, 2026-11-04)."""
+    adapters.source.messages = [message("one"), {**message("two"), "id": message("one")["id"]}]
+    scope, result = await run_capture(store, adapters)
+    assert result.outcome == "partial"
+    async with store.factory() as session:
+        histories = list((await session.scalars(select(ChatCaptureAttempt.evidence_history).where(
+            ChatCaptureAttempt.snapshot_id == scope.snapshot_id, ChatCaptureAttempt.state == "FAILED"))).all())
+    reasons = {entry["observation_mismatch"]["movement_reason"] for history in histories for entry in history
+               if "observation_mismatch" in entry}
+    assert reasons == {"conflicting source versions during enumeration"}
+
+
+async def test_partial_capture_binaries_are_reused_by_the_next_capture(store, adapters):
+    """A chat left PARTIAL by one unavailable file re-uploaded every healthy binary on the
+    next capture (52 objects / 8.8 MB on a real tenant, 2026-11-04). Published PARTIAL
+    inventories hold LIVE, verified objects and are valid reuse candidates."""
+    broken = dict(message("broken", attached=True), id="broken")
+    broken["attachments"] = [{**broken["attachments"][0], "id": "missing",
+                              "contentUrl": "https://tenant.sharepoint.com/missing.pdf"}]
+    adapters.source.messages = [message("ok", attached=True), broken]
+    adapters.source.fail_urls = {"https://tenant.sharepoint.com/missing.pdf"}
+    _, first = await run_capture(store, adapters)
+    assert first.outcome == "partial" and len(adapters.storage.uploads) == 1
+    _, second = await run_capture(store, adapters)
+    assert second.outcome == "partial" and len(adapters.storage.uploads) == 1
 
 
 async def test_upload_retry_uses_new_generation_and_preserves_spool(store, adapters, monkeypatch):

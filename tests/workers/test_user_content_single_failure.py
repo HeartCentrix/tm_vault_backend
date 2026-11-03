@@ -60,3 +60,33 @@ async def test_single_content_wrapper_preserves_inner_outcome(bw, monkeypatch, s
     else:
         assert await call == {"item_count": 0, "bytes_added": 0}
         assert stored.status == bw.SnapshotStatus[status]
+
+
+async def test_single_content_wrapper_keeps_inner_delta_counters(bw, monkeypatch):
+    """Unchanged incremental: inner handler settled new_item_count=0 / bytes_added=0;
+    the wrapper must not overwrite that delta with the inventory totals
+    (observed 2026-11-04: 104 new items / 2.6 MB "added" for a no-op rerun)."""
+    snapshot_id, resource_id, job_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    stored = SimpleNamespace(
+        id=snapshot_id, status=bw.SnapshotStatus.COMPLETED, extra_data={},
+        item_count=104, new_item_count=0, bytes_added=0, bytes_total=2598536,
+    )
+    session = SimpleNamespace(get=AsyncMock(return_value=stored), commit=AsyncMock())
+
+    @asynccontextmanager
+    async def factory():
+        yield session
+
+    monkeypatch.setattr(bw, "async_session_factory", factory)
+    worker = bw.BackupWorker.__new__(bw.BackupWorker)
+    worker.worker_id = "regression"
+    worker._backup_user_content_parallel = AsyncMock(
+        return_value={"item_count": 104, "bytes_added": 2598536}
+    )
+    await worker._backup_user_content_single(
+        object(), SimpleNamespace(id=resource_id),
+        SimpleNamespace(id=snapshot_id, status=bw.SnapshotStatus.IN_PROGRESS),
+        object(), {"jobId": str(job_id)},
+    )
+    assert (stored.item_count, stored.bytes_total) == (104, 2598536)
+    assert (stored.new_item_count, stored.bytes_added) == (0, 0)

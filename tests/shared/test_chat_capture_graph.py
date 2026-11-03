@@ -642,3 +642,16 @@ async def test_direct_chat_routes_share_the_per_chat_pace_bucket(source_factory,
                      "/v1.0/chats/abc/messages/m1/hostedContents/h1/$value"):
             await source._pace("https://graph.microsoft.com" + path)
         assert list(chat_capture_graph._RESOURCE_BUCKETS) == [(source._initial_tenant, "chat", "abc")]
+
+
+async def test_chat_list_expands_members_for_folder_names(source_factory):
+    """Topic-less chats are named after their other members, so the principal-scoped
+    chat list must carry members inline (one request, no per-chat /members fan-out)."""
+    make, requests, *_ = source_factory
+    page = {"value": [{"id": "chat", "topic": None, "chatType": "oneOnOne",
+                       "members": [{"displayName": "Rohit", "userId": "2"}]}]}
+    async with make(lambda request: httpx.Response(200, json=page)) as source:
+        chats = [c async for c in source.iter_chats()]
+    assert chats[0]["members"][0]["displayName"] == "Rohit"
+    listing = [r for r in requests if r.url.host == "graph.microsoft.com"][0]
+    assert listing.url.path == "/v1.0/users/user/chats" and listing.url.params.get("$expand") == "members"

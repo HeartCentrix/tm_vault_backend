@@ -277,7 +277,9 @@ class StrictChatGraphSource:
             url, params = next_url, None
 
     async def iter_chats(self) -> AsyncIterator[dict]:
-        async for page in self._pages(f"/users/{_component(self.principal_id)}/chats", params={"$top": "50"}):
+        # Members ride along so topic-less chats can be labelled after their people.
+        async for page in self._pages(f"/users/{_component(self.principal_id)}/chats",
+                                      params={"$top": "50", "$expand": "members"}):
             for chat in page:
                 yield chat
 

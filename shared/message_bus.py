@@ -240,7 +240,11 @@ class MessageBus:
     
     async def publish(self, routing_key: str, message: Dict[str, Any], priority: int = 5):
         """Publish message to queue"""
-        if not settings.RABBITMQ_ENABLED or not self.exchange:
+        if not settings.RABBITMQ_ENABLED:
+            return
+        if not self.exchange:
+            print(f"[MESSAGE_BUS] publish to {routing_key} dropped: bus not connected "
+                  "(call message_bus.connect() at startup)")
             return
         
         message_body = json.dumps(message).encode()

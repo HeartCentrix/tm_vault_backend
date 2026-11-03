@@ -30,7 +30,8 @@ def capture(monkeypatch):
     tree = ast.parse(path.read_text())
     names = {"_usermail_backup_attachments", "_record_enumeration_failure",
              "EnumerationFailed", "enumeration_failure_extra_data", "reconcile_enumeration_failure_status",
-             "mailbox_batch_concurrency"}
+             "mailbox_batch_concurrency", "_mail_needs_attachments", "_mail_attachment_candidates",
+             "_mail_attachment_gap", "_degrade_for_attachment_gap"}
     nodes = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
              and n.name in names]
     snapshot = SimpleNamespace(id=uuid.uuid4(), status=SnapshotStatus.IN_PROGRESS,
@@ -66,7 +67,7 @@ def capture(monkeypatch):
     worker._shard_failure_ledger = lambda: worker.ledger
     async def patch_snapshot(id_, extra): snapshot.extra_data.update(extra); return True
     worker._patch_snapshot_extra_data = patch_snapshot
-    for name in ("_usermail_backup_attachments", "_record_enumeration_failure"):
+    for name in ("_usermail_backup_attachments", "_record_enumeration_failure", "_degrade_for_attachment_gap"):
         setattr(worker, name, MethodType(namespace[name], worker))
 
     # Execute the production USER_MAIL branch, including its return before finalize.

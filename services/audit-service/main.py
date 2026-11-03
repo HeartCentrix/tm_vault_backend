@@ -2276,7 +2276,12 @@ async def get_batch_children(batch_id: str):
                    -- (2026-05-15 incident). Fallback only when
                    -- new_item_count is genuinely NULL (handler never
                    -- ran the settle path).
-                   COALESCE(s.new_item_count, s.item_count)      AS item_count,
+                   -- An IN_PROGRESS row has no settled delta yet (the chat path
+                   -- publishes item_count/bytes_total while running and settles
+                   -- new_item_count/bytes_added at the end), so show progress so
+                   -- far instead of 0 / "—" (2026-11-04).
+                   CASE WHEN s.status::text = 'IN_PROGRESS' THEN COALESCE(s.item_count, 0)
+                        ELSE COALESCE(s.new_item_count, s.item_count) END AS item_count,
                    COALESCE(s.item_count, 0)                     AS item_count_total,
                    -- bytesAdded must reconcile with the Activity row total,
                    -- which SUMs snapshots.bytes_added across the whole batch.
@@ -2286,7 +2291,9 @@ async def get_batch_children(batch_id: str):
                    -- then made the row total ("~200 KB") un-attributable in
                    -- the detail. Sum per resource so each contributor surfaces
                    -- its bytes and the per-resource grid adds up to the row.
-                   SUM(s.bytes_added) OVER (PARTITION BY s.resource_id)
+                   CASE WHEN s.status::text = 'IN_PROGRESS' AND s.type::text = 'FULL'
+                        THEN COALESCE(s.bytes_total, 0)
+                        ELSE SUM(s.bytes_added) OVER (PARTITION BY s.resource_id) END
                                                                  AS bytes_added,
                    s.bytes_total                                 AS bytes_total
               FROM snapshots s

@@ -30,3 +30,34 @@ def test_body_reference_follows_stable_card_identity():
 def test_file_attachments_keep_their_graph_id():
     file = {"id": "f1", "contentType": "reference", "contentUrl": "https://tenant.sharepoint.com/file.pdf"}
     assert stable_attachment_identity(file) == "f1"
+
+
+def _shared_id_message(order=(0, 1)):
+    # Sanitized shape of a real Bhavya message: a messageReference and a
+    # forwardedMessageReference share one original attachment id.
+    refs = [{"id": "shared-id", "contentType": "messageReference",
+             "content": '{"messageId":"referenced","text":"quoted"}'},
+            {"id": "shared-id", "contentType": "forwardedMessageReference",
+             "content": '{"messageId":"referenced","text":"forwarded"}'}]
+    return {"id": "message", "attachments": [refs[i] for i in order],
+            "body": {"content": '<attachment id="shared-id"></attachment><attachment id="shared-id"></attachment>'}}
+
+
+def test_references_sharing_an_original_id_keep_distinct_identities():
+    normalized = stable_attachment_references(_shared_id_message())
+    ids = [a["id"] for a in normalized["attachments"]]
+    assert len(set(ids)) == 2 and all(i.startswith("card:") for i in ids)
+    # The body cannot tell the two apart either; it maps deterministically.
+    assert normalized["body"]["content"].count(f'id="{min(ids)}"') == 2
+    assert stable_attachment_references(_shared_id_message(order=(1, 0)))["body"] == normalized["body"]
+    assert {a["id"] for a in stable_attachment_references(_shared_id_message(order=(1, 0)))["attachments"]} == set(ids)
+
+
+def test_shared_original_id_does_not_conflict_in_the_ledger():
+    from types import SimpleNamespace
+    from shared.chat_capture import ChatObservationLedger
+    from shared.chat_catalogue_identity import CapturedChatItem
+    normalized = stable_attachment_references(_shared_id_message())
+    with ChatObservationLedger(SimpleNamespace(chat_id="chat"), observation_hash_version=2) as ledger:
+        for attachment in normalized["attachments"]:
+            assert ledger.record(0, CapturedChatItem("CHAT_ATTACHMENT", attachment["id"], "message", attachment, None))

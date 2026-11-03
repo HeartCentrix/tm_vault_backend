@@ -222,19 +222,26 @@ _ATTACHMENT_REFERENCE = re.compile(r"""(<attachment\s+id\s*=\s*["'])([^"']+)(["'
 
 
 def stable_attachment_references(message):
-    """Copy of ``message`` whose metadata-only attachment ids, and the matching
-    ``<attachment id="...">`` tokens in the body, are content-derived. Invalid
-    attachment sets are returned unchanged for the caller to classify."""
+    """Give attachments their content-derived identity and follow it in the body.
+
+    Identities are computed per attachment: Graph can hand two references
+    (messageReference + forwardedMessageReference) the same rotating id with
+    different content. The body token cannot tell those apart, so it maps to the
+    smallest canonical id deterministically, independent of attachment order."""
     native = message.get("attachments")
     if not isinstance(native, list) or not native:
         return message
     if any(not isinstance(a, dict) or not isinstance(a.get("id"), str) or not a["id"] for a in native):
         return message
-    mapping = {a["id"]: stable_attachment_identity(a) for a in native}
-    mapping = {old: new for old, new in mapping.items() if old != new}
-    if not mapping:
+    stable = [stable_attachment_identity(a) for a in native]
+    candidates = {}
+    for attachment, new in zip(native, stable):
+        if new != attachment["id"]:
+            candidates.setdefault(attachment["id"], []).append(new)
+    if not candidates:
         return message
-    out = {**message, "attachments": [{**a, "id": mapping.get(a["id"], a["id"])} for a in native]}
+    out = {**message, "attachments": [{**a, "id": new} for a, new in zip(native, stable)]}
+    mapping = {old: min(news) for old, news in candidates.items()}
     body = message.get("body")
     content = body.get("content") if isinstance(body, dict) else None
     if isinstance(content, str) and content:
@@ -283,7 +290,9 @@ async def _retained(*, scope, keeper, factory, storage, item_type, graph_id, par
     if checksum is None and not (source.get("source_etag") or source.get("source_ctag")):
         return None
     async def find(session):
-        complete_candidate = ChatInventory.state == "COMPLETE"
+        # Published PARTIAL inventories hold LIVE, verified objects too; without them a
+        # chat with one unavailable file re-uploaded every healthy binary each run.
+        complete_candidate = ChatInventory.state.in_(("COMPLETE", "PARTIAL"))
         if checksum is None:
             # Fast tag-only reuse stays in the same observed visibility scope.
             # Cross-context reuse requires this capture's actual source bytes.
@@ -584,7 +593,7 @@ async def _capture_chat_inventory(*, scope, graph_client, storage, session_facto
             try:
                 with ChatObservationLedger(scope, observation_hash_version=lease.observation_hash_version) as ledger:
                     first, second = _Pass(), _Pass()
-                    movement = False
+                    movement, movement_reason = False, "observation fingerprints differ"
                     try:
                         first = await _observe(scope=scope, keeper=keeper, factory=session_factory, storage=storage,
                             source=source, ledger=ledger, observation=0, exclude_message=exclude_message, folder_path=folder_path)
@@ -592,10 +601,13 @@ async def _capture_chat_inventory(*, scope, graph_client, storage, session_facto
                             source=source, ledger=ledger, observation=1, exclude_message=exclude_message, folder_path=folder_path)
                         movement = (first.complete and second.complete and not first.unresolved and not second.unresolved and
                                     ledger.fingerprint(0) != ledger.fingerprint(1))
-                    except ChatSourceMovement:
-                        movement, first.conflicts = True, 1
+                    except ChatSourceMovement as exc:
+                        movement, first.conflicts, movement_reason = True, 1, str(exc)
                     if movement:
-                        mismatch = ledger.difference_details()
+                        mismatch = {**ledger.difference_details(), "movement_reason": movement_reason}
+                        logger.warning("chat_source_movement attempt_id=%s chat=%s retry=%s reason=%s only_first=%s only_second=%s changed=%s",
+                                       lease.attempt_id, scope.chat_id, retry, movement_reason,
+                                       mismatch.get("only_first"), mismatch.get("only_second"), mismatch.get("changed"))
                         async def save_mismatch(session, mismatch=mismatch):
                             attempt, _ = await catalogue._attempt(session, keeper.lease)
                             attempt.evidence_history = [*(attempt.evidence_history or []), {"observation_mismatch": mismatch}]

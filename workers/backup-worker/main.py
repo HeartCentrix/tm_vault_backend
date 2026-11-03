@@ -4411,6 +4411,38 @@ CAL_INHERIT_FIELDS = (
     "responseRequested", "webLink", "attendees",
 )
 
+
+def _mail_needs_attachments(raw) -> bool:
+    """Graph's hasAttachments ignores inline (cid:) images; those messages need the
+    attachment helper too, or recovery renders broken images."""
+    if not isinstance(raw, dict):
+        return False
+    if raw.get("hasAttachments"):
+        return True
+    body = (raw.get("body") or {}).get("content") or ""
+    return "cid:" in body or "CID:" in body
+
+
+def _mail_attachment_candidates(rows):
+    """Persist-tuples (type, name, ext, extra, ...) whose message needs attachment work."""
+    return [t for t in rows if isinstance(t, tuple) and len(t) >= 4 and isinstance(t[3], dict)
+            and _mail_needs_attachments(t[3].get("raw"))]
+
+
+def _mail_attachment_gap(rows) -> int:
+    """Count EMAIL_ATTACHMENT rows whose bytes were not captured and stop their declared
+    size from counting as backed-up bytes (declared_size is kept for diagnostics)."""
+    gap = 0
+    for row in rows:
+        extra = getattr(row, "extra_data", None) or {}
+        if getattr(row, "item_type", None) == "EMAIL_ATTACHMENT" and extra.get("resolved") is False:
+            gap += 1
+            if row.content_size:
+                row.extra_data = {**extra, "declared_size": row.content_size}
+                row.content_size = 0
+    return gap
+
+
 class BackupWorker:
     """High-performance backup worker with parallelism and Server-Side Copy"""
 
@@ -8595,15 +8627,7 @@ class BackupWorker:
                             f"persist: {_mail_persisted_total} msgs, "
                             f"{_mail_persisted_bytes} bytes committed"
                         )
-                        return [
-                            t for t in out
-                            if (
-                                isinstance(t, tuple) and len(t) >= 4
-                                and isinstance(t[3], dict)
-                                and isinstance(t[3].get("raw"), dict)
-                                and t[3]["raw"].get("hasAttachments")
-                            )
-                        ]
+                        return _mail_attachment_candidates(out)
 
                     return out
 
@@ -12948,16 +12972,7 @@ class BackupWorker:
                         # hasAttachments=false, so the body renders broken
                         # icons in recovery. Detect `cid:` in the body and
                         # force-include those messages too.
-                        def _needs_attachments(raw: Dict[str, Any]) -> bool:
-                            if raw.get("hasAttachments"):
-                                return True
-                            body = (raw.get("body") or {}).get("content") or ""
-                            return 'cid:' in body or 'CID:' in body
-                        emails_with_att = [
-                            extra.get("raw") for (_t, _n, _e, extra, *_rest) in items_data
-                            if isinstance(extra, dict) and isinstance(extra.get("raw"), dict)
-                            and _needs_attachments(extra["raw"])
-                        ]
+                        emails_with_att = [t[3]["raw"] for t in _mail_attachment_candidates(items_data)]
                         if emails_with_att:
                             try:
                                 att_items, att_bytes = await self._usermail_backup_attachments(
@@ -13241,6 +13256,7 @@ class BackupWorker:
                             "required chat attachment persistence failed: " + type(exc).__name__)
                         raise
                 elif att_items:
+                    await self._degrade_for_attachment_gap(snapshot.id, att_items)
                     # Guard against IntegrityError on session.add_all(). If
                     # a rogue duplicate sneaks past the phase-level dedup
                     # (e.g., cross-resource race across parallel _backup_one
@@ -16760,6 +16776,15 @@ class BackupWorker:
                 f"snapshot {snapshot_id}: {_rmw_err}"
             )
             return False
+
+    async def _degrade_for_attachment_gap(self, snapshot_id: uuid.UUID, rows) -> int:
+        """Unresolved EMAIL_ATTACHMENT rows mean required bytes were not captured:
+        settle PARTIAL, never COMPLETED."""
+        gap = _mail_attachment_gap(rows)
+        if gap:
+            await self._stamp_snapshot_degraded(
+                snapshot_id, f"{gap} email attachment(s) not captured (download/upload failed)")
+        return gap
 
     async def _stamp_snapshot_degraded(
         self, snapshot_id: uuid.UUID, reason: str,
@@ -26349,10 +26374,14 @@ class BackupWorker:
                         raise EnumerationFailed(reason or "Tier-2 content backup failed")
                     items = int(result.get("item_count", 0) or 0)
                     bytes_total = int(result.get("bytes_added", 0) or 0)
+                    # The inner handler owns the delta counters (new_item_count /
+                    # bytes_added); only a ghost row it never wrote takes the totals.
+                    ghost = not (snap.item_count or snap.new_item_count or snap.bytes_total)
                     snap.item_count = items
-                    snap.new_item_count = items
                     snap.bytes_total = bytes_total
-                    snap.bytes_added = bytes_total
+                    if ghost:
+                        snap.new_item_count = items
+                        snap.bytes_added = bytes_total
                     await _s.commit()
         except EnumerationFailed:
             raise
@@ -32775,10 +32804,14 @@ class BackupWorker:
                 if snap is not None:
                     items = int(result.get("item_count", 0) or 0)
                     bytes_total = int(result.get("bytes_added", 0) or 0)
+                    # The inner handler owns the delta counters (new_item_count /
+                    # bytes_added); only a ghost row it never wrote takes the totals.
+                    ghost = not (snap.item_count or snap.new_item_count or snap.bytes_total)
                     snap.item_count = items
-                    snap.new_item_count = items
                     snap.bytes_total = bytes_total
-                    snap.bytes_added = bytes_total
+                    if ghost:
+                        snap.new_item_count = items
+                        snap.bytes_added = bytes_total
                     await _s.commit()
         except Exception as _bump_err:
             print(

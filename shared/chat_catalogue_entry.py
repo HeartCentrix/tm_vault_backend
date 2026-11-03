@@ -217,11 +217,39 @@ async def _published_chat(session, scope):
         association.uploaded_bytes, association.started_at, association.finished_at, association.failure_reason)
 
 
-def _folder(chat):
+_FOLDER_NAME_MAX = 80
+
+
+def chat_folder(chat, principal_id):
+    """Folder label for a chat: topic, else the other members (1:1 → the other person,
+    group → "A, B, C" or "A, B +N more"), else a hash. Labels are presentation only."""
     topic = chat.get("topic")
-    display = topic.strip() if isinstance(topic, str) and topic.strip() else (
-        "Chat " + hashlib.sha256(chat["id"].encode()).hexdigest()[:8])
-    return "chats/" + display
+    if isinstance(topic, str) and topic.strip():
+        display = topic.strip()
+    else:
+        me = (principal_id or "").lower()
+        others = []
+        for member in chat.get("members") or []:
+            if not isinstance(member, dict):
+                continue
+            name = member.get("displayName")
+            if isinstance(name, str) and name.strip() and str(member.get("userId") or "").lower() != me:
+                others.append(name.strip())
+        if not others:
+            display = "Chat " + hashlib.sha256(chat["id"].encode()).hexdigest()[:8]
+        elif str(chat.get("chatType") or "").lower() == "oneonone":
+            display = others[0]
+        else:
+            picked = []
+            for name in others:
+                candidate = ", ".join([*picked, name])
+                if picked and len(candidate) > _FOLDER_NAME_MAX:
+                    break
+                picked.append(name)
+            display = ", ".join(picked)
+            if len(picked) < len(others):
+                display += f" +{len(others) - len(picked)} more"
+    return "chats/" + display.replace("/", "-")
 
 
 async def _chat_list(source):
@@ -231,9 +259,9 @@ async def _chat_list(source):
         if not isinstance(cid, str) or not cid:
             raise ChatCatalogueIntegrityError("chat listing contains an invalid source identity")
         observed = {"id": cid, "topic": chat.get("topic"), "chatType": chat.get("chatType")}
-        if cid in chats and chats[cid] != observed:
+        if cid in chats and {k: chats[cid][k] for k in observed} != observed:
             raise ChatCatalogueConflict("chat listing changed while it was being enumerated")
-        chats[cid] = observed
+        chats[cid] = {**observed, "members": chat.get("members") or []}
     return chats
 
 
@@ -319,7 +347,7 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                     result = previous
                     if result is None:
                         result = await capture_chat_inventory(scope=scope, graph_client=source, storage=storage,
-                            session_factory=session_factory, folder_path=_folder(chats[cid]),
+                            session_factory=session_factory, folder_path=chat_folder(chats[cid], principal),
                             exclude_message=exclude_message, scope_filter_hash=scope_filter_hash)
                     try:
                         await run_catalogue_transaction(session_factory,
