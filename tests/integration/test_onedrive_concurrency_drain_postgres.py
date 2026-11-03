@@ -112,14 +112,17 @@ async def test_onedrive_finishes_admitted_files_and_batched_proof_before_defer(
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
-        assert sorted(path for path in sent if path.startswith("/file/")) == ["/file/a", "/file/b"]
+        admitted = [path.rsplit('/', 1)[-1] for path in sent if path.startswith('/file/')]
+        assert len(admitted) == len(set(admitted)) == 2
+        assert set(admitted) <= {'a', 'b', 'c'}
+        remaining = {'a', 'b', 'c', 'd'} - set(admitted)
         assert not executions[0].drain_callbacks
-        assert sorted(key for chunk in metadata_batches[1:] for key in chunk) == ["a", "b"]
+        assert sorted(key for chunk in metadata_batches[1:] for key in chunk) == sorted(admitted)
         assert all(len(chunk) <= 20 for chunk in metadata_batches)
         async with store.factory.begin() as session:
             rows = (await session.scalars(select(models.SnapshotItem).where(
                 models.SnapshotItem.snapshot_id == env.scope.snapshot_id))).all()
-            assert {row.external_id for row in rows if row.blob_path} == {"a", "b"}
+            assert {row.external_id for row in rows if row.blob_path} == set(admitted)
             assert all(row.extra_data["onedrive_download_source"]["eTag"] == "version-1"
                        for row in rows if row.blob_path)
             provider = await session.scalar(select(models.ProviderWork).where(
@@ -128,5 +131,5 @@ async def test_onedrive_finishes_admitted_files_and_batched_proof_before_defer(
             provider.next_eligible_at = datetime.now(timezone.utc)
         before_resume = len(metadata_batches)
         assert await asyncio.wait_for(runner.run_once(), 5) == (2, 2048)
-        assert all(set(chunk) <= {"c", "d"} for chunk in metadata_batches[before_resume:])
+        assert all(set(chunk) <= remaining for chunk in metadata_batches[before_resume:])
         assert sorted(path for path in sent if path.startswith("/file/")) == ["/file/a", "/file/b", "/file/c", "/file/d"]

@@ -242,3 +242,50 @@ async def test_expired_waiter_is_removed_without_starving_live_requests(redis_cl
     await redis_client.zadd(admission.prefix+'fair:expiry',{'dead':0})
     async with admission.admit(scope(module),wait_budget=0): pass
     assert await redis_client.hlen(admission.prefix+'fair:pending')==0
+
+
+async def test_queued_sibling_withdraws_before_waiting_for_drain_receipt(redis_client):
+    from uuid import uuid4
+    from types import SimpleNamespace
+    from shared import provider_runtime as runtime
+    from shared.provider_admission import ScopedProviderAdmission, AdmissionLimits, ProviderRequestContext
+    limiter = ScopedProviderAdmission(redis_client, namespace=uuid4().hex,
+        limits=AdmissionLimits(rate=10000, burst=10000, global_concurrency=1, tenant_concurrency=1))
+    context = ProviderRequestContext('tenant','app','sharepoint')
+    execution = runtime.ProviderExecution(None, SimpleNamespace(weight=1))
+    proof_started, proof_done = asyncio.Event(), asyncio.Event()
+    async def proof():
+        proof_started.set()
+        async with limiter.admit(context, wait_budget=0):
+            proof_done.set()
+    async def request(budget):
+        async with limiter.admit(context, wait_budget=budget):
+            pytest.fail('new request transmitted after congestion')
+    tasks=[]
+    marker=None
+    try:
+        async with limiter.admit(context, wait_budget=0):
+            marker=runtime._EXECUTION.set(execution)
+            with runtime.provider_drain_callback(proof):
+                older=asyncio.create_task(request(5))
+                tasks.append(older)
+                async with asyncio.timeout(1):
+                    while await redis_client.hlen(limiter.prefix+'fair:pending') != 1:
+                        await asyncio.sleep(.001)
+                newer=asyncio.create_task(request(0))
+                tasks.append(newer)
+                await asyncio.wait_for(proof_started.wait(),1)
+                # Keep callback registered while drain task takes its snapshot.
+                await asyncio.sleep(.02)
+        await asyncio.wait_for(proof_done.wait(),1)
+        outcomes = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True),1)
+        assert all(isinstance(outcome, runtime.ProviderTurnDeferred) for outcome in outcomes)
+        assert await redis_client.hlen(limiter.prefix+'fair:pending') == 0
+    finally:
+        if marker is not None: runtime._EXECUTION.reset(marker)
+        for task in tasks:
+            task.cancel()
+        if execution.drain_task is not None:
+            execution.drain_task.cancel()
+            tasks.append(execution.drain_task)
+        await asyncio.gather(*tasks,return_exceptions=True)

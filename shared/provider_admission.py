@@ -318,7 +318,7 @@ class ScopedProviderAdmission:
             while True:
                 from shared.provider_runtime import (before_provider_admission,
                     provider_admission_granted, wait_provider_concurrency)
-                await before_provider_admission()
+                await before_provider_admission(withdraw=withdraw)
                 try:
                     polls += 1
                     granted, delay, clock, reason, denied, signal = await self._grant_script(keys=[*buckets, *slots, cancelled, pending, expiry, fair_clock, signals], args=[
@@ -335,7 +335,7 @@ class ScopedProviderAdmission:
                             await self._release_script(keys=release_keys, args=[token, self.limits.lease_seconds])
                         except Exception:
                             raise ProviderDeferred(context, 5, stage='coordinator_unavailable') from None
-                        await before_provider_admission()
+                        await before_provider_admission(withdraw=withdraw)
                     logger.debug('provider_network_granted workload=%s weight=%d wait_s=%.3f polls=%d',
                         workload, weight, time.monotonic()-started, polls)
                     if polls > 1:

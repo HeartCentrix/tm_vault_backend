@@ -222,7 +222,7 @@ def _can_drain(execution):
         bool(transfer and transfer.execution is execution and transfer.active))
 
 
-async def before_provider_admission():
+async def before_provider_admission(*, withdraw=None):
     check_provider_turn()
     execution = current_execution()
     if execution is None or execution.congestion is None:
@@ -231,6 +231,8 @@ async def before_provider_admission():
         if time.monotonic() >= execution.drain_deadline:
             raise ProviderTurnDeferred(execution.congestion)
         return
+    if withdraw is not None:
+        await withdraw()
     await asyncio.shield(execution.drain_task)
     raise ProviderTurnDeferred(execution.deferred or execution.congestion)
 
