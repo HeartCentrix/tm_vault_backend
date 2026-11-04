@@ -922,6 +922,45 @@ async def test_long_run_still_shares_a_capture_made_hours_after_it_started(store
     assert (await derive(adapters, store, beta_scope)).outcome == "complete"
 
 
+async def test_copy_keeps_every_message_and_file_after_the_capturers_backup_is_deleted(store, adapters):
+    """Amit 2026-11-05: members who copied another member's capture must keep all their
+    messages and files when that member's backup is later deleted."""
+    from sqlalchemy import delete
+    from shared.chat_catalogue_gc import collect_chat_catalogue
+    from shared.models import Snapshot
+
+    class Deletes:
+        def __init__(self):
+            self.paths = []
+
+        def get_store_by_id(self, backend):
+            return self
+
+        async def delete(self, container, path):
+            self.paths.append(path)
+
+    async def delete_backup(scope):
+        async with store.factory.begin() as session:
+            await session.execute(delete(SnapshotItem).where(SnapshotItem.snapshot_id == scope.snapshot_id))
+            await session.execute(delete(Snapshot).where(Snapshot.id == scope.snapshot_id))
+
+    adapters.source.messages = [message(attached=True), dict(message(hosted=True), id="with-image")]
+    beta_scope = await member_scope(store, "chat-alpha")
+    alpha_scope, _ = await run_capture(store, adapters)
+    beta = await derive(adapters, store, beta_scope)
+    await delete_backup(alpha_scope)
+    storage = Deletes()
+    await collect_chat_catalogue(session_factory=store.factory, storage=storage, limit=100)
+    async with store.factory() as session:
+        kept = (await session.scalars(select(SnapshotItem).where(SnapshotItem.snapshot_id == beta_scope.snapshot_id))).all()
+        objects = (await session.scalars(select(ChatBlobObject.state))).all()
+    assert storage.paths == [] and len(kept) == beta.item_count == 4
+    assert objects and set(objects) == {"LIVE"}
+    await delete_backup(beta_scope)                      # the collector does delete them once nobody has them
+    await collect_chat_catalogue(session_factory=store.factory, storage=storage, limit=100)
+    assert len(storage.paths) == len(objects)
+
+
 async def test_member_waits_instead_of_duplicating_an_active_capture(store, adapters):
     from shared import chat_catalogue as catalogue
     beta_scope = await member_scope(store, "chat-alpha")

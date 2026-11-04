@@ -305,10 +305,30 @@ def chat_folder(chat, principal_id):
 _POSTPONED = object()
 
 
-def _capture_order(chat_ids, principal):
+def _capture_order(chat_ids, principal, first=()):
     """Members of one group chat must not all reach it at the same moment: each would capture
-    and upload it in full before any could derive from another's finished capture."""
-    return sorted(chat_ids, key=lambda cid: hashlib.sha256((principal + "\x00" + cid).encode()).digest())
+    and upload it in full before any could derive from another's finished capture. Chats
+    other members are waiting on this member to capture (``first``) come first."""
+    return sorted(chat_ids, key=lambda cid: (cid not in first,
+                                             hashlib.sha256((principal + "\x00" + cid).encode()).digest()))
+
+
+def _chat_members(chat):
+    return {str(m.get("userId") or "").lower() for m in chat.get("members") or [] if isinstance(m, dict)}
+
+
+def _capture_owner(chat, principal, peers):
+    """The member whose backup captures a shared chat in this run; the others copy their visible
+    part of it. It is the one who sees the most history (earliest visibleHistoryStartDateTime,
+    full history first) among this member and the chat's members backed up in this run
+    (``peers``, lower-case). Graph lists every member's start, and ties go to a fixed hash,
+    so every member's worker picks the same capturer whatever order the workers run in."""
+    candidates = {(principal or "").lower()} | (_chat_members(chat) & set(peers))
+    def rank(member):
+        start = visible_history_start(chat, member)
+        return (start is not None, start or datetime.min.replace(tzinfo=timezone.utc),
+                hashlib.sha256((str(chat.get("id")) + "\x00" + member).encode()).digest())
+    return min(candidates, key=rank)
 
 
 def _hosted_elsewhere(chat, home_tenant, result) -> bool:
@@ -379,6 +399,13 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                 snapshot_lease_token = int(snapshot.lease_token or 0)
             if job_lease_token is None:
                 job_lease_token = int((await session.get(Job, snapshot.job_id)).lease_token or 0)
+        # Other members' chat backups in this run: a shared chat is captured once, by the member
+        # who sees the most history; the others copy it.
+        peers = {str((extra or {}).get("user_id") or external).lower(): sid
+                 for sid, external, extra in (await session.execute(select(Snapshot.id, Resource.external_id,
+                     Resource.extra_data).join(Resource, Resource.id == Snapshot.resource_id).where(
+                     Snapshot.job_id == snapshot.job_id, Snapshot.id != snapshot_id,
+                     Resource.type == ResourceType.USER_CHATS))).all()} if snapshot.job_id else {}
         published = set((await session.scalars(select(SnapshotChatInventory.chat_id)
             .where(SnapshotChatInventory.snapshot_id == snapshot_id))).all())
         allowed = None
@@ -408,7 +435,10 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
             if published - selected and allowed is None:
                 errors.append("chat membership changed across capture attempts")
             shared_capture = os.getenv("CHAT_SHARED_CAPTURE", "true").lower() not in ("0", "false", "no", "off")
-            keys = _capture_order(selected, principal) if shared_capture else sorted(selected)
+            me = principal.lower()
+            owners = {cid: _capture_owner(chats[cid], principal, peers) for cid in selected} if shared_capture else {}
+            mine_for_others = {cid for cid, owner in owners.items() if owner == me and _chat_members(chats[cid]) & set(peers)}
+            keys = _capture_order(selected, principal, mine_for_others) if shared_capture else sorted(selected)
             # Each user's backup holds the history Teams shares with that user.
             filters = {cid: _visibility_filter(chats[cid], principal, exclude_message, scope_filter_hash) for cid in keys}
             def chat_scope(cid):
@@ -429,26 +459,41 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                     theirs = visible_history_start(chat, donor)
                     return theirs is None or (mine is not None and theirs <= mine)
                 return covers
+            async def owner_will_capture(cid):
+                """Another member of this run sees more of the chat and has not captured it yet."""
+                owner = owners.get(cid)
+                if owner is None or owner == me:
+                    return False
+                async with session_factory() as session:
+                    if await session.scalar(select(Snapshot.status).where(Snapshot.id == peers[owner])) != SnapshotStatus.IN_PROGRESS:
+                        return False
+                    return await session.scalar(select(SnapshotChatInventory.chat_id).where(
+                        SnapshotChatInventory.snapshot_id == peers[owner], SnapshotChatInventory.chat_id == cid).limit(1)) is None
             async def capture(cid, final=True):
                 await cancel_check()
                 scope = chat_scope(cid)
                 async with session_factory() as session:
                     previous = await _published_chat(session, scope)
+                busy = False
                 if previous is None and shared_capture:
                     previous = await derive_shared_chat(scope=scope, session_factory=session_factory,
                         covers=covers_for(cid), folder_path=chat_folder(chats[cid], principal),
                         exclude_message=filters[cid][0], scope_filter_hash=filters[cid][1])
-                    if previous is SHARED_CAPTURE_BUSY:
-                        if not final:
-                            return _POSTPONED
-                        if current_execution() is not None:
-                            # Hand the turn back; on resume this chat derives from the finished capture.
-                            defer_provider(ProviderDeferred(None, 15, stage="shared_chat_wait"))
+                    busy = previous is SHARED_CAPTURE_BUSY
+                    if busy:
                         previous = None
                 if previous is None and not full_backup:
+                    # This member's own unchanged capture costs one request and no waiting.
                     previous = await reuse_unchanged_chat(scope=scope, graph_client=source,
                         session_factory=session_factory, folder_path=chat_folder(chats[cid], principal),
                         exclude_message=filters[cid][0], scope_filter_hash=filters[cid][1])
+                if previous is None and shared_capture and (busy or await owner_will_capture(cid)):
+                    # Another member of this run is capturing it (busy) or will: leave it for now.
+                    if not final:
+                        return _POSTPONED
+                    if current_execution() is not None:
+                        # Hand the turn back; on resume this chat derives from the finished capture.
+                        defer_provider(ProviderDeferred(None, 15 if busy else 60, stage="shared_chat_wait"))
                 async with unit_scope('chat:' + hashlib.sha256(cid.encode()).hexdigest(), 'chat'):
                     result = previous
                     if result is None:
