@@ -231,3 +231,24 @@ async def test_failed_content_download_keeps_an_unresolved_row(capture):
     assert [item.external_id for item in items] == ["m::binary"]
     assert items[0].extra_data["resolved"] is False and size == 0
     assert capture[-1]["_mail_attachment_gap"](items) == 1
+
+
+async def test_failed_bulk_mime_fetch_falls_back_to_the_single_message_fetch(capture):
+    """Railway 2026-11-04 21:41: the bulk MIME pre-fetch failed 4 of 16 messages of one mailbox and
+    they were never fetched again, so their inline images were missed, although Microsoft served
+    every one of that mailbox's 172 MIME sources when fetched singly (read-only probe)."""
+    graph = Graph([{"m": response("m")}])
+    single = []
+
+    async def bulk(user_id, message_ids):
+        return {"m": RuntimeError("bulk fetch failed")}
+
+    async def one(user_id, message_id):
+        single.append(message_id)
+        return b"MIME"
+
+    graph.get_messages_mime_concurrent, graph.get_message_mime_source = bulk, one
+    worker, resource, snapshot, tenant, _ = capture
+    await worker._usermail_backup_attachments(graph, resource, snapshot, tenant, "user",
+                                              [{"id": "m", "body": {"content": "<img src='cid:inline'>"}}])
+    assert single == ["m"]

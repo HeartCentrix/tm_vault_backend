@@ -13861,6 +13861,7 @@ class BackupWorker:
                 )
                 _ok = 0
                 _fail = 0
+                _reasons: Dict[str, int] = {}
                 for _mid, _r in bulk_results.items():
                     if isinstance(_r, (ProviderDeferred, ProviderBudgetExhausted,
                                        ProviderTurnDeferred, asyncio.CancelledError)):
@@ -13869,11 +13870,17 @@ class BackupWorker:
                         mime_pre_map[_mid] = bytes(_r)
                         _ok += 1
                     else:
-                        mime_pre_map[_mid] = None
+                        # Left out of the map: the message falls back to the single-message
+                        # fetch (its own retries). Railway 2026-11-04: 4 of 16 bulk failures were
+                        # never retried, though Microsoft served each one singly.
                         _fail += 1
+                        _status = getattr(getattr(_r, "response", None), "status_code", None)
+                        _key = f"{type(_r).__name__}{'/' + str(_status) if _status else ''}"
+                        _reasons[_key] = _reasons.get(_key, 0) + 1
                 print(
                     f"[{self.worker_id}] [MIME-BULK] result: "
-                    f"{_ok} ok, {_fail} fail of {len(need_mime_msg_ids)}",
+                    f"{_ok} ok, {_fail} fail of {len(need_mime_msg_ids)}"
+                    + (f" (retrying singly; reasons {_reasons})" if _fail else ""),
                 )
             except (ProviderDeferred, ProviderBudgetExhausted):
                 raise
@@ -14096,11 +14103,9 @@ class BackupWorker:
                     mime_bytes: Optional[bytes] = None
                     # Fast path: bulk pre-fetch already grabbed this
                     # message's MIME via the 12-app concurrent fetcher.
-                    # `mime_pre_map` contains an entry per msg the
-                    # pre-fetch attempted: bytes on success, None on
-                    # failure. A missing key means the pre-fetch step
-                    # decided this msg didn't need MIME (or itself
-                    # failed entirely and skipped population).
+                    # `mime_pre_map` holds the bytes the bulk pre-fetch got.
+                    # A missing key means the bulk step skipped this msg,
+                    # failed for it, or failed entirely: fetch it singly.
                     if msg_id in mime_pre_map:
                         mime_bytes = mime_pre_map[msg_id]
                     else:
