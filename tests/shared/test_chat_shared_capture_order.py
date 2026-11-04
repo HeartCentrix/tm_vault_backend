@@ -42,3 +42,15 @@ def test_a_member_captures_the_shared_chats_others_wait_for_first():
     order = _capture_order(chats, "principal-alpha", first=owned)
     assert set(order[:2]) == owned and sorted(order) == sorted(chats)
     assert order[2:] == [c for c in _capture_order(chats, "principal-alpha") if c not in owned]
+
+
+def test_someone_who_left_the_chat_never_captures_it_for_members():
+    """Railway 2026-11-04: a chat still in Narendra's list no longer listed him as a member. His
+    worker picked him by the tie hash, Ranjeet's worker (not seeing him) picked Ranjeet, and the
+    copy check refuses a non-member donor, so both captured. A current member captures; the
+    former member copies from it."""
+    from shared.chat_catalogue_entry import _capture_owner
+    chat = group(("R", "0001-01-01T00:00:00Z"), ("Q", "0001-01-01T00:00:00Z"))
+    for left in ("n1", "n2", "n3", "n4"):  # whatever the tie hash would say
+        assert _capture_owner(chat, left, {"r"}) == "r" == _capture_owner(chat, "R", {left})
+    assert _capture_owner(chat, "N1", set()) == "n1"  # no member in this run: capture it yourself

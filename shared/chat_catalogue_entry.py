@@ -323,7 +323,10 @@ def _capture_owner(chat, principal, peers):
     full history first) among this member and the chat's members backed up in this run
     (``peers``, lower-case). Graph lists every member's start, and ties go to a fixed hash,
     so every member's worker picks the same capturer whatever order the workers run in."""
-    candidates = {(principal or "").lower()} | (_chat_members(chat) & set(peers))
+    # Only current members: a donor must be a member to be copied from, and someone who left still
+    # lists the chat but is invisible to the members' workers.
+    me = (principal or "").lower()
+    candidates = _chat_members(chat) & (set(peers) | {me}) or {me}
     def rank(member):
         start = visible_history_start(chat, member)
         return (start is not None, start or datetime.min.replace(tzinfo=timezone.utc),
