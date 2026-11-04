@@ -192,3 +192,35 @@ def test_transport_failures_back_off_like_before():
     from shared.graph_ratelimit import retry_wait
     assert [retry_wait(None, None, attempt) for attempt in range(4)] == [1, 2, 4, 8]
     assert [retry_wait(500, None, attempt) for attempt in range(4)] == [2, 2, 2, 2]
+
+
+async def test_sharepoint_token_uses_the_certificate_app_not_the_pooled_graph_app(monkeypatch):
+    """Railway 2026-11-04: SharePoint discovery/backup got 401 — the SharePoint certificate is
+    registered only on the main app, but tokens were requested as whichever pooled Graph app the
+    worker held (AADSTS700027). SharePoint tokens are minted as the certificate's app."""
+    import jwt
+    from contextlib import asynccontextmanager
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from shared.graph_client import GraphClient
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048).private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+    monkeypatch.setattr(GraphClient, "_load_sharepoint_cert", classmethod(lambda cls: (key, b"dGh1bWI")))
+    monkeypatch.setenv("SHAREPOINT_CLIENT_ID", "sharepoint-cert-app")
+    posted = []
+
+    class Session:
+        async def post(self, url, data=None):
+            posted.append(data)
+            return httpx.Response(200, json={"access_token": "t", "expires_in": 3600}, request=httpx.Request("POST", url))
+
+    client = GraphClient("pooled-graph-app", "secret", "tenant-id")
+
+    @asynccontextmanager
+    async def session():
+        yield Session()
+
+    monkeypatch.setattr(client, "_http_session", session)
+    assert await client._get_sharepoint_token("contoso.sharepoint.com") == "t"
+    claims = jwt.decode(posted[0]["client_assertion"], options={"verify_signature": False})
+    assert posted[0]["client_id"] == claims["iss"] == claims["sub"] == "sharepoint-cert-app"

@@ -3519,7 +3519,7 @@ class GraphClient:
         if assertion:
             data = {
                 "grant_type": "client_credentials",
-                "client_id": self.client_id,
+                "client_id": self._sharepoint_app_id(),
                 "scope": scope,
                 "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
                 "client_assertion": assertion,
@@ -3618,6 +3618,13 @@ class GraphClient:
         cls._sp_cert_cache = (pem_bytes, thumbprint_b64url)
         return cls._sp_cert_cache
 
+    def _sharepoint_app_id(self) -> str:
+        """The app registration that holds the SharePoint certificate. Workers round-robin a
+        pool of Graph apps, but the certificate is registered on one app only; asking for a
+        SharePoint token as a pooled app fails (AADSTS700027 -> 401, Railway 2026-11-04)."""
+        import os as _os
+        return (_os.getenv("SHAREPOINT_CLIENT_ID") or _os.getenv("MICROSOFT_CLIENT_ID") or self.client_id).strip()
+
     def _build_sharepoint_client_assertion(self, token_url: str) -> Optional[str]:
         """Build the signed JWT assertion that proves we control the cert
         whose public key is registered on the AAD app. Returns None when
@@ -3631,10 +3638,11 @@ class GraphClient:
         import jwt as _jwt
 
         now = int(datetime.utcnow().timestamp())
+        app_id = self._sharepoint_app_id()
         payload = {
             "aud": token_url,
-            "iss": self.client_id,
-            "sub": self.client_id,
+            "iss": app_id,
+            "sub": app_id,
             "jti": str(_uuid.uuid4()),
             "nbf": now,
             "exp": now + 10 * 60,  # 10 minutes; AAD caps at 10
