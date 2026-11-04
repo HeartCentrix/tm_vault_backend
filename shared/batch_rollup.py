@@ -1266,6 +1266,29 @@ def _fmt_bytes(n: int) -> str:
     return f"{v:.1f} EiB"
 
 
+async def _dispatched_leaves(session, leaf_ids):
+    """Drop leaves job dispatch never backs up because their SLA disables the workload
+    (job-service's ``filter_resource_map_by_policy_flags``; e.g. USER_ARCHIVE under a policy
+    with backup_exchange_archive=False, the column default). Such a leaf never gets a snapshot,
+    so requiring one pinned the batch IN_PROGRESS forever (Railway 2026-11-04). A leaf with no
+    policy keeps the old rule: dispatch refuses unassigned resources before batching."""
+    from sqlalchemy import select
+    from shared.models import SlaPolicy
+    from shared.sla_workloads import resource_type_enabled
+
+    rows = (await session.execute(text("""
+        SELECT id, type::text AS type, sla_policy_id FROM resources WHERE id = ANY(cast(:ids AS uuid[]))
+    """), {"ids": leaf_ids})).all()
+    policy_ids = {row.sla_policy_id for row in rows if row.sla_policy_id}
+    if not policy_ids:
+        return leaf_ids
+    policies = {policy.id: policy for policy in (await session.execute(
+        select(SlaPolicy).where(SlaPolicy.id.in_(policy_ids)))).scalars().all()}
+    disabled = {str(row.id) for row in rows if row.sla_policy_id in policies and
+                not resource_type_enabled(row.type, policies[row.sla_policy_id])}
+    return [leaf for leaf in leaf_ids if leaf not in disabled]
+
+
 async def _finalize_batch_if_complete(batch_id, session) -> Optional[str]:
     """Strict 4-condition completion gate for a backup_batches row.
 
@@ -1405,6 +1428,7 @@ async def _finalize_batch_if_complete(batch_id, session) -> Optional[str]:
         leaf_ids = []
     leaf_ids.extend(non_entra)
     leaf_ids = list(dict.fromkeys(leaf_ids))  # dedupe, preserve order
+    leaf_ids = await _dispatched_leaves(session, leaf_ids)
 
     if not leaf_ids:
         return None
