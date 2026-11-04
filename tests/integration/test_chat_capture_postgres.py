@@ -804,3 +804,109 @@ async def test_card_attachment_with_volatile_graph_id_is_stable_across_passes(st
     _, result = await run_capture(store, adapters)
     assert result.outcome == "complete" and result.item_count == 2
     assert adapters.source.passes == 2
+
+
+async def member_scope(store, chat_id, principal="principal-beta", scope_hash="b" * 64):
+    from shared.chat_catalogue_identity import ChatCaptureScope
+    from shared.models import Job, JobStatus, JobType, Resource, ResourceType, Snapshot
+    resource, job, snapshot = uuid4(), uuid4(), uuid4()
+    async with store.factory.begin() as session:
+        session.add(Resource(id=resource, tenant_id=store.tenant, type=ResourceType.USER_CHATS,
+            external_id=principal, display_name="Other synthetic principal",
+            extra_data={"user_id": principal, "chat_inventory_format": 1}))
+        await session.flush()
+        session.add(Job(id=job, type=JobType.BACKUP, tenant_id=store.tenant, resource_id=resource,
+            status=JobStatus.RUNNING))
+        await session.flush()
+        session.add(Snapshot(id=snapshot, resource_id=resource, job_id=job, backend_id=store.backend,
+            extra_data={"chat_inventory_format": 1}))
+    return ChatCaptureScope(snapshot, resource, store.tenant, chat_id, principal, scope_hash, store.backend)
+
+
+def alpha_covers(principal, filter_hash):
+    return principal == "principal-alpha" and filter_hash is None
+
+
+async def derive(adapters, store, scope, covers=alpha_covers, **kwargs):
+    return await adapters.capture.derive_shared_chat(scope=scope, session_factory=store.factory,
+        folder_path="chats/Member view", covers=covers, **kwargs)
+
+
+async def test_member_derives_fresh_complete_capture_without_source_or_storage_work(store, adapters):
+    """Railway 2026-11-04: 628 of 1,259 chat captures repeated a chat another member had
+    just captured (same 180 objects uploaded twice). Reads are app-level, so a member's
+    copy derives from a fresh complete capture of the same chat."""
+    adapters.source.messages = [message(attached=True), dict(message(hosted=True), id="with-image")]
+    alpha_scope, alpha = await run_capture(store, adapters)
+    reads = (adapters.source.passes, adapters.source.downloads, adapters.source.hosted_downloads)
+    uploads = len(adapters.storage.uploads)
+    beta_scope = await member_scope(store, alpha_scope.chat_id)
+    beta = await derive(adapters, store, beta_scope)
+    assert alpha.outcome == beta.outcome == "complete"
+    assert beta.item_count == alpha.item_count == 4 and beta.uploaded_bytes == 0
+    assert (adapters.source.passes, adapters.source.downloads, adapters.source.hosted_downloads) == reads
+    assert len(adapters.storage.uploads) == uploads
+    async with store.factory() as session:
+        attempt = await session.scalar(select(ChatCaptureAttempt).where(
+            ChatCaptureAttempt.snapshot_id == beta_scope.snapshot_id))
+        links = await session.scalar(select(func.count()).select_from(SnapshotItem).where(
+            SnapshotItem.snapshot_id == beta_scope.snapshot_id))
+    assert attempt.state == "PUBLISHED" and links == 4
+    assert any(entry.get("derived_from_principal") == "principal-alpha" for entry in attempt.evidence_history)
+
+
+async def test_derived_copy_keeps_only_the_members_visible_history(store, adapters):
+    old = dict(message(attached=True), id="old", createdDateTime="2025-01-01T00:00:00Z")
+    new = dict(message(), id="new", createdDateTime="2026-06-01T00:00:00Z")
+    adapters.source.messages = [old, new]
+    alpha_scope, alpha = await run_capture(store, adapters)
+    beta_scope = await member_scope(store, alpha_scope.chat_id)
+    beta = await derive(adapters, store, beta_scope,
+        exclude_message=lambda raw: raw.get("createdDateTime", "") < "2026-01-01", scope_filter_hash="f" * 64)
+    assert alpha.item_count == 3 and beta.outcome == "complete" and beta.item_count == 1
+    async with store.factory() as session:
+        kept = set((await session.scalars(select(SnapshotItem.external_id).where(
+            SnapshotItem.snapshot_id == beta_scope.snapshot_id))).all())
+    assert len(kept) == 1 and all("old" not in key for key in kept)
+
+
+async def test_stale_or_non_covering_capture_is_not_a_donor(store, adapters):
+    adapters.source.messages = [message()]
+    alpha_scope, _ = await run_capture(store, adapters)
+    beta_scope = await member_scope(store, alpha_scope.chat_id)
+    assert await derive(adapters, store, beta_scope, covers=lambda principal, filter_hash: False) is None
+    async with store.factory.begin() as session:
+        await session.execute(text("UPDATE chat_capture_attempts SET created_at = created_at - interval '3 hours'"))
+    assert await derive(adapters, store, beta_scope) is None
+
+
+async def test_member_waits_instead_of_duplicating_an_active_capture(store, adapters):
+    from shared import chat_catalogue as catalogue
+    alpha_scope = await store.new_scope()
+    async with store.factory.begin() as session:
+        await catalogue.begin_capture(session, scope=alpha_scope)
+    beta_scope = await member_scope(store, alpha_scope.chat_id)
+    assert await derive(adapters, store, beta_scope) is adapters.capture.SHARED_CAPTURE_BUSY
+
+
+async def test_retired_donor_object_falls_back_to_a_normal_capture(store, adapters, monkeypatch):
+    adapters.source.messages = [message(attached=True)]
+    alpha_scope, _ = await run_capture(store, adapters)
+    async with store.factory.begin() as session:
+        await session.execute(text("UPDATE chat_blob_objects SET state = 'DELETING'"))
+    beta_scope = await member_scope(store, alpha_scope.chat_id)
+    assert await derive(adapters, store, beta_scope) is None
+    async with store.factory.begin() as session:
+        await session.execute(text("UPDATE chat_blob_objects SET state = 'LIVE'"))
+        assert await session.scalar(select(func.count()).select_from(SnapshotItem).where(
+            SnapshotItem.snapshot_id == beta_scope.snapshot_id)) == 0
+    adapters.source.permission_scope_hash = "b" * 64
+
+    @asynccontextmanager
+    async def pinned(base, *, principal_id):
+        yield adapters.source
+
+    monkeypatch.setattr(adapters.capture, "pinned_chat_source", pinned)
+    beta = await adapters.capture.capture_chat_inventory(scope=beta_scope, graph_client=object(),
+        storage=adapters.storage, session_factory=store.factory)
+    assert beta.outcome == "complete"

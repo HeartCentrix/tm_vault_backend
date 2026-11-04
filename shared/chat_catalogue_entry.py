@@ -302,6 +302,15 @@ def chat_folder(chat, principal_id):
     return "chats/" + display.replace("/", "-")
 
 
+_POSTPONED = object()
+
+
+def _capture_order(chat_ids, principal):
+    """Members of one group chat must not all reach it at the same moment: each would capture
+    and upload it in full before any could derive from another's finished capture."""
+    return sorted(chat_ids, key=lambda cid: hashlib.sha256((principal + "\x00" + cid).encode()).digest())
+
+
 def _hosted_elsewhere(chat, home_tenant, result) -> bool:
     """A chat hosted in another organization's tenant that Microsoft let us read nothing of
     (it answers app access with 403): listed as hosted elsewhere, not our failure."""
@@ -330,7 +339,9 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
     """Return None only for an eligible disabled legacy path; never downgrade."""
     from shared.provider_runtime import (unit_scope, checkpoint_unit, check_provider_turn,
         ProviderTurnDeferred, current_execution, other_provider_work_waiting, yield_provider_turn)
-    from shared.chat_capture import capture_chat_inventory
+    from shared.chat_capture import capture_chat_inventory, derive_shared_chat, SHARED_CAPTURE_BUSY
+    from shared.provider_admission import ProviderDeferred
+    from shared.provider_runtime import defer_provider
     from shared.chat_capture_graph import pinned_chat_source, effective_capture_scope_hash
     if type(concurrency) is not int or concurrency < 1:
         raise ValueError("chat capture concurrency must be positive")
@@ -390,7 +401,8 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                 errors.append("some planned chats are no longer visible to the capture principal")
             if published - selected and allowed is None:
                 errors.append("chat membership changed across capture attempts")
-            keys = sorted(selected)
+            shared_capture = os.getenv("CHAT_SHARED_CAPTURE", "true").lower() not in ("0", "false", "no", "off")
+            keys = _capture_order(selected, principal) if shared_capture else sorted(selected)
             # Each user's backup holds the history Teams shares with that user.
             filters = {cid: _visibility_filter(chats[cid], principal, exclude_message, scope_filter_hash) for cid in keys}
             def chat_scope(cid):
@@ -398,11 +410,35 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                     effective_capture_scope_hash(source.permission_scope_hash, filters[cid][1]),
                     backend_id, partition_id, snapshot_lease_token=snapshot_lease_token,
                     partition_lease_token=partition_lease_token, job_lease_token=job_lease_token)
-            async def capture(cid):
+            def covers_for(cid):
+                chat, mine = chats[cid], visible_history_start(chats[cid], principal)
+                members = {str(m.get("userId") or "").lower() for m in chat.get("members") or [] if isinstance(m, dict)}
+                def covers(donor, recorded_filter):
+                    # The donor's capture holds everything this member sees: same configured
+                    # filter, and its visible history starts no later than this member's.
+                    if (donor or "").lower() not in members:
+                        return False
+                    if recorded_filter != _visibility_filter(chat, donor, exclude_message, scope_filter_hash)[1]:
+                        return False
+                    theirs = visible_history_start(chat, donor)
+                    return theirs is None or (mine is not None and theirs <= mine)
+                return covers
+            async def capture(cid, final=True):
                 await cancel_check()
                 scope = chat_scope(cid)
                 async with session_factory() as session:
                     previous = await _published_chat(session, scope)
+                if previous is None and shared_capture:
+                    previous = await derive_shared_chat(scope=scope, session_factory=session_factory,
+                        covers=covers_for(cid), folder_path=chat_folder(chats[cid], principal),
+                        exclude_message=filters[cid][0], scope_filter_hash=filters[cid][1])
+                    if previous is SHARED_CAPTURE_BUSY:
+                        if not final:
+                            return _POSTPONED
+                        if current_execution() is not None:
+                            # Hand the turn back; on resume this chat derives from the finished capture.
+                            defer_provider(ProviderDeferred(None, 15, stage="shared_chat_wait"))
+                        previous = None
                 async with unit_scope('chat:' + hashlib.sha256(cid.encode()).hexdigest(), 'chat'):
                     result = previous
                     if result is None:
@@ -419,19 +455,22 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                     await checkpoint_unit(receipt_id=str(result.inventory_id),
                         state='COMPLETED' if result.outcome == 'complete' else 'FAILED')
                     return result
-            remaining = iter(keys)
+            remaining, postponed = iter(keys), []
             yield_requested, processed = False, 0
-            async def worker():
+            async def worker(final):
                 nonlocal completed, yield_requested, processed
                 for cid in remaining:
                     if yield_requested:
                         return
                     await cancel_check()
                     try:
-                        result = await capture(cid)
+                        result = await capture(cid, final)
                     except (Exception, asyncio.CancelledError) as exc:
                         result = exc
                     await cancel_check()
+                    if result is _POSTPONED:
+                        postponed.append(cid)
+                        continue
                     if isinstance(result, asyncio.CancelledError):
                         raise result
                     if isinstance(result, ChatCatalogueWorkLeaseMoved):
@@ -464,18 +503,24 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                     if (cid not in published and time.monotonic() - turn_started >= min_turn_s
                             and await other_provider_work_waiting()):
                         yield_requested = True
-            workers = [asyncio.create_task(worker()) for _ in range(min(concurrency, len(keys)))]
-            try:
-                await asyncio.gather(*workers)
-            except ProviderTurnDeferred:
-                # Provider pause is cooperative. Ownership loss and explicit
-                # cancellation still interrupt siblings through finally below.
-                await asyncio.gather(*workers, return_exceptions=True)
-                raise
-            finally:
-                for task in workers:
-                    task.cancel()
-                await asyncio.gather(*workers, return_exceptions=True)
+            for final in (False, True):
+                if final:
+                    # Chats another member was capturing come last, by then usually derivable.
+                    if not postponed or yield_requested:
+                        break
+                    remaining = iter(list(postponed))
+                workers = [asyncio.create_task(worker(final)) for _ in range(min(concurrency, len(keys)))]
+                try:
+                    await asyncio.gather(*workers)
+                except ProviderTurnDeferred:
+                    # Provider pause is cooperative. Ownership loss and explicit
+                    # cancellation still interrupt siblings through finally below.
+                    await asyncio.gather(*workers, return_exceptions=True)
+                    raise
+                finally:
+                    for task in workers:
+                        task.cancel()
+                    await asyncio.gather(*workers, return_exceptions=True)
             if yield_requested and processed < len(keys):
                 yield_provider_turn()
             final_chats = set(await _chat_list(source))

@@ -6,7 +6,7 @@ import copy
 from collections import OrderedDict
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import logging
@@ -18,7 +18,7 @@ import time
 from uuid import UUID
 from weakref import WeakKeyDictionary
 
-from sqlalchemy import and_, delete, exists, or_, select
+from sqlalchemy import and_, delete, exists, func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from shared import chat_catalogue as catalogue
@@ -26,7 +26,7 @@ from shared.chat_catalogue_identity import (
     SOURCE_UNAVAILABLE_FIELD,
     CaptureEvidence, CaptureResult, CapturedChatItem, ChatContentDescriptor,
     _digest, _payload, authentication_context_fingerprint, canonical_version_fingerprint, metadata_only_attachment,
-    qualified_chat_item_key, observation_semantic, validate_observation_hash_version,
+    qualified_chat_item_key, observation_semantic, source_inventory_fingerprint, validate_observation_hash_version,
 )
 from shared.chat_capture_graph import EXTERNAL_TENANT_FILE, ChatGraphError, StrictChatGraphSource, effective_capture_scope_hash, pinned_chat_source
 from shared.chat_capture_storage import upload_capture_content, verify_catalogue_content
@@ -606,19 +606,137 @@ async def _verified_state(factory, scope, fingerprint, observation_hash_version)
     return await run_catalogue_transaction(factory, find) is not None
 
 
+async def _discard_attempt(session, lease, scope, reason):
+    """Drop an unpublished attempt's snapshot links so a fresh attempt can stage the chat."""
+    if await session.get(SnapshotChatInventory, (scope.snapshot_id, scope.chat_id)) is not None:
+        raise catalogue.ChatCatalogueConflict("terminal inventory cannot restart")
+    matching = exists(select(ChatInventoryItem.logical_key).where(
+        ChatInventoryItem.inventory_id == lease.staged_inventory_id,
+        ChatInventoryItem.logical_key == SnapshotItem.external_id,
+        ChatInventoryItem.version_id == SnapshotItem.chat_version_id))
+    await session.execute(delete(SnapshotItem).where(SnapshotItem.snapshot_id == scope.snapshot_id, matching))
+    attempt = await session.get(ChatCaptureAttempt, lease.attempt_id)
+    attempt.state, attempt.failure_reason = "FAILED", reason
+
+
 async def _restart(factory, keeper, scope):
     async def operation(session):
         await catalogue.renew_capture(session, lease=keeper.lease)
-        if await session.get(SnapshotChatInventory, (scope.snapshot_id, scope.chat_id)) is not None:
-            raise catalogue.ChatCatalogueConflict("terminal inventory cannot restart")
-        matching = exists(select(ChatInventoryItem.logical_key).where(
-            ChatInventoryItem.inventory_id == keeper.lease.staged_inventory_id,
-            ChatInventoryItem.logical_key == SnapshotItem.external_id,
-            ChatInventoryItem.version_id == SnapshotItem.chat_version_id))
-        await session.execute(delete(SnapshotItem).where(SnapshotItem.snapshot_id == scope.snapshot_id, matching))
-        attempt = await session.get(ChatCaptureAttempt, keeper.lease.attempt_id)
-        attempt.state, attempt.failure_reason = "FAILED", "source changed during bounded reconciliation"
+        await _discard_attempt(session, keeper.lease, scope, "source changed during bounded reconciliation")
     await run_catalogue_transaction(factory, operation)
+
+
+SHARED_CAPTURE_BUSY = object()
+
+
+def _recorded_filter(attempt):
+    for entry in attempt.evidence_history or []:
+        if isinstance(entry, dict) and "source_filter_sha256" in entry:
+            return entry["source_filter_sha256"]
+    return None
+
+
+async def derive_shared_chat(*, scope, session_factory, covers, folder_path=None,
+                             exclude_message=None, scope_filter_hash=None):
+    """Build this member's inventory from another member's fresh COMPLETE capture of the chat.
+
+    Messages, hosted contents and files are read through app-level routes, so every member's
+    capture of a chat sees the same source; only the visible-history boundary differs, and it
+    is re-applied here. ``covers(principal_id, recorded_filter_hash)`` says whether that
+    member's capture holds everything this member sees. Returns SHARED_CAPTURE_BUSY while a
+    covering member is capturing the chat, None when there is no usable donor (the caller
+    captures from Graph), else the published CaptureResult. Publication runs the normal
+    completeness checks; any mismatch discards this attempt and returns None.
+    """
+    from shared.config import settings
+    from shared.models import Snapshot
+    version = settings.CHAT_OBSERVATION_HASH_VERSION
+    window = timedelta(minutes=float(os.getenv("CHAT_SHARED_CAPTURE_WINDOW_MIN", "30")))
+
+    async def find(session):
+        started = (await session.get(Snapshot, scope.snapshot_id)).started_at
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        now = await session.scalar(select(func.clock_timestamp()))
+        rows = (await session.execute(select(ChatCaptureAttempt, ChatInventory).outerjoin(
+            ChatInventory, ChatInventory.id == ChatCaptureAttempt.staged_inventory_id).where(
+            ChatCaptureAttempt.tenant_id == scope.tenant_id, ChatCaptureAttempt.chat_id == scope.chat_id,
+            ChatCaptureAttempt.principal_id != scope.principal_id,
+            ChatCaptureAttempt.created_at >= started - window)
+            .order_by(ChatCaptureAttempt.created_at.desc()))).all()
+        busy = False
+        for attempt, inventory in rows:
+            if not covers(attempt.principal_id, _recorded_filter(attempt)):
+                continue
+            if (attempt.state == "PUBLISHED" and inventory is not None and inventory.state == "COMPLETE"
+                    and inventory.observation_hash_version == version):
+                versions = (await session.scalars(select(ChatItemVersion).join(ChatInventoryItem,
+                    ChatInventoryItem.version_id == ChatItemVersion.id).where(
+                    ChatInventoryItem.inventory_id == inventory.id))).all()
+                return attempt.id, attempt.principal_id, [catalogue._captured(v) for v in versions]
+            busy = busy or (attempt.state in catalogue._ACTIVE and attempt.expires_at > now)
+        return SHARED_CAPTURE_BUSY if busy else None
+
+    found = await run_catalogue_transaction(session_factory, find)
+    if found is None or found is SHARED_CAPTURE_BUSY:
+        return found
+    donor_attempt, donor_principal, items = found
+    kept, selected = set(), []
+    for item in items:
+        if item.item_type in catalogue._MESSAGE_TYPES:
+            if exclude_message is not None and exclude_message({**item.payload, "_chat_folder_path": folder_path}):
+                continue
+            kept.add(item.graph_id)
+            selected.append(item)
+    # Parents before children: a child link needs its parent's staged row.
+    selected += [item for item in items if item.item_type not in catalogue._MESSAGE_TYPES
+                 and (item.parent_graph_id is None or item.parent_graph_id in kept)]
+    required = sum(1 for item in selected if item.item_type in ("CHAT_ATTACHMENT", "CHAT_HOSTED_CONTENT")
+                   and (item.item_type == "CHAT_HOSTED_CONTENT" or not metadata_only_attachment(item.payload))
+                   and item.payload.get(SOURCE_UNAVAILABLE_FIELD) is not True)
+    durable = sum(1 for item in selected if item.content is not None)
+    fingerprint = source_inventory_fingerprint(scope=scope, items=selected, observation_hash_version=version)
+    started = datetime.now(timezone.utc)
+
+    async def begin(session):
+        lease = await catalogue.begin_capture(session, scope=scope, folder_path=folder_path,
+                                              observation_hash_version=version)
+        attempt = await session.get(ChatCaptureAttempt, lease.attempt_id)
+        attempt.evidence_history = [*([{"source_filter_sha256": scope_filter_hash}] if scope_filter_hash is not None else []),
+            {"derived_from_attempt": str(donor_attempt), "derived_from_principal": donor_principal}]
+        return lease
+
+    lease = await run_catalogue_transaction(session_factory, begin)
+    try:
+        for start in range(0, len(selected), 200):
+            async def stage(session, batch=selected[start:start + 200]):
+                nonlocal lease
+                lease = await catalogue.renew_capture(session, lease=lease)
+                await catalogue.stage_versions(session, lease=lease, items=batch)
+            await run_catalogue_transaction(session_factory, stage)
+        evidence = CaptureEvidence(True, True, fingerprint, fingerprint, 0, required, durable, 0,
+                                   started, datetime.now(timezone.utc), observation_hash_version=version)
+
+        async def finish(session):
+            attempt, _ = await catalogue._attempt(session, lease)
+            staged = await catalogue._staged(session, await session.get(ChatInventory, attempt.staged_inventory_id), scope)
+            if staged.gaps or staged.source_hash != fingerprint or (staged.required, staged.durable) != (required, durable):
+                return None
+            await catalogue.record_capture_evidence(session, lease=lease, evidence=evidence)
+            return await catalogue.publish_inventory(session, lease=lease)
+
+        result = await run_catalogue_transaction(session_factory, finish)
+    except catalogue.ChatCatalogueIntegrityError:
+        result = None
+    if result is None:
+        async def discard(session):
+            await _discard_attempt(session, lease, scope, "shared capture derivation rejected")
+        await run_catalogue_transaction(session_factory, discard)
+        logger.warning("chat_shared_capture_rejected chat=%s donor_attempt=%s", scope.chat_id, donor_attempt)
+        return None
+    logger.info("chat_shared_capture_derived attempt_id=%s chat=%s donor_attempt=%s items=%s",
+                lease.attempt_id, scope.chat_id, donor_attempt, len(selected))
+    return result
 
 
 @asynccontextmanager

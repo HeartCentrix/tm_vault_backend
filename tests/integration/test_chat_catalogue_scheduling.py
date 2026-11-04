@@ -67,6 +67,9 @@ def scheduled_source(store, monkeypatch):
             source.closed = True
 
     monkeypatch.setattr(chat_capture_graph, "pinned_chat_source", pinned)
+    # These tests pin slot scheduling to alphabetical chat order; per-member ordering for
+    # shared capture has its own test.
+    monkeypatch.setenv("CHAT_SHARED_CAPTURE", "false")
 
     class Storage:
         def active_backend_id(self):
