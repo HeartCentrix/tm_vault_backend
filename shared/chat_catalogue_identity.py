@@ -309,7 +309,7 @@ class CapturedChatItem:
             content_type in {"messageReference", "forwardedMessageReference", "meetingReference"})
         requires_binary = self.item_type == "CHAT_HOSTED_CONTENT" or (
             self.item_type == "CHAT_ATTACHMENT" and not metadata_only)
-        if requires_binary and self.content is None:
+        if requires_binary and self.content is None and self.payload.get(SOURCE_UNAVAILABLE_FIELD) is not True:
             raise ValueError("required binary content has no content descriptor")
 
 
@@ -392,6 +392,12 @@ class StageResult:
         _count(self.new_versions, "new_versions")
         if self.new_versions > self.staged_items:
             raise ValueError("new_versions exceeds successfully staged_items")
+
+
+# Marks a byte-less child record whose bytes Microsoft itself could not serve (gone, or a
+# persistent server error) although the listing named it. Coverage treats it as captured
+# metadata, not a missing required binary: PARTIAL is reserved for our own failures.
+SOURCE_UNAVAILABLE_FIELD = "chat_catalogue_source_unavailable"
 
 
 def authentication_context_fingerprint(scope: ChatCaptureScope) -> str:

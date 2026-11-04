@@ -28,6 +28,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 
 from shared.chat_catalogue_identity import (
+    SOURCE_UNAVAILABLE_FIELD,
     CaptureEvidence, CaptureLease, CaptureResult, CapturedChatItem,
     ChatCaptureScope, ChatContentDescriptor, StageResult,
     _digest, _payload, authentication_context_fingerprint,
@@ -457,6 +458,8 @@ async def _staged(session, inventory, scope):
                 payload[field] = ([{"id": child.get("id"), "contentType": child.get("contentType", "")}
                     if isinstance(child, Mapping) else None for child in children]
                     if isinstance(children, (tuple, list)) else None)
+        elif item.payload.get(SOURCE_UNAVAILABLE_FIELD) is True:
+            payload[SOURCE_UNAVAILABLE_FIELD] = True
         narrow = SimpleNamespace(item_type=item.item_type, graph_id=item.graph_id,
             parent_graph_id=item.parent_graph_id, payload=payload, content=True if content is not None else None)
         coverage.append(narrow)
@@ -527,7 +530,9 @@ def _coverage(scope, items):
                 expect(parent, kind, child.get("id"), kind == "CHAT_HOSTED_CONTENT" or not card)
     gaps.extend({"kind": "missing_child", "logical_key": key} for key in sorted(set(expected) - set(actual)))
     gaps.extend({"kind": "unmanifested_child", "logical_key": key} for key in sorted(set(actual) - set(expected)))
-    required_keys = {key for key, required in expected.items() if required}
+    unavailable = {key for key, item in actual.items() if item.content is None and
+                   isinstance(item.payload, Mapping) and item.payload.get(SOURCE_UNAVAILABLE_FIELD) is True}
+    required_keys = {key for key, required in expected.items() if required and key not in unavailable}
     required_keys.update(qualified_chat_item_key(scope.chat_id, item.item_type, item.graph_id, item.parent_graph_id)
                          for item in items if item.content is not None)
     return len(required_keys), gaps

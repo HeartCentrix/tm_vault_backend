@@ -10,13 +10,16 @@ import os
 import time
 from uuid import UUID
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import cast, func, or_, select
+from sqlalchemy.dialects.postgresql import JSONB
 
 from shared.chat_catalogue import ChatCatalogueConflict, ChatCatalogueIntegrityError, ChatCatalogueWorkLeaseMoved
 from shared.chat_catalogue_identity import CaptureResult, ChatCaptureScope, authentication_context_fingerprint
 from shared.db_retry import run_catalogue_transaction
-from shared.models import (ChatCaptureAttempt, ChatInventory, Job, JobStatus, Resource, ResourceType, SlaPolicy,
-    Snapshot, SnapshotChatInventory, SnapshotItem, SnapshotPartition, SnapshotStatus, SnapshotType)
+from shared.models import (ChatCaptureAttempt, ChatInventory, ChatInventoryItem, ChatItemVersion, Job, JobStatus,
+    Resource, ResourceType, SlaPolicy, Snapshot, SnapshotChatInventory, SnapshotItem, SnapshotPartition,
+    SnapshotStatus, SnapshotType)
+from shared.chat_catalogue_identity import SOURCE_UNAVAILABLE_FIELD
 
 
 class ChatCatalogueAdoptionError(RuntimeError):
@@ -299,6 +302,14 @@ def chat_folder(chat, principal_id):
     return "chats/" + display.replace("/", "-")
 
 
+def _hosted_elsewhere(chat, home_tenant, result) -> bool:
+    """A chat hosted in another organization's tenant that Microsoft let us read nothing of
+    (it answers app access with 403): listed as hosted elsewhere, not our failure."""
+    tenant = (chat or {}).get("tenantId")
+    return (isinstance(tenant, str) and isinstance(home_tenant, str) and bool(home_tenant) and
+            tenant.lower() != home_tenant.lower() and result.outcome == "failed" and not result.item_count)
+
+
 async def _chat_list(source):
     chats = {}
     async for chat in source.iter_chats():
@@ -308,7 +319,7 @@ async def _chat_list(source):
         observed = {"id": cid, "topic": chat.get("topic"), "chatType": chat.get("chatType")}
         if cid in chats and {k: chats[cid][k] for k in observed} != observed:
             raise ChatCatalogueConflict("chat listing changed while it was being enumerated")
-        chats[cid] = {**observed, "members": chat.get("members") or []}
+        chats[cid] = {**observed, "members": chat.get("members") or [], "tenantId": chat.get("tenantId")}
     return chats
 
 
@@ -369,7 +380,7 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
     # Yielding costs a re-claim and a full chat re-list; keep a fresh turn
     # productive for at least this long before fair checkpoints apply.
     turn_started, min_turn_s = time.monotonic(), float(os.getenv("CHAT_TURN_MIN_SECONDS", "60"))
-    errors, completed, planned, selected = [], 0, 0, set()
+    errors, completed, planned, selected, external = [], 0, 0, set(), []
     try:
         async with pinned_chat_source(graph_client, principal_id=principal) as source:
             chats = await _chat_list(source)
@@ -444,6 +455,9 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                         errors.append(f"chat capture did not complete ({type(result).__name__})")
                     elif result.outcome == "complete":
                         completed += 1
+                    elif _hosted_elsewhere(chats.get(cid), getattr(source, "home_tenant_id", None), result):
+                        completed += 1
+                        external.append(cid)
                     else:
                         errors.append(result.failure_reason or "chat capture has incomplete coverage")
                     processed += 1
@@ -488,7 +502,13 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
         complete = not errors and completed == planned
         outcome = "complete" if complete else ("partial" if known or result["item_count"] else "failed")
         reason = "; ".join(dict.fromkeys(errors))[:1500] if errors else None
+        unavailable = await session.scalar(select(func.count()).select_from(SnapshotChatInventory)
+            .join(ChatInventoryItem, ChatInventoryItem.inventory_id == SnapshotChatInventory.inventory_id)
+            .join(ChatItemVersion, ChatItemVersion.id == ChatInventoryItem.version_id)
+            .where(SnapshotChatInventory.snapshot_id == snapshot_id, ChatItemVersion.object_id.is_(None),
+                   cast(ChatItemVersion.payload, JSONB)[SOURCE_UNAVAILABLE_FIELD].astext == "true")) or 0
         record = {"complete": complete, "planned_chats": planned, "completed_chats": completed,
+            "external_tenant_chats": sorted(external), "source_unavailable_items": unavailable,
             "selection_sha256": hashlib.sha256(json.dumps(sorted(selected), separators=(",", ":")).encode()).hexdigest(),
             "filter_sha256": scope_filter_hash, "started_at": started.isoformat(), "finished_at": finished.isoformat(),
             "failure_reason": reason}

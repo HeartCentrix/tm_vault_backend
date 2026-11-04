@@ -165,25 +165,45 @@ async def test_refreshed_attachment_url_on_overlapping_page_is_verified_without_
     assert adapters.source.passes == 2
 
 
-async def test_hosted_404_remains_partial_with_read_progress(store, adapters, caplog):
+def _hosted_unavailable(adapters, status):
     from shared.chat_capture_graph import ChatGraphError
-    caplog.set_level(logging.INFO, logger='shared.chat_capture')
-    adapters.source.messages = [dict(message(hosted=True), etag='stable')]
 
     @asynccontextmanager
     async def unavailable(*args):
-        raise ChatGraphError('Graph capture content failed with HTTP 404', status_code=404)
+        raise ChatGraphError(f'Graph capture content failed with HTTP {status}', status_code=status)
         yield
 
     adapters.source.open_hosted = unavailable
+
+
+@pytest.mark.parametrize('status', [404, 500])
+async def test_hosted_content_microsoft_cannot_serve_is_recorded_not_partial(store, adapters, caplog, status):
+    """Microsoft lists the hosted item but answers its bytes with gone (404) or a persistent
+    server error (500, e.g. Teams /views/video clips). That is not our failure: the chat is
+    COMPLETE, the item is kept as a byte-less record marked unavailable at the source, and
+    the failure is still logged with its status."""
+    from shared.models import ChatItemVersion
+    caplog.set_level(logging.INFO, logger='shared.chat_capture')
+    adapters.source.messages = [dict(message(hosted=True), etag='stable')]
+    _hosted_unavailable(adapters, status)
+    _, result = await run_capture(store, adapters)
+    assert result.outcome == 'complete' and result.item_count == 2
+    async with store.factory() as session:
+        hosted = (await session.scalars(select(ChatItemVersion).where(
+            ChatItemVersion.item_type == 'CHAT_HOSTED_CONTENT'))).all()
+    assert len(hosted) == 1 and hosted[0].object_id is None
+    assert hosted[0].payload['chat_catalogue_source_unavailable'] is True
+    lines = [record.getMessage() for record in caplog.records if record.name == 'shared.chat_capture']
+    failures = [value for value in lines if value.startswith('chat_capture_failure')]
+    assert len(failures) == 2 and all(f'status={status}' in v for v in failures)
+
+
+async def test_hosted_content_permission_denial_stays_partial(store, adapters):
+    """A 403 can be our app's missing or misconfigured permission, so it stays PARTIAL."""
+    adapters.source.messages = [dict(message(hosted=True), etag='stable')]
+    _hosted_unavailable(adapters, 403)
     _, result = await run_capture(store, adapters)
     assert result.outcome == 'partial' and result.item_count == 1
-    lines = [record.getMessage() for record in caplog.records if record.name == 'shared.chat_capture']
-    progress = [value for value in lines if value.startswith('chat_capture_progress')]
-    assert len(progress) == 2
-    assert all('verified_binary=0 unresolved=1' in value for value in progress)
-    failures = [value for value in lines if value.startswith('chat_capture_failure')]
-    assert len(failures) == 2 and all('phase=CHAT_HOSTED_CONTENT' in v and 'status=404' in v for v in failures)
 
 
 async def test_captured_binaries_restore_after_previous_snapshot_is_deleted(store, adapters, snapshot_api, monkeypatch):

@@ -23,11 +23,12 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from shared import chat_catalogue as catalogue
 from shared.chat_catalogue_identity import (
+    SOURCE_UNAVAILABLE_FIELD,
     CaptureEvidence, CaptureResult, CapturedChatItem, ChatContentDescriptor,
     _digest, _payload, authentication_context_fingerprint, canonical_version_fingerprint,
     qualified_chat_item_key, observation_semantic, validate_observation_hash_version,
 )
-from shared.chat_capture_graph import StrictChatGraphSource, effective_capture_scope_hash, pinned_chat_source
+from shared.chat_capture_graph import ChatGraphError, StrictChatGraphSource, effective_capture_scope_hash, pinned_chat_source
 from shared.chat_capture_storage import upload_capture_content, verify_catalogue_content
 from shared.chat_content_stream import spool_chat_content
 from shared.db_retry import run_catalogue_transaction
@@ -146,6 +147,11 @@ class ChatObservationLedger:
         logger.warning("chat_capture_failure observation=%s phase=%s error=%s status=%s code=%s request_id=%s",
                        observation, phase, type(error).__name__, status,
                        _identifier(getattr(error, "code", None)), _identifier(getattr(error, "request_id", None)))
+
+    def unavailable(self, observation, item_type, graph_id, parent_graph_id):
+        """Microsoft could not serve this listed child's bytes: not a required binary."""
+        key = qualified_chat_item_key(self.scope.chat_id, item_type, graph_id, parent_graph_id)
+        self.db.execute("UPDATE expected SET required=0 WHERE pass=? AND key=?", (observation, key))
 
     def failure_details(self):
         names = ("observation", "phase", "error_type", "status_code", "graph_id", "parent_graph_id",
@@ -454,6 +460,14 @@ async def _binary(*, scope, keeper, factory, storage, source_client, item_type,
             mark("stage")
         return report(item)
 
+def _source_unavailable(exc) -> bool:
+    """Microsoft named the item but cannot serve its bytes: 404/410 gone, or a 500 that
+    survived the request retries (Teams /views/video clips answer 500 every time). 401/403
+    (our permissions), 429 and 502-504 (throttling/outage), transport and storage failures
+    stay unresolved, so they keep the chat PARTIAL."""
+    return isinstance(exc, ChatGraphError) and getattr(exc, "status_code", None) in (404, 410, 500)
+
+
 def _without_home_tenant(message: dict, home_tenant) -> dict:
     """Graph reports a same-tenant reacting/mentioned user's tenantId as the home tenant on one
     read and omits it on the next, and swaps a reaction's displayName label between wordings.
@@ -551,7 +565,14 @@ async def _observe(*, scope, keeper, factory, storage, source, ledger, observati
                             raise
                         except Exception as exc:
                             ledger.failure(observation, kind, exc, child["id"], identifier)
-                            stats.unresolved += 1
+                            if _source_unavailable(exc):
+                                ledger.unavailable(observation, kind, child["id"], identifier)
+                                captured = CapturedChatItem(kind, child["id"], identifier,
+                                                            {**child, SOURCE_UNAVAILABLE_FIELD: True}, None)
+                                if ledger.record(observation, captured) and observation == 0:
+                                    pending.append(captured)
+                            else:
+                                stats.unresolved += 1
                         if len(pending) >= 200:
                             await _stage(factory, keeper, pending)
                             pending = []

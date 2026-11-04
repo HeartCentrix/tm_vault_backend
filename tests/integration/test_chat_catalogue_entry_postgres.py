@@ -366,6 +366,33 @@ async def test_worker_publishes_and_settles_full_then_reused_incremental_with_ho
     assert resumed["resumed_terminal"] and resumed["new_item_count"] == 0 and resumed["bytes_added"] == 0
 
 
+async def test_chat_hosted_in_another_tenant_is_listed_not_partial(store, source_adapter):
+    """Microsoft refuses app access (403) to chats hosted in another organization's tenant
+    (external meeting chats). That is not our app or permission failure: the backup is not
+    PARTIAL and the chat is listed as hosted elsewhere. A same-tenant 403 stays PARTIAL."""
+    from shared.chat_capture_graph import ChatGraphError
+    scope = await legacy_scope(store)
+    source = source_adapter.source
+    source.home_tenant_id = "home-tenant"
+    source.chats.append({"id": "external-meeting", "topic": "Vendor call", "tenantId": "other-tenant"})
+    original = source.iter_message_pages
+    async def denied(chat_id):
+        if chat_id in ("external-meeting", "same-tenant-denied"):
+            raise ChatGraphError("Graph capture metadata failed with HTTP 403", status_code=403)
+        async for page in original(chat_id):
+            yield page
+    source.iter_message_pages = denied
+    result = await source_adapter.run(scope)
+    assert result["outcome"] == "complete" and result["item_count"] == 1
+    async with store.factory() as session:
+        record = (await session.get(models.Snapshot, scope.snapshot_id)).extra_data["chat_catalogue_scopes"]["resource"]
+    assert record["complete"] and record["external_tenant_chats"] == ["external-meeting"]
+
+    source.chats.append({"id": "same-tenant-denied", "topic": "Ours", "tenantId": "home-tenant"})
+    second = await store.new_scope()
+    assert (await source_adapter.run(second))["outcome"] == "partial"
+
+
 async def test_worker_preserves_partial_and_failed_source_outcomes(store, source_adapter, worker_entry):
     scope = await legacy_scope(store)
     source_adapter.source.chats.append({"id": "unavailable", "topic": "Unavailable"})
