@@ -162,6 +162,43 @@ async def find_existing_blob(
         return None
 
 
+async def find_unchanged_file_blob(
+    session: AsyncSession,
+    *,
+    resource_id: UUID,
+    external_id: str,
+    quickxor: str,
+    size: int,
+    exclude_snapshot_id: UUID,
+) -> Optional[Tuple[str, str]]:
+    """(blob_path, content_checksum) of this file's copy in the resource's latest COMPLETED or
+    PARTIAL backup when its content is unchanged: same drive item, same Graph quickXorHash,
+    same size. None means download it.
+
+    The quickXorHash is stored in the item's metadata; content_checksum holds the SHA-256, so a
+    quickXorHash lookup against content_checksum (find_existing_blob) never matches and a
+    requested full backup re-downloaded and re-stored every file (Railway 2026-11-04, 142 GiB).
+    Uses the (snapshot_id, external_id, item_type) index per candidate snapshot."""
+    if not quickxor or not external_id or size is None:
+        return None
+    from shared.models import Snapshot, SnapshotStatus
+    try:
+        stmt = (select(SnapshotItem.blob_path, SnapshotItem.content_checksum)
+                .join(Snapshot, Snapshot.id == SnapshotItem.snapshot_id)
+                .where(Snapshot.resource_id == resource_id, Snapshot.id != exclude_snapshot_id,
+                       Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL]),
+                       SnapshotItem.external_id == external_id, SnapshotItem.blob_path.isnot(None),
+                       SnapshotItem.content_size == size, SnapshotItem.content_checksum.isnot(None),
+                       SnapshotItem.extra_data["quickxor"].as_string() == quickxor)
+                .order_by(Snapshot.created_at.desc()).limit(1))
+        row = (await session.execute(stmt)).first()
+        return (row[0], row[1]) if row else None
+    except Exception as exc:
+        # Advisory like find_existing_blob: on a DB hiccup, download instead.
+        log.debug("find_unchanged_file_blob failed: %s", exc)
+        return None
+
+
 async def bulk_find_existing_blobs(
     session: AsyncSession,
     tenant_id: UUID,

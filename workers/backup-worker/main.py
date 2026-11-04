@@ -21302,18 +21302,29 @@ class BackupWorker:
                     # a tenant. If we already have a blob matching
                     # this hash in the same tenant, reuse it and
                     # skip the download+upload entirely.
-                    from shared.blob_dedup import find_existing_blob
-                    existing_bp = None
+                    from shared.blob_dedup import find_existing_blob, find_unchanged_file_blob
+                    existing_bp, existing_sha = None, None
                     dedup_key = qxh or ""
                     if dedup_key:
                         try:
                             async with async_session_factory() as _sess:
-                                existing_bp = await find_existing_blob(
-                                    _sess, tenant.id, dedup_key,
-                                    min_size_bytes=4096,
+                                # Same drive item, same quickXorHash and size as in the
+                                # last backup: reuse that copy (the hash lives in item
+                                # metadata; content_checksum is the SHA-256).
+                                unchanged = await find_unchanged_file_blob(
+                                    _sess, resource_id=resource.id, external_id=file_id,
+                                    quickxor=dedup_key, size=real_size,
+                                    exclude_snapshot_id=snapshot.id,
                                 )
+                                if unchanged:
+                                    existing_bp, existing_sha = unchanged
+                                else:
+                                    existing_bp = await find_existing_blob(
+                                        _sess, tenant.id, dedup_key,
+                                        min_size_bytes=4096,
+                                    )
                         except Exception:
-                            existing_bp = None
+                            existing_bp, existing_sha = None, None
 
                     if existing_bp:
                         # Dedup hit — reuse the existing blob_path,
@@ -21322,9 +21333,9 @@ class BackupWorker:
                         upload_result = {
                             "success": True,
                             "blob_path": existing_bp,
-                            "method": "dedup_hit",
+                            "method": "unchanged_reuse" if existing_sha else "dedup_hit",
                         }
-                        sha256 = dedup_key
+                        sha256 = existing_sha or dedup_key
                         blob_path = existing_bp
                         print(
                             f"[{self.worker_id}] [USER_ONEDRIVE] "
