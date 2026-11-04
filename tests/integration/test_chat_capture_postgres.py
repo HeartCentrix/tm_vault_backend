@@ -193,6 +193,41 @@ async def test_initial_then_unchanged_reuses_immutable_inventory(store, adapters
         assert await session.scalar(select(func.count()).select_from(SnapshotItem)) == 6
 
 
+async def test_home_tenant_enrichment_flip_keeps_one_version(store, adapters):
+    """Graph returns the reacting/mentioned user's tenantId as the home tenant on one read and
+    omits it on the next, and swaps the reaction's displayName label ("Laugh" vs "Grinning face
+    with smiling eyes"). Those flips must not create a new stored message version; another
+    tenant's id is real identity and is kept. Exports render reactions from reactionType."""
+    adapters.source.home_tenant_id = "home-tenant"
+
+    def with_identities(home_value, label):
+        value = message()
+        home = {"id": "u1"} if home_value is None else {"id": "u1", "tenantId": home_value}
+        value["reactions"] = [
+            {"reactionType": "laugh", "displayName": label, "user": {"user": dict(home)}},
+            {"reactionType": "heart", "user": {"user": {"id": "u2", "tenantId": "other-tenant"}}},
+        ]
+        value["mentions"] = [{"id": 0, "mentioned": {"user": dict(home)}}]
+        return value
+
+    adapters.source.messages = [with_identities("HOME-TENANT", "Laugh")]
+    _, first = await run_capture(store, adapters)
+    adapters.source.messages = [with_identities(None, "Grinning face with smiling eyes")]
+    _, second = await run_capture(store, adapters)
+
+    assert first.outcome == second.outcome == "complete"
+    assert second.reused and second.inventory_id == first.inventory_id
+    async with store.factory() as session:
+        payloads = (await session.scalars(select(ChatItemVersion.payload)
+            .where(ChatItemVersion.item_type == "TEAMS_CHAT_MESSAGE"))).all()
+    assert len(payloads) == 1
+    reactions = payloads[0]["reactions"]
+    assert [r["user"]["user"] for r in reactions] == [{"id": "u1"}, {"id": "u2", "tenantId": "other-tenant"}]
+    assert [r["reactionType"] for r in reactions] == ["laugh", "heart"]
+    assert all("displayName" not in r for r in reactions)
+    assert payloads[0]["mentions"][0]["mentioned"]["user"] == {"id": "u1"}
+
+
 async def test_unchanged_chat_matching_a_verified_inventory_needs_one_pass(store, adapters):
     """Pass 1 reproducing an inventory that two passes already verified COMPLETE is a
     consistent state; the second listing only doubled incremental Graph cost."""

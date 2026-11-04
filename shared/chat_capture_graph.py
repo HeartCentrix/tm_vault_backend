@@ -142,6 +142,7 @@ class StrictChatGraphSource:
         self.principal_id = principal_id
         self._initial_app = client.client_id
         self._initial_tenant = client.tenant_id
+        self.home_tenant_id = client.tenant_id
         self._initial_secret = client.client_secret
         self.permission_scope_hash = permission_scope_hash_for(
             tenant_id=self._initial_tenant, application_id=self._initial_app, principal_id=principal_id)

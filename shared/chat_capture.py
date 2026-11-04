@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from collections import OrderedDict
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass, replace
@@ -453,17 +454,43 @@ async def _binary(*, scope, keeper, factory, storage, source_client, item_type,
             mark("stage")
         return report(item)
 
+def _without_home_tenant(message: dict, home_tenant) -> dict:
+    """Graph reports a same-tenant reacting/mentioned user's tenantId as the home tenant on one
+    read and omits it on the next, and swaps a reaction's displayName label between wordings.
+    Store neither, so those flips are not new message versions. Any other tenant's id is real
+    cross-tenant identity and is kept; exports render reactions from reactionType."""
+    home = home_tenant.lower() if isinstance(home_tenant, str) and home_tenant else None
+    for field, path in (("reactions", ("user", "user")), ("mentions", ("mentioned", "user"))):
+        entries = message.get(field)
+        if not isinstance(entries, list):
+            continue
+        entries = copy.deepcopy(entries)
+        for entry in entries:
+            if field == "reactions" and isinstance(entry, dict):
+                entry.pop("displayName", None)
+            identity = entry
+            for key in path:
+                identity = identity.get(key) if isinstance(identity, dict) else None
+            if isinstance(identity, dict) and "tenantId" in identity:
+                tenant = identity["tenantId"]
+                if tenant is None or (home is not None and str(tenant).lower() == home):
+                    del identity["tenantId"]
+        message[field] = entries
+    return message
+
+
 async def _observe(*, scope, keeper, factory, storage, source, ledger, observation,
                    exclude_message=None, folder_path=None):
     stats = _Pass()
     file_versions = OrderedDict()
+    home_tenant = getattr(source, "home_tenant_id", None)
     try:
         async for page in source.iter_message_pages(scope.chat_id):
             keeper.check()
             prepared, parents = [], []
             try:
                 for raw in page:
-                    parent = stable_attachment_references(dict(raw))
+                    parent = _without_home_tenant(stable_attachment_references(dict(raw)), home_tenant)
                     if exclude_message is not None and exclude_message({**parent, "_chat_folder_path": folder_path}):
                         continue
                     if not ledger.observe_message(observation, raw):
