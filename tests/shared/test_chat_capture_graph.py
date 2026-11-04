@@ -848,3 +848,27 @@ async def test_throttling_gets_a_longer_backoff_budget_than_server_errors(source
                 _ = [page async for page in source.iter_message_pages("chat")]
         assert sum(r.url.host == "graph.microsoft.com" for r in requests) == sent
     assert waits[:8] == [1, 2, 4, 8, 16, 32, 32, 32] and waits[8:] == [0, 0, 0, 0]
+
+
+async def test_hosted_video_bytes_are_tried_once_not_retried(source_factory, monkeypatch):
+    """Real tenant 2026-11-04: every hosted item whose id names /views/video (57/57) answered
+    $value with 500 on every try, while images and audio downloaded. Retrying a video costs ~17 s
+    per item and stretched a meeting chat into the run's tail; it gets one request."""
+    import base64
+    from shared.chat_capture_graph import StrictChatGraphSource, ChatGraphError
+
+    async def no_wait(*args):
+        pass
+
+    monkeypatch.setattr(StrictChatGraphSource, "_pause", no_wait)
+    hosted = lambda view: base64.b64encode(
+        f"id=x-0-cus-d1-abc,type=1,url=https://us-api.asm.skype.com/v1/objects/0-cus-d1-abc/views/{view}".encode()).decode()
+    make, requests, *_ = source_factory
+    for view, sent in (("video", 1), ("imgo", 5)):
+        requests.clear()
+        async with make(lambda request: httpx.Response(500)) as source:
+            with pytest.raises(ChatGraphError) as raised:
+                async with source.open_hosted("chat", "message", hosted(view)):
+                    pass
+        assert raised.value.status_code == 500
+        assert sum(r.url.path.endswith("/$value") for r in requests) == sent, view

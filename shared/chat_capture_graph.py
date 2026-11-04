@@ -7,6 +7,7 @@ still enumerates its own source membership.
 from __future__ import annotations
 
 import asyncio
+import re
 import base64
 from contextlib import asynccontextmanager
 import hashlib
@@ -145,8 +146,19 @@ _RETRIES = 4            # server errors, transport, 401: short fixed waits
 _THROTTLE_RETRIES = 8   # 429: backoff budget (Teams answers Retry-After 0 and throttles again)
 
 
-def _retries(status):
-    return _THROTTLE_RETRIES if status == 429 else _RETRIES
+def _retries(status, server_retries=_RETRIES):
+    return _THROTTLE_RETRIES if status == 429 else server_retries
+
+
+def _hosted_view(hosted_content_id):
+    """Teams hosted-content ids are base64 of the media URL, which names the view
+    (imgo, audio, video ...). None when the id does not say."""
+    try:
+        raw = base64.b64decode(hosted_content_id + "=" * (-len(hosted_content_id) % 4)).decode("utf-8", "ignore")
+    except (ValueError, TypeError):
+        return None
+    match = re.search(r"/views/([A-Za-z0-9_]+)", raw)
+    return match.group(1) if match else None
 
 
 class StrictChatGraphSource:
@@ -406,7 +418,7 @@ class StrictChatGraphSource:
         return item
 
     @asynccontextmanager
-    async def _stream(self, url: str, *, graph: bool, expected_size: int | None = None):
+    async def _stream(self, url: str, *, graph: bool, expected_size: int | None = None, server_retries: int = _RETRIES):
         token = await self._context()
         client = await self._client._get_shared_http()
         headers = {"Accept-Encoding": "identity"}
@@ -431,7 +443,7 @@ class StrictChatGraphSource:
                         _target(url, graph=False)
                         redirects += 1
                         continue
-                    if response.status_code in (429, 500, 502, 503, 504) and attempt < _retries(response.status_code):
+                    if response.status_code in (429, 500, 502, 503, 504) and attempt < _retries(response.status_code, server_retries):
                         # Close this response before waiting and retrying.
                         retry_response = response
                     else:
@@ -493,7 +505,10 @@ class StrictChatGraphSource:
     @asynccontextmanager
     async def open_hosted(self, chat_id: str, message_id: str, hcid: str):
         path = f"/chats/{_component(chat_id)}/messages/{_component(message_id)}/hostedContents/{_component(hcid)}/$value"
-        async with self._stream(self._client.GRAPH_URL + path, graph=True) as opened:
+        # Real tenant: every /views/video item answered 500 on every try (57/57) while images and
+        # audio downloaded; one request records it unavailable instead of ~17 s of retries.
+        retries = 0 if _hosted_view(hcid) == "video" else _RETRIES
+        async with self._stream(self._client.GRAPH_URL + path, graph=True, server_retries=retries) as opened:
             yield opened
 
 
