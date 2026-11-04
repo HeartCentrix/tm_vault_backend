@@ -183,3 +183,12 @@ def test_server_errors_retry_on_a_short_fixed_wait_while_throttling_backs_off():
     throttled.attempts = 3
     assert server == [2.0, 2.0, 2.0]
     assert throttled.retry_delay(ProviderReadError("file_stream", status=429)) == 8.0
+
+
+def test_transport_failures_back_off_like_before():
+    """A dropped connection is network trouble, not a Microsoft 500: keep the backoff.
+    Local real-data run 2026-11-04: fixed 2 s waits gave up on a ~10 s network blip that the
+    previous 1+2+4+8 s backoff rode out, leaving a 4,689-message chat PARTIAL."""
+    from shared.graph_ratelimit import retry_wait
+    assert [retry_wait(None, None, attempt) for attempt in range(4)] == [1, 2, 4, 8]
+    assert [retry_wait(500, None, attempt) for attempt in range(4)] == [2, 2, 2, 2]

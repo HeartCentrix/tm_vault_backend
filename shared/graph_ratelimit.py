@@ -21,6 +21,9 @@ from typing import List, Optional
 def retry_wait(status: Optional[int], retry_after: Optional[float], attempt: int) -> float:
     """Throttling (429, or 503 carrying Retry-After) honours the server and backs off.
     A Microsoft server error is not load: retry after a short fixed wait, never above 10 s."""
+    if status is None:
+        # No response at all (dropped connection): network trouble, back off.
+        return float(2 ** min(attempt, 5))
     if status == 429 or (status == 503 and retry_after is not None):
         # Never faster than the backoff floor: Teams sends Retry-After 0 and throttles again.
         return float(max(retry_after or 0, 2 ** min(attempt, 5)))
