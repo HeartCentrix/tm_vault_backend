@@ -430,6 +430,11 @@ async def checkpoint_unit(*, receipt_id=None, state='COMPLETED', reconciliations
     unit.reconciliations = row.reconciliations
 
 
+# Due work still unclaimed this long means every worker is busy. Free workers poll every second and
+# claim due work within ~2 s (Railway 2026-11-04), so handing back for fresher work only idles lanes.
+_STARVED_AFTER = timedelta(seconds=15)
+
+
 async def other_provider_work_waiting():
     execution = current_execution()
     if execution is None:
@@ -437,7 +442,7 @@ async def other_provider_work_waiting():
     async with execution.factory() as session:
         return bool(await session.scalar(select(exists(select(ProviderWork.id).where(
             ProviderWork.id != execution.claim.work_id, ProviderWork.state == 'WAITING',
-            ProviderWork.next_eligible_at <= func.clock_timestamp())))))
+            ProviderWork.next_eligible_at <= func.clock_timestamp() - _STARVED_AFTER)))))
 
 
 def yield_provider_turn():

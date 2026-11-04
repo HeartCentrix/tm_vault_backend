@@ -468,3 +468,24 @@ async def test_sibling_checkpoints_do_not_exclusively_lock_shared_job(store):
         async with store.factory.begin() as b:
             await b.execute(text("SET LOCAL lock_timeout='250ms'"))
             await work.record_unit_checkpoint(b, second, unit_key='two', kind='mail')
+
+async def test_only_work_no_free_worker_picked_up_makes_a_turn_hand_back(store):
+    # Railway 2026-11-04: free workers claim due work within ~2 s, yet a running chat turn handed
+    # back whenever any other work was due, idling its lanes for work that never needed its slot.
+    from sqlalchemy import func
+    from shared.provider_runtime import ProviderExecution, _EXECUTION, other_provider_work_waiting
+    await enqueue(store)
+    mine = await claim(store)
+    other = await enqueue(store)
+    async def due_since(seconds):
+        async with store.factory.begin() as db:
+            await db.execute(update(models.ProviderWork).where(models.ProviderWork.id == other.work_id)
+                .values(state='WAITING', next_eligible_at=func.clock_timestamp() - timedelta(seconds=seconds)))
+    token = _EXECUTION.set(ProviderExecution(store.factory, mine))
+    try:
+        await due_since(2)
+        assert not await other_provider_work_waiting()
+        await due_since(60)
+        assert await other_provider_work_waiting()
+    finally:
+        _EXECUTION.reset(token)
