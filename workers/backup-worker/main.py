@@ -32330,13 +32330,14 @@ class BackupWorker:
                     ),
                     {"rid": str(resource_id)},
                 )
-                # JSONB minus-key drops the legacy mirror if present.
+                # Resource.extra_data is the json column "metadata"; jsonb
+                # minus-key drops the legacy mirror if present.
                 await session.execute(
                     text(
                         "UPDATE resources "
-                        "SET extra_data = extra_data - 'mail_delta_tokens_by_folder' "
+                        "SET metadata = (metadata::jsonb - 'mail_delta_tokens_by_folder')::json "
                         "WHERE id = :rid "
-                        "  AND extra_data ? 'mail_delta_tokens_by_folder'"
+                        "  AND metadata::jsonb ? 'mail_delta_tokens_by_folder'"
                     ),
                     {"rid": str(resource_id)},
                 )
