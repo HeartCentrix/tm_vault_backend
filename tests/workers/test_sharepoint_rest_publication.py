@@ -24,6 +24,7 @@ def run_row():
     path = Path(__file__).parents[2] / "workers/backup-worker/main.py"
     tree = ast.parse(path.read_text())
     fn = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == "_backup_sp_rest_row")
+    helpers = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("_sp_row_version", "_reusable_sp_copy")]
     state = {"uploads": [], "rows": [], "db_fail": False, "metadata_calls": 0}
     stats = {k: 0 for k in ("rest_rows", "rest_fail", "rest_files_ok", "rest_bytes")}
 
@@ -51,7 +52,7 @@ def run_row():
           "azure_storage_manager": SimpleNamespace(build_blob_path=lambda *args: "blob"),
           "record_sp_rest_failure": lambda stats, *args, **kwargs: (stats.update(rest_fail=stats['rest_fail'] + 1) or "failed")}
     # Execute the production method unchanged; replace only its external seams.
-    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), ns)
+    exec(compile(ast.Module(body=[*helpers, fn], type_ignores=[]), str(path), "exec"), ns)
 
     async def run(*, metadata=None, chunks=(b"abc",), metadata_error=None, after=None):
         if metadata is None:

@@ -4320,6 +4320,77 @@ async def list_onedrive_ids_by_prefix(
     return {"ids": deduped_ids, "count": len(deduped_ids)}
 
 
+# A SharePoint restore point = its own list/REST rows (every list is re-read on every run) plus library files
+# (Graph delta: an incremental run stores only changed files) merged from it and every earlier restore point,
+# newest copy per file winning and tombstoned (deleted) files hidden. Railway 2026-11-04: Documents showed 0
+# files after any incremental run; TM's two sites back up incrementally every 8 h.
+_SP_SITE_ROW_IDS = """
+    WITH points AS (
+        SELECT s.id, s.created_at FROM snapshots s
+        WHERE s.resource_id = :rid AND s.created_at <= :at
+          AND (s.status IN ('COMPLETED', 'PARTIAL') OR s.id = :sid)),
+    files AS (
+        SELECT DISTINCT ON (si.external_id) si.id, si.is_deleted
+        FROM snapshot_items si JOIN points p ON p.id = si.snapshot_id
+        WHERE si.item_type = 'FILE'
+        ORDER BY si.external_id, p.created_at DESC, si.id DESC)
+    SELECT id FROM files WHERE is_deleted IS NOT TRUE
+    UNION ALL
+    SELECT si.id FROM snapshot_items si
+    WHERE si.snapshot_id = :sid AND si.item_type <> 'FILE' AND si.is_deleted IS NOT TRUE"""
+
+
+def _sharepoint_library_folder(item: SnapshotItem, libraries: list) -> Optional[str]:
+    """Snapshots before 2026-11-04 stored library files under Graph's raw '/drives/<id>/root:' path, which
+    the Site view cannot place. Map them to '{site}/lists/{library}{sub}' by matching the file's URL to its
+    library's URL (both captured), longest library URL first."""
+    from urllib.parse import unquote
+    if not (item.folder_path or "").startswith("/drives/"):
+        return None
+    structured = (item.extra_data or {}).get("structured") or {}
+    url, site = unquote(structured.get("web_url") or ""), structured.get("site_label")
+    for lib_url, name, list_site in libraries:
+        if site or list_site:
+            if url.lower().startswith(lib_url.lower() + "/"):
+                sub = url[len(lib_url):].rsplit("/", 1)[0]
+                return f"{site or list_site}/lists/{name}{sub}"
+    return None
+
+
+async def _sharepoint_site_files(db, snapshot: Snapshot, *, page: int, size: int, search: Optional[str]):
+    from urllib.parse import unquote
+    from sqlalchemy import column
+    from sqlalchemy.dialects.postgresql import UUID as _PgUUID
+    visible = text(_SP_SITE_ROW_IDS).columns(column("id", _PgUUID(as_uuid=True))).subquery("visible")
+    filters = [SnapshotItem.id.in_(select(visible.c.id))]
+    if search:
+        filters.append(SnapshotItem.name.ilike(f"%{search}%"))
+    params = {"rid": snapshot.resource_id, "sid": snapshot.id, "at": snapshot.created_at}
+    total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters), params)).scalar() or 0
+    items = (await db.execute(
+        select(SnapshotItem).where(*filters)
+        .order_by(func.lower(SnapshotItem.name).asc(), SnapshotItem.id.asc())
+        .offset((page - 1) * size).limit(size), params)).scalars().all()
+    libraries = []
+    if any((i.folder_path or "").startswith("/drives/") for i in items):
+        for row in (await db.execute(select(SnapshotItem.name, SnapshotItem.extra_data, SnapshotItem.folder_path).where(
+                SnapshotItem.snapshot_id == snapshot.id, SnapshotItem.item_type == "SHAREPOINT_LIST"))).all():
+            md = row.extra_data or {}
+            if md.get("web_url"):
+                libraries.append((unquote(md["web_url"]).rstrip("/"), row.name,
+                                  md.get("site_label") or (row.folder_path or "").rsplit("/lists", 1)[0] or None))
+        libraries.sort(key=lambda lib: len(lib[0]), reverse=True)
+    content = []
+    for item in items:
+        response = _item_to_response(item)
+        folder = _sharepoint_library_folder(item, libraries)
+        if folder:
+            response.folderPath = folder
+        content.append(response)
+    return {"content": content, "totalElements": total, "totalPages": max(1, (total + size - 1) // size),
+            "size": size, "number": page}
+
+
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/files")
 async def list_snapshot_files(
     snapshot_id: str,
@@ -4338,6 +4409,10 @@ async def list_snapshot_files(
     No item_type filter — whatever is in the snapshot shows up. Mail /
     OneDrive / Contacts / Calendar / Chats have their own dedicated
     endpoints that filter by type; this one is intentionally broad."""
+    snapshot = await db.get(Snapshot, UUID(snapshot_id))
+    if snapshot is not None and await db.scalar(select(Resource.type).where(
+            Resource.id == snapshot.resource_id)) == ResourceType.SHAREPOINT_SITE:
+        return await _sharepoint_site_files(db, snapshot, page=page, size=size, search=search)
     filters = [SnapshotItem.snapshot_id == UUID(snapshot_id)]
     if search:
         filters.append(SnapshotItem.name.ilike(f"%{search}%"))

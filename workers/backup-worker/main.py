@@ -4476,6 +4476,44 @@ def _library_has_drive(lst: Dict[str, Any], drive_urls: Set[str]) -> bool:
     return bool(url) and url in drive_urls
 
 
+def _library_tombstone_row(snapshot, tenant_id, item: Dict[str, Any]) -> Dict[str, Any]:
+    """A library file Graph reports deleted. The Site view merges library files across restore points
+    (delta stores only changes), so without this row an older copy would keep showing."""
+    drive_id = item.get("_drive_id") or (item.get("parentReference") or {}).get("driveId")
+    return {
+        "id": uuid.uuid4(), "snapshot_id": snapshot.id, "tenant_id": tenant_id, "backend_id": snapshot.backend_id,
+        "external_id": str(item.get("id")), "item_type": "FILE", "name": (item.get("name") or str(item.get("id")))[:255],
+        "folder_path": _drive_item_folder_path(item), "content_size": 0, "blob_path": None, "is_deleted": True,
+        "metadata": {"structured": {"drive_id": drive_id, "site_label": item.get("_site_label"),
+                                    "library": item.get("_drive_name"), "deleted": True}},
+    }
+
+
+def _unseen_library_files(prior_rows, seen_by_drive: Dict[str, Set[str]]):
+    """prior_rows: newest (external_id, name, folder_path, is_deleted, drive_id) per file before this run.
+    A full listing that did not return a still-visible file means it was deleted."""
+    return [r for r in prior_rows if not r[3] and r[0] not in seen_by_drive.get(r[4], set())]
+
+
+def _sp_row_version(row: Dict[str, Any]) -> Optional[str]:
+    """A SharePoint list row's own change key (owshiddenversion bumps on every item or file change), so an
+    unchanged list file needs no request: TM's REST pass re-downloaded 11,317 files / 214 MB every 8 h."""
+    fvat = row.get("FieldValuesAsText") if isinstance(row.get("FieldValuesAsText"), dict) else {}
+    guid = row.get("GUID") or row.get("UniqueId")
+    hidden = row.get("owshiddenversion") or fvat.get("owshiddenversion")
+    if not guid or hidden in (None, ""):
+        return None
+    return "|".join(str(x) for x in (guid, hidden, row.get("Modified") or fvat.get("Modified") or "",
+                                     row.get("OData__UIVersionString") or fvat.get("OData__x005f_UIVersionString") or ""))
+
+
+def _reusable_sp_copy(previous: Optional[Dict[str, Any]], version: Optional[str]) -> bool:
+    """Reuse the previous restore point's copy of the same version: stored bytes, or a ghosted file that has
+    no content stream (retried 28,660 times in TM's 30 days). A copy that failed before is tried again."""
+    return bool(previous and version and previous.get("row_version") == version
+                and (previous.get("blob_path") or previous.get("ghosted")))
+
+
 class BackupWorker:
     """High-performance backup worker with parallelism and Server-Side Copy"""
 
@@ -22126,6 +22164,60 @@ class BackupWorker:
             "bytes_added": sum(r.get("bytes_added", 0) for r in results if isinstance(r, dict)),
         }
 
+    async def _previous_sp_rest_rows(self, snapshot: Snapshot, site_id: str) -> Dict[str, Dict[str, Any]]:
+        """The latest earlier restore point's list rows for this site (every run re-reads every list)."""
+        from sqlalchemy import text as _text
+        async with async_session_factory() as sess:
+            prev = await sess.scalar(_text("""
+                SELECT s.id FROM snapshots s WHERE s.resource_id = :rid AND s.id <> :sid
+                  AND s.created_at <= :at AND s.status IN ('COMPLETED', 'PARTIAL')
+                ORDER BY s.created_at DESC LIMIT 1"""),
+                {"rid": snapshot.resource_id, "sid": snapshot.id, "at": snapshot.created_at})
+            if prev is None:
+                return {}
+            rows = (await sess.execute(_text("""
+                SELECT external_id, blob_path, content_hash, content_size,
+                       metadata->>'row_version' AS row_version, metadata->>'ghosted' AS ghosted, metadata->'file' AS file
+                FROM snapshot_items WHERE snapshot_id = :prev AND metadata->>'source' = 'sp_rest'
+                  AND metadata->>'site_id' = :site AND metadata->>'row_version' IS NOT NULL"""),
+                {"prev": prev, "site": site_id})).mappings().all()
+        return {r["external_id"]: {**r, "ghosted": r["ghosted"] == "true",
+                                   "file": json.loads(r["file"]) if isinstance(r["file"], str) else r["file"]}
+                for r in rows}
+
+    async def _insert_snapshot_item_rows(self, rows: List[Dict[str, Any]]) -> None:
+        if not rows:
+            return
+        from sqlalchemy.dialects.postgresql import insert as _pg_insert
+        async with async_session_factory() as sess:
+            await sess.execute(_pg_insert(SnapshotItem.__table__).values(rows).on_conflict_do_nothing(
+                index_elements=["snapshot_id", "external_id", "item_type"]))
+            await sess.commit()
+
+    async def _tombstone_unseen_library_files(self, snapshot: Snapshot, tenant: Tenant,
+                                              drive_ids: List[str], seen_by_drive: Dict[str, Set[str]]) -> int:
+        from sqlalchemy import text as _text
+        async with async_session_factory() as sess:
+            prior = (await sess.execute(_text("""
+                SELECT DISTINCT ON (si.external_id) si.external_id, si.name, si.folder_path, si.is_deleted,
+                       si.metadata->'structured'->>'drive_id' AS drive
+                FROM snapshot_items si JOIN snapshots s ON s.id = si.snapshot_id
+                WHERE s.resource_id = :rid AND s.id <> :sid AND s.created_at <= :at
+                  AND s.status IN ('COMPLETED', 'PARTIAL') AND si.item_type = 'FILE'
+                  AND si.metadata->'structured'->>'drive_id' = ANY(:drives)
+                ORDER BY si.external_id, s.created_at DESC, si.id DESC"""),
+                {"rid": snapshot.resource_id, "sid": snapshot.id, "at": snapshot.created_at,
+                 "drives": list(drive_ids)})).all()
+        unseen = _unseen_library_files([tuple(r) for r in prior], seen_by_drive)
+        rows = []
+        for ext_id, name, folder, _deleted, drive in unseen:
+            row = _library_tombstone_row(snapshot, tenant.id, {"id": ext_id, "name": name, "_drive_id": drive})
+            row["folder_path"] = folder
+            rows.append(row)
+        for i in range(0, len(rows), 1000):
+            await self._insert_snapshot_item_rows(rows[i:i + 1000])
+        return len(rows)
+
     async def backup_single_file(self, resource: Resource, tenant: Tenant, snapshot: Snapshot,
                                  file_item: Dict, graph_client: GraphClient, job_id: uuid.UUID) -> Dict:
         """
@@ -28971,6 +29063,7 @@ class BackupWorker:
                 or (drive_delta_tokens_by_site.get(site_id) or {})
             )
             per_drive_out: Dict[str, Dict[str, Optional[str]]] = {}
+            seen_by_drive: Dict[str, Set[str]] = {}  # ponytail: in-memory id set per library; spill if libraries reach ~10M files
 
             # Diagnostic: count what we actually enumerate + stream.
             try:
@@ -29020,10 +29113,20 @@ class BackupWorker:
                         _rate_last_t = _now
                         _rate_last_n = streamed
                     item["_site_label"] = site_label
+                    if item.get("_drive_id") and item.get("id"):
+                        seen_by_drive.setdefault(item["_drive_id"], set()).add(str(item["id"]))
                     if compiled_exclusions and self._item_is_excluded_compiled("FILE", item, compiled_exclusions):
                         stats["drive_excluded"] += 1
                         continue
                     await drive_queue.put(item)
+                # A library listed without a delta token (first run, reset, resync) reports no deletions.
+                full_listings = [d for d in per_drive_out if not per_drive_in.get(d)]
+                if full_listings:
+                    try:
+                        stats["drive_tombstones"] = stats.get("drive_tombstones", 0) + \
+                            await self._tombstone_unseen_library_files(snapshot, tenant, full_listings, seen_by_drive)
+                    except Exception as exc:
+                        logger.warning("SharePoint deletion check for %s failed: %s", site_label, exc)
             except Exception as exc:
                 # An enumeration that dies mid-walk (expired auth,
                 # persistent 429, network partition) leaves whole
@@ -29077,6 +29180,11 @@ class BackupWorker:
                 stats["rest_enum_fail"] = stats.get("rest_enum_fail", 0) + 1
                 return
             sp_hostname = _urlsplit(sp_site_web_url).hostname
+            try:
+                previous_rows = await self._previous_sp_rest_rows(snapshot, site_id)
+            except Exception as exc:
+                previous_rows = {}
+                logger.warning("SharePoint previous list rows for %s unavailable: %s", site_label, exc)
             try:
                 drive_urls: Optional[Set[str]] = _drive_web_urls(
                     await graph_client.list_sharepoint_site_drives(site_id))
@@ -29268,6 +29376,7 @@ class BackupWorker:
                     ):
                         await rest_queue.put({
                             "row": row,
+                            "previous": previous_rows.get(f"{lst_id}:{row.get('Id') or row.get('ID')}"),
                             "lst_id": lst_id,
                             "list_display": display,
                             "site_id": site_id,
@@ -29321,6 +29430,12 @@ class BackupWorker:
                                 f"queue_depth={drive_queue.qsize()}/{drive_queue.maxsize}"
                             )
                             _consume_stats["last_log"] = _now
+                    if isinstance(r, dict) and r.get("method") == "skipped_deleted" and item.get("_site_label"):
+                        try:
+                            await self._insert_snapshot_item_rows([_library_tombstone_row(snapshot, tenant.id, item)])
+                            stats["drive_tombstones"] = stats.get("drive_tombstones", 0) + 1
+                        except Exception as exc:
+                            logger.warning("SharePoint deletion record for %s failed: %s", item.get("id"), exc)
                     if isinstance(r, dict):
                         if r.get("success"):
                             stats["drive_ok"] += 1
@@ -29409,7 +29524,8 @@ class BackupWorker:
               f"{stats['drive_bytes']} bytes")
         print(f"[{self.worker_id}]   [SP_LISTS] {stats['list_folders']} lists, "
               f"{stats['rest_rows']} rows processed, {stats['rest_files_ok']} files "
-              f"({stats['rest_bytes']} bytes), {stats['rest_fail']} failed")
+              f"({stats['rest_bytes']} bytes), {stats['rest_fail']} failed, "
+              f"{stats.get('rest_reused', 0)} unchanged reused, {stats.get('drive_tombstones', 0)} deletions recorded")
         # Breakdown of why REST rows didn't produce file content — helps
         # diagnose "283 items, 0 bytes" type snapshots.
         print(f"[{self.worker_id}]   [SP_REST_BREAKDOWN] "
@@ -29659,7 +29775,17 @@ class BackupWorker:
             stats["rest_rows_folder"] += 1
 
         file_identity = None
-        if srv_rel and not is_folder:
+        row_version = _sp_row_version(row)
+        ghosted = False
+        previous = work.get("previous")
+        reused = bool(srv_rel and not is_folder and _reusable_sp_copy(previous, row_version))
+        if reused:
+            # Same item version as the previous restore point: point at its copy, no SharePoint request.
+            stats["rest_reused"] = stats.get("rest_reused", 0) + 1
+            blob_path, content_hash = previous.get("blob_path"), previous.get("content_hash")
+            downloaded_bytes = size = int(previous.get("content_size") or 0)
+            file_info, ghosted = previous.get("file"), bool(previous.get("ghosted"))
+        elif srv_rel and not is_folder:
             try:
                 file_info = await graph_client.get_sharepoint_file_metadata_via_rest(
                     sp_hostname, sp_site_web_url, srv_rel,
@@ -29674,7 +29800,7 @@ class BackupWorker:
                 logger.warning("SP REST file metadata failed: %s", type(exc).__name__)
                 file_info = None
 
-        if file_info is not None:
+        if file_info is not None and not reused:
             blob_path_candidate = azure_storage_manager.build_blob_path(
                 str(tenant.id), str(resource.id), str(snapshot.id),
                 f"splist_{lst_id}_{it_id}",
@@ -29698,6 +29824,8 @@ class BackupWorker:
                         downloaded_bytes = os.path.getsize(tmp_path)
                         if downloaded_bytes != size:
                             raise ProviderReadError("download_length_mismatch")
+                        # Keep this second read: SharePoint's $value download sends no ETag and ignores
+                        # If-Match (probed 2026-11-05), so it is the only guard against a mid-backup edit.
                         current_info = await graph_client.get_sharepoint_file_metadata_via_rest(
                             sp_hostname, sp_site_web_url, srv_rel,
                         )
@@ -29726,6 +29854,7 @@ class BackupWorker:
                     # Record possible template-backed files separately; missing
                     # required bytes still leave incomplete coverage.
                     if record_sp_rest_failure(stats, srv_rel, exc) == "ghosted":
+                        ghosted = True
                         print(f"[{self.worker_id}]   [SP_LIST_GHOSTED] "
                               f"{site_label}/{display}/{name}: no content "
                               f"stream — metadata captured; required "
@@ -29781,6 +29910,8 @@ class BackupWorker:
                         "modified": row.get("Modified") or (file_info or {}).get("TimeLastModified"),
                         "version": (file_info or {}).get("UIVersionLabel"),
                         "source": "sp_rest",
+                        "row_version": row_version,
+                        "ghosted": ghosted,
                         # Every list row ships its full FieldValuesAsText
                         # dictionary (Title / Modified / custom columns / …)
                         # so the Recovery UI can render AFI-style column

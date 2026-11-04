@@ -55,3 +55,64 @@ def test_a_library_missing_from_the_drives_is_left_to_the_list_pass():
     drives = _bw._drive_web_urls([{"webUrl": "https://qfion.sharepoint.com/sites/DonorDesk/Shared%20Documents"}])
     assert not _bw._library_has_drive({"webUrl": "https://qfion.sharepoint.com/sites/DonorDesk/SiteAssets"}, drives)
     assert not _bw._library_has_drive({}, drives)
+
+
+# Deletions: the Site view merges library files across restore points (Graph delta stores only changes),
+# so a deleted file needs a tombstone or an older copy would show again.
+
+def test_a_deleted_library_file_becomes_a_tombstone_under_its_library():
+    from types import SimpleNamespace
+    snap = SimpleNamespace(id="snap-1", backend_id="backend-1")
+    item = {"id": "f2", "deleted": {"state": "deleted"}, "_site_label": "Donor Desk", "_drive_name": "Documents",
+            "_drive_id": "drive-1", "parentReference": {"driveId": "drive-1"}}
+    row = _bw._library_tombstone_row(snap, "tenant-1", item)
+    assert row["item_type"] == "FILE" and row["is_deleted"] is True and row["blob_path"] is None
+    assert row["external_id"] == "f2" and row["folder_path"] == "Donor Desk/lists/Documents"
+    assert row["backend_id"] == "backend-1" and row["metadata"]["structured"]["drive_id"] == "drive-1"
+
+
+def test_a_full_listing_tombstones_only_files_it_no_longer_sees():
+    prior = [("a", "a.docx", "S/lists/Documents", False, "d1"), ("b", "b.docx", "S/lists/Documents", True, "d1"),
+             ("x", "x.docx", "S/lists/Documents/Old", False, "d1")]
+    unseen = _bw._unseen_library_files(prior, {"d1": {"a"}})
+    assert [r[0] for r in unseen] == ["x"]
+
+
+async def test_drive_items_carry_their_drive_id(monkeypatch):
+    from shared.graph_client import GraphClient
+    client = GraphClient("app", "secret", "tenant")
+
+    async def drives(site_id):
+        return [{"id": "drive-1", "name": "Documents"}]
+
+    async def items(drive_id, token, holder):
+        yield {"id": "f1"}
+
+    monkeypatch.setattr(client, "list_sharepoint_site_drives", drives)
+    monkeypatch.setattr(client, "iter_drive_items_by_id", items)
+    got = [i async for i in client.iter_sharepoint_site_all_drive_items("site")]
+    assert got == [{"id": "f1", "_drive_name": "Documents", "_drive_id": "drive-1"}]
+
+
+# Unchanged list files: TM's REST pass re-downloaded 11,317 files / 214 MB every 8 h and retried
+# 28,660 ghosted catalog files in 30 days. A list row's own version fields identify an unchanged file.
+
+ROW = {"GUID": "g-1", "Modified": "2026-10-16T16:49:32Z", "OData__UIVersionString": "1.0",
+       "FieldValuesAsText": {"owshiddenversion": "3"}}
+
+
+def test_a_list_row_version_changes_whenever_the_item_changes():
+    assert _bw._sp_row_version(ROW) == _bw._sp_row_version(dict(ROW))
+    assert _bw._sp_row_version(ROW) != _bw._sp_row_version({**ROW, "FieldValuesAsText": {"owshiddenversion": "4"}})
+    assert _bw._sp_row_version(ROW) != _bw._sp_row_version({**ROW, "Modified": "2026-10-17T00:00:00Z"})
+    assert _bw._sp_row_version({"Modified": "x"}) is None          # no item id or version: never reuse
+
+
+def test_only_a_stored_or_ghosted_copy_of_the_same_version_is_reused():
+    version = _bw._sp_row_version(ROW)
+    stored = {"row_version": version, "blob_path": "b/1", "ghosted": False}
+    assert _bw._reusable_sp_copy(stored, version)
+    assert _bw._reusable_sp_copy({**stored, "blob_path": None, "ghosted": True}, version)
+    assert not _bw._reusable_sp_copy({**stored, "blob_path": None}, version)      # failed before: try again
+    assert not _bw._reusable_sp_copy({**stored, "row_version": "old"}, version)
+    assert not _bw._reusable_sp_copy(None, version) and not _bw._reusable_sp_copy(stored, None)

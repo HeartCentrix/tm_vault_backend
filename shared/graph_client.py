@@ -3354,6 +3354,7 @@ class GraphClient:
                 drive_id, drive_delta_tokens.get(drive_id), local_holder,
             ):
                 item["_drive_name"] = drive_name
+                item["_drive_id"] = drive_id
                 yield item
             if drive_delta_holder is not None and local_holder.get("deltaLink"):
                 drive_delta_holder[drive_id] = local_holder

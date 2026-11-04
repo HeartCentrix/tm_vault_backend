@@ -1493,7 +1493,7 @@ class RestoreWorker:
             # freshly-provisioned site (spec.newSiteName). Resolved once per
             # resource group so we don't create the site per-file.
             sp_target_site_id: Optional[str] = None
-            if resource_type == "SHAREPOINT":
+            if resource_type == "SHAREPOINT_SITE":
                 sp_target_site_id = await self._resolve_sharepoint_target_site(
                     session, graph_client, resource, tenant, spec,
                 )
@@ -1714,6 +1714,12 @@ class RestoreWorker:
                 try:
                     if item.item_type in ("EMAIL",):
                         await self._restore_email_to_mailbox(graph_client, resource, item, session=session)
+                    elif self._is_sharepoint_file(resource, item):
+                        await self._restore_file_to_sharepoint(
+                            graph_client, resource, item,
+                            conflict_mode=conflict_mode,
+                            target_site_id=sp_target_site_id,
+                        )
                     elif item.item_type in ("FILE", "ONEDRIVE_FILE"):
                         await self._restore_file_to_onedrive(graph_client, resource, item, conflict_mode=conflict_mode)
                     elif item.item_type in ("SHAREPOINT_FILE", "SHAREPOINT_LIST_ITEM"):
@@ -1970,6 +1976,10 @@ class RestoreWorker:
             try:
                 if item.item_type in ("EMAIL",):
                     await self._restore_email_to_mailbox(graph_client, target_resource, item, session=session)
+                elif self._is_sharepoint_file(target_resource, item):
+                    await self._restore_file_to_sharepoint(
+                        graph_client, target_resource, item, target_site_id=target_resource.external_id,
+                        source_site_id=await self._item_source_site_id(session, item))
                 elif item.item_type in ("FILE", "ONEDRIVE_FILE"):
                     await self._restore_file_to_onedrive(graph_client, target_resource, item)
                 elif item.item_type in ("SHAREPOINT_FILE",):
@@ -2025,7 +2035,9 @@ class RestoreWorker:
                 elif target_resource.type.value == "ONEDRIVE":
                     await self._restore_file_to_onedrive(graph_client, target_resource, item)
                 elif target_resource.type.value == "SHAREPOINT_SITE":
-                    await self._restore_file_to_sharepoint(graph_client, target_resource, item)
+                    await self._restore_file_to_sharepoint(
+                        graph_client, target_resource, item, target_site_id=target_resource.external_id,
+                        source_site_id=await self._item_source_site_id(session, item))
                 else:
                     failed_count += 1
                     continue
@@ -3699,6 +3711,57 @@ class RestoreWorker:
             if chunk:
                 yield chunk
 
+    async def _item_source_site_id(self, session, item) -> Optional[str]:
+        """The SharePoint site an item was captured from (cross-resource restores only know the target)."""
+        cache = self.__dict__.setdefault("_snapshot_source_sites", {})
+        if item.snapshot_id not in cache:
+            snap = await session.get(Snapshot, item.snapshot_id)
+            source = await session.get(Resource, snap.resource_id) if snap else None
+            cache[item.snapshot_id] = source.external_id if source else None
+        return cache[item.snapshot_id]
+
+    @staticmethod
+    def _is_sharepoint_file(resource, item) -> bool:
+        """Library files (item_type FILE) of a SharePoint site restore into SharePoint, not OneDrive."""
+        kind = getattr(getattr(resource, "type", None), "value", getattr(resource, "type", None))
+        return str(kind) == "SHAREPOINT_SITE" and item.item_type in ("FILE", "SHAREPOINT_FILE")
+
+    @staticmethod
+    def _sharepoint_library_and_folder(item) -> Tuple[Optional[str], str]:
+        """'{site}/lists/{library}/sub' -> (library, 'sub'); Graph paths ('/drive(s)/.../root:/sub') -> (None, 'sub')."""
+        folder = (getattr(item, "folder_path", None) or "").strip()
+        if "/lists/" in folder and not folder.startswith("/"):
+            library, _, sub = folder.split("/lists/", 1)[1].partition("/")
+            return library or None, sub.strip("/")
+        if "root:" in folder:
+            folder = folder.split("root:", 1)[1]
+        return None, folder.strip("/")
+
+    async def _sharepoint_restore_drive(self, graph_client, item, site_id: str, same_site: bool,
+                                        library: Optional[str]) -> Optional[str]:
+        """The library (drive) to restore into: the captured drive or list on the same site; on another
+        site, the library with the same name. None = the site's default library (legacy rows)."""
+        md = self._get_item_metadata(item)
+        structured = md.get("structured") or {}
+        if same_site and structured.get("drive_id"):
+            return structured["drive_id"]
+        graph_site = site_id.replace("/", ",")
+        cache = self.__dict__.setdefault("_sp_list_drive_ids", {})
+        list_id = md.get("list_id") if same_site else None
+        if not list_id and library:
+            key = (site_id, "name", library)
+            if key not in cache:
+                lists = (await graph_client._get(f"{graph_client.GRAPH_URL}/sites/{graph_site}/lists",
+                                                 params={"$select": "id,displayName", "$top": "999"})).get("value") or []
+                cache[key] = next((l["id"] for l in lists if l.get("displayName") == library), None)
+            list_id = cache[key]
+        if not list_id:
+            return None
+        key = (site_id, "drive", list_id)
+        if key not in cache:
+            cache[key] = (await graph_client._get(f"{graph_client.GRAPH_URL}/sites/{graph_site}/lists/{list_id}/drive")).get("id")
+        return cache[key]
+
     async def _sharepoint_default_drive_id(
         self, graph_client: GraphClient, site_id: str,
     ) -> str:
@@ -3712,10 +3775,10 @@ class RestoreWorker:
         return drive_id
 
     async def _upload_sharepoint_file_stream(
-        self, graph_client, item, site_id, target_path, file_name, stream_plan,
+        self, graph_client, item, site_id, target_path, file_name, stream_plan, drive_id=None,
     ):
         container, total_size = stream_plan
-        drive_id = await self._sharepoint_default_drive_id(graph_client, site_id)
+        drive_id = drive_id or await self._sharepoint_default_drive_id(graph_client, site_id)
         print(
             f"[{self.worker_id}] [SP-RESTORE] streaming {file_name} "
             f"({total_size} bytes) via uploadSession to drive {drive_id}",
@@ -3759,6 +3822,7 @@ class RestoreWorker:
         item: SnapshotItem,
         conflict_mode: str = "SEPARATE_FOLDER",
         target_site_id: Optional[str] = None,
+        source_site_id: Optional[str] = None,
     ):
         """Restore file to SharePoint site via Graph API.
 
@@ -3801,15 +3865,13 @@ class RestoreWorker:
                 )
         file_name = raw_data.get("name", item.name or f"restored_{item.external_id}")
 
-        # Preserve the original folder tree. folder_path for SharePoint
-        # items is captured as ``{site_label}/lists/{list}/sub/folders`` or
-        # the Graph ``parentReference.path`` (e.g. ``/drive/root:/Docs/2024``).
-        # Strip the Graph anchor so we land inside the target drive's root.
-        raw_folder = (getattr(item, "folder_path", None) or "").strip()
-        folder_trail = raw_folder
-        if folder_trail.startswith("/drive/root:"):
-            folder_trail = folder_trail.split(":", 1)[1]
-        folder_trail = folder_trail.strip("/")
+        # Land in the file's own library, inside its own sub-folder ('{site}/lists/{library}/sub' is the
+        # captured trail). Unresolvable libraries fall back to the default library under '{library}/sub'.
+        library, folder_trail = self._sharepoint_library_and_folder(item)
+        same_site = target_site_id is None or target_site_id == (source_site_id or resource.external_id)
+        drive_id = await self._sharepoint_restore_drive(graph_client, item, site_id, same_site, library)
+        if library and drive_id is None:
+            folder_trail = "/".join(p for p in (library, folder_trail) if p)
 
         prefix = self._conflict_path_prefix(conflict_mode)
         parts = [p for p in (prefix.strip("/"), folder_trail, file_name) if p]
@@ -3817,7 +3879,7 @@ class RestoreWorker:
 
         if stream_plan is not None:
             result = await self._upload_sharepoint_file_stream(
-                graph_client, item, site_id, target_path, file_name, stream_plan,
+                graph_client, item, site_id, target_path, file_name, stream_plan, drive_id=drive_id,
             )
         else:
             # Quote each path segment exactly like the streaming helper
@@ -3829,7 +3891,8 @@ class RestoreWorker:
             quoted_path = "/".join(
                 _q(seg, safe="") for seg in target_path.split("/") if seg
             )
-            url = f"{graph_client.GRAPH_URL}/sites/{graph_site_id}/drive/root:/{quoted_path}:/content"
+            url = (f"{graph_client.GRAPH_URL}/drives/{drive_id}/root:/{quoted_path}:/content" if drive_id
+                   else f"{graph_client.GRAPH_URL}/sites/{graph_site_id}/drive/root:/{quoted_path}:/content")
             result = await graph_client._put(
                 url,
                 content=file_content,
@@ -3879,7 +3942,7 @@ class RestoreWorker:
             if not target:
                 raise ValueError(f"targetResourceId {target_resource_id} not found")
             target_type = target.type.value if hasattr(target.type, "value") else str(target.type)
-            if target_type != "SHAREPOINT":
+            if target_type != "SHAREPOINT_SITE":
                 raise ValueError(f"targetResourceId {target_resource_id} is not a SharePoint resource (got {target_type})")
             return target.external_id
 
