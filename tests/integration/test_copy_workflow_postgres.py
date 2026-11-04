@@ -15,7 +15,7 @@ def api():
 
 
 async def test_flagoff_collection_is_noop_without_database(monkeypatch):
-    monkeypatch.delenv('COPY_WORK_ENABLED',raising=False)
+    monkeypatch.setenv('COPY_WORK_ENABLED','false')
     with api().copy_collection(uuid4()) as active:
         assert active is None
         assert await api().defer_current_copy('CHAT_CARRY',{}) is None

@@ -2,7 +2,7 @@
 def test_legacy_producers_require_rollout_enable_but_readers_do_not(monkeypatch):
     from shared.chat_presentation import chat_presentation_enabled
     monkeypatch.delenv('CHAT_PRESENTATION_ENABLED', raising=False)
-    assert not chat_presentation_enabled()
+    assert chat_presentation_enabled()  # default ON since 2026-11-04 (validated on Railway)
     monkeypatch.setenv('CHAT_PRESENTATION_ENABLED', 'true')
     assert chat_presentation_enabled()
     monkeypatch.setenv('CHAT_PRESENTATION_ENABLED', 'false')

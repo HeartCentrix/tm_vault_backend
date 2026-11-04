@@ -415,7 +415,7 @@ class Settings:
         # Rollback = unset env var, redeploy. Spec at
         # docs/superpowers/specs/2026-05-15-backup-batch-row-redesign-design.md.
         self.BATCH_ROW_REDESIGN_ENABLED = os.getenv(
-            "BATCH_ROW_REDESIGN_ENABLED", "false"
+            "BATCH_ROW_REDESIGN_ENABLED", "true"
         ).lower() in ("true", "1", "yes")
         self.BATCH_STALL_TIMEOUT_HOURS = int(
             os.getenv("BATCH_STALL_TIMEOUT_HOURS", "24")
@@ -657,7 +657,7 @@ class Settings:
         if self.CHAT_OBSERVATION_HASH_VERSION not in (1, 2):
             raise ValueError("CHAT_OBSERVATION_HASH_VERSION must be 1 or 2")
         self.CHAT_CATALOGUE_WRITER_ENABLED = os.getenv(
-            "CHAT_CATALOGUE_WRITER_ENABLED", "false",
+            "CHAT_CATALOGUE_WRITER_ENABLED", "true",
         ).lower() in ("true", "1", "yes")
         # Whale-user chat backups (a single user with hundreds of chats
         # across many teams + 1:1s) partition by chat-id batches so

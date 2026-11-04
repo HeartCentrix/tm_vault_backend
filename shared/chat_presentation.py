@@ -23,7 +23,7 @@ class ChatSelectionError(ValueError):
 
 
 def chat_presentation_enabled():
-    return os.getenv('CHAT_PRESENTATION_ENABLED', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+    return os.getenv('CHAT_PRESENTATION_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
 
 
 def captured_topic_observation(observed, cached):

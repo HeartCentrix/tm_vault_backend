@@ -70,7 +70,7 @@ def _uuid(value):
 
 
 def copy_work_enabled():
-    return os.getenv('COPY_WORK_ENABLED', 'false').strip().lower() in ('1','true','yes','on')
+    return os.getenv('COPY_WORK_ENABLED', 'true').strip().lower() in ('1','true','yes','on')
 
 
 def copy_work_guards_enabled():

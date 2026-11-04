@@ -39,7 +39,7 @@ class ProviderClaim:
 
 
 def enabled():
-    return os.getenv('PROVIDER_WORK_ENABLED', 'false').lower() in ('true', '1', 'yes', 'on')
+    return os.getenv('PROVIDER_WORK_ENABLED', 'true').lower() in ('true', '1', 'yes', 'on')
 
 
 def guards_enabled():

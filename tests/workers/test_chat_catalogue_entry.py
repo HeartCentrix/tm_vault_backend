@@ -93,10 +93,10 @@ async def test_outer_finalizer_keeps_persisted_catalogue_partial_outcome(bw, mon
     worker._write_snapshot_terminal.assert_not_awaited()
 
 
-def test_catalogue_writer_defaults_off(monkeypatch):
+def test_catalogue_writer_defaults_on(monkeypatch):
     from shared.config import Settings
     monkeypatch.delenv("CHAT_CATALOGUE_WRITER_ENABLED", raising=False)
-    assert Settings().CHAT_CATALOGUE_WRITER_ENABLED is False
+    assert Settings().CHAT_CATALOGUE_WRITER_ENABLED is True
 
 
 async def test_parallel_wrapper_returns_catalogue_counters_and_propagates_moved_owner(bw, monkeypatch):
