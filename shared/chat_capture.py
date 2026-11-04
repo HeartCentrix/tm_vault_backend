@@ -144,9 +144,11 @@ class ChatObservationLedger:
             (observation, phase, type(error).__name__, status, graph_id, parent_id,
              _identifier(getattr(error, "code", None)), _identifier(getattr(error, "inner_code", None)),
              _identifier(getattr(error, "request_id", None))))
-        logger.warning("chat_capture_failure observation=%s phase=%s error=%s status=%s code=%s request_id=%s",
+        # ChatGraphError messages are fixed adapter strings (no URLs); other exception text is not logged.
+        reason = str(error)[:80] if isinstance(error, ChatGraphError) and status is None else None
+        logger.warning("chat_capture_failure observation=%s phase=%s error=%s status=%s code=%s request_id=%s reason=%s",
                        observation, phase, type(error).__name__, status,
-                       _identifier(getattr(error, "code", None)), _identifier(getattr(error, "request_id", None)))
+                       _identifier(getattr(error, "code", None)), _identifier(getattr(error, "request_id", None)), reason)
 
     def unavailable(self, observation, item_type, graph_id, parent_graph_id):
         """Microsoft could not serve this listed child's bytes: not a required binary."""
