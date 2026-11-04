@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import email.utils
+import logging
 import math
+from contextlib import asynccontextmanager
 from collections import deque
 import random
 import time
@@ -102,6 +104,87 @@ class BackoffWalker:
     def reset(self) -> None:
         self._index = 0
         self._cumulative = 0.0
+
+
+class HostThrottle:
+    """Admission for one throttled host (SharePoint REST): SharePoint throttles the app across
+    the whole tenant, so one 429 pauses every request to the host, and in-flight requests adapt
+    (halve once per throttle window, grow back on success, never above the configured ceiling).
+
+    ``shared`` (optional, async ``get()``/``put(deadline)``) spreads the pause to other processes.
+    It fails open to the local pause: a coordinator outage must not stop backups."""
+
+    _SYNC_EVERY = 1.0
+    _SHARED_OUTAGE_BACKOFF = 60.0
+
+    def __init__(self, max_concurrency: int, shared=None):
+        self.max = max(1, int(max_concurrency))
+        self.limit = float(self.max)
+        self.in_flight = 0
+        self.paused_until = 0.0  # epoch seconds, comparable across processes
+        self._shared = shared
+        self._shared_down_until = 0.0
+        self._next_sync = 0.0
+        self._cond = asyncio.Condition()
+
+    def _shared_up(self) -> bool:
+        return self._shared is not None and time.time() >= self._shared_down_until
+
+    def _shared_failed(self, exc: Exception) -> None:
+        self._shared_down_until = time.time() + self._SHARED_OUTAGE_BACKOFF
+        logging.getLogger(__name__).warning("host_throttle_shared_unavailable error=%s", type(exc).__name__)
+
+    async def _sync(self) -> None:
+        now = time.time()
+        if not self._shared_up() or now < self._next_sync:
+            return
+        self._next_sync = now + self._SYNC_EVERY
+        try:
+            deadline = await self._shared.get()
+        except Exception as exc:
+            self._shared_failed(exc)
+            return
+        if deadline:
+            self.paused_until = max(self.paused_until, float(deadline))
+
+    async def _wait_pause(self) -> None:
+        await self._sync()
+        deadline = self.paused_until
+        while deadline > time.time():
+            await asyncio.sleep(deadline - time.time())
+            if self.paused_until <= deadline:
+                return
+            deadline = self.paused_until
+
+    @asynccontextmanager
+    async def slot(self):
+        while True:
+            await self._wait_pause()
+            async with self._cond:
+                if self.in_flight < int(self.limit):
+                    self.in_flight += 1
+                    break
+                await self._cond.wait()
+        try:
+            yield
+        finally:
+            async with self._cond:
+                self.in_flight -= 1
+                self._cond.notify_all()
+
+    async def throttled(self, seconds: float) -> None:
+        now = time.time()
+        if now >= self.paused_until:
+            self.limit = max(1.0, self.limit / 2)
+        self.paused_until = max(self.paused_until, now + max(0.0, seconds))
+        if self._shared_up():
+            try:
+                await self._shared.put(self.paused_until)
+            except Exception as exc:
+                self._shared_failed(exc)
+
+    def succeeded(self) -> None:
+        self.limit = min(float(self.max), self.limit + 1.0 / self.limit)
 
 
 class AsyncTokenBucket:

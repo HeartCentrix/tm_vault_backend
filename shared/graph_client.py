@@ -35,7 +35,7 @@ def _assert_graph_target(url: str) -> None:
 from shared.provider_read import ProviderReadBudget, ProviderReadError
 from shared.power_bi_client import PowerBIClient
 from shared.graph_ratelimit import (
-    RateLimitPolicy, GraphRetryExhaustedError,
+    HostThrottle, RateLimitPolicy, GraphRetryExhaustedError,
 )
 
 logger = logging.getLogger(__name__)
@@ -136,8 +136,43 @@ class GraphCredentialInvalid(httpx.HTTPStatusError):
 def _sharepoint_budget():
     """SharePoint throttles with Retry-After values well past the generic 30 s budget; waiting
     them out keeps items in the backup (local 19-site run 2026-11-04: 359 429s, 41 items or list
-    pages dropped by the generic budget). Very long cooldowns still return to the caller."""
-    return ProviderReadBudget(max_attempts=8, max_wait=300.0, max_elapsed=600.0)
+    pages dropped by the generic budget). Throttling is bounded by time waited, not tries: the
+    Railway 19-site run (fbf5904) dropped files after 8 x 429 and left 12/19 sites PARTIAL.
+    Very long cooldowns still return to the caller."""
+    return ProviderReadBudget(max_attempts=8, max_wait=900.0, max_elapsed=1800.0, max_throttle_attempts=64)
+
+
+# SharePoint throttles an app across the whole tenant: one throttle per (app, host) per process.
+_SHAREPOINT_THROTTLES: Dict[Tuple[str, str], HostThrottle] = {}
+# Microsoft "Avoid getting throttled or blocked in SharePoint Online": decorated traffic is
+# prioritised over undecorated traffic when SharePoint throttles.
+_SHAREPOINT_USER_AGENT = "NONISV|HeartCentrix|TMVault/1.0"
+
+
+def _is_throttle(error: ProviderReadError) -> bool:
+    return error.status_code == 429 or (error.status_code == 503 and error.retry_after is not None)
+
+
+class _SharedPause:
+    """Spreads a SharePoint throttle pause to every worker process through the shared Redis."""
+
+    def __init__(self, key: str):
+        self.key = key
+
+    async def _client(self):
+        from shared.graph_rate_limiter import graph_rate_limiter
+        client = await graph_rate_limiter.redis()
+        if client is None:
+            raise ConnectionError("coordinator unavailable")
+        return client
+
+    async def get(self):
+        value = await (await self._client()).get(self.key)
+        return float(value) if value else None
+
+    async def put(self, deadline: float) -> None:
+        ttl_ms = max(1000, int((deadline - time.time()) * 1000))
+        await (await self._client()).set(self.key, repr(deadline), px=ttl_ms)
 
 class GraphClient:
     """Client for Microsoft Graph API calls with multi-app support"""
@@ -3803,23 +3838,48 @@ class GraphClient:
                 or not hostname.lower().endswith(_ALLOWED_GRAPH_SUFFIXES)):
             raise ValueError("SharePoint request must retain its authenticated host")
 
+    def _sharepoint_throttle(self, hostname: str) -> HostThrottle:
+        key = (self._sharepoint_app_id(), hostname.lower())
+        throttle = _SHAREPOINT_THROTTLES.get(key)
+        if throttle is None:
+            from shared.config import settings
+            shared = None
+            if os.environ.get("REDIS_URL") or settings.REDIS_ENABLED:
+                shared = _SharedPause("sharepoint:pause:" + hashlib.sha256("|".join(key).encode()).hexdigest()[:24])
+            throttle = _SHAREPOINT_THROTTLES[key] = HostThrottle(
+                int(os.environ.get("SHAREPOINT_REST_CONCURRENCY", "16")), shared=shared)
+        return throttle
+
+    @staticmethod
+    async def _sharepoint_retry_wait(throttle: HostThrottle, budget, error: ProviderReadError) -> None:
+        delay = budget.retry_delay(error)
+        if _is_throttle(error):
+            # The next slot() waits it out together with every other request to this host.
+            await throttle.throttled(delay)
+        else:
+            await asyncio.sleep(delay)
+
     async def _sharepoint_rest_json(self, hostname: str, url: str, *, params=None, stage: str):
         self._assert_sharepoint_target(hostname, url)
         budget = _sharepoint_budget()
+        throttle = self._sharepoint_throttle(hostname)
         while True:
             budget.attempts += 1
-            token = await self._get_sharepoint_token(hostname)
             try:
-                async with self._http_session() as client:
-                    response = await client.get(url, params=params, headers={
-                        "Authorization": f"Bearer {token}",
-                        "Accept": "application/json;odata=nometadata",
-                    })
+                async with throttle.slot():
+                    token = await self._get_sharepoint_token(hostname)
+                    async with self._http_session() as client:
+                        response = await client.get(url, params=params, headers={
+                            "Authorization": f"Bearer {token}",
+                            "Accept": "application/json;odata=nometadata",
+                            "User-Agent": _SHAREPOINT_USER_AGENT,
+                        })
                 if response.status_code >= 400:
                     error = ProviderReadError.from_response(response, stage, attempts=budget.attempts)
                     if response.status_code not in (429, 500, 502, 503, 504):
                         raise error
                 else:
+                    throttle.succeeded()
                     try:
                         data = response.json()
                     except ValueError:
@@ -3829,7 +3889,7 @@ class GraphClient:
                     return data
             except httpx.TransportError:
                 error = ProviderReadError(stage, code="transport", attempts=budget.attempts)
-            await asyncio.sleep(budget.retry_delay(error))
+            await self._sharepoint_retry_wait(throttle, budget, error)
 
     async def get_sharepoint_file_metadata_via_rest(self, hostname: str, site_web_url: str, server_relative_url: str) -> Dict[str, Any]:
         """Read file metadata; absence/denial cannot masquerade as a non-file row."""
@@ -3864,49 +3924,54 @@ class GraphClient:
         url = f"{site_web_url.rstrip('/')}/_api/web/GetFileByServerRelativeUrl('{safe_path}')/$value"
         self._assert_sharepoint_target(hostname, url)
         budget = _sharepoint_budget()
+        throttle = self._sharepoint_throttle(hostname)
         while True:
             budget.attempts += 1
-            token = await self._get_sharepoint_token(hostname)
-            headers = {"Authorization": f"Bearer {token}", "Accept-Encoding": "identity"}
-            if expected_etag:
-                headers["If-Match"] = expected_etag
             received = 0
             try:
-                async with self._http_session() as client:
-                    async with client.stream("GET", url, headers=headers) as response:
-                        if response.status_code >= 400:
-                            error = ProviderReadError.from_response(response, "file_stream", attempts=budget.attempts)
-                            if response.status_code not in (429, 500, 502, 503, 504):
-                                raise error
-                        elif response.status_code != 200:
-                            raise ProviderReadError("unexpected_stream_status", status=response.status_code)
-                        else:
-                            etag = response.headers.get("ETag")
-                            if expected_etag and etag and etag != expected_etag:
-                                raise ProviderReadError("file_version_changed")
-                            length = response.headers.get("Content-Length")
-                            try:
-                                length = int(length) if length is not None else None
-                            except ValueError:
-                                raise ProviderReadError("invalid_content_length") from None
-                            if length is not None and (length < 0 or (expected_size is not None and length != expected_size)):
-                                raise ProviderReadError("content_length_mismatch")
-                            async for chunk in response.aiter_bytes(chunk_size):
-                                if chunk:
-                                    received += len(chunk)
-                                    if expected_size is not None and received > expected_size:
-                                        raise ProviderReadError("content_length_exceeded")
-                                    yield chunk
-                            if ((length is not None and received != length)
-                                    or (expected_size is not None and received != expected_size)):
-                                raise ProviderReadError("truncated_content_length")
-                            return
+                # The slot covers the whole body: an open download is an in-flight request.
+                async with throttle.slot():
+                    token = await self._get_sharepoint_token(hostname)
+                    headers = {"Authorization": f"Bearer {token}", "Accept-Encoding": "identity",
+                               "User-Agent": _SHAREPOINT_USER_AGENT}
+                    if expected_etag:
+                        headers["If-Match"] = expected_etag
+                    async with self._http_session() as client:
+                        async with client.stream("GET", url, headers=headers) as response:
+                            if response.status_code >= 400:
+                                error = ProviderReadError.from_response(response, "file_stream", attempts=budget.attempts)
+                                if response.status_code not in (429, 500, 502, 503, 504):
+                                    raise error
+                            elif response.status_code != 200:
+                                raise ProviderReadError("unexpected_stream_status", status=response.status_code)
+                            else:
+                                throttle.succeeded()
+                                etag = response.headers.get("ETag")
+                                if expected_etag and etag and etag != expected_etag:
+                                    raise ProviderReadError("file_version_changed")
+                                length = response.headers.get("Content-Length")
+                                try:
+                                    length = int(length) if length is not None else None
+                                except ValueError:
+                                    raise ProviderReadError("invalid_content_length") from None
+                                if length is not None and (length < 0 or (expected_size is not None and length != expected_size)):
+                                    raise ProviderReadError("content_length_mismatch")
+                                async for chunk in response.aiter_bytes(chunk_size):
+                                    if chunk:
+                                        received += len(chunk)
+                                        if expected_size is not None and received > expected_size:
+                                            raise ProviderReadError("content_length_exceeded")
+                                        yield chunk
+                                if ((length is not None and received != length)
+                                        or (expected_size is not None and received != expected_size)):
+                                    raise ProviderReadError("truncated_content_length")
+                                return
             except httpx.TransportError:
                 error = ProviderReadError("file_stream", code="transport", attempts=budget.attempts)
                 if received:
                     raise error from None
             # Both response and connection scope are released before waiting.
-            await asyncio.sleep(budget.retry_delay(error))
+            await self._sharepoint_retry_wait(throttle, budget, error)
 
     async def get_sharepoint_site_list_items(self, site_id: str, list_id: str, delta_token: str = None) -> Dict[str, Any]:
         """

@@ -33,7 +33,7 @@ def client_factory(monkeypatch):
 
         async def route(request):
             state["calls"] += 1
-            assert state["calls"] < 10, "unbounded retries"
+            assert state["calls"] < 100, "unbounded retries"
             return handler(request, state["calls"])
 
         async def sleep(seconds):
@@ -46,6 +46,7 @@ def client_factory(monkeypatch):
             monkeypatch.setattr(client, "_http_session", session)
             monkeypatch.setattr(client, "_get_sharepoint_token", token)
             monkeypatch.setattr("shared.graph_client.asyncio.sleep", sleep)
+            monkeypatch.setattr("shared.graph_client._SHAREPOINT_THROTTLES", {})
             yield client, state
     return make
 
@@ -82,7 +83,34 @@ async def test_retry_budget_finite_even_retry_after_zero(client_factory):
     async with client_factory(lambda r, n: httpx.Response(429, headers={"Retry-After": "0"})) as (client, state):
         with pytest.raises(Exception, match="429|budget"):
             _ = [x async for x in client.iter_sharepoint_list_items_via_rest(HOST, WEB, "list")]
-        assert state["calls"] <= 8
+        assert state["calls"] <= 64 and sum(state["sleeps"]) <= 900
+
+
+async def test_throttling_past_eight_tries_is_waited_out_not_dropped(client_factory):
+    """Railway 19-site run 2026-11-04 (fbf5904): files failed with `status=429 attempts=8` and
+    12/19 sites went PARTIAL. Throttling is bounded by time waited, not by a try count."""
+    def route(req, n):
+        return httpx.Response(429, headers={"Retry-After": "0"}) if n <= 12 else httpx.Response(200, json={"Length": "1"})
+    async with client_factory(route) as (client, state):
+        assert await client.get_sharepoint_file_metadata_via_rest(HOST, WEB, "/sites/a/x") == {"Length": "1"}
+        assert state["calls"] == 13
+
+
+async def test_server_errors_still_stop_after_eight_tries(client_factory):
+    async with client_factory(lambda r, n: httpx.Response(500)) as (client, state):
+        with pytest.raises(Exception, match="500"):
+            await client.get_sharepoint_file_metadata_via_rest(HOST, WEB, "/sites/a/x")
+        assert state["calls"] == 8
+
+
+async def test_a_throttle_pauses_the_host_for_every_client_in_the_process(client_factory):
+    import time
+    responses = [httpx.Response(429, headers={"Retry-After": "30"}), httpx.Response(200, json={"Length": "1"})]
+    async with client_factory(lambda r, n: responses[n - 1]) as (client, state):
+        await client.get_sharepoint_file_metadata_via_rest(HOST, WEB, "/sites/a/x")
+        other = GraphClient("app", "secret", "tenant")
+        assert other._sharepoint_throttle(HOST) is client._sharepoint_throttle(HOST)
+        assert client._sharepoint_throttle(HOST).paused_until > time.time() + 20
 
 
 async def test_sharepoint_throttling_waits_out_retry_after_instead_of_dropping_items(client_factory):
@@ -92,14 +120,14 @@ async def test_sharepoint_throttling_waits_out_retry_after_instead_of_dropping_i
                  httpx.Response(200, json={"value": [{"Id": 1}]})]
     async with client_factory(lambda r, n: responses[n - 1]) as (client, state):
         rows = [x async for x in client.iter_sharepoint_list_items_via_rest(HOST, WEB, "list")]
-        assert rows == [{"Id": 1}] and state["sleeps"] == [40, 40]
+        assert rows == [{"Id": 1}] and state["sleeps"] == pytest.approx([40, 40], abs=0.5)
 
 
 async def test_long_retry_after_deferred_without_early_retry(client_factory):
-    async with client_factory(lambda r, n: httpx.Response(503, headers={"Retry-After": "600"})) as (client, state):
+    async with client_factory(lambda r, n: httpx.Response(503, headers={"Retry-After": "1000"})) as (client, state):
         with pytest.raises(Exception) as exc:
             _ = [x async for x in client.iter_sharepoint_list_items_via_rest(HOST, WEB, "list")]
-        assert getattr(exc.value, "retry_after", None) == 600
+        assert getattr(exc.value, "retry_after", None) == 1000
         assert state["calls"] == 1
         assert state["sleeps"] == []
 

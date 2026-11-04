@@ -241,6 +241,14 @@ class GraphRateLimiter:
             _loc.hostname, _loc.port,
         )
 
+    async def redis(self):
+        """The shared coordinator client, or None when none is configured or reachable."""
+        try:
+            await self.maybe_init_redis()
+        except ProviderReadError:
+            return None
+        return getattr(self._bucket, "_redis", None)
+
     async def acquire(self, n: float = 1.0, reason: str = "graph_call") -> float:
         """Block until ``n`` tokens are available. Returns wait-seconds.
 

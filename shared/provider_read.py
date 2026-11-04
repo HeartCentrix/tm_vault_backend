@@ -56,13 +56,17 @@ class ProviderReadBudget:
     max_attempts: int = 4
     max_wait: float = 30.0
     max_elapsed: float = 120.0
+    # Throttling is load, not failure: callers may bound it by time waited instead of tries.
+    max_throttle_attempts: int = 0
 
     def __post_init__(self):
         self.started = time.monotonic()
 
     def retry_delay(self, error: ProviderReadError) -> float:
         delay = max(0.0, retry_wait(error.status_code, error.retry_after, self.attempts))
-        if (self.attempts >= self.max_attempts or self.waited + delay > self.max_wait
+        throttled = error.status_code == 429 or (error.status_code == 503 and error.retry_after is not None)
+        limit = self.max_throttle_attempts if throttled and self.max_throttle_attempts else self.max_attempts
+        if (self.attempts >= limit or self.waited + delay > self.max_wait
                 or time.monotonic() - self.started + delay > self.max_elapsed):
             error.retry_after = delay
             raise error
