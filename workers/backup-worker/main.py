@@ -13225,8 +13225,9 @@ class BackupWorker:
                             from shared.provider_admission import ProviderDeferred
                             from shared.provider_runtime import ProviderBudgetExhausted
                             from shared.provider_work import ProviderWorkConflict
+                            from shared.provider_runtime import provider_slot
                             try:
-                                async with self._onedrive_backup_semaphore:
+                                async with provider_slot(self._onedrive_backup_semaphore, stage="onedrive_slot_busy"):
                                     _uploaded, att_bytes = await self._useronedrive_backup_files(
                                         graph_client, resource, snapshot, tenant, drive_id, file_items,
                                         expected_job_token=message.get("_job_lease_token"),
@@ -19128,8 +19129,9 @@ class BackupWorker:
         tenant_sem = await self._acquire_tenant_slot(str(tenant_id))
         copy_handoff = False
         try:
+            from shared.provider_runtime import provider_slot
             async with tenant_sem:
-                async with self._onedrive_backup_semaphore:
+                async with provider_slot(self._onedrive_backup_semaphore, stage="onedrive_slot_busy"):
                     with _worker_copy_collection(
                         snapshot_id, partition_id, resource_id,
                         expected_snapshot_token=getattr(snapshot, "lease_token", None),

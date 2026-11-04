@@ -444,6 +444,19 @@ def yield_provider_turn():
     defer_provider(ProviderDeferred(None, 0, stage='fair_checkpoint'))
 
 
+@asynccontextmanager
+async def provider_slot(semaphore, *, stage, retry_seconds=10):
+    """A claimed provider leaf must not idle on its lease behind work already holding this
+    worker's slots: hand the lease back so a worker with a free slot runs it. Legacy
+    consumers (no provider work) keep waiting for the slot."""
+    # ponytail: re-claim churn every retry_seconds while all slots are busy; claim-time
+    # slot awareness in the runner would avoid it if the churn ever shows up in DB load.
+    if current_execution() is not None and semaphore.locked():
+        defer_provider(ProviderDeferred(None, retry_seconds, stage=stage))
+    async with semaphore:
+        yield
+
+
 async def _join_provider_tasks(execution):
     if execution.drain_task is not None:
         execution.drain_task.cancel()
