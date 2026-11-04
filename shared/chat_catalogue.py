@@ -465,9 +465,14 @@ async def _staged(session, inventory, scope):
         coverage.append(narrow)
         parents_to_check.append((row.link_parent, narrow))
     await rows.close()
-    count = await session.scalar(select(func.count()).select_from(SnapshotItem).outerjoin(ChatItemVersion,
-        ChatItemVersion.id == SnapshotItem.chat_version_id).where(SnapshotItem.snapshot_id == scope.snapshot_id,
-        or_(SnapshotItem.extra_data["chat_id"].as_string() == scope.chat_id, ChatItemVersion.chat_id == scope.chat_id)))
+    # EXISTS keeps this a per-row primary-key probe of the snapshot's own links. The OR across
+    # an outer join planned a parallel hash join over every chat version per publish, which
+    # exhausted Postgres shared memory with many concurrent publishes (Railway 2026-11-04).
+    owned_by_chat = select(ChatItemVersion.id).where(ChatItemVersion.id == SnapshotItem.chat_version_id,
+        ChatItemVersion.chat_id == scope.chat_id).exists()
+    count = await session.scalar(select(func.count()).select_from(SnapshotItem).where(
+        SnapshotItem.snapshot_id == scope.snapshot_id,
+        or_(SnapshotItem.extra_data["chat_id"].as_string() == scope.chat_id, owned_by_chat)))
     if count != len(expected):
         raise ChatCatalogueIntegrityError("snapshot/chat links do not exactly match staged logical keys and versions")
     parents = _parents(scope, coverage)
