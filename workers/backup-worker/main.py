@@ -4242,10 +4242,13 @@ def is_ghosted_catalog_file(
     A catalog path and404cannot distinguish unavailable content from a
     template-backed file. This classification never proves backup coverage.
     """
-    response = getattr(exc, "response", None)
-    if getattr(response, "status_code", None) != 404:
+    if _SHAREPOINT_CATALOG_MARKER not in (server_relative_url or ""):
         return False
-    return _SHAREPOINT_CATALOG_MARKER in (server_relative_url or "")
+    response = getattr(exc, "response", None)
+    # Template-served gallery files 404, or stream a body whose length differs from the
+    # declared Length (_catalogs/masterpage .js, local Qfion run 2026-11-04).
+    return (getattr(response, "status_code", None) == 404 or getattr(exc, "stage", None) in
+            ("content_length_mismatch", "truncated_content_length", "content_length_exceeded"))
 
 
 def record_sp_rest_failure(
@@ -4310,11 +4313,11 @@ def partition_loss_degraded_reason(
 
 
 def sharepoint_total_failures(stats: Dict[str, Any]) -> int:
-    """Count required content and enumeration gaps without hiding catalog404s."""
+    """Count required content and enumeration gaps. Ghosted catalog template files are
+    Microsoft-side (served from the site definition) and stay in stats["rest_ghosted"] only."""
     return (
         int(stats.get("drive_fail", 0) or 0)
         + int(stats.get("rest_fail", 0) or 0)
-        + int(stats.get("rest_ghosted", 0) or 0)
         + int(stats.get("enum_fail", 0) or 0)
         + int(stats.get("rest_enum_fail", 0) or 0)
     )

@@ -82,7 +82,17 @@ async def test_retry_budget_finite_even_retry_after_zero(client_factory):
     async with client_factory(lambda r, n: httpx.Response(429, headers={"Retry-After": "0"})) as (client, state):
         with pytest.raises(Exception, match="429|budget"):
             _ = [x async for x in client.iter_sharepoint_list_items_via_rest(HOST, WEB, "list")]
-        assert state["calls"] <= 4
+        assert state["calls"] <= 8
+
+
+async def test_sharepoint_throttling_waits_out_retry_after_instead_of_dropping_items(client_factory):
+    """Local 19-site run 2026-11-04: 359 SharePoint 429s; 41 items/lists were dropped because
+    the generic budget gives up past 30 s of waiting. Honour Retry-After within a bounded budget."""
+    responses = [httpx.Response(429, headers={"Retry-After": "40"}), httpx.Response(429, headers={"Retry-After": "40"}),
+                 httpx.Response(200, json={"value": [{"Id": 1}]})]
+    async with client_factory(lambda r, n: responses[n - 1]) as (client, state):
+        rows = [x async for x in client.iter_sharepoint_list_items_via_rest(HOST, WEB, "list")]
+        assert rows == [{"Id": 1}] and state["sleeps"] == [40, 40]
 
 
 async def test_long_retry_after_deferred_without_early_retry(client_factory):
@@ -160,3 +170,16 @@ async def test_rest_collection_follows_all_pages_and_detects_multi_page_cycle(mo
     with pytest.raises(ProviderReadError):
         await gc._get_sharepoint_lists_via_rest('tenant.sharepoint.com', 'https://tenant.sharepoint.com/sites/sub')
     assert calls == [first, second]
+
+
+def test_server_errors_retry_on_a_short_fixed_wait_while_throttling_backs_off():
+    from shared.provider_read import ProviderReadBudget, ProviderReadError
+    budget = ProviderReadBudget()
+    server = []
+    for _ in range(3):
+        budget.attempts += 1
+        server.append(budget.retry_delay(ProviderReadError("file_stream", status=500)))
+    throttled = ProviderReadBudget()
+    throttled.attempts = 3
+    assert server == [2.0, 2.0, 2.0]
+    assert throttled.retry_delay(ProviderReadError("file_stream", status=429)) == 8.0

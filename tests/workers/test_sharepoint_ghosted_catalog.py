@@ -78,16 +78,26 @@ def test_non_http_exception_is_a_real_failure():
     ) is False
 
 
-def test_possible_ghosted_files_count_toward_missing_content():
-    """Without durable content or a verified restore recipe, coverage is partial."""
+def test_ghosted_template_files_do_not_make_a_site_partial():
+    """Template files SharePoint serves from the site definition are Microsoft-side gaps, not our
+    failure (owner rule 2026-11-04: PARTIAL only for our app or misconfigured permission). They stay
+    counted in rest_ghosted for visibility."""
     stats = {"drive_fail": 0, "rest_fail": 0, "enum_fail": 0, "rest_ghosted": 19}
-    assert _bw.sharepoint_total_failures(stats) == 19
+    assert _bw.sharepoint_total_failures(stats) == 0
+
+
+def test_template_file_size_mismatch_in_a_catalog_is_a_ghost():
+    """Local run 2026-11-04: _catalogs/masterpage .js files served a different length than declared."""
+    from shared.provider_read import ProviderReadError
+    path = "/sites/projects/_catalogs/masterpage/Display Templates/Search/Item_Default.js"
+    assert _bw.is_ghosted_catalog_file(path, ProviderReadError("content_length_mismatch")) is True
+    assert _bw.is_ghosted_catalog_file(_NORMAL_URL, ProviderReadError("content_length_mismatch")) is False
 
 
 def test_real_failures_still_count_alongside_ghosts():
     """Ghost accounting must not mask genuine failures in the same run."""
     stats = {"drive_fail": 1, "rest_fail": 2, "enum_fail": 3, "rest_ghosted": 19}
-    assert _bw.sharepoint_total_failures(stats) == 25
+    assert _bw.sharepoint_total_failures(stats) == 6
 
 
 # ─── the counting seam ────────────────────────────────────────────────────
@@ -128,11 +138,11 @@ def test_recording_accumulates_across_calls():
         )
     assert stats["rest_ghosted"] == 19
     assert stats["rest_fail"] == 2
-    # All missing content reaches PARTIAL, including possible templates.
-    assert _bw.sharepoint_total_failures(stats) == 21
+    # Only the real missing documents make the site PARTIAL; templates stay counted as ghosted.
+    assert _bw.sharepoint_total_failures(stats) == 2
 
 
-def test_catalog_path_and_404_alone_never_prove_content_was_backed_up():
+def test_catalog_404_is_recorded_as_ghosted_not_as_a_failure():
     stats = {}
     _bw.record_sp_rest_failure(stats, _CATALOG_URL, _http_error(404, _CATALOG_URL))
-    assert _bw.sharepoint_total_failures(stats) == 1
+    assert stats["rest_ghosted"] == 1 and _bw.sharepoint_total_failures(stats) == 0

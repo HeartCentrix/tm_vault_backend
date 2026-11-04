@@ -7,7 +7,7 @@ import time
 
 import httpx
 
-from shared.graph_ratelimit import parse_retry_after
+from shared.graph_ratelimit import parse_retry_after, retry_wait
 
 
 def _identifier(value):
@@ -53,17 +53,17 @@ class ProviderReadBudget:
     attempts: int = 0
     waited: float = 0.0
     started: float = 0.0
+    max_attempts: int = 4
+    max_wait: float = 30.0
+    max_elapsed: float = 120.0
 
     def __post_init__(self):
         self.started = time.monotonic()
 
     def retry_delay(self, error: ProviderReadError) -> float:
-        delay = error.retry_after
-        if delay is None:
-            delay = float(2 ** min(self.attempts, 5))
-        delay = max(0.0, delay)
-        if (self.attempts >= 4 or self.waited + delay > 30
-                or time.monotonic() - self.started + delay > 120):
+        delay = max(0.0, retry_wait(error.status_code, error.retry_after, self.attempts))
+        if (self.attempts >= self.max_attempts or self.waited + delay > self.max_wait
+                or time.monotonic() - self.started + delay > self.max_elapsed):
             error.retry_after = delay
             raise error
         self.waited += delay
