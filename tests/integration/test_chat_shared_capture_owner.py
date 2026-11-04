@@ -82,23 +82,26 @@ def members(store, monkeypatch):
     storage = Storage()
     storage.backend = store.backend
 
-    async def snapshot(principal, job):
-        resource, snap = uuid4(), uuid4()
+    async def snapshot(principal, job, resource=None):
+        snap = uuid4()
         async with store.factory.begin() as session:
-            session.add(models.Resource(id=resource, tenant_id=store.tenant, type=models.ResourceType.USER_CHATS,
-                external_id=principal, display_name=principal,
-                extra_data={"user_id": principal, "chat_inventory_format": 1}))
-            await session.flush()
+            if resource is None:
+                resource = uuid4()
+                session.add(models.Resource(id=resource, tenant_id=store.tenant, type=models.ResourceType.USER_CHATS,
+                    external_id=principal, display_name=principal,
+                    extra_data={"user_id": principal, "chat_inventory_format": 1}))
+                await session.flush()
             session.add(models.Snapshot(id=snap, resource_id=resource, job_id=job, backend_id=store.backend,
                 extra_data={"chat_inventory_format": 1}))
         return resource, snap
 
-    async def job():
+    async def job(planned=()):
         job_id = uuid4()
         async with store.factory.begin() as session:
             session.add(models.Job(id=job_id, type=models.JobType.BACKUP, tenant_id=store.tenant,
-                                   status=models.JobStatus.RUNNING))
+                                   status=models.JobStatus.RUNNING, batch_resource_ids=list(planned)))
         return job_id
+
 
     async def run(resource, snap):
         return await chat_catalogue_entry.run_chat_catalogue_resource(
@@ -176,3 +179,51 @@ async def test_incremental_unchanged_chat_reuses_own_copy_without_waiting(store,
         resource_id=y_resource, snapshot_id=y_snap, writer_enabled=True, graph_client=object(),
         session_factory=store.factory, storage=members_storage(store), concurrency=2, full_backup=False)
     assert result["outcome"] == "complete" and sources[Y].reads == ["latest:" + GROUP]
+
+
+async def test_later_member_waits_for_an_earlier_member_whose_backup_has_not_started_yet(store, members):
+    """Railway 2026-11-04 21:04: the batch created the 10 chat backups one by one, 16 s apart. Akshat
+    (joined later) started before Rohit's (full history) backup existed, treated itself as the
+    capturer, and Rohit captured the chat again at 21:08. The job's planned resources say who is in
+    the run before their backups exist."""
+    sources, snapshot, job, run = members
+    x_resource = uuid4()
+    async with store.factory.begin() as session:
+        session.add(models.Resource(id=x_resource, tenant_id=store.tenant, type=models.ResourceType.USER_CHATS,
+            external_id=X, display_name=X, extra_data={"user_id": X, "chat_inventory_format": 1}))
+    y_resource = uuid4()
+    async with store.factory.begin() as session:
+        session.add(models.Resource(id=y_resource, tenant_id=store.tenant, type=models.ResourceType.USER_CHATS,
+            external_id=Y, display_name=Y, extra_data={"user_id": Y, "chat_inventory_format": 1}))
+    batch = await job(planned=[x_resource, y_resource])
+    _, y_snap = await snapshot(Y, batch, resource=y_resource)        # X's backup does not exist yet
+    gate = asyncio.Event()
+    sources[X] = Source(X, [GROUP])
+    sources[Y] = Source(Y, [GROUP, Y_ONLY], gate=gate)
+    y_run = asyncio.create_task(run(y_resource, y_snap))
+    for _ in range(200):
+        if Y_ONLY in sources[Y].reads:
+            break
+        await asyncio.sleep(0.01)
+    assert sources[Y].reads == [Y_ONLY]
+    _, x_snap = await snapshot(X, batch, resource=x_resource)
+    assert (await run(x_resource, x_snap))["outcome"] == "complete"
+    gate.set()
+    assert (await y_run)["outcome"] == "complete"
+    assert GROUP not in sources[Y].reads
+
+
+async def test_member_does_not_wait_at_the_end_for_a_backup_that_never_started(store, members):
+    sources, snapshot, job, run = members
+    x_resource = uuid4()
+    async with store.factory.begin() as session:
+        session.add(models.Resource(id=x_resource, tenant_id=store.tenant, type=models.ResourceType.USER_CHATS,
+            external_id=X, display_name=X, extra_data={"user_id": X, "chat_inventory_format": 1}))
+    y_resource = uuid4()
+    async with store.factory.begin() as session:
+        session.add(models.Resource(id=y_resource, tenant_id=store.tenant, type=models.ResourceType.USER_CHATS,
+            external_id=Y, display_name=Y, extra_data={"user_id": Y, "chat_inventory_format": 1}))
+    batch = await job(planned=[x_resource, y_resource])
+    _, y_snap = await snapshot(Y, batch, resource=y_resource)
+    sources[Y] = Source(Y, [GROUP])
+    assert (await run(y_resource, y_snap))["outcome"] == "complete" and GROUP in sources[Y].reads

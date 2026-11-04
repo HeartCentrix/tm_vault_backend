@@ -399,13 +399,20 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                 snapshot_lease_token = int(snapshot.lease_token or 0)
             if job_lease_token is None:
                 job_lease_token = int((await session.get(Job, snapshot.job_id)).lease_token or 0)
-        # Other members' chat backups in this run: a shared chat is captured once, by the member
-        # who sees the most history; the others copy it.
-        peers = {str((extra or {}).get("user_id") or external).lower(): sid
-                 for sid, external, extra in (await session.execute(select(Snapshot.id, Resource.external_id,
-                     Resource.extra_data).join(Resource, Resource.id == Snapshot.resource_id).where(
-                     Snapshot.job_id == snapshot.job_id, Snapshot.id != snapshot_id,
-                     Resource.type == ResourceType.USER_CHATS))).all()} if snapshot.job_id else {}
+        # Other members' chat backups in this run, planned or started: a shared chat is captured once,
+        # by the member who sees the most history; the others copy it. The batch creates its backups
+        # one by one (Railway: 16 s apart), so the planned list counts members whose backup is not
+        # created yet.
+        job_id, peers = snapshot.job_id, {}
+        if job_id:
+            planned = set((await session.get(Job, job_id)).batch_resource_ids or [])
+            planned |= set((await session.scalars(select(Snapshot.resource_id).where(Snapshot.job_id == job_id))).all())
+            planned.discard(resource.id)
+            if planned:
+                peers = {str((extra or {}).get("user_id") or external).lower(): rid
+                         for rid, external, extra in (await session.execute(select(Resource.id, Resource.external_id,
+                             Resource.extra_data).where(Resource.id.in_(planned),
+                             Resource.type == ResourceType.USER_CHATS))).all()}
         published = set((await session.scalars(select(SnapshotChatInventory.chat_id)
             .where(SnapshotChatInventory.snapshot_id == snapshot_id))).all())
         allowed = None
@@ -459,16 +466,22 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                     theirs = visible_history_start(chat, donor)
                     return theirs is None or (mine is not None and theirs <= mine)
                 return covers
-            async def owner_will_capture(cid):
+            async def owner_will_capture(cid, final):
                 """Another member of this run sees more of the chat and has not captured it yet."""
                 owner = owners.get(cid)
                 if owner is None or owner == me:
                     return False
                 async with session_factory() as session:
-                    if await session.scalar(select(Snapshot.status).where(Snapshot.id == peers[owner])) != SnapshotStatus.IN_PROGRESS:
+                    theirs = (await session.execute(select(Snapshot.id, Snapshot.status).where(
+                        Snapshot.job_id == job_id, Snapshot.resource_id == peers[owner])
+                        .order_by(Snapshot.created_at.desc()).limit(1))).first()
+                    if theirs is None:
+                        # Its backup is not created yet: leave the chat for later, never wait on it at the end.
+                        return not final
+                    if theirs.status != SnapshotStatus.IN_PROGRESS:
                         return False
                     return await session.scalar(select(SnapshotChatInventory.chat_id).where(
-                        SnapshotChatInventory.snapshot_id == peers[owner], SnapshotChatInventory.chat_id == cid).limit(1)) is None
+                        SnapshotChatInventory.snapshot_id == theirs.id, SnapshotChatInventory.chat_id == cid).limit(1)) is None
             async def capture(cid, final=True):
                 await cancel_check()
                 scope = chat_scope(cid)
@@ -487,7 +500,7 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                     previous = await reuse_unchanged_chat(scope=scope, graph_client=source,
                         session_factory=session_factory, folder_path=chat_folder(chats[cid], principal),
                         exclude_message=filters[cid][0], scope_filter_hash=filters[cid][1])
-                if previous is None and shared_capture and (busy or await owner_will_capture(cid)):
+                if previous is None and shared_capture and (busy or await owner_will_capture(cid, final)):
                     # Another member of this run is capturing it (busy) or will: leave it for now.
                     if not final:
                         return _POSTPONED
