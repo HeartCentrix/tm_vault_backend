@@ -7199,7 +7199,8 @@ class BackupWorker:
                 exclude_message=predicate, scope_filter_hash=filter_hash, check_cancelled=cancel_check,
                 concurrency=max(1, int(os.getenv("USER_CHATS_PARALLEL_CHATS", "4"))),
                 snapshot_lease_token=getattr(snapshot, "lease_token", None), partition_lease_token=token,
-                job_lease_token=(message or {}).get("_job_lease_token"))
+                job_lease_token=(message or {}).get("_job_lease_token"),
+                full_backup=bool((message or {}).get("forceFullBackup") or (message or {}).get("type") == "FULL"))
             if result is None or result.get("resumed_terminal"):
                 return result
 

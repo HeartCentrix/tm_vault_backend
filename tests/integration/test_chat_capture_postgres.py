@@ -5,7 +5,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import importlib.util
 import os
 from pathlib import Path
@@ -985,3 +985,30 @@ async def test_second_pass_does_not_retry_content_the_first_pass_found_unavailab
     _, result = await run_capture(store, adapters)
     assert result.outcome == "complete" and result.item_count == 2
     assert adapters.source.hosted_downloads == 1
+
+
+async def test_daily_schedule_reuses_an_unchanged_chat_and_reconciles_weekly(store, adapters, monkeypatch):
+    """A once-a-day SLA finds the last full read ~24 h old; reuse must still apply. A full
+    re-read happens once the last full read is a week old."""
+    monkeypatch.delenv("CHAT_INCREMENTAL_RECONCILE_HOURS", raising=False)
+    adapters.source.messages = [message()]
+    first_scope, _ = await run_capture(store, adapters)
+    adapters.source.latest_change = datetime(2020, 1, 1, tzinfo=timezone.utc)
+
+    async def age(days):  # every capture of the chat, including reused copies' provenance
+        when = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        async with store.factory.begin() as session:
+            for attempt in (await session.scalars(select(ChatCaptureAttempt).where(
+                    ChatCaptureAttempt.chat_id == first_scope.chat_id))).all():
+                if attempt.evidence:
+                    attempt.evidence = {**attempt.evidence, "started_at": when}
+                attempt.evidence_history = [
+                    {**e, "source_observed_at": when, "full_observed_at": when} if isinstance(e, dict) and "source_observed_at" in e else e
+                    for e in attempt.evidence_history or []]
+
+    await age(2)
+    daily = replace(await store.new_scope(), chat_id=first_scope.chat_id)
+    assert (await reuse(adapters, store, daily)).outcome == "complete"
+    await age(8)
+    weekly = replace(await store.new_scope(), chat_id=first_scope.chat_id)
+    assert await reuse(adapters, store, weekly) is None

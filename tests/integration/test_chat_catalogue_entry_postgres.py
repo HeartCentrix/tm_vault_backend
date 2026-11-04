@@ -174,8 +174,10 @@ def source_adapter(store, monkeypatch):
             self.hosted_calls.append((chat_id, message_id))
             if False:
                 yield {}
+        latest_change = None
         async def latest_message_change(self, chat_id):
-            return datetime.now(timezone.utc)  # always changed: these tests exercise the full capture
+            # Default: always changed, so these tests exercise the full capture.
+            return self.latest_change or datetime.now(timezone.utc)
     source = Source()
     @asynccontextmanager
     async def pinned(_client, *, principal_id):
@@ -378,9 +380,12 @@ async def test_chat_hosted_in_another_tenant_is_listed_not_partial(store, source
     source = source_adapter.source
     source.home_tenant_id = "home-tenant"
     source.chats.append({"id": "external-meeting", "topic": "Vendor call", "tenantId": "other-tenant"})
+    # Railway 2026-11-04: Graph lists some cross-organization chats as chatType
+    # unknownFutureValue with no tenantId; they answer 403 InsufficientPrivileges like the rest.
+    source.chats.append({"id": "unlabelled-external", "topic": None, "chatType": "unknownFutureValue"})
     original = source.iter_message_pages
     async def denied(chat_id):
-        if chat_id in ("external-meeting", "same-tenant-denied"):
+        if chat_id in ("external-meeting", "unlabelled-external", "same-tenant-denied"):
             raise ChatGraphError("Graph capture metadata failed with HTTP 403", status_code=403)
         async for page in original(chat_id):
             yield page
@@ -389,11 +394,14 @@ async def test_chat_hosted_in_another_tenant_is_listed_not_partial(store, source
     assert result["outcome"] == "complete" and result["item_count"] == 1
     async with store.factory() as session:
         record = (await session.get(models.Snapshot, scope.snapshot_id)).extra_data["chat_catalogue_scopes"]["resource"]
-    assert record["complete"] and record["external_tenant_chats"] == ["external-meeting"]
+    assert record["complete"] and record["external_tenant_chats"] == ["external-meeting", "unlabelled-external"]
 
     source.chats.append({"id": "same-tenant-denied", "topic": "Ours", "tenantId": "home-tenant"})
     second = await store.new_scope()
     assert (await source_adapter.run(second))["outcome"] == "partial"
+    source.chats[-1] = {"id": "same-tenant-denied", "topic": "Ours", "chatType": "group"}  # no tenant, ordinary type
+    third = await store.new_scope()
+    assert (await source_adapter.run(third))["outcome"] == "partial"
 
 
 async def test_worker_preserves_partial_and_failed_source_outcomes(store, source_adapter, worker_entry):
@@ -488,3 +496,17 @@ async def test_partition_without_original_claim_token_refuses_before_graph(store
     with pytest.raises(api().ChatCatalogueWorkLeaseMoved):
         await worker_entry.run(scope, partitionId=str(partition_id), partitionFilter={"chatIds": ["chat-alpha"]})
     assert source_adapter.source.list_calls == 0
+
+
+async def test_requested_full_backup_reads_every_chat_even_when_unchanged(store, source_adapter):
+    """Incremental reuse is for incremental runs; a full backup (forceFullBackup / type FULL)
+    re-reads every chat from Graph."""
+    source = source_adapter.source
+    await source_adapter.run(await legacy_scope(store))
+    source.latest_change = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    reads = len(source.message_calls)
+    assert (await source_adapter.run(await store.new_scope(), full_backup=True))["outcome"] == "complete"
+    assert len(source.message_calls) > reads
+    reads = len(source.message_calls)
+    assert (await source_adapter.run(await store.new_scope()))["outcome"] == "complete"
+    assert len(source.message_calls) == reads

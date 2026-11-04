@@ -313,10 +313,15 @@ def _capture_order(chat_ids, principal):
 
 def _hosted_elsewhere(chat, home_tenant, result) -> bool:
     """A chat hosted in another organization's tenant that Microsoft let us read nothing of
-    (it answers app access with 403): listed as hosted elsewhere, not our failure."""
-    tenant = (chat or {}).get("tenantId")
-    return (isinstance(tenant, str) and isinstance(home_tenant, str) and bool(home_tenant) and
-            tenant.lower() != home_tenant.lower() and result.outcome == "failed" and not result.item_count)
+    (it answers app access with 403): listed as hosted elsewhere, not our failure. Graph lists
+    some cross-organization chats as chatType unknownFutureValue with no tenantId at all
+    (Railway 2026-11-04: every such chat answered 403 InsufficientPrivileges)."""
+    chat = chat or {}
+    tenant = chat.get("tenantId")
+    elsewhere = (tenant.lower() != home_tenant.lower() if isinstance(tenant, str) and tenant
+                 else chat.get("chatType") == "unknownFutureValue")
+    return (isinstance(home_tenant, str) and bool(home_tenant) and elsewhere
+            and result.outcome == "failed" and not result.item_count)
 
 
 async def _chat_list(source):
@@ -335,8 +340,9 @@ async def _chat_list(source):
 async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enabled, graph_client,
         session_factory, storage, partition_filter=None, partition_id=None, policy_id=None,
         exclude_message=None, scope_filter_hash=None, check_cancelled=None, concurrency=1,
-        snapshot_lease_token=None, partition_lease_token=None, job_lease_token=None):
-    """Return None only for an eligible disabled legacy path; never downgrade."""
+        snapshot_lease_token=None, partition_lease_token=None, job_lease_token=None, full_backup=False):
+    """Return None only for an eligible disabled legacy path; never downgrade.
+    full_backup: a requested full backup re-reads every chat (no unchanged-chat reuse)."""
     from shared.provider_runtime import (unit_scope, checkpoint_unit, check_provider_turn,
         ProviderTurnDeferred, current_execution, other_provider_work_waiting, yield_provider_turn)
     from shared.chat_capture import capture_chat_inventory, derive_shared_chat, reuse_unchanged_chat, SHARED_CAPTURE_BUSY
@@ -439,7 +445,7 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                             # Hand the turn back; on resume this chat derives from the finished capture.
                             defer_provider(ProviderDeferred(None, 15, stage="shared_chat_wait"))
                         previous = None
-                if previous is None:
+                if previous is None and not full_backup:
                     previous = await reuse_unchanged_chat(scope=scope, graph_client=source,
                         session_factory=session_factory, folder_path=chat_folder(chats[cid], principal),
                         exclude_message=filters[cid][0], scope_filter_hash=filters[cid][1])

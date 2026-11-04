@@ -578,8 +578,14 @@ async def test_link_to_another_tenants_file_is_external_not_a_permission_gap(sou
 
 
 @pytest.mark.parametrize("host_status", [403, 429, 503])
-async def test_inconclusive_host_check_never_marks_external(source_factory, host_status):
+async def test_inconclusive_host_check_never_marks_external(source_factory, host_status, monkeypatch):
     """Only Graph's 400 for a foreign host is proof; anything else keeps the path fallback."""
+    from shared.chat_capture_graph import StrictChatGraphSource
+
+    async def no_wait(*args):
+        pass
+
+    monkeypatch.setattr(StrictChatGraphSource, "_pause", no_wait)  # 429 budget is real backoff
     make, *_ = source_factory
     handler, _ = _dead_link_handler(host_status=host_status)
     async with make(handler) as source:
@@ -820,3 +826,25 @@ async def test_message_listing_orders_by_creation_so_no_message_is_skipped(sourc
         assert [page async for page in source.iter_message_pages('chat')] == [[]]
     listed = [r for r in requests if r.url.host == 'graph.microsoft.com' and r.url.path.endswith('/messages')]
     assert [r.url.params.get('$orderby') for r in listed] == ['createdDateTime desc']
+
+
+async def test_throttling_gets_a_longer_backoff_budget_than_server_errors(source_factory, monkeypatch):
+    """Railway 2026-11-04: Teams answered hosted-content 429s with Retry-After 0-8 s; four
+    retries (one immediate on Retry-After 0) ran out in ~17 s and left two meeting chats PARTIAL."""
+    from shared import chat_capture_graph
+    from shared.chat_capture_graph import StrictChatGraphSource, ChatGraphError
+    from shared.graph_ratelimit import retry_wait
+    waits = []
+
+    async def pause(self, response, attempt):
+        waits.append(retry_wait(response.status_code, 0.0, attempt))
+
+    monkeypatch.setattr(StrictChatGraphSource, "_pause", pause)
+    make, requests, *_ = source_factory
+    for status, sent in ((429, 9), (500, 5)):
+        requests.clear()
+        async with make(lambda request: httpx.Response(status, headers={"Retry-After": "0"})) as source:
+            with pytest.raises(ChatGraphError):
+                _ = [page async for page in source.iter_message_pages("chat")]
+        assert sum(r.url.host == "graph.microsoft.com" for r in requests) == sent
+    assert waits[:8] == [1, 2, 4, 8, 16, 32, 32, 32] and waits[8:] == [0, 0, 0, 0]

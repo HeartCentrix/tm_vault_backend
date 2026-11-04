@@ -141,6 +141,14 @@ def effective_capture_scope_hash(base_hash: str, scope_filter_hash: str | None =
         separators=(",", ":")).encode()).hexdigest()
 
 
+_RETRIES = 4            # server errors, transport, 401: short fixed waits
+_THROTTLE_RETRIES = 8   # 429: backoff budget (Teams answers Retry-After 0 and throttles again)
+
+
+def _retries(status):
+    return _THROTTLE_RETRIES if status == 429 else _RETRIES
+
+
 class StrictChatGraphSource:
     """Pinned application source. Construct through ``pinned_chat_source``."""
 
@@ -227,22 +235,22 @@ class StrictChatGraphSource:
 
     async def _json(self, url: str, *, params=None) -> dict:
         _target(url, graph=True)
-        for attempt in range(5):
+        for attempt in range(_THROTTLE_RETRIES + 1):
             token = await self._context()
             client = await self._client._get_shared_http()
             await self._pace(url)
             try:
                 response = await client.get(url, params=params, headers={"Authorization": f"Bearer {token}"}, follow_redirects=False)
             except httpx.TransportError:
-                if attempt == 4:
+                if attempt >= _RETRIES:
                     raise ChatGraphError("Graph capture transport retries exhausted") from None
                 await self._pause(None, attempt)
                 continue
             await self._context()
-            if response.status_code == 401 and attempt < 4:
+            if response.status_code == 401 and attempt < _RETRIES:
                 self._client._access_token = None
                 continue
-            if response.status_code in (429, 500, 502, 503, 504) and attempt < 4:
+            if response.status_code in (429, 500, 502, 503, 504) and attempt < _retries(response.status_code):
                 await self._pause(response, attempt)
                 continue
             if response.status_code != 200:
@@ -423,7 +431,7 @@ class StrictChatGraphSource:
                         _target(url, graph=False)
                         redirects += 1
                         continue
-                    if response.status_code in (429, 500, 502, 503, 504) and attempt < 4:
+                    if response.status_code in (429, 500, 502, 503, 504) and attempt < _retries(response.status_code):
                         # Close this response before waiting and retrying.
                         retry_response = response
                     else:

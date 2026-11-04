@@ -792,7 +792,7 @@ async def reuse_unchanged_chat(*, scope, graph_client, session_factory, folder_p
 
     Kill switch CHAT_INCREMENTAL_REUSE=false (on by default). A full capture still runs when the
     chat changed, when the scope (principal, permissions, visibility filter) differs, or when the
-    last full capture is older than CHAT_INCREMENTAL_RECONCILE_HOURS (default 24), which also
+    last full capture is older than CHAT_INCREMENTAL_RECONCILE_HOURS (default 168: a daily SLA still reuses; weekly full read), which also
     covers changes a modification time may not reflect (e.g. linked-file edits). Returns None
     whenever the caller should capture from Graph.
     """
@@ -800,7 +800,7 @@ async def reuse_unchanged_chat(*, scope, graph_client, session_factory, folder_p
         return None
     from shared.config import settings
     version = settings.CHAT_OBSERVATION_HASH_VERSION
-    reconcile = timedelta(hours=float(os.getenv("CHAT_INCREMENTAL_RECONCILE_HOURS", "24")))
+    reconcile = timedelta(hours=float(os.getenv("CHAT_INCREMENTAL_RECONCILE_HOURS", "168")))
     overlap = timedelta(minutes=float(os.getenv("CHAT_INCREMENTAL_OVERLAP_MIN", "15")))
 
     async def find(session):
