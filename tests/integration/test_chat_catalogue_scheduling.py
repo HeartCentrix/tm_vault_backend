@@ -172,3 +172,50 @@ async def test_individual_errors_leave_remaining_chats_and_honest_outcome(
         record = snapshot.extra_data["chat_catalogue_scopes"]["resource"]
         assert not record["complete"] and record["planned_chats"] == 3
         assert record["completed_chats"] == item_count
+
+
+async def test_turn_hand_back_keeps_free_slots_working_while_a_long_chat_holds_the_turn(store, scheduled_source, monkeypatch):
+    """Railway 2026-11-04 22:18: chat backups asked to hand back their turn stopped starting
+    chats and waited 15-35 min for 1-2 huge captures, their other slots idle. The turn cannot
+    end before those captures finish anyway, so free slots keep working until they do."""
+    from shared import provider_runtime
+
+    async def waiting():
+        return True
+
+    monkeypatch.setattr(provider_runtime, "other_provider_work_waiting", waiting)
+    monkeypatch.setattr(provider_runtime, "yield_provider_turn", lambda: None)
+    monkeypatch.setenv("CHAT_TURN_MIN_SECONDS", "0")
+    scope = await store.new_scope()
+    source = scheduled_source.source
+    for cid in ("chat-B", "chat-C", "chat-D", "chat-E"):
+        source.release[cid].set()
+    runner = asyncio.create_task(scheduled_source.run(scope))
+    try:
+        await asyncio.wait_for(source.started["chat-A"].wait(), timeout=5)
+        for cid in ("chat-C", "chat-D", "chat-E"):        # A still holds the turn
+            await asyncio.wait_for(source.started[cid].wait(), timeout=5)
+        assert not source.release["chat-A"].is_set()
+    finally:
+        for release in source.release.values():
+            release.set()
+        await runner
+
+
+async def test_turn_hand_back_stops_new_chats_once_the_holding_capture_finishes(store, scheduled_source, monkeypatch):
+    from shared import provider_runtime
+
+    async def waiting():
+        return True
+
+    yielded = []
+    monkeypatch.setattr(provider_runtime, "other_provider_work_waiting", waiting)
+    monkeypatch.setattr(provider_runtime, "yield_provider_turn", lambda: yielded.append(True))
+    monkeypatch.setenv("CHAT_TURN_MIN_SECONDS", "0")
+    scope = await store.new_scope()
+    source = scheduled_source.source
+    for release in source.release.values():
+        release.set()
+    await scheduled_source.run(scope)
+    # Nothing holds the turn: after the first finished chat no new chat starts, the turn is handed back.
+    assert yielded and not all(source.started[cid].is_set() for cid in source.chat_ids)

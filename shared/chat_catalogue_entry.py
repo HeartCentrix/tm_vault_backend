@@ -527,16 +527,24 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                     return result
             remaining, postponed = iter(keys), []
             yield_requested, processed = False, 0
+            # A turn handed back for fairness still waits for captures already running. Free
+            # slots keep working until exactly those captures finish (Railway 2026-11-04 22:18:
+            # backups idled 15-35 min behind 1-2 huge chats); then no new chat starts.
+            running, holders = set(), set()
             async def worker(final):
-                nonlocal completed, yield_requested, processed
+                nonlocal completed, yield_requested, processed, holders
                 for cid in remaining:
-                    if yield_requested:
+                    if yield_requested and not (holders & running):
                         return
                     await cancel_check()
+                    token = object()
+                    running.add(token)
                     try:
                         result = await capture(cid, final)
                     except (Exception, asyncio.CancelledError) as exc:
                         result = exc
+                    finally:
+                        running.discard(token)
                     await cancel_check()
                     if result is _POSTPONED:
                         postponed.append(cid)
@@ -570,9 +578,9 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                     else:
                         errors.append(result.failure_reason or "chat capture has incomplete coverage")
                     processed += 1
-                    if (cid not in published and time.monotonic() - turn_started >= min_turn_s
+                    if (not yield_requested and cid not in published and time.monotonic() - turn_started >= min_turn_s
                             and await other_provider_work_waiting()):
-                        yield_requested = True
+                        yield_requested, holders = True, set(running)
             for final in (False, True):
                 if final:
                     # Chats another member was capturing come last, by then usually derivable.

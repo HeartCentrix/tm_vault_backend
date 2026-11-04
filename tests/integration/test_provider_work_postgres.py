@@ -343,7 +343,7 @@ async def test_chat_fair_checkpoint_keeps_published_receipt_and_finishes_active_
     from shared.provider_runtime import ProviderWorkRunner
     from unittest.mock import AsyncMock
     source = source_adapter.source
-    source.chats = [{'id': 'a'}, {'id': 'b'}, {'id': 'c'}]
+    source.chats = [{'id': 'a'}, {'id': 'b'}, {'id': 'c'}, {'id': 'd'}]
     scope = await store.new_scope()
     async with store.factory.begin() as db:
         await work.ensure_work(db, snapshot_id=scope.snapshot_id, snapshot_token=0, job_token=0)
@@ -357,11 +357,13 @@ async def test_chat_fair_checkpoint_keeps_published_receipt_and_finishes_active_
     assert (await runner.run_once())['provider_waiting']
     async with store.factory() as db:
         published = (await db.scalars(select(models.SnapshotChatInventory))).all()
-        assert len(published) == 2 and all(row.coverage_status == 'COMPLETE' for row in published)
+        # The first finisher asks to hand back; its free slot keeps capturing (c) while the other
+        # chat still holds the turn, then both stop and d waits for the next turn.
+        assert len(published) == 3 and all(row.coverage_status == 'COMPLETE' for row in published)
         assert all(attempt.state == 'PUBLISHED' for attempt in (await db.scalars(select(models.ChatCaptureAttempt))).all())
     assert (await runner.run_once())['outcome'] == 'complete'
     # Each source observation ran exactly twice; fairness did not restart a proof.
-    assert sorted(source.message_calls) == ['a', 'a', 'b', 'b', 'c', 'c']
+    assert sorted(source.message_calls) == ['a', 'a', 'b', 'b', 'c', 'c', 'd', 'd']
 
 async def test_swallowed_defer_cannot_complete_and_remaining_provider_tasks_are_joined(store):
     import asyncio
