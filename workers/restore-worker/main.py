@@ -1719,6 +1719,7 @@ class RestoreWorker:
                             graph_client, resource, item,
                             conflict_mode=conflict_mode,
                             target_site_id=sp_target_site_id,
+                            session=session,
                         )
                     elif item.item_type in ("FILE", "ONEDRIVE_FILE"):
                         await self._restore_file_to_onedrive(graph_client, resource, item, conflict_mode=conflict_mode)
@@ -1727,6 +1728,7 @@ class RestoreWorker:
                             graph_client, resource, item,
                             conflict_mode=conflict_mode,
                             target_site_id=sp_target_site_id,
+                            session=session,
                         )
                     elif item.item_type == "CALENDAR_EVENT":
                         await self._restore_event_to_calendar(session, graph_client, resource, item)
@@ -1979,11 +1981,11 @@ class RestoreWorker:
                 elif self._is_sharepoint_file(target_resource, item):
                     await self._restore_file_to_sharepoint(
                         graph_client, target_resource, item, target_site_id=target_resource.external_id,
-                        source_site_id=await self._item_source_site_id(session, item))
+                        source_site_id=await self._item_source_site_id(session, item), session=session)
                 elif item.item_type in ("FILE", "ONEDRIVE_FILE"):
                     await self._restore_file_to_onedrive(graph_client, target_resource, item)
                 elif item.item_type in ("SHAREPOINT_FILE",):
-                    await self._restore_file_to_sharepoint(graph_client, target_resource, item)
+                    await self._restore_file_to_sharepoint(graph_client, target_resource, item, session=session)
                 else:
                     print(f"[{self.worker_id}] Cross-user restore not supported for: {item.item_type}")
                     failed_count += 1
@@ -2037,7 +2039,7 @@ class RestoreWorker:
                 elif target_resource.type.value == "SHAREPOINT_SITE":
                     await self._restore_file_to_sharepoint(
                         graph_client, target_resource, item, target_site_id=target_resource.external_id,
-                        source_site_id=await self._item_source_site_id(session, item))
+                        source_site_id=await self._item_source_site_id(session, item), session=session)
                 else:
                     failed_count += 1
                     continue
@@ -3726,12 +3728,35 @@ class RestoreWorker:
         kind = getattr(getattr(resource, "type", None), "value", getattr(resource, "type", None))
         return str(kind) == "SHAREPOINT_SITE" and item.item_type in ("FILE", "SHAREPOINT_FILE")
 
+    async def _sharepoint_library_root(self, session, item) -> Optional[str]:
+        """Server-relative root folder ('/sites/X/SiteAssets') of the library a list-pass row came from,
+        from that list's row in the same snapshot. None for library (drive) rows or without a session."""
+        list_id = self._get_item_metadata(item).get("list_id")
+        if session is None or not list_id:
+            return None
+        cache = self.__dict__.setdefault("_sp_library_roots", {})
+        key = (item.snapshot_id, list_id)
+        if key not in cache:
+            from urllib.parse import unquote, urlparse
+            md = await session.scalar(select(SnapshotItem.extra_data).where(
+                SnapshotItem.snapshot_id == item.snapshot_id, SnapshotItem.external_id == list_id,
+                SnapshotItem.item_type == "SHAREPOINT_LIST").limit(1))
+            url = (md or {}).get("web_url")
+            cache[key] = unquote(urlparse(url).path).rstrip("/") if url else None
+        return cache[key]
+
     @staticmethod
-    def _sharepoint_library_and_folder(item) -> Tuple[Optional[str], str]:
-        """'{site}/lists/{library}/sub' -> (library, 'sub'); Graph paths ('/drive(s)/.../root:/sub') -> (None, 'sub')."""
+    def _sharepoint_library_and_folder(item, library_root: Optional[str] = None) -> Tuple[Optional[str], str]:
+        """'{site}/lists/{library}/sub' -> (library, 'sub'); Graph paths ('/drive(s)/.../root:/sub') -> (None, 'sub').
+        List-pass rows keep the library's URL folder in their trail ('Site Assets/SiteAssets/sub'); with the
+        library's root folder known, 'sub' comes from the file's server-relative URL instead."""
         folder = (getattr(item, "folder_path", None) or "").strip()
         if "/lists/" in folder and not folder.startswith("/"):
             library, _, sub = folder.split("/lists/", 1)[1].partition("/")
+            url = (getattr(item, "extra_data", None) or {}).get("server_relative_url") or ""
+            parent = url.rsplit("/", 1)[0]
+            if library_root and (parent.lower() + "/").startswith(library_root.lower() + "/"):
+                sub = parent[len(library_root):]
             return library or None, sub.strip("/")
         if "root:" in folder:
             folder = folder.split("root:", 1)[1]
@@ -3752,7 +3777,7 @@ class RestoreWorker:
             key = (site_id, "name", library)
             if key not in cache:
                 lists = (await graph_client._get(f"{graph_client.GRAPH_URL}/sites/{graph_site}/lists",
-                                                 params={"$select": "id,displayName", "$top": "999"})).get("value") or []
+                                                 params={"$select": "id,displayName,system", "$top": "999"})).get("value") or []
                 cache[key] = next((l["id"] for l in lists if l.get("displayName") == library), None)
             list_id = cache[key]
         if not list_id:
@@ -3823,6 +3848,7 @@ class RestoreWorker:
         conflict_mode: str = "SEPARATE_FOLDER",
         target_site_id: Optional[str] = None,
         source_site_id: Optional[str] = None,
+        session=None,
     ):
         """Restore file to SharePoint site via Graph API.
 
@@ -3867,7 +3893,7 @@ class RestoreWorker:
 
         # Land in the file's own library, inside its own sub-folder ('{site}/lists/{library}/sub' is the
         # captured trail). Unresolvable libraries fall back to the default library under '{library}/sub'.
-        library, folder_trail = self._sharepoint_library_and_folder(item)
+        library, folder_trail = self._sharepoint_library_and_folder(item, await self._sharepoint_library_root(session, item))
         same_site = target_site_id is None or target_site_id == (source_site_id or resource.external_id)
         drive_id = await self._sharepoint_restore_drive(graph_client, item, site_id, same_site, library)
         if library and drive_id is None:

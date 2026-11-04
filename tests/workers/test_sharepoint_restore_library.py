@@ -12,6 +12,7 @@ import pathlib
 import sys
 from datetime import datetime
 from types import SimpleNamespace
+from uuid import UUID
 
 _WORKER_DIR = pathlib.Path(__file__).resolve().parents[2] / "workers" / "restore-worker"
 if str(_WORKER_DIR) not in sys.path:
@@ -46,7 +47,10 @@ class Graph:
         if url.endswith("/lists/test-docs/drive"):
             return {"id": "test-drive-docs"}
         if "/sites/test-site/lists" in url:
-            return {"value": [{"id": "test-docs", "displayName": "Documents"}, {"id": "test-sa", "displayName": "Site Assets"}]}
+            # Graph hides system libraries (Site Assets, Style Library, Site Pages) unless `system` is selected.
+            system = "system" in (params or {}).get("$select", "").split(",")
+            return {"value": [{"id": "test-docs", "displayName": "Documents"}]
+                    + ([{"id": "test-sa", "displayName": "Site Assets", "system": {}}] if system else [])}
         raise AssertionError("unexpected GET " + url)
 
 
@@ -75,9 +79,24 @@ def library_file():
 
 
 def site_asset():
+    """Stored shape (Railway, Donor Desk): the list pass keeps the library's URL folder in the trail."""
     return SimpleNamespace(item_type="SHAREPOINT_FILE", external_id="list-sa:7", name="logo.png", blob_path="b/7",
-                           folder_path="Donor Desk/lists/Site Assets/SitePages", tenant_id="t",
-                           extra_data={"list_id": "list-sa", "list_name": "Site Assets"})
+                           folder_path="Donor Desk/lists/Site Assets/SiteAssets/SitePages", tenant_id="t",
+                           snapshot_id=SNAPSHOT,
+                           extra_data={"list_id": "list-sa", "list_name": "Site Assets", "source": "sp_rest",
+                                       "server_relative_url": "/sites/DonorDesk/SiteAssets/SitePages/logo.png"})
+
+
+SNAPSHOT = UUID("00000000-0000-0000-0000-0000000000a1")
+
+
+class Session:
+    """The snapshot's list row for Site Assets (its web_url is the library's root folder)."""
+
+    async def scalar(self, stmt):
+        sql = str(stmt.compile(compile_kwargs={"literal_binds": True}))
+        assert "'list-sa'" in sql and SNAPSHOT.hex in sql and "'SHAREPOINT_LIST'" in sql, sql
+        return {"web_url": "https://qfion.sharepoint.com/sites/DonorDesk/SiteAssets"}
 
 
 def test_a_library_file_restores_into_its_own_library_and_folder(monkeypatch):
@@ -90,7 +109,7 @@ def test_a_library_file_restores_into_its_own_library_and_folder(monkeypatch):
 def test_a_list_file_restores_into_its_library_found_from_the_list(monkeypatch):
     main = _load_main(); graph = Graph(); worker = worker_with(monkeypatch, main)
     asyncio.run(worker._restore_file_to_sharepoint(graph, SimpleNamespace(external_id="site-1"), site_asset(),
-                                                   conflict_mode="SEPARATE_FOLDER"))
+                                                   conflict_mode="SEPARATE_FOLDER", session=Session()))
     day = datetime.utcnow().strftime("%Y-%m-%d")
     assert graph.puts == [f"https://graph.test/v1.0/drives/drive-sa/root:/Restored%20by%20TM/{day}/SitePages/logo.png:/content"]
 
@@ -99,7 +118,8 @@ def test_restore_into_another_site_matches_the_library_by_name(monkeypatch):
     main = _load_main(); graph = Graph(); worker = worker_with(monkeypatch, main)
     for item in (library_file(), site_asset()):
         asyncio.run(worker._restore_file_to_sharepoint(graph, SimpleNamespace(external_id="site-1"), item,
-                                                       conflict_mode="OVERWRITE", target_site_id="test-site"))
+                                                       conflict_mode="OVERWRITE", target_site_id="test-site",
+                                                       session=Session()))
     assert graph.puts == ["https://graph.test/v1.0/drives/test-drive-docs/root:/General/plan.docx:/content",
                           "https://graph.test/v1.0/drives/test-drive-sa/root:/SitePages/logo.png:/content"]
 
