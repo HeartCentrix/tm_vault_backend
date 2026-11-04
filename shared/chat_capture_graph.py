@@ -111,12 +111,17 @@ def _content_length(response: httpx.Response) -> int | None:
     return length
 
 
-def permission_scope_hash_for(*, tenant_id: str, application_id: str, principal_id: str) -> str:
-    """Hash owned credentials' configuration; this does not attest actual grants."""
-    for value in (tenant_id, application_id, principal_id):
+def permission_scope_hash_for(*, tenant_id: str, principal_id: str) -> str:
+    """Hash the capture's credential configuration; this does not attest actual grants.
+
+    The app registration is deliberately not part of it: workers round-robin a pool of apps
+    with the same tenant consent, and keying on the app made every run a new scope, so
+    nothing verified was reused (Railway 2026-11-04: incremental re-downloaded every chat
+    binary). Reuse still requires an identical observation fingerprint, and a credential
+    change inside one capture is still refused by ``_context``."""
+    for value in (tenant_id, principal_id):
         _component(value)
-    context = {"tenant": tenant_id, "application": application_id,
-               "principal": principal_id, "auth_mode": "client_credentials",
+    context = {"tenant": tenant_id, "principal": principal_id, "auth_mode": "client_credentials",
                "requested_scope": "https://graph.microsoft.com/.default"}
     return hashlib.sha256(json.dumps(context, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -145,7 +150,7 @@ class StrictChatGraphSource:
         self.home_tenant_id = client.tenant_id
         self._initial_secret = client.client_secret
         self.permission_scope_hash = permission_scope_hash_for(
-            tenant_id=self._initial_tenant, application_id=self._initial_app, principal_id=principal_id)
+            tenant_id=self._initial_tenant, principal_id=principal_id)
         self._closed = False
         self._pacing_policy = client._policy
         self._resource_buckets: dict[tuple[str, str, str], AsyncTokenBucket] = {}

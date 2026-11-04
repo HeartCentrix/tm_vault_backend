@@ -606,7 +606,20 @@ async def test_public_configuration_hash_matches_open_source(source_factory):
     module = importlib.import_module("shared.chat_capture_graph")
     async with make(lambda request: httpx.Response(200, json={"value": []})) as source:
         assert source.permission_scope_hash == module.permission_scope_hash_for(
-            tenant_id="tenant", application_id="app", principal_id="user")
+            tenant_id="tenant", principal_id="user")
+
+
+async def test_pooled_apps_share_one_capture_scope(source_factory):
+    """Railway round-robins a pool of app registrations with the same tenant consent. A chat
+    read by another pooled app is the same capture scope, so verified content is reused instead
+    of re-downloaded; other users and tenants stay separate scopes."""
+    make, *_ = source_factory
+    ok = lambda request: httpx.Response(200, json={"value": []})
+    async with make(ok) as first, make(ok, application_id="other-app") as pooled, \
+            make(ok, principal_id="other-user") as other_user, make(ok, tenant_id="other-tenant") as other_tenant:
+        assert pooled.permission_scope_hash == first.permission_scope_hash
+        assert other_user.permission_scope_hash != first.permission_scope_hash
+        assert other_tenant.permission_scope_hash != first.permission_scope_hash
 
 
 async def test_provider_denial_keeps_safe_code_and_request_id_without_error_message(source_factory):
