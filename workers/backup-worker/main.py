@@ -4448,6 +4448,34 @@ def _mail_attachment_gap(rows) -> int:
     return gap
 
 
+def _drive_item_folder_path(file_item: Dict[str, Any]) -> Optional[str]:
+    """SharePoint library files live under '{site}/lists/{library}/...' like every other list item
+    (the Recovery Site view and file export group by that prefix); Graph's raw parent path
+    ('/drives/<id>/root:') hid them. OneDrive files keep Graph's parent path."""
+    path = (file_item.get("parentReference") or {}).get("path")
+    site, library = file_item.get("_site_label"), file_item.get("_drive_name")
+    if not (site and library):
+        return path
+    sub = path.split("root:", 1)[1] if path and "root:" in path else ""
+    return f"{site}/lists/{library}{sub.rstrip('/')}"
+
+
+def _normal_web_url(url: Optional[str]) -> str:
+    from urllib.parse import unquote
+    return unquote(url or "").rstrip("/").lower()
+
+
+def _drive_web_urls(drives: List[Dict[str, Any]]) -> Set[str]:
+    return {_normal_web_url(d.get("webUrl")) for d in drives if d.get("webUrl")}
+
+
+def _library_has_drive(lst: Dict[str, Any], drive_urls: Set[str]) -> bool:
+    """Graph's /sites/{id}/drives omits some libraries (Site Assets, Style Library); only a
+    library it actually lists is backed up by the drive pass."""
+    url = _normal_web_url(lst.get("webUrl"))
+    return bool(url) and url in drive_urls
+
+
 class BackupWorker:
     """High-performance backup worker with parallelism and Server-Side Copy"""
 
@@ -22359,6 +22387,8 @@ class BackupWorker:
         metadata["drive_id"] = drive_id or (file_item.get("parentReference") or {}).get("driveId")
         if file_item.get("_site_label"):
             metadata["site_label"] = file_item["_site_label"]
+        if file_item.get("_drive_name"):
+            metadata["library"] = file_item["_drive_name"]
         # Persist source_etag + lastModifiedDateTime on the FILE row so the
         # next backup's carry-forward path can compare without re-reading the
         # blob's Azure metadata. M365 updates eTag on every content edit;
@@ -22397,7 +22427,7 @@ class BackupWorker:
             "external_id": file_id,
             "item_type": "FILE",
             "name": file_name,
-            "folder_path": file_item.get("parentReference", {}).get("path"),
+            "folder_path": _drive_item_folder_path(file_item),
             "content_hash": content_hash if content_hash else None,
             "content_size": content_size,
             "blob_path": blob_path,
@@ -29047,6 +29077,13 @@ class BackupWorker:
                 stats["rest_enum_fail"] = stats.get("rest_enum_fail", 0) + 1
                 return
             sp_hostname = _urlsplit(sp_site_web_url).hostname
+            try:
+                drive_urls: Optional[Set[str]] = _drive_web_urls(
+                    await graph_client.list_sharepoint_site_drives(site_id))
+            except Exception as exc:
+                # Unknown coverage: keep leaving libraries to the drive pass (no duplicate bytes).
+                drive_urls = None
+                logger.warning("SharePoint drive list for %s failed: %s", site_label, exc)
 
             for lst in (lists_resp.get("value") or []):
                 lst_id = lst.get("id") or ""
@@ -29208,13 +29245,14 @@ class BackupWorker:
                 except Exception as exc:
                     logger.warning("list-folder persist failed for %s/%s: %s", site_label, display, exc)
 
-                if is_library and not is_catalog:
+                if is_library and not is_catalog and (drive_urls is None or _library_has_drive(lst, drive_urls)):
                     # Plain document libraries are already picked up by the
                     # drive producer — re-enqueueing them via SP REST would
                     # duplicate bytes and double the Graph/SP REST cost.
                     # Catalog libraries fall through: their file bytes still
                     # come from the drive producer, and this REST pass adds
-                    # the list-item columns on top.
+                    # the list-item columns on top. So do libraries Graph
+                    # never lists as drives (Site Assets, Style Library).
                     continue
                 if not (sp_hostname and sp_site_web_url):
                     logger.warning("Cannot derive SP site URL for %s, skipping list items", site_label)
