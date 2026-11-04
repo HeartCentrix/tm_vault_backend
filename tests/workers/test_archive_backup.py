@@ -948,3 +948,14 @@ def test_archive_persist_uses_blob_path_returned_by_dedup(monkeypatch):
     assert _run(persist([({"id": "i0"}, {"data": "ZDA="})])) == (1, 2, 0)
     (rows,) = stub.statements[0]._multi_values
     assert rows[0]["blob_path"] == "prior-snapshot/opaque"
+
+
+def test_archive_source_context_does_not_depend_on_the_pooled_app():
+    """Railway 2026-11-04: Amit's archive FAILED 'archive capture source context changed' when its
+    provider work resumed on another app of the pool. Pooled apps share one tenant consent."""
+    from types import SimpleNamespace
+    one = SimpleNamespace(client_id="app-one", tenant_id="tenant-a")
+    two = SimpleNamespace(client_id="app-two", tenant_id="tenant-a")
+    other = SimpleNamespace(client_id="app-one", tenant_id="tenant-b")
+    assert ab.archive_source_visibility(one) == ab.archive_source_visibility(two)
+    assert ab.archive_source_visibility(one) != ab.archive_source_visibility(other)

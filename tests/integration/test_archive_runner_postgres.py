@@ -131,7 +131,8 @@ async def test_page_commit_survives_process_cancel_without_false_completion(stor
         snap = await db.get(models.Snapshot, snapshot.id)
         assert snap.status == models.SnapshotStatus.IN_PROGRESS
     ledger = ArchiveCapture(store.factory, fence)
-    await ledger.begin('https://graph.microsoft.com/beta/admin/exchange/mailboxes/MBX:Primary/folders', 'synthetic')
+    await ledger.begin('https://graph.microsoft.com/beta/admin/exchange/mailboxes/MBX:Primary/folders',
+                       archive.archive_source_visibility(Source()))
     scope = await ledger.claim_scope()
     assert scope['phase'] == 'root'
     assert scope['next_url'].endswith('?page=2')

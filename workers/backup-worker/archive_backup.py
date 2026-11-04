@@ -1802,6 +1802,13 @@ def _make_durable_persist(resource, snapshot, tenant, ledger, settings):
     return persist
 
 
+def archive_source_visibility(graph_client):
+    """The credential context that decides what the capture can see: the tenant's consent.
+    Not the app id: workers round-robin a pool of apps with the same consent, and a resumed
+    capture on another app was refused as a changed source (Railway 2026-11-04)."""
+    return 'tenant:' + str(getattr(graph_client, 'tenant_id', '') or '')
+
+
 async def _run_durable_archive(graph_client, resource, snapshot, tenant, *, worker_id, force_full,
                                settings, fence, copy_capture, factory=None, persist_batch=None):
     from shared.archive_capture import ArchiveCapture, ArchiveConflict, archive_final_gate, canonical_base
@@ -1818,8 +1825,7 @@ async def _run_durable_archive(graph_client, resource, snapshot, tenant, *, work
         or (resource.extra_data or {}).get('archive_mailbox_id') or resource.external_id)
     base = canonical_base(f'https://graph.microsoft.com/{settings.ARCHIVE_GRAPH_VERSION}/admin/exchange/mailboxes/{mbx}/folders')
     ledger = ArchiveCapture(factory, fence, max_locations=getattr(settings, 'ARCHIVE_MAX_LOCATIONS', 8))
-    visibility = str(getattr(graph_client, 'client_id', ''))
-    await ledger.begin(base, visibility)
+    await ledger.begin(base, archive_source_visibility(graph_client))
     # Carry the marker into the detached caller object; later finalization must see it.
     async with factory() as db:
         from shared.models import Snapshot
