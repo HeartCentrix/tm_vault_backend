@@ -738,7 +738,9 @@ async def _publish_copy(*, scope, session_factory, items, folder_path, exclude_m
 
 async def derive_shared_chat(*, scope, session_factory, covers, folder_path=None,
                              exclude_message=None, scope_filter_hash=None):
-    """Build this member's inventory from another member's fresh COMPLETE capture of the chat.
+    """Build this member's inventory from another member's COMPLETE capture of the chat whose
+    data was read after this member's backup run started (a copy counts by its original read
+    time), so a run of any length shares its captures and never borrows an earlier run's.
 
     Messages, hosted contents and files are read through app-level routes, so every member's
     capture of a chat sees the same source; only the visible-history boundary differs, and it
@@ -748,28 +750,27 @@ async def derive_shared_chat(*, scope, session_factory, covers, folder_path=None
     captures from Graph), else the published CaptureResult.
     """
     from shared.config import settings
-    from shared.models import Snapshot
+    from shared.models import Job, Snapshot
     version = settings.CHAT_OBSERVATION_HASH_VERSION
-    window = timedelta(minutes=float(os.getenv("CHAT_SHARED_CAPTURE_WINDOW_MIN", "30")))
 
     async def find(session):
-        started = (await session.get(Snapshot, scope.snapshot_id)).started_at
-        if started.tzinfo is None:
-            started = started.replace(tzinfo=timezone.utc)
+        snapshot = await session.get(Snapshot, scope.snapshot_id)
+        job = await session.get(Job, snapshot.job_id) if snapshot.job_id else None
+        started = _when((job.created_at if job else None) or snapshot.started_at)
         now = await session.scalar(select(func.clock_timestamp()))
         rows = (await session.execute(select(ChatCaptureAttempt, ChatInventory).outerjoin(
             ChatInventory, ChatInventory.id == ChatCaptureAttempt.staged_inventory_id).where(
             ChatCaptureAttempt.tenant_id == scope.tenant_id, ChatCaptureAttempt.chat_id == scope.chat_id,
             ChatCaptureAttempt.principal_id != scope.principal_id,
-            ChatCaptureAttempt.created_at >= started - window)
+            ChatCaptureAttempt.created_at >= started)
             .order_by(ChatCaptureAttempt.created_at.desc()))).all()
         busy = False
         for attempt, inventory in rows:
             if not covers(attempt.principal_id, _recorded_filter(attempt)):
                 continue
+            observed, full = _observed_times(attempt)
             if (attempt.state == "PUBLISHED" and inventory is not None and inventory.state == "COMPLETE"
-                    and inventory.observation_hash_version == version):
-                observed, full = _observed_times(attempt)
+                    and inventory.observation_hash_version == version and observed and observed >= started):
                 return attempt, observed, full, [catalogue._captured(v) for v in (await _inventory_items(session, inventory.id)).all()]
             busy = busy or (attempt.state in catalogue._ACTIVE and attempt.expires_at > now)
         return SHARED_CAPTURE_BUSY if busy else None

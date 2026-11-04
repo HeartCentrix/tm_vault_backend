@@ -848,10 +848,10 @@ async def test_member_derives_fresh_complete_capture_without_source_or_storage_w
     just captured (same 180 objects uploaded twice). Reads are app-level, so a member's
     copy derives from a fresh complete capture of the same chat."""
     adapters.source.messages = [message(attached=True), dict(message(hosted=True), id="with-image")]
+    beta_scope = await member_scope(store, "chat-alpha")
     alpha_scope, alpha = await run_capture(store, adapters)
     reads = (adapters.source.passes, adapters.source.downloads, adapters.source.hosted_downloads)
     uploads = len(adapters.storage.uploads)
-    beta_scope = await member_scope(store, alpha_scope.chat_id)
     beta = await derive(adapters, store, beta_scope)
     assert alpha.outcome == beta.outcome == "complete"
     assert beta.item_count == alpha.item_count == 4 and beta.uploaded_bytes == 0
@@ -870,8 +870,8 @@ async def test_derived_copy_keeps_only_the_members_visible_history(store, adapte
     old = dict(message(attached=True), id="old", createdDateTime="2025-01-01T00:00:00Z")
     new = dict(message(), id="new", createdDateTime="2026-06-01T00:00:00Z")
     adapters.source.messages = [old, new]
+    beta_scope = await member_scope(store, "chat-alpha")
     alpha_scope, alpha = await run_capture(store, adapters)
-    beta_scope = await member_scope(store, alpha_scope.chat_id)
     beta = await derive(adapters, store, beta_scope,
         exclude_message=lambda raw: raw.get("createdDateTime", "") < "2026-01-01", scope_filter_hash="f" * 64)
     assert alpha.item_count == 3 and beta.outcome == "complete" and beta.item_count == 1
@@ -883,29 +883,60 @@ async def test_derived_copy_keeps_only_the_members_visible_history(store, adapte
 
 async def test_stale_or_non_covering_capture_is_not_a_donor(store, adapters):
     adapters.source.messages = [message()]
-    alpha_scope, _ = await run_capture(store, adapters)
-    beta_scope = await member_scope(store, alpha_scope.chat_id)
+    beta_scope = await member_scope(store, "chat-alpha")
+    await run_capture(store, adapters)
     assert await derive(adapters, store, beta_scope, covers=lambda principal, filter_hash: False) is None
     async with store.factory.begin() as session:
         await session.execute(text("UPDATE chat_capture_attempts SET created_at = created_at - interval '3 hours'"))
     assert await derive(adapters, store, beta_scope) is None
 
 
+async def test_capture_read_before_this_run_started_is_not_a_donor(store, adapters):
+    """Railway 2026-11-04: in the 13:52 full run, 55 chat copies came from the 11:56 run's
+    captures (read up to 25 min before the run began), so those backups missed messages sent
+    in between. Only data read after this member's run started is shared."""
+    adapters.source.messages = [message()]
+    await run_capture(store, adapters)
+    beta_scope = await member_scope(store, "chat-alpha")
+    assert await derive(adapters, store, beta_scope) is None
+
+
+async def test_copy_of_data_read_before_this_run_is_not_a_donor(store, adapters):
+    """A copy is made later than the data it holds was read; its read time decides."""
+    gamma_scope = await member_scope(store, "chat-alpha", principal="principal-gamma", scope_hash="c" * 64)
+    adapters.source.messages = [message()]
+    await run_capture(store, adapters)
+    beta_scope = await member_scope(store, "chat-alpha")
+    assert (await derive(adapters, store, gamma_scope)).outcome == "complete"
+    assert await derive(adapters, store, beta_scope,
+        covers=lambda principal, filter_hash: principal in ("principal-alpha", "principal-gamma")) is None
+
+
+async def test_long_run_still_shares_a_capture_made_hours_after_it_started(store, adapters):
+    beta_scope = await member_scope(store, "chat-alpha")
+    async with store.factory.begin() as session:
+        await session.execute(text("UPDATE jobs SET created_at = created_at - interval '3 hours'"))
+        await session.execute(text("UPDATE snapshots SET started_at = started_at - interval '3 hours'"))
+    adapters.source.messages = [message()]
+    await run_capture(store, adapters)
+    assert (await derive(adapters, store, beta_scope)).outcome == "complete"
+
+
 async def test_member_waits_instead_of_duplicating_an_active_capture(store, adapters):
     from shared import chat_catalogue as catalogue
+    beta_scope = await member_scope(store, "chat-alpha")
     alpha_scope = await store.new_scope()
     async with store.factory.begin() as session:
         await catalogue.begin_capture(session, scope=alpha_scope)
-    beta_scope = await member_scope(store, alpha_scope.chat_id)
     assert await derive(adapters, store, beta_scope) is adapters.capture.SHARED_CAPTURE_BUSY
 
 
 async def test_retired_donor_object_falls_back_to_a_normal_capture(store, adapters, monkeypatch):
     adapters.source.messages = [message(attached=True)]
-    alpha_scope, _ = await run_capture(store, adapters)
+    beta_scope = await member_scope(store, "chat-alpha")
+    await run_capture(store, adapters)
     async with store.factory.begin() as session:
         await session.execute(text("UPDATE chat_blob_objects SET state = 'DELETING'"))
-    beta_scope = await member_scope(store, alpha_scope.chat_id)
     assert await derive(adapters, store, beta_scope) is None
     async with store.factory.begin() as session:
         await session.execute(text("UPDATE chat_blob_objects SET state = 'LIVE'"))
