@@ -462,8 +462,10 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                         # Progress is advisory; a failed refresh cannot undo a
                         # durable publication or replay Graph/storage work.
                         logging.getLogger(__name__).warning("chat live progress refresh failed (%s)", type(exc).__name__)
-                    await checkpoint_unit(receipt_id=str(result.inventory_id),
-                        state='COMPLETED' if result.outcome == 'complete' else 'FAILED')
+                    # A chat hosted in another organization is done, not failed (same rule as the snapshot).
+                    done = result.outcome == 'complete' or _hosted_elsewhere(
+                        chats.get(cid), getattr(source, "home_tenant_id", None), result)
+                    await checkpoint_unit(receipt_id=str(result.inventory_id), state='COMPLETED' if done else 'FAILED')
                     return result
             remaining, postponed = iter(keys), []
             yield_requested, processed = False, 0

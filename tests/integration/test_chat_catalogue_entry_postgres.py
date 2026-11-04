@@ -510,3 +510,29 @@ async def test_requested_full_backup_reads_every_chat_even_when_unchanged(store,
     reads = len(source.message_calls)
     assert (await source_adapter.run(await store.new_scope()))["outcome"] == "complete"
     assert len(source.message_calls) == reads
+
+
+async def test_chat_hosted_elsewhere_completes_its_provider_unit(store, source_adapter, monkeypatch):
+    """Railway 2026-11-04: Divyansh's chat snapshot was COMPLETED but its provider work PARTIAL:
+    the two chats Microsoft refuses (another organization's tenant) marked their units FAILED
+    while the snapshot counted them as hosted elsewhere."""
+    from shared import provider_runtime
+    from shared.chat_capture_graph import ChatGraphError
+    units = []
+
+    async def record(**kwargs):
+        units.append(kwargs.get("state"))
+
+    monkeypatch.setattr(provider_runtime, "checkpoint_unit", record)
+    source = source_adapter.source
+    source.home_tenant_id = "home-tenant"
+    source.chats.append({"id": "external-meeting", "topic": "Vendor call", "tenantId": "other-tenant"})
+    original = source.iter_message_pages
+    async def denied(chat_id):
+        if chat_id == "external-meeting":
+            raise ChatGraphError("Graph capture metadata failed with HTTP 403", status_code=403)
+        async for page in original(chat_id):
+            yield page
+    source.iter_message_pages = denied
+    assert (await source_adapter.run(await legacy_scope(store)))["outcome"] == "complete"
+    assert units == ["COMPLETED", "COMPLETED"]
