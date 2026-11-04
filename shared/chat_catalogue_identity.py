@@ -303,12 +303,8 @@ class CapturedChatItem:
         object.__setattr__(self, "payload", _freeze_json(_payload(self.payload)))
         if self.content is not None and not isinstance(self.content, ChatContentDescriptor):
             raise TypeError("content must be a ChatContentDescriptor")
-        content_type = self.payload.get("contentType", self.payload.get("content_type", ""))
-        metadata_only = isinstance(content_type, str) and (
-            content_type.startswith("application/vnd.microsoft.card") or
-            content_type in {"messageReference", "forwardedMessageReference", "meetingReference"})
         requires_binary = self.item_type == "CHAT_HOSTED_CONTENT" or (
-            self.item_type == "CHAT_ATTACHMENT" and not metadata_only)
+            self.item_type == "CHAT_ATTACHMENT" and not metadata_only_attachment(self.payload))
         if requires_binary and self.content is None and self.payload.get(SOURCE_UNAVAILABLE_FIELD) is not True:
             raise ValueError("required binary content has no content descriptor")
 
@@ -398,6 +394,15 @@ class StageResult:
 # persistent server error) although the listing named it. Coverage treats it as captured
 # metadata, not a missing required binary: PARTIAL is reserved for our own failures.
 SOURCE_UNAVAILABLE_FIELD = "chat_catalogue_source_unavailable"
+# Reply/forward/meeting pointers and Teams tabs (Planner, OneNote, ...) carry no file bytes.
+POINTER_ATTACHMENT_TYPES = frozenset({"messageReference", "forwardedMessageReference", "meetingReference", "tabReference"})
+
+
+def metadata_only_attachment(payload) -> bool:
+    content_type = payload.get("contentType", payload.get("content_type", ""))
+    return isinstance(content_type, str) and (
+        content_type.startswith("application/vnd.microsoft.card") or content_type in POINTER_ATTACHMENT_TYPES)
+
 
 
 def authentication_context_fingerprint(scope: ChatCaptureScope) -> str:

@@ -252,7 +252,8 @@ def test_inline_descriptor_verifies_actual_bytes(changes):
 
 
 def test_metadata_only_cards_and_pointer_items_do_not_require_binary_content():
-    for content_type in ("application/vnd.microsoft.card.adaptive", "messageReference", "forwardedMessageReference", "meetingReference"):
+    for content_type in ("application/vnd.microsoft.card.adaptive", "messageReference", "forwardedMessageReference",
+                         "meetingReference", "tabReference"):
         assert item(item_type="CHAT_ATTACHMENT", graph_id="card-alpha", parent_graph_id="message-alpha",
                     payload={"contentType": content_type, "content": {"text": "captured"}}).content is None
 

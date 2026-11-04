@@ -29,6 +29,9 @@ _RESOURCE_BUCKETS: WeakValueDictionary[tuple[str, str, str], AsyncTokenBucket] =
 
 from shared.provider_read import ProviderReadError
 
+EXTERNAL_TENANT_FILE = "externalTenantFile"
+
+
 class ChatGraphError(RuntimeError):
     """Capture cannot establish complete source coverage; URLs are redacted."""
 
@@ -154,6 +157,7 @@ class StrictChatGraphSource:
         self._closed = False
         self._pacing_policy = client._policy
         self._resource_buckets: dict[tuple[str, str, str], AsyncTokenBucket] = {}
+        self._foreign_hosts: dict[str, bool] = {}
 
     async def _context(self) -> str:
         if self._closed:
@@ -327,9 +331,27 @@ class StrictChatGraphSource:
         except ChatGraphError as exc:
             if exc.status_code != 403:
                 raise
+            if await self._foreign_host(urlsplit(source_url).hostname):
+                external = ChatGraphError("Graph file is held by another tenant", status_code=403)
+                external.code = EXTERNAL_TENANT_FILE
+                raise external from None
             item = await self._resolve_by_path(source_url, exc)
         self._file_identity(item)
         return item
+
+    async def _foreign_host(self, host) -> bool:
+        """Graph answers /sites/{host} with 400 invalidRequest for any host outside the app's
+        tenancy (a file another tenant shared into the chat). Only that answer is proof:
+        200 or an error (throttling, outage) keeps the normal dead-link handling."""
+        if host not in self._foreign_hosts:
+            try:
+                await self._json(f"{self._client.GRAPH_URL}/sites/{_component(host)}")
+                self._foreign_hosts[host] = False
+            except ChatGraphError as exc:
+                if exc.status_code != 400:
+                    return False
+                self._foreign_hosts[host] = True
+        return self._foreign_hosts[host]
 
     async def _resolve_by_path(self, source_url: str, denied: ChatGraphError) -> dict:
         """Graph answers a revoked or expired sharing link with 403 even when the file is still

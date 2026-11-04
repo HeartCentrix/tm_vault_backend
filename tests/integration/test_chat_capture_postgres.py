@@ -580,6 +580,17 @@ async def test_metadata_only_card_is_complete_without_binary_download(store, ada
     assert not adapters.storage.uploads
 
 
+async def test_teams_tab_is_complete_without_download(store, adapters):
+    """A Planner/OneNote tab pinned in a chat is a pointer with no file bytes (Railway 2026-11-04:
+    "Kanban Task Board" was fetched as a file and kept five users' group chat PARTIAL)."""
+    adapters.source.messages = [message()]
+    adapters.source.messages[0]["attachments"] = [{"id": "tab", "contentType": "tabReference",
+        "name": "Kanban Task Board", "contentUrl": None, "content": None}]
+    _, result = await run_capture(store, adapters)
+    assert result.outcome == "complete" and result.item_count == 2
+    assert result.uploaded_bytes == 0 and adapters.source.downloads == 0
+
+
 async def test_shared_file_reuses_object_after_each_principals_own_byte_verification(store, adapters, monkeypatch):
     from shared.chat_catalogue_identity import ChatCaptureScope
     from shared.models import (ChatInventory, Job, JobStatus, JobType, Resource,

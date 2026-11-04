@@ -509,7 +509,7 @@ DEAD_LINK = ("https://tenant-my.sharepoint.com/personal/harsh_tenant_com/Documen
              "Microsoft%20Teams%20Chat%20Files/Budget%202026%23v2.xlsx")
 
 
-def _dead_link_handler(*, site_status=200, item_status=200, share_status=403):
+def _dead_link_handler(*, site_status=200, item_status=200, share_status=403, host_status=200):
     requested = []
 
     def handler(request):
@@ -517,6 +517,8 @@ def _dead_link_handler(*, site_status=200, item_status=200, share_status=403):
         requested.append(path)
         if path.startswith("/v1.0/shares/"):
             return httpx.Response(share_status, json={"error": {"code": "accessDenied" if share_status == 403 else "notAllowed"}})
+        if path == "/v1.0/sites/tenant-my.sharepoint.com":
+            return httpx.Response(host_status, json={"id": "root"} if host_status == 200 else {"error": {"code": "invalidRequest"}})
         if path == "/v1.0/sites/tenant-my.sharepoint.com:/personal/harsh_tenant_com":
             return httpx.Response(site_status, json={"id": "host,site-guid,web-guid"} if site_status == 200 else {})
         if path == "/v1.0/sites/host,site-guid,web-guid/drive/root:/Microsoft Teams Chat Files/Budget 2026#v2.xlsx":
@@ -533,7 +535,7 @@ async def test_dead_sharing_link_falls_back_to_the_file_path(source_factory):
     handler, requested = _dead_link_handler()
     async with make(handler) as source:
         assert (await source.resolve_file(DEAD_LINK))["id"] == "item"
-    assert len(requested) == 3
+    assert len(requested) == 4
 
 
 async def test_dead_sharing_link_to_a_deleted_file_is_404(source_factory):
@@ -557,6 +559,31 @@ async def test_dead_link_site_lookup_decides_permission_or_gone(source_factory, 
         with pytest.raises(ChatGraphError) as raised:
             await source.resolve_file(DEAD_LINK)
     assert raised.value.status_code == expected
+
+
+@pytest.mark.parametrize("link", [DEAD_LINK, "https://tenant-my.sharepoint.com/:i:/p/lyly_nguyen/EaBcD"])
+async def test_link_to_another_tenants_file_is_external_not_a_permission_gap(source_factory, link):
+    """Graph answers /sites/{host} with 400 invalidRequest for any host outside the app's own
+    tenancy (probe 2026-11-04: heartcentrix-my.sharepoint.com from the Qfion app). Such a file
+    is another tenant's content, like an external-tenant chat: unavailable, not PARTIAL."""
+    from shared.chat_capture import _source_unavailable
+    from shared.chat_capture_graph import ChatGraphError, EXTERNAL_TENANT_FILE
+    make, *_ = source_factory
+    handler, requested = _dead_link_handler(host_status=400)
+    async with make(handler) as source:
+        with pytest.raises(ChatGraphError) as raised:
+            await source.resolve_file(link)
+    assert raised.value.code == EXTERNAL_TENANT_FILE and _source_unavailable(raised.value)
+    assert requested[1] == "/v1.0/sites/tenant-my.sharepoint.com"
+
+
+@pytest.mark.parametrize("host_status", [403, 429, 503])
+async def test_inconclusive_host_check_never_marks_external(source_factory, host_status):
+    """Only Graph's 400 for a foreign host is proof; anything else keeps the path fallback."""
+    make, *_ = source_factory
+    handler, _ = _dead_link_handler(host_status=host_status)
+    async with make(handler) as source:
+        assert (await source.resolve_file(DEAD_LINK))["id"] == "item"
 
 
 async def test_locked_site_is_not_retried_by_path(source_factory):

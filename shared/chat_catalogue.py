@@ -32,7 +32,7 @@ from shared.chat_catalogue_identity import (
     CaptureEvidence, CaptureLease, CaptureResult, CapturedChatItem,
     ChatCaptureScope, ChatContentDescriptor, StageResult,
     _digest, _payload, authentication_context_fingerprint,
-    canonical_payload_sha256, canonical_version_fingerprint,
+    canonical_payload_sha256, canonical_version_fingerprint, metadata_only_attachment,
     qualified_chat_item_key, observation_semantic, validate_observation_hash_version,
 )
 from shared.models import (
@@ -529,10 +529,7 @@ def _coverage(scope, items):
                 if not isinstance(child, Mapping):
                     gaps.append({"kind": "invalid_child_manifest", "parent_graph_id": parent.graph_id})
                     continue
-                content_type = child.get("contentType", "")
-                card = isinstance(content_type, str) and (content_type.startswith("application/vnd.microsoft.card") or
-                    content_type in {"messageReference", "forwardedMessageReference", "meetingReference"})
-                expect(parent, kind, child.get("id"), kind == "CHAT_HOSTED_CONTENT" or not card)
+                expect(parent, kind, child.get("id"), kind == "CHAT_HOSTED_CONTENT" or not metadata_only_attachment(child))
     gaps.extend({"kind": "missing_child", "logical_key": key} for key in sorted(set(expected) - set(actual)))
     gaps.extend({"kind": "unmanifested_child", "logical_key": key} for key in sorted(set(actual) - set(expected)))
     unavailable = {key for key, item in actual.items() if item.content is None and

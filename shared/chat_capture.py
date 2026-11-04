@@ -25,10 +25,10 @@ from shared import chat_catalogue as catalogue
 from shared.chat_catalogue_identity import (
     SOURCE_UNAVAILABLE_FIELD,
     CaptureEvidence, CaptureResult, CapturedChatItem, ChatContentDescriptor,
-    _digest, _payload, authentication_context_fingerprint, canonical_version_fingerprint,
+    _digest, _payload, authentication_context_fingerprint, canonical_version_fingerprint, metadata_only_attachment,
     qualified_chat_item_key, observation_semantic, validate_observation_hash_version,
 )
-from shared.chat_capture_graph import ChatGraphError, StrictChatGraphSource, effective_capture_scope_hash, pinned_chat_source
+from shared.chat_capture_graph import EXTERNAL_TENANT_FILE, ChatGraphError, StrictChatGraphSource, effective_capture_scope_hash, pinned_chat_source
 from shared.chat_capture_storage import upload_capture_content, verify_catalogue_content
 from shared.chat_content_stream import spool_chat_content
 from shared.db_retry import run_catalogue_transaction
@@ -221,17 +221,11 @@ class _CaptureLeaseKeeper:
                 await close()
 
 
-def _metadata_only(attachment):
-    content_type = attachment.get("contentType", "")
-    return isinstance(content_type, str) and (content_type.startswith("application/vnd.microsoft.card") or
-        content_type in {"messageReference", "forwardedMessageReference", "meetingReference"})
-
-
 def stable_attachment_identity(attachment):
     """Graph mints a new ``id`` for card/reference attachments on every read, which
     made two identical observations look like source movement. Their identity is
     their content; file attachments keep the Graph id their download needs."""
-    if not _metadata_only(attachment):
+    if not metadata_only_attachment(attachment):
         return attachment["id"]
     body = {k: v for k, v in attachment.items() if k != "id"}
     return "card:" + hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()[:40]
@@ -467,8 +461,10 @@ def _source_unavailable(exc) -> bool:
     is locked by a tenant admin ("Access to this site has been blocked"), or a 500 that
     survived the request retries (Teams /views/video clips answer 500 every time). 401/403
     (our permissions), 429 and 502-504 (throttling/outage), transport and storage failures
-    stay unresolved, so they keep the chat PARTIAL."""
-    return isinstance(exc, ChatGraphError) and getattr(exc, "status_code", None) in (404, 410, 423, 500)
+    stay unresolved, so they keep the chat PARTIAL. A file held by another tenant is that
+    tenant's content (like an external-tenant chat), not a gap in our permissions."""
+    return isinstance(exc, ChatGraphError) and (getattr(exc, "status_code", None) in (404, 410, 423, 500)
+                                                or getattr(exc, "code", None) == EXTERNAL_TENANT_FILE)
 
 
 def _without_home_tenant(message: dict, home_tenant) -> dict:
@@ -534,7 +530,7 @@ async def _observe(*, scope, keeper, factory, storage, source, ledger, observati
                     manifest = []
                     for kind, values in (("CHAT_ATTACHMENT", attachments), ("CHAT_HOSTED_CONTENT", hosted)):
                         for child in values:
-                            required = kind == "CHAT_HOSTED_CONTENT" or not _metadata_only(child)
+                            required = kind == "CHAT_HOSTED_CONTENT" or not metadata_only_attachment(child)
                             manifest.append({"item_type": kind, "graph_id": child["id"], "requires_content": required})
                             ledger.expect(observation, kind, child["id"], identifier, required=required)
                     parent["chat_catalogue_expected_children"] = {"complete": hosted_complete and valid, "items": manifest}
@@ -553,7 +549,7 @@ async def _observe(*, scope, keeper, factory, storage, source, ledger, observati
                 for kind, values in (("CHAT_ATTACHMENT", attachments), ("CHAT_HOSTED_CONTENT", hosted)):
                     for child in values:
                         try:
-                            if kind == "CHAT_ATTACHMENT" and _metadata_only(child):
+                            if kind == "CHAT_ATTACHMENT" and metadata_only_attachment(child):
                                 captured = CapturedChatItem(kind, child["id"], identifier, child, None)
                                 if ledger.record(observation, captured) and observation == 0:
                                     pending.append(captured)
