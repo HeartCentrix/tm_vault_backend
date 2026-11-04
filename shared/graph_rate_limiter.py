@@ -18,6 +18,9 @@ from shared.provider_read import ProviderReadError
 
 logger = logging.getLogger(__name__)
 
+_COORDINATOR_ATTEMPTS = 3
+
+
 def _validate_cost(cost, capacity):
     if not math.isfinite(cost) or cost <= 0 or cost > capacity:
         raise ValueError("admission cost must be positive, finite and no larger than capacity")
@@ -107,6 +110,7 @@ class _RedisTokenBucket:
     async def acquire(self, n: float = 1.0) -> float:
         _validate_cost(n, self.capacity)
         waited = 0.0
+        misses = 0
         while True:
             try:
                 if self._script is None:
@@ -119,8 +123,15 @@ class _RedisTokenBucket:
                 if not math.isfinite(wait) or wait < 0:
                     raise ValueError("invalid coordinator delay")
             except Exception as exc:
-                logger.warning("Graph admission coordinator unavailable: %s", type(exc).__name__)
-                raise ProviderReadError("coordinator_unavailable", retry_after=5) from None
+                # A single slow round trip (2 s socket timeout, cross-region Redis) is not an
+                # outage; still fail closed when the coordinator keeps missing.
+                misses += 1
+                logger.warning("Graph admission coordinator unavailable: %s (attempt %s/%s)",
+                               type(exc).__name__, misses, _COORDINATOR_ATTEMPTS)
+                if misses >= _COORDINATOR_ATTEMPTS:
+                    raise ProviderReadError("coordinator_unavailable", retry_after=5, attempts=misses) from None
+                await asyncio.sleep(0.5 * misses)
+                continue
             if wait == 0:
                 return waited
             await asyncio.sleep(wait)

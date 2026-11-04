@@ -20,12 +20,35 @@ async def test_redis_denial_redraws_before_grant(monkeypatch):
     assert len(calls) == 2
 
 
-async def test_redis_outage_never_falls_back_to_full_local_quota():
+async def test_redis_outage_never_falls_back_to_full_local_quota(monkeypatch):
+    calls = []
     async def script(**kwargs):
+        calls.append(kwargs)
         raise OSError('coordinator offline')
+    async def sleep(delay):
+        pass
+    monkeypatch.setattr('shared.graph_rate_limiter.asyncio.sleep', sleep)
     bucket = _RedisTokenBucket(SimpleNamespace(register_script=lambda lua: script), 'key', 10, 1, _LocalTokenBucket(10, 1))
     with pytest.raises(Exception, match='coordinator'):
         await bucket.acquire()
+    assert len(calls) == 3
+
+
+async def test_single_coordinator_timeout_is_retried(monkeypatch):
+    """Railway 2026-11-04: one 2 s Redis timeout (cross-region) failed a 127 GiB OneDrive at
+    attempts=1. A transient miss is retried; only a persistent outage fails closed."""
+    calls, slept = [], []
+    async def script(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise TimeoutError
+        return ('0', '0')
+    async def sleep(delay):
+        slept.append(delay)
+    monkeypatch.setattr('shared.graph_rate_limiter.asyncio.sleep', sleep)
+    bucket = _RedisTokenBucket(SimpleNamespace(register_script=lambda lua: script), 'key', 10, 1, _LocalTokenBucket(10, 1))
+    assert await bucket.acquire() == 0
+    assert len(calls) == 2 and len(slept) == 1
 
 
 @pytest.mark.parametrize('cost', [0, -1, 2, float('nan'), float('inf')])
