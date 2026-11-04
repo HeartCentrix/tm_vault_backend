@@ -461,11 +461,12 @@ async def _binary(*, scope, keeper, factory, storage, source_client, item_type,
         return report(item)
 
 def _source_unavailable(exc) -> bool:
-    """Microsoft named the item but cannot serve its bytes: 404/410 gone, or a 500 that
+    """Microsoft named the item but cannot serve its bytes: 404/410 gone, 423 the owning site
+    is locked by a tenant admin ("Access to this site has been blocked"), or a 500 that
     survived the request retries (Teams /views/video clips answer 500 every time). 401/403
     (our permissions), 429 and 502-504 (throttling/outage), transport and storage failures
     stay unresolved, so they keep the chat PARTIAL."""
-    return isinstance(exc, ChatGraphError) and getattr(exc, "status_code", None) in (404, 410, 500)
+    return isinstance(exc, ChatGraphError) and getattr(exc, "status_code", None) in (404, 410, 423, 500)
 
 
 def _without_home_tenant(message: dict, home_tenant) -> dict:

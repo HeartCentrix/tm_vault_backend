@@ -322,9 +322,34 @@ class StrictChatGraphSource:
     async def resolve_file(self, source_url: str) -> dict:
         _target(source_url, graph=False)
         share = "u!" + base64.urlsafe_b64encode(source_url.encode()).decode().rstrip("=")
-        item = await self._json(f"{self._client.GRAPH_URL}/shares/{share}/driveItem")
+        try:
+            item = await self._json(f"{self._client.GRAPH_URL}/shares/{share}/driveItem")
+        except ChatGraphError as exc:
+            if exc.status_code != 403:
+                raise
+            item = await self._resolve_by_path(source_url, exc)
         self._file_identity(item)
         return item
+
+    async def _resolve_by_path(self, source_url: str, denied: ChatGraphError) -> dict:
+        """Graph answers a revoked or expired sharing link with 403 even when the file is still
+        in a library this app can read. Look it up by path in the owning site's default library:
+        found -> back it up; 404 -> the file (or its whole site, e.g. a deleted user's
+        OneDrive) is gone; site refuses us -> the 403 stands as a permission problem."""
+        parsed = urlsplit(source_url)
+        segments = [unquote(part) for part in parsed.path.split("/") if part]
+        if (len(segments) < 4 or segments[0] not in ("personal", "sites") or
+                segments[2] not in ("Documents", "Shared Documents")):
+            raise denied
+        site_path = "/".join(quote(part, safe="") for part in segments[:2])
+        try:
+            site = await self._json(f"{self._client.GRAPH_URL}/sites/{parsed.hostname}:/{site_path}")
+        except ChatGraphError as exc:
+            if exc.status_code == 404:
+                raise
+            raise denied from None
+        relative = "/".join(quote(part, safe="") for part in segments[3:])
+        return await self._json(f"{self._client.GRAPH_URL}/sites/{_component(site.get('id'))}/drive/root:/{relative}")
 
     async def refresh_file(self, drive_id: str, item_id: str) -> dict:
         item = await self._json(f"{self._client.GRAPH_URL}/drives/{_component(drive_id)}/items/{_component(item_id)}")

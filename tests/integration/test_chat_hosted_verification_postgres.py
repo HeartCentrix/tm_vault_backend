@@ -176,7 +176,7 @@ def _hosted_unavailable(adapters, status):
     adapters.source.open_hosted = unavailable
 
 
-@pytest.mark.parametrize('status', [404, 500])
+@pytest.mark.parametrize('status', [404, 423, 500])
 async def test_hosted_content_microsoft_cannot_serve_is_recorded_not_partial(store, adapters, caplog, status):
     """Microsoft lists the hosted item but answers its bytes with gone (404) or a persistent
     server error (500, e.g. Teams /views/video clips). That is not our failure: the chat is

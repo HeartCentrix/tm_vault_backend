@@ -505,6 +505,70 @@ async def test_file_resolver_bypasses_negative_cache_and_reports_errors(source_f
     assert calls == 2
 
 
+DEAD_LINK = ("https://tenant-my.sharepoint.com/personal/harsh_tenant_com/Documents/"
+             "Microsoft%20Teams%20Chat%20Files/Budget%202026%23v2.xlsx")
+
+
+def _dead_link_handler(*, site_status=200, item_status=200, share_status=403):
+    requested = []
+
+    def handler(request):
+        path = request.url.path
+        requested.append(path)
+        if path.startswith("/v1.0/shares/"):
+            return httpx.Response(share_status, json={"error": {"code": "accessDenied" if share_status == 403 else "notAllowed"}})
+        if path == "/v1.0/sites/tenant-my.sharepoint.com:/personal/harsh_tenant_com":
+            return httpx.Response(site_status, json={"id": "host,site-guid,web-guid"} if site_status == 200 else {})
+        if path == "/v1.0/sites/host,site-guid,web-guid/drive/root:/Microsoft Teams Chat Files/Budget 2026#v2.xlsx":
+            return httpx.Response(item_status, json={"id": "item", "parentReference": {"driveId": "drive"}}
+                                  if item_status == 200 else {"error": {"code": "itemNotFound"}})
+        return httpx.Response(418)
+    return handler, requested
+
+
+async def test_dead_sharing_link_falls_back_to_the_file_path(source_factory):
+    """Graph answers a revoked/expired sharing link with 403 even when the file still exists
+    in a OneDrive we can read; the file is then found by its path and backed up."""
+    make, *_ = source_factory
+    handler, requested = _dead_link_handler()
+    async with make(handler) as source:
+        assert (await source.resolve_file(DEAD_LINK))["id"] == "item"
+    assert len(requested) == 3
+
+
+async def test_dead_sharing_link_to_a_deleted_file_is_404(source_factory):
+    from shared.chat_capture_graph import ChatGraphError
+    make, *_ = source_factory
+    handler, _ = _dead_link_handler(item_status=404)
+    async with make(handler) as source:
+        with pytest.raises(ChatGraphError) as raised:
+            await source.resolve_file(DEAD_LINK)
+    assert raised.value.status_code == 404
+
+
+@pytest.mark.parametrize("site_status, expected", [(403, 403), (404, 404)])
+async def test_dead_link_site_lookup_decides_permission_or_gone(source_factory, site_status, expected):
+    """A site that refuses us keeps the original 403 (a real permission problem); a site that
+    no longer exists (deleted user's OneDrive) means the file is gone: 404."""
+    from shared.chat_capture_graph import ChatGraphError
+    make, *_ = source_factory
+    handler, _ = _dead_link_handler(site_status=site_status)
+    async with make(handler) as source:
+        with pytest.raises(ChatGraphError) as raised:
+            await source.resolve_file(DEAD_LINK)
+    assert raised.value.status_code == expected
+
+
+async def test_locked_site_is_not_retried_by_path(source_factory):
+    from shared.chat_capture_graph import ChatGraphError
+    make, *_ = source_factory
+    handler, requested = _dead_link_handler(share_status=423)
+    async with make(handler) as source:
+        with pytest.raises(ChatGraphError) as raised:
+            await source.resolve_file(DEAD_LINK)
+    assert raised.value.status_code == 423 and len(requested) == 1
+
+
 async def test_documented_onedrive_short_share_url_is_resolved(source_factory):
     make, *_ = source_factory
     async with make(lambda request: httpx.Response(200, json={"id": "item", "parentReference": {"driveId": "drive"}})) as source:
