@@ -17,7 +17,7 @@ os.environ.setdefault("ALLOW_DEV_JWT_SECRETS", "true")
 import pytest
 from sqlalchemy import func, select, text
 
-from shared.models import ChatBlobObject, ChatCaptureAttempt, ChatItemVersion, SnapshotItem
+from shared.models import ChatBlobObject, ChatCaptureAttempt, ChatInventory, ChatItemVersion, SnapshotItem
 from shared.storage.base import BlobInfo, BlobProps
 
 
@@ -108,9 +108,17 @@ class Source:
 
     hosted_error = None
 
+    hosted_delay, hosted_in_flight, hosted_peak = 0, 0, 0
+
     @asynccontextmanager
     async def open_hosted(self, chat_id, message_id, hcid):
         self.hosted_downloads += 1
+        self.hosted_in_flight += 1
+        self.hosted_peak = max(self.hosted_peak, self.hosted_in_flight)
+        try:
+            await asyncio.sleep(self.hosted_delay)
+        finally:
+            self.hosted_in_flight -= 1
         if self.hosted_error is not None:
             raise self.hosted_error
         async def chunks():
@@ -790,7 +798,10 @@ async def test_file_reuse_never_assumes_untagged_contents_unchanged(store, adapt
     assert adapters.source.downloads == 4
 
 
-async def test_cached_file_still_checks_missing_stored_content(store, adapters):
+async def test_cached_file_still_checks_missing_stored_content(store, adapters, monkeypatch):
+    # The scenario is ordered by call count (the second message runs after the first is
+    # stored), so files are captured one at a time here.
+    monkeypatch.setenv("CHAT_BINARY_CONCURRENCY", "1")
     adapters.source.messages = [dict(message(attached=True),id=f'message-{i}') for i in range(2)]
     original = adapters.source.resolve_file
     calls = 0
@@ -1082,3 +1093,36 @@ async def test_daily_schedule_reuses_an_unchanged_chat_and_reconciles_weekly(sto
     await age(8)
     weekly = replace(await store.new_scope(), chat_id=first_scope.chat_id)
     assert await reuse(adapters, store, weekly) is None
+
+
+def hosted_message(n):
+    value = message(hosted=True)
+    value["id"] = f"message-{n}"
+    value["_hosted"] = [{"id": f"image-{n}", "contentType": "image/png"}]
+    value["body"]["content"] = value["body"]["content"].replace("messages/message/", f"messages/message-{n}/").replace("hostedContents/image/", f"hostedContents/image-{n}/")
+    return value
+
+
+async def test_one_chat_downloads_its_images_in_parallel_up_to_the_limit(store, adapters, monkeypatch):
+    """Railway 2026-11-04: a chat's files and images were captured one after another
+    (101 binaries took ~1,091 of a 1,374 s capture); a bounded pool keeps memory flat."""
+    monkeypatch.setenv("CHAT_BINARY_CONCURRENCY", "4")
+    adapters.source.messages = [hosted_message(n) for n in range(10)]
+    adapters.source.hosted_delay = 0.05
+    _, result = await run_capture(store, adapters)
+    assert result.outcome == "complete" and result.item_count == 20
+    assert adapters.source.hosted_peak == 4
+
+
+async def test_parallel_capture_publishes_the_same_inventory_as_one_at_a_time(store, adapters, monkeypatch):
+    adapters.source.messages = [hosted_message(n) for n in range(10)] + [dict(message(attached=True), id="with-file")]
+    monkeypatch.setenv("CHAT_BINARY_CONCURRENCY", "1")
+    _, serial = await run_capture(store, adapters)
+    monkeypatch.setenv("CHAT_BINARY_CONCURRENCY", "6")
+    _, parallel = await run_capture(store, adapters)
+    assert serial.outcome == parallel.outcome == "complete"
+    async with store.factory() as session:
+        hashes = [
+            await session.scalar(select(ChatInventory.membership_sha256).where(ChatInventory.id == r.inventory_id))
+            for r in (serial, parallel)]
+    assert serial.item_count == parallel.item_count and hashes[0] == hashes[1]

@@ -380,7 +380,7 @@ def _hosted_marker(message):
 
 
 async def _binary(*, scope, keeper, factory, storage, source_client, item_type,
-                  graph_id, parent_id, payload, stage, file_versions=None, hosted_marker=None):
+                  graph_id, parent_id, payload, stage, file_versions=None, hosted_marker=None, file_inflight=None):
     file = item_type == "CHAT_ATTACHMENT"
     raw = await source_client.resolve_file(payload.get("contentUrl")) if file else None
     payload = dict(payload)
@@ -388,6 +388,27 @@ async def _binary(*, scope, keeper, factory, storage, source_client, item_type,
         payload["captured_content_type"] = raw["file"]["mimeType"]
     source = _file_source(raw) if file else dict(source_drive_id=None, source_item_id=None, source_etag=hosted_marker, source_ctag=None)
     cache_key = tuple(source.items()) if file and (source['source_etag'] or source['source_ctag']) else None
+    # The same exact file version attached to several messages downloads once, also when
+    # those messages are captured in parallel: later ones wait for the first, then reuse it.
+    owned = None
+    if file_inflight is not None and cache_key is not None:
+        while cache_key in file_inflight:
+            await file_inflight[cache_key].wait()
+        if file_versions is None or cache_key not in file_versions:
+            owned = file_inflight[cache_key] = asyncio.Event()
+    try:
+        return await _binary_capture(scope=scope, keeper=keeper, factory=factory, storage=storage,
+            source_client=source_client, item_type=item_type, graph_id=graph_id, parent_id=parent_id,
+            payload=payload, stage=stage, file_versions=file_versions, file=file, raw=raw, source=source,
+            cache_key=cache_key)
+    finally:
+        if owned is not None:
+            file_inflight.pop(cache_key, None)
+            owned.set()
+
+
+async def _binary_capture(*, scope, keeper, factory, storage, source_client, item_type, graph_id, parent_id,
+                          payload, stage, file_versions, file, raw, source, cache_key):
     if file_versions is not None and cache_key in file_versions:
         content, content_type = file_versions[cache_key]
         file_versions.move_to_end(cache_key)
@@ -496,11 +517,104 @@ def _without_home_tenant(message: dict, home_tenant) -> dict:
     return message
 
 
+_STOPS_CAPTURE = (asyncio.CancelledError, ChatSourceMovement, catalogue.ChatCatalogueConflict,
+                  catalogue.ChatCatalogueIntegrityError, SQLAlchemyError)
+
+
+class _BinaryPool:
+    """A chat's files and hosted contents captured at most `limit` at a time (Railway 2026-11-04:
+    one after another, 101 binaries took ~1,091 s of a 1,374 s capture). Bytes spool to disk,
+    so memory stays bounded by the limit. An error that stops a capture cancels the rest and
+    reaches the pass unchanged; staging still serialises on the attempt row lock."""
+
+    def __init__(self, limit):
+        self.slots, self.tasks = asyncio.Semaphore(max(1, limit)), set()
+
+    def _raise_finished(self):
+        for task in [t for t in self.tasks if t.done()]:
+            self.tasks.discard(task)
+            if task.cancelled():
+                raise asyncio.CancelledError()
+            if task.exception() is not None:
+                raise task.exception()
+
+    async def submit(self, coro):
+        try:
+            self._raise_finished()
+            await self.slots.acquire()
+            self._raise_finished()
+        except BaseException:
+            coro.close()
+            raise
+
+        async def run():
+            try:
+                await coro
+            finally:
+                self.slots.release()
+        self.tasks.add(asyncio.create_task(run()))
+
+    async def drain(self):
+        while self.tasks:
+            await asyncio.wait(self.tasks, return_when=asyncio.FIRST_COMPLETED)
+            self._raise_finished()
+
+    async def cancel(self):
+        for task in self.tasks:
+            task.cancel()
+        await asyncio.gather(*self.tasks, return_exceptions=True)
+        self.tasks.clear()
+
+
 async def _observe(*, scope, keeper, factory, storage, source, ledger, observation,
                    exclude_message=None, folder_path=None):
     stats = _Pass()
-    file_versions = OrderedDict()
+    file_versions, file_inflight = OrderedDict(), {}
     home_tenant = getattr(source, "home_tenant_id", None)
+    # ponytail: per-chat cap only; a worker can hold CHAT_CAPTURE_CONCURRENCY x this many files in flight
+    # (8 x 8 = 64 on Railway, streamed via disk). Add a process-wide cap if disk or memory gets tight.
+    pool = _BinaryPool(int(os.getenv("CHAT_BINARY_CONCURRENCY", "8")))
+    pending = []
+
+    async def flush(at_least=1):
+        if len(pending) >= at_least:
+            batch = pending[:]
+            del pending[:]
+            await _stage(factory, keeper, batch)
+
+    async def capture_binary(kind, child, identifier, marker):
+        try:
+            captured = await _binary(scope=scope, keeper=keeper, factory=factory, storage=storage,
+                source_client=source, item_type=kind, graph_id=child["id"], parent_id=identifier,
+                payload=child, stage=observation == 0, file_versions=file_versions,
+                hosted_marker=marker if kind == "CHAT_HOSTED_CONTENT" else None, file_inflight=file_inflight)
+            if ledger.record(observation, captured):
+                stats.verified_binary += 1
+        except _STOPS_CAPTURE:
+            raise
+        except Exception as exc:
+            ledger.failure(observation, kind, exc, child["id"], identifier)
+            if _source_unavailable(exc):
+                ledger.unavailable(observation, kind, child["id"], identifier)
+                captured = CapturedChatItem(kind, child["id"], identifier,
+                                            {**child, SOURCE_UNAVAILABLE_FIELD: True}, None)
+                if ledger.record(observation, captured) and observation == 0:
+                    pending.append(captured)
+            else:
+                stats.unresolved += 1
+
+    try:
+        await _observe_pages(scope=scope, keeper=keeper, factory=factory, source=source, ledger=ledger,
+            observation=observation, exclude_message=exclude_message, folder_path=folder_path,
+            stats=stats, home_tenant=home_tenant, pool=pool, pending=pending, flush=flush,
+            capture_binary=capture_binary)
+    finally:
+        await pool.cancel()
+    return stats
+
+
+async def _observe_pages(*, scope, keeper, factory, source, ledger, observation, exclude_message, folder_path,
+                         stats, home_tenant, pool, pending, flush, capture_binary):
     try:
         async for page in source.iter_message_pages(scope.chat_id):
             keeper.check()
@@ -548,58 +662,40 @@ async def _observe(*, scope, keeper, factory, storage, source, ledger, observati
                 # interruption then leaves a readable partial message inventory.
                 if parents:
                     await _stage(factory, keeper, parents)
-            pending = []
             for identifier, attachments, hosted, marker in prepared:
                 for kind, values in (("CHAT_ATTACHMENT", attachments), ("CHAT_HOSTED_CONTENT", hosted)):
                     for child in values:
-                        try:
-                            if kind == "CHAT_ATTACHMENT" and metadata_only_attachment(child):
-                                captured = CapturedChatItem(kind, child["id"], identifier, child, None)
-                                if ledger.record(observation, captured) and observation == 0:
-                                    pending.append(captured)
-                            elif observation and ledger.unavailable_in_first_pass(kind, child["id"], identifier):
-                                # Pass 2 re-observes membership; bytes Microsoft could not serve in
-                                # pass 1 are not fetched (and retried) a second time.
-                                ledger.unavailable(observation, kind, child["id"], identifier)
-                                ledger.record(observation, CapturedChatItem(kind, child["id"], identifier,
-                                                                            {**child, SOURCE_UNAVAILABLE_FIELD: True}, None))
-                            else:
-                                captured = await _binary(scope=scope, keeper=keeper, factory=factory, storage=storage,
-                                    source_client=source, item_type=kind, graph_id=child["id"], parent_id=identifier,
-                                    payload=child, stage=observation == 0, file_versions=file_versions,
-                                    hosted_marker=marker if kind == "CHAT_HOSTED_CONTENT" else None)
-                                if ledger.record(observation, captured):
-                                    stats.verified_binary += 1
-                        except (asyncio.CancelledError, ChatSourceMovement, catalogue.ChatCatalogueConflict, catalogue.ChatCatalogueIntegrityError, SQLAlchemyError):
-                            raise
-                        except Exception as exc:
-                            ledger.failure(observation, kind, exc, child["id"], identifier)
-                            if _source_unavailable(exc):
-                                ledger.unavailable(observation, kind, child["id"], identifier)
-                                captured = CapturedChatItem(kind, child["id"], identifier,
-                                                            {**child, SOURCE_UNAVAILABLE_FIELD: True}, None)
-                                if ledger.record(observation, captured) and observation == 0:
-                                    pending.append(captured)
-                            else:
-                                stats.unresolved += 1
-                        if len(pending) >= 200:
-                            await _stage(factory, keeper, pending)
-                            pending = []
-            if pending:
-                await _stage(factory, keeper, pending)
+                        if kind == "CHAT_ATTACHMENT" and metadata_only_attachment(child):
+                            captured = CapturedChatItem(kind, child["id"], identifier, child, None)
+                            if ledger.record(observation, captured) and observation == 0:
+                                pending.append(captured)
+                        elif observation and ledger.unavailable_in_first_pass(kind, child["id"], identifier):
+                            # Pass 2 re-observes membership; bytes Microsoft could not serve in
+                            # pass 1 are not fetched (and retried) a second time.
+                            ledger.unavailable(observation, kind, child["id"], identifier)
+                            ledger.record(observation, CapturedChatItem(kind, child["id"], identifier,
+                                                                        {**child, SOURCE_UNAVAILABLE_FIELD: True}, None))
+                        else:
+                            await pool.submit(capture_binary(kind, child, identifier, marker))
+                        await flush(200)
+            await flush()
             stats.pages += 1
             logger.info(
                 "chat_capture_progress attempt_id=%s observation=%s pages=%s messages_observed=%s "
                 "hosted_enumerations=%s duplicate_messages_skipped=%s verified_binary=%s unresolved=%s",
                 keeper.lease.attempt_id, observation + 1, stats.pages, stats.messages,
                 stats.hosted_lists, stats.duplicate_messages, stats.verified_binary, stats.unresolved)
+        await pool.drain()
+        await flush()
         stats.complete = True
-    except (asyncio.CancelledError, ChatSourceMovement, catalogue.ChatCatalogueConflict, catalogue.ChatCatalogueIntegrityError, SQLAlchemyError):
+    except _STOPS_CAPTURE:
         raise
     except Exception as exc:
         ledger.failure(observation, "message_enumeration", exc)
         stats.unresolved += 1
-    return stats
+        # Children already started still land (as before, when they ran inline).
+        await pool.drain()
+        await flush()
 
 
 def _single_pass_enabled():
