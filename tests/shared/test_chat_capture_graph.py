@@ -759,3 +759,64 @@ async def test_chat_list_expands_members_for_folder_names(source_factory):
     assert chats[0]["members"][0]["displayName"] == "Rohit"
     listing = [r for r in requests if r.url.host == "graph.microsoft.com"][0]
     assert listing.url.path == "/v1.0/users/user/chats" and listing.url.params.get("$expand") == "members"
+
+
+async def test_latest_message_change_reads_one_newest_modified_message(source_factory):
+    """Incremental check: one request for the most recently modified message of the chat."""
+    from datetime import datetime, timezone
+    make, requests, *_ = source_factory
+
+    def handler(request):
+        assert request.url.path == "/v1.0/chats/chat/messages"
+        assert request.url.params["$top"] == "1"
+        assert request.url.params["$orderby"] == "lastModifiedDateTime desc"
+        return httpx.Response(200, json={"value": [{"id": "one", "lastModifiedDateTime": "2026-11-04T01:24:04.9051234Z"}]})
+
+    async with make(handler) as source:
+        latest = await source.latest_message_change("chat")
+    assert latest == datetime(2026, 11, 4, 1, 24, 4, 905123, tzinfo=timezone.utc)
+    assert len([r for r in requests if r.url.host == "graph.microsoft.com"]) == 1
+
+
+async def test_latest_message_change_of_an_empty_chat_is_none_and_bad_rows_fail(source_factory):
+    from shared.chat_capture_graph import ChatGraphError
+    make, *_ = source_factory
+    async with make(lambda request: httpx.Response(200, json={"value": []})) as source:
+        assert await source.latest_message_change("chat") is None
+    async with make(lambda request: httpx.Response(200, json={"value": [{"id": "x"}]})) as source:
+        with pytest.raises(ChatGraphError):
+            await source.latest_message_change("chat")
+
+
+async def test_microsoft_server_errors_retry_on_a_short_fixed_wait_and_throttling_backs_off(monkeypatch):
+    """Railway 2026-11-04: hosted contents answering 500 waited 1+2+4+8 s each. Backoff is for
+    throttling (429); a Microsoft server error retries after a short fixed wait, never above 10 s."""
+    from shared import chat_capture_graph
+    waits = []
+
+    async def sleep(seconds):
+        waits.append(seconds)
+
+    monkeypatch.setattr(chat_capture_graph, "asyncio", SimpleNamespace(sleep=sleep))
+    request = httpx.Request("GET", "https://graph.microsoft.com/v1.0/chats/c/messages/m/hostedContents/h/$value")
+
+    async def pause(status, attempts, headers=None):
+        for attempt in range(attempts):
+            await chat_capture_graph.StrictChatGraphSource._pause(None, httpx.Response(status, headers=headers, request=request), attempt)
+
+    await pause(500, 4)
+    await pause(502, 1, {"Retry-After": "60"})
+    await pause(429, 4)
+    await pause(503, 1, {"Retry-After": "30"})
+    assert waits == [2, 2, 2, 2, 10, 1, 2, 4, 8, 30]
+
+
+async def test_message_listing_orders_by_creation_so_no_message_is_skipped(source_factory):
+    """Real tenant 2026-11-04: Graph's default listing (lastModifiedDateTime) returned 139 of a
+    meeting chat's 4,689 messages; createdDateTime desc returned all of them, and across 215 chats
+    it returned every message the default listing did."""
+    make, requests, *_ = source_factory
+    async with make(lambda request: httpx.Response(200, json={'value': []})) as source:
+        assert [page async for page in source.iter_message_pages('chat')] == [[]]
+    listed = [r for r in requests if r.url.host == 'graph.microsoft.com' and r.url.path.endswith('/messages')]
+    assert [r.url.params.get('$orderby') for r in listed] == ['createdDateTime desc']

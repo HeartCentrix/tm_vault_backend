@@ -59,6 +59,13 @@ class Source:
         self.fail_urls = set()
         self.hosted_downloads = 0
 
+    latest_change = None
+    change_checks = 0
+
+    async def latest_message_change(self, chat_id):
+        self.change_checks += 1
+        return self.latest_change
+
     async def iter_message_pages(self, chat_id):
         self.passes += 1
         values = self.movement(self.passes) if self.movement else self.messages
@@ -99,9 +106,13 @@ class Source:
 
         yield chunks(), len(data), "application/pdf"
 
+    hosted_error = None
+
     @asynccontextmanager
     async def open_hosted(self, chat_id, message_id, hcid):
         self.hosted_downloads += 1
+        if self.hosted_error is not None:
+            raise self.hosted_error
         async def chunks():
             yield b"PNG"
         yield chunks(), 3, "image/png"
@@ -910,3 +921,67 @@ async def test_retired_donor_object_falls_back_to_a_normal_capture(store, adapte
     beta = await adapters.capture.capture_chat_inventory(scope=beta_scope, graph_client=object(),
         storage=adapters.storage, session_factory=store.factory)
     assert beta.outcome == "complete"
+
+
+async def reuse(adapters, store, scope, **kwargs):
+    return await adapters.capture.reuse_unchanged_chat(scope=scope, graph_client=object(),
+        session_factory=store.factory, folder_path="chats/Captured topic", **kwargs)
+
+
+async def test_unchanged_chat_reuses_its_last_complete_inventory_without_listing(store, adapters, monkeypatch):
+    """Codex 2026-11-04: an incremental re-read every message page of every chat. A chat whose
+    newest modification predates the last complete capture reuses that capture (one request)."""
+    monkeypatch.setenv("CHAT_INCREMENTAL_REUSE", "true")
+    adapters.source.messages = [message(attached=True)]
+    first_scope, first = await run_capture(store, adapters)
+    adapters.source.latest_change = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    passes, downloads = adapters.source.passes, adapters.source.downloads
+    second_scope = replace(await store.new_scope(), chat_id=first_scope.chat_id)
+    second = await reuse(adapters, store, second_scope)
+    assert first.outcome == second.outcome == "complete" and second.item_count == first.item_count == 2
+    assert (adapters.source.passes, adapters.source.downloads, adapters.source.change_checks) == (passes, downloads, 1)
+    async with store.factory() as session:
+        attempt = await session.scalar(select(ChatCaptureAttempt).where(
+            ChatCaptureAttempt.snapshot_id == second_scope.snapshot_id))
+    assert any("reused_unchanged_from_attempt" in entry for entry in attempt.evidence_history)
+
+
+async def test_changed_stale_or_disabled_chat_is_captured_normally(store, adapters, monkeypatch):
+    adapters.source.messages = [message()]
+    first_scope, _ = await run_capture(store, adapters)
+    scope = replace(await store.new_scope(), chat_id=first_scope.chat_id)
+    adapters.source.latest_change = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    monkeypatch.setenv("CHAT_INCREMENTAL_REUSE", "false")
+    assert await reuse(adapters, store, scope) is None                      # kill switch
+    monkeypatch.delenv("CHAT_INCREMENTAL_REUSE")                            # production default: on
+    adapters.source.latest_change = datetime.now(timezone.utc)
+    assert await reuse(adapters, store, scope) is None                      # a message changed
+    adapters.source.latest_change = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    monkeypatch.setenv("CHAT_INCREMENTAL_RECONCILE_HOURS", "0")
+    checks = adapters.source.change_checks
+    assert await reuse(adapters, store, scope) is None                      # due for a full reconciliation
+    assert adapters.source.change_checks == checks
+    monkeypatch.delenv("CHAT_INCREMENTAL_RECONCILE_HOURS")
+    assert (await reuse(adapters, store, scope)).outcome == "complete"      # unchanged: reused by default
+
+
+async def test_reuse_requires_the_same_capture_scope(store, adapters, monkeypatch):
+    monkeypatch.setenv("CHAT_INCREMENTAL_REUSE", "true")
+    adapters.source.messages = [message()]
+    first_scope, _ = await run_capture(store, adapters)
+    adapters.source.latest_change = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    other = replace(await store.new_scope(), chat_id=first_scope.chat_id, permission_scope_hash="c" * 64)
+    assert await reuse(adapters, store, other) is None
+
+
+async def test_second_pass_does_not_retry_content_the_first_pass_found_unavailable(store, adapters):
+    """Railway 2026-11-04: a meeting chat with ~100 hosted videos answering 500 spent ~25 s of
+    retries per item in BOTH observation passes (55+ min for one chat). The second pass
+    re-observes membership; content pass 1 already found unavailable is not fetched again."""
+    from shared.chat_capture_graph import ChatGraphError
+    from shared.chat_catalogue_identity import SOURCE_UNAVAILABLE_FIELD
+    adapters.source.messages = [message(hosted=True)]
+    adapters.source.hosted_error = ChatGraphError("Graph capture hosted_content failed with HTTP 500", status_code=500)
+    _, result = await run_capture(store, adapters)
+    assert result.outcome == "complete" and result.item_count == 2
+    assert adapters.source.hosted_downloads == 1

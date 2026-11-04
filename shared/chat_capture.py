@@ -155,6 +155,10 @@ class ChatObservationLedger:
         key = qualified_chat_item_key(self.scope.chat_id, item_type, graph_id, parent_graph_id)
         self.db.execute("UPDATE expected SET required=0 WHERE pass=? AND key=?", (observation, key))
 
+    def unavailable_in_first_pass(self, item_type, graph_id, parent_graph_id):
+        key = qualified_chat_item_key(self.scope.chat_id, item_type, graph_id, parent_graph_id)
+        return self.db.execute("SELECT 1 FROM expected WHERE pass=0 AND key=? AND required=0", (key,)).fetchone() is not None
+
     def failure_details(self):
         names = ("observation", "phase", "error_type", "status_code", "graph_id", "parent_graph_id",
                  "provider_code", "provider_inner_code", "provider_request_id")
@@ -553,6 +557,12 @@ async def _observe(*, scope, keeper, factory, storage, source, ledger, observati
                                 captured = CapturedChatItem(kind, child["id"], identifier, child, None)
                                 if ledger.record(observation, captured) and observation == 0:
                                     pending.append(captured)
+                            elif observation and ledger.unavailable_in_first_pass(kind, child["id"], identifier):
+                                # Pass 2 re-observes membership; bytes Microsoft could not serve in
+                                # pass 1 are not fetched (and retried) a second time.
+                                ledger.unavailable(observation, kind, child["id"], identifier)
+                                ledger.record(observation, CapturedChatItem(kind, child["id"], identifier,
+                                                                            {**child, SOURCE_UNAVAILABLE_FIELD: True}, None))
                             else:
                                 captured = await _binary(scope=scope, keeper=keeper, factory=factory, storage=storage,
                                     source_client=source, item_type=kind, graph_id=child["id"], parent_id=identifier,
@@ -636,51 +646,39 @@ def _recorded_filter(attempt):
     return None
 
 
-async def derive_shared_chat(*, scope, session_factory, covers, folder_path=None,
-                             exclude_message=None, scope_filter_hash=None):
-    """Build this member's inventory from another member's fresh COMPLETE capture of the chat.
+def _when(value):
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
-    Messages, hosted contents and files are read through app-level routes, so every member's
-    capture of a chat sees the same source; only the visible-history boundary differs, and it
-    is re-applied here. ``covers(principal_id, recorded_filter_hash)`` says whether that
-    member's capture holds everything this member sees. Returns SHARED_CAPTURE_BUSY while a
-    covering member is capturing the chat, None when there is no usable donor (the caller
-    captures from Graph), else the published CaptureResult. Publication runs the normal
-    completeness checks; any mismatch discards this attempt and returns None.
-    """
+
+def _observed_times(attempt):
+    """(when the attempt's data was read from Microsoft, when the last full capture of it ran).
+    A copy keeps the original reading time: changes after it must still be seen."""
+    for entry in attempt.evidence_history or []:
+        if isinstance(entry, dict) and entry.get("source_observed_at"):
+            observed = _when(entry["source_observed_at"])
+            return observed, _when(entry.get("full_observed_at")) or observed
+    started = _when((attempt.evidence or {}).get("started_at")) if attempt.evidence else None
+    return started, started
+
+
+def _inventory_items(session, inventory_id):
+    return session.scalars(select(ChatItemVersion).join(ChatInventoryItem,
+        ChatInventoryItem.version_id == ChatItemVersion.id).where(ChatInventoryItem.inventory_id == inventory_id))
+
+
+async def _publish_copy(*, scope, session_factory, items, folder_path, exclude_message, scope_filter_hash, provenance, label):
+    """Publish this member's inventory from already-captured items (another member's capture or
+    its own unchanged one), re-applying its visibility. The normal staging locks every object and
+    rejects retired ones; the catalogue's own validation is checked before publishing. Any
+    mismatch discards the attempt and returns None so the caller captures from Graph."""
     from shared.config import settings
-    from shared.models import Snapshot
     version = settings.CHAT_OBSERVATION_HASH_VERSION
-    window = timedelta(minutes=float(os.getenv("CHAT_SHARED_CAPTURE_WINDOW_MIN", "30")))
-
-    async def find(session):
-        started = (await session.get(Snapshot, scope.snapshot_id)).started_at
-        if started.tzinfo is None:
-            started = started.replace(tzinfo=timezone.utc)
-        now = await session.scalar(select(func.clock_timestamp()))
-        rows = (await session.execute(select(ChatCaptureAttempt, ChatInventory).outerjoin(
-            ChatInventory, ChatInventory.id == ChatCaptureAttempt.staged_inventory_id).where(
-            ChatCaptureAttempt.tenant_id == scope.tenant_id, ChatCaptureAttempt.chat_id == scope.chat_id,
-            ChatCaptureAttempt.principal_id != scope.principal_id,
-            ChatCaptureAttempt.created_at >= started - window)
-            .order_by(ChatCaptureAttempt.created_at.desc()))).all()
-        busy = False
-        for attempt, inventory in rows:
-            if not covers(attempt.principal_id, _recorded_filter(attempt)):
-                continue
-            if (attempt.state == "PUBLISHED" and inventory is not None and inventory.state == "COMPLETE"
-                    and inventory.observation_hash_version == version):
-                versions = (await session.scalars(select(ChatItemVersion).join(ChatInventoryItem,
-                    ChatInventoryItem.version_id == ChatItemVersion.id).where(
-                    ChatInventoryItem.inventory_id == inventory.id))).all()
-                return attempt.id, attempt.principal_id, [catalogue._captured(v) for v in versions]
-            busy = busy or (attempt.state in catalogue._ACTIVE and attempt.expires_at > now)
-        return SHARED_CAPTURE_BUSY if busy else None
-
-    found = await run_catalogue_transaction(session_factory, find)
-    if found is None or found is SHARED_CAPTURE_BUSY:
-        return found
-    donor_attempt, donor_principal, items = found
     kept, selected = set(), []
     for item in items:
         if item.item_type in catalogue._MESSAGE_TYPES:
@@ -703,7 +701,7 @@ async def derive_shared_chat(*, scope, session_factory, covers, folder_path=None
                                               observation_hash_version=version)
         attempt = await session.get(ChatCaptureAttempt, lease.attempt_id)
         attempt.evidence_history = [*([{"source_filter_sha256": scope_filter_hash}] if scope_filter_hash is not None else []),
-            {"derived_from_attempt": str(donor_attempt), "derived_from_principal": donor_principal}]
+                                    provenance]
         return lease
 
     lease = await run_catalogue_transaction(session_factory, begin)
@@ -730,13 +728,119 @@ async def derive_shared_chat(*, scope, session_factory, covers, folder_path=None
         result = None
     if result is None:
         async def discard(session):
-            await _discard_attempt(session, lease, scope, "shared capture derivation rejected")
+            await _discard_attempt(session, lease, scope, f"{label} rejected")
         await run_catalogue_transaction(session_factory, discard)
-        logger.warning("chat_shared_capture_rejected chat=%s donor_attempt=%s", scope.chat_id, donor_attempt)
+        logger.warning("%s_rejected chat=%s provenance=%s", label, scope.chat_id, provenance)
         return None
-    logger.info("chat_shared_capture_derived attempt_id=%s chat=%s donor_attempt=%s items=%s",
-                lease.attempt_id, scope.chat_id, donor_attempt, len(selected))
+    logger.info("%s attempt_id=%s chat=%s items=%s", label, lease.attempt_id, scope.chat_id, len(selected))
     return result
+
+
+async def derive_shared_chat(*, scope, session_factory, covers, folder_path=None,
+                             exclude_message=None, scope_filter_hash=None):
+    """Build this member's inventory from another member's fresh COMPLETE capture of the chat.
+
+    Messages, hosted contents and files are read through app-level routes, so every member's
+    capture of a chat sees the same source; only the visible-history boundary differs, and it
+    is re-applied here. ``covers(principal_id, recorded_filter_hash)`` says whether that
+    member's capture holds everything this member sees. Returns SHARED_CAPTURE_BUSY while a
+    covering member is capturing the chat, None when there is no usable donor (the caller
+    captures from Graph), else the published CaptureResult.
+    """
+    from shared.config import settings
+    from shared.models import Snapshot
+    version = settings.CHAT_OBSERVATION_HASH_VERSION
+    window = timedelta(minutes=float(os.getenv("CHAT_SHARED_CAPTURE_WINDOW_MIN", "30")))
+
+    async def find(session):
+        started = (await session.get(Snapshot, scope.snapshot_id)).started_at
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        now = await session.scalar(select(func.clock_timestamp()))
+        rows = (await session.execute(select(ChatCaptureAttempt, ChatInventory).outerjoin(
+            ChatInventory, ChatInventory.id == ChatCaptureAttempt.staged_inventory_id).where(
+            ChatCaptureAttempt.tenant_id == scope.tenant_id, ChatCaptureAttempt.chat_id == scope.chat_id,
+            ChatCaptureAttempt.principal_id != scope.principal_id,
+            ChatCaptureAttempt.created_at >= started - window)
+            .order_by(ChatCaptureAttempt.created_at.desc()))).all()
+        busy = False
+        for attempt, inventory in rows:
+            if not covers(attempt.principal_id, _recorded_filter(attempt)):
+                continue
+            if (attempt.state == "PUBLISHED" and inventory is not None and inventory.state == "COMPLETE"
+                    and inventory.observation_hash_version == version):
+                observed, full = _observed_times(attempt)
+                return attempt, observed, full, [catalogue._captured(v) for v in (await _inventory_items(session, inventory.id)).all()]
+            busy = busy or (attempt.state in catalogue._ACTIVE and attempt.expires_at > now)
+        return SHARED_CAPTURE_BUSY if busy else None
+
+    found = await run_catalogue_transaction(session_factory, find)
+    if found is None or found is SHARED_CAPTURE_BUSY:
+        return found
+    donor, observed, full, items = found
+    return await _publish_copy(scope=scope, session_factory=session_factory, items=items, folder_path=folder_path,
+        exclude_message=exclude_message, scope_filter_hash=scope_filter_hash, label="chat_shared_capture_derived",
+        provenance={"derived_from_attempt": str(donor.id), "derived_from_principal": donor.principal_id,
+                    "source_observed_at": observed.isoformat() if observed else None,
+                    "full_observed_at": full.isoformat() if full else None})
+
+
+async def reuse_unchanged_chat(*, scope, graph_client, session_factory, folder_path=None,
+                               exclude_message=None, scope_filter_hash=None):
+    """Incremental: a chat with no message modified since this member's last COMPLETE capture of
+    the same scope reuses that capture instead of re-reading every page (one Graph request).
+
+    Kill switch CHAT_INCREMENTAL_REUSE=false (on by default). A full capture still runs when the
+    chat changed, when the scope (principal, permissions, visibility filter) differs, or when the
+    last full capture is older than CHAT_INCREMENTAL_RECONCILE_HOURS (default 24), which also
+    covers changes a modification time may not reflect (e.g. linked-file edits). Returns None
+    whenever the caller should capture from Graph.
+    """
+    if os.getenv("CHAT_INCREMENTAL_REUSE", "true").strip().lower() not in ("1", "true", "yes", "on"):
+        return None
+    from shared.config import settings
+    version = settings.CHAT_OBSERVATION_HASH_VERSION
+    reconcile = timedelta(hours=float(os.getenv("CHAT_INCREMENTAL_RECONCILE_HOURS", "24")))
+    overlap = timedelta(minutes=float(os.getenv("CHAT_INCREMENTAL_OVERLAP_MIN", "15")))
+
+    async def find(session):
+        row = (await session.execute(select(ChatCaptureAttempt, ChatInventory).join(
+            ChatInventory, ChatInventory.id == ChatCaptureAttempt.staged_inventory_id).where(
+            ChatCaptureAttempt.tenant_id == scope.tenant_id, ChatCaptureAttempt.chat_id == scope.chat_id,
+            ChatCaptureAttempt.principal_id == scope.principal_id, ChatCaptureAttempt.state == "PUBLISHED",
+            ChatCaptureAttempt.snapshot_id != scope.snapshot_id, ChatInventory.state == "COMPLETE",
+            ChatInventory.authentication_context_sha256 == authentication_context_fingerprint(scope),
+            ChatInventory.observation_hash_version == version)
+            .order_by(ChatCaptureAttempt.created_at.desc()).limit(1))).first()
+        if row is None:
+            return None
+        attempt, inventory = row
+        observed, full = _observed_times(attempt)
+        return attempt.id, inventory.id, observed, full
+
+    found = await run_catalogue_transaction(session_factory, find)
+    if found is None:
+        return None
+    attempt_id, inventory_id, observed, full = found
+    if observed is None or full is None or datetime.now(timezone.utc) - full >= reconcile:
+        return None
+    try:
+        async with _source(graph_client, scope.principal_id) as source:
+            latest = await source.latest_message_change(scope.chat_id)
+    except ChatGraphError as exc:
+        logger.warning("chat_incremental_check_failed chat=%s status=%s", scope.chat_id, getattr(exc, "status_code", None))
+        return None
+    if latest is not None and latest > observed - overlap:
+        return None
+
+    async def load(session):
+        return [catalogue._captured(v) for v in (await _inventory_items(session, inventory_id)).all()]
+
+    items = await run_catalogue_transaction(session_factory, load)
+    return await _publish_copy(scope=scope, session_factory=session_factory, items=items, folder_path=folder_path,
+        exclude_message=exclude_message, scope_filter_hash=scope_filter_hash, label="chat_incremental_reused",
+        provenance={"reused_unchanged_from_attempt": str(attempt_id), "source_observed_at": observed.isoformat(),
+                    "full_observed_at": full.isoformat(), "latest_message_change": latest.isoformat() if latest else None})
 
 
 @asynccontextmanager

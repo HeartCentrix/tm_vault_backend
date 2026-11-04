@@ -195,7 +195,7 @@ async def test_hosted_content_microsoft_cannot_serve_is_recorded_not_partial(sto
     assert hosted[0].payload['chat_catalogue_source_unavailable'] is True
     lines = [record.getMessage() for record in caplog.records if record.name == 'shared.chat_capture']
     failures = [value for value in lines if value.startswith('chat_capture_failure')]
-    assert len(failures) == 2 and all(f'status={status}' in v for v in failures)
+    assert len(failures) == 1 and f'status={status}' in failures[0]  # pass 2 does not refetch it
 
 
 async def test_hosted_content_permission_denial_stays_partial(store, adapters):

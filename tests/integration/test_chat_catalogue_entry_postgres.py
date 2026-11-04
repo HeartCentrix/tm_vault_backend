@@ -6,6 +6,7 @@ import importlib
 import importlib.util
 from contextlib import asynccontextmanager
 from copy import deepcopy
+from datetime import datetime, timezone
 import hashlib
 from types import SimpleNamespace
 from pathlib import Path
@@ -173,6 +174,8 @@ def source_adapter(store, monkeypatch):
             self.hosted_calls.append((chat_id, message_id))
             if False:
                 yield {}
+        async def latest_message_change(self, chat_id):
+            return datetime.now(timezone.utc)  # always changed: these tests exercise the full capture
     source = Source()
     @asynccontextmanager
     async def pinned(_client, *, principal_id):

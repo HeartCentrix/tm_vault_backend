@@ -339,7 +339,7 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
     """Return None only for an eligible disabled legacy path; never downgrade."""
     from shared.provider_runtime import (unit_scope, checkpoint_unit, check_provider_turn,
         ProviderTurnDeferred, current_execution, other_provider_work_waiting, yield_provider_turn)
-    from shared.chat_capture import capture_chat_inventory, derive_shared_chat, SHARED_CAPTURE_BUSY
+    from shared.chat_capture import capture_chat_inventory, derive_shared_chat, reuse_unchanged_chat, SHARED_CAPTURE_BUSY
     from shared.provider_admission import ProviderDeferred
     from shared.provider_runtime import defer_provider
     from shared.chat_capture_graph import pinned_chat_source, effective_capture_scope_hash
@@ -439,6 +439,10 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                             # Hand the turn back; on resume this chat derives from the finished capture.
                             defer_provider(ProviderDeferred(None, 15, stage="shared_chat_wait"))
                         previous = None
+                if previous is None:
+                    previous = await reuse_unchanged_chat(scope=scope, graph_client=source,
+                        session_factory=session_factory, folder_path=chat_folder(chats[cid], principal),
+                        exclude_message=filters[cid][0], scope_filter_hash=filters[cid][1])
                 async with unit_scope('chat:' + hashlib.sha256(cid.encode()).hexdigest(), 'chat'):
                     result = previous
                     if result is None:

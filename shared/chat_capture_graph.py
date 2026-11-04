@@ -20,7 +20,7 @@ from weakref import WeakValueDictionary
 import httpx
 
 from shared.graph_client import GraphClient
-from shared.graph_ratelimit import AsyncTokenBucket, parse_retry_after
+from shared.graph_ratelimit import AsyncTokenBucket, parse_retry_after, retry_wait
 
 
 # Active sources own these buckets; closing the last source releases its entries.
@@ -218,7 +218,7 @@ class StrictChatGraphSource:
 
     async def _pause(self, response: httpx.Response | None, attempt: int):
         delay = parse_retry_after(response.headers.get("Retry-After")) if response is not None else None
-        wait = min(120, max(0, delay if delay is not None else 2 ** attempt))
+        wait = min(120, max(0, retry_wait(response.status_code if response is not None else None, delay, attempt)))
         logging.getLogger(__name__).warning("chat_graph_retry status=%s endpoint=%s attempt=%s retry_after=%s wait_s=%s",
                        response.status_code if response is not None else "transport",
                        response.request.url.path.rsplit("/", 1)[-1] if response is not None else "-",
@@ -302,11 +302,29 @@ class StrictChatGraphSource:
         # Membership comes from the principal-scoped chat list; message reads use the
         # direct chat route. On a real tenant the user-nested route returned inconsistent
         # subsets (364 vs 11 messages) while /chats/{id}/messages was stable.
+        # Creation order: the default (lastModifiedDateTime) listing returned 139 of a meeting
+        # chat's 4,689 messages on a real tenant; createdDateTime desc returned all of them.
         path = f"/chats/{_component(chat_id)}/messages"
-        async for page in self._pages(path, params={"$top": "50"}):
+        async for page in self._pages(path, params={"$top": "50", "$orderby": "createdDateTime desc"}):
             if len(page) > 50 or any(row.get("chatId", chat_id) != chat_id for row in page):
                 raise ChatGraphError("Graph message page changed collection scope")
             yield page
+
+    async def latest_message_change(self, chat_id: str):
+        """Modification time of the chat's most recently modified message (None when empty):
+        one request, used by the incremental unchanged-chat check."""
+        from shared.chat_catalogue_entry import _graph_time
+        data = await self._json(f"{self._client.GRAPH_URL}/chats/{_component(chat_id)}/messages",
+                                params={"$top": "1", "$orderby": "lastModifiedDateTime desc"})
+        values = data.get("value")
+        if not isinstance(values, list):
+            raise ChatGraphError("malformed Graph collection page")
+        if not values:
+            return None
+        latest = _graph_time(values[0].get("lastModifiedDateTime") if isinstance(values[0], dict) else None)
+        if latest is None:
+            raise ChatGraphError("Graph message has no modification time")
+        return latest
 
     async def iter_hosted_contents(self, chat_id: str, message_id: str) -> AsyncIterator[dict]:
         path = f"/chats/{_component(chat_id)}/messages/{_component(message_id)}/hostedContents"
