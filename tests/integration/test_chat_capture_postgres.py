@@ -1027,6 +1027,55 @@ async def test_unchanged_chat_reuses_its_last_complete_inventory_without_listing
     assert any("reused_unchanged_from_attempt" in entry for entry in attempt.evidence_history)
 
 
+async def chat_rows(store, snapshot_id):
+    async with store.factory() as session:
+        return sorted((r.external_id, r.chat_version_id, r.item_type, r.parent_external_id, r.blob_path, r.folder_path)
+                      for r in (await session.scalars(select(SnapshotItem).where(SnapshotItem.snapshot_id == snapshot_id))).all())
+
+
+async def test_unchanged_chat_links_its_complete_inventory_without_restaging(store, adapters, monkeypatch):
+    """Railway 2026-11-05 incremental: every unchanged chat re-staged all its items (payloads loaded
+    into the worker, re-hashed and written back 200 at a time): median 5.8 s per chat, 1,115 chats,
+    most of a 25-minute run. The unchanged inventory is linked and its rows copied in the database."""
+    monkeypatch.setenv("CHAT_INCREMENTAL_REUSE", "true")
+    adapters.source.messages = [message(attached=True)]
+    first_scope, first = await run_capture(store, adapters)
+    adapters.source.latest_change = datetime(2020, 1, 1, tzinfo=timezone.utc)
+
+    async def no_staging(*args, **kwargs):
+        raise AssertionError("an unchanged chat must not be re-staged")
+    monkeypatch.setattr(adapters.capture.catalogue, "stage_versions", no_staging)
+    renamed = "chats/Renamed topic"
+    previous, previous_result = first_scope, first
+    for _ in range(2):  # a linked copy can itself be reused by the next incremental
+        scope = replace(await store.new_scope(), chat_id=first_scope.chat_id)
+        result = await adapters.capture.reuse_unchanged_chat(scope=scope, graph_client=object(),
+            session_factory=store.factory, folder_path=renamed)
+        assert result.outcome == "complete" and result.inventory_id == first.inventory_id
+        assert result.item_count == previous_result.item_count == 2
+        before, after = await chat_rows(store, previous.snapshot_id), await chat_rows(store, scope.snapshot_id)
+        assert [row[:5] for row in after] == [row[:5] for row in before] and {row[5] for row in after} == {renamed}
+        async with store.factory() as session:
+            attempt = await session.scalar(select(ChatCaptureAttempt).where(ChatCaptureAttempt.snapshot_id == scope.snapshot_id))
+            assert attempt.state == "PUBLISHED" and attempt.reused_inventory and attempt.staged_inventory_id == first.inventory_id
+            assert any("reused_unchanged_from_attempt" in entry for entry in attempt.evidence_history)
+            assert await session.scalar(select(func.count()).select_from(ChatInventory).where(
+                ChatInventory.chat_id == first_scope.chat_id, ChatInventory.id != first.inventory_id)) == 0
+        previous, previous_result = scope, result
+
+
+async def test_unchanged_chat_whose_earlier_rows_are_gone_is_restaged(store, adapters, monkeypatch):
+    monkeypatch.setenv("CHAT_INCREMENTAL_REUSE", "true")
+    adapters.source.messages = [message(attached=True)]
+    first_scope, first = await run_capture(store, adapters)
+    adapters.source.latest_change = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    async with store.factory.begin() as session:
+        await session.execute(SnapshotItem.__table__.delete().where(SnapshotItem.snapshot_id == first_scope.snapshot_id))
+    scope = replace(await store.new_scope(), chat_id=first_scope.chat_id)
+    result = await reuse(adapters, store, scope)
+    assert result.outcome == "complete" and result.item_count == 2 and len(await chat_rows(store, scope.snapshot_id)) == 2
+
+
 async def test_changed_stale_or_disabled_chat_is_captured_normally(store, adapters, monkeypatch):
     adapters.source.messages = [message()]
     first_scope, _ = await run_capture(store, adapters)

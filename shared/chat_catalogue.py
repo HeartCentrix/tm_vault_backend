@@ -627,6 +627,56 @@ async def publish_inventory(session, *, lease: CaptureLease) -> CaptureResult:
     return _result(attempt, association, chosen, uploaded)
 
 
+async def publish_unchanged_inventory(session, *, lease: CaptureLease, inventory_id, source_snapshot_id,
+                                      evidence: dict, history: list) -> CaptureResult | None:
+    """Publish this capture as the scope's unchanged COMPLETE inventory, copying the snapshot rows its
+    earlier publication wrote inside the database (no payload round trip, no re-hash). Re-staging an
+    unchanged chat cost a median 5.8 s (Railway 2026-11-05: 1,115 chats, most of a 25-minute
+    incremental). Returns None, with nothing written, unless that publication still holds exactly
+    the inventory's rows."""
+    attempt, scope = await _attempt(session, lease)
+    try:
+        observed = _evidence(evidence)
+    except (KeyError, TypeError, ValueError):
+        observed = None
+    inventory = await _locked(session, ChatInventory, ChatInventory.id == inventory_id, shared=True)
+    if (observed is None or inventory is None or inventory.state != "COMPLETE" or inventory.tenant_id != scope.tenant_id or
+            inventory.chat_id != scope.chat_id or
+            inventory.authentication_context_sha256 != authentication_context_fingerprint(scope)):
+        return None
+    nested = await session.begin_nested()
+    copied = (await session.execute(text("""
+        INSERT INTO snapshot_items (id, snapshot_id, tenant_id, external_id, parent_external_id, item_type, name,
+            folder_path, content_hash, content_checksum, content_size, blob_path, encryption_key_id, backup_version,
+            metadata, is_deleted, backend_id, chat_version_id, created_at)
+        SELECT gen_random_uuid(), :snapshot, si.tenant_id, si.external_id, si.parent_external_id, si.item_type, si.name,
+            :folder, si.content_hash, si.content_checksum, si.content_size, si.blob_path, si.encryption_key_id,
+            si.backup_version, si.metadata, si.is_deleted, si.backend_id, si.chat_version_id, now() AT TIME ZONE 'utc'
+        FROM snapshot_items si JOIN chat_inventory_items ii
+          ON ii.logical_key = si.external_id AND ii.version_id = si.chat_version_id
+        WHERE ii.inventory_id = :inventory AND si.snapshot_id = :source"""),
+        {"snapshot": scope.snapshot_id, "folder": attempt.folder_path, "inventory": inventory.id,
+         "source": source_snapshot_id})).rowcount
+    if copied != inventory.item_count:
+        await nested.rollback()
+        return None
+    await nested.commit()
+    staged_id = attempt.staged_inventory_id
+    attempt.evidence, attempt.evidence_history = evidence, [*(attempt.evidence_history or []), *history, evidence]
+    attempt.reused_inventory, attempt.staged_inventory_id = True, inventory.id
+    await session.flush()
+    await session.execute(delete(ChatInventory).where(ChatInventory.id == staged_id))
+    association = SnapshotChatInventory(snapshot_id=scope.snapshot_id, chat_id=scope.chat_id,
+        tenant_id=scope.tenant_id, inventory_id=inventory.id, capture_attempt_id=attempt.id, coverage_status="COMPLETE",
+        started_at=observed.started_at, finished_at=observed.finished_at, failure_reason=None,
+        uploaded_bytes=0)
+    session.add(association)
+    await _check_expiry(session, attempt)
+    attempt.state = "PUBLISHED"
+    await session.flush()
+    return _result(attempt, association, inventory, 0)
+
+
 async def suspend_capture(session, *, lease, claim, unit_key, next_eligible_at):
     """Supersede only this unpublished attempt and retain its pending receipt."""
     from shared import provider_work

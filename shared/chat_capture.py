@@ -913,12 +913,12 @@ async def reuse_unchanged_chat(*, scope, graph_client, session_factory, folder_p
             return None
         attempt, inventory = row
         observed, full = _observed_times(attempt)
-        return attempt.id, inventory.id, observed, full
+        return attempt.id, inventory.id, observed, full, attempt.snapshot_id, attempt.evidence
 
     found = await run_catalogue_transaction(session_factory, find)
     if found is None:
         return None
-    attempt_id, inventory_id, observed, full = found
+    attempt_id, inventory_id, observed, full, source_snapshot_id, source_evidence = found
     if observed is None or full is None or datetime.now(timezone.utc) - full >= reconcile:
         return None
     try:
@@ -929,6 +929,13 @@ async def reuse_unchanged_chat(*, scope, graph_client, session_factory, folder_p
         return None
     if latest is not None and latest > observed - overlap:
         return None
+    provenance = {"reused_unchanged_from_attempt": str(attempt_id), "source_observed_at": observed.isoformat(),
+                  "full_observed_at": full.isoformat(), "latest_message_change": latest.isoformat() if latest else None}
+    linked = await _link_unchanged(scope=scope, session_factory=session_factory, folder_path=folder_path,
+        inventory_id=inventory_id, source_snapshot_id=source_snapshot_id, source_evidence=source_evidence,
+        history=[*([{"source_filter_sha256": scope_filter_hash}] if scope_filter_hash is not None else []), provenance])
+    if linked is not None:
+        return linked
 
     async def load(session):
         return [catalogue._captured(v) for v in (await _inventory_items(session, inventory_id)).all()]
@@ -936,8 +943,38 @@ async def reuse_unchanged_chat(*, scope, graph_client, session_factory, folder_p
     items = await run_catalogue_transaction(session_factory, load)
     return await _publish_copy(scope=scope, session_factory=session_factory, items=items, folder_path=folder_path,
         exclude_message=exclude_message, scope_filter_hash=scope_filter_hash, label="chat_incremental_reused",
-        provenance={"reused_unchanged_from_attempt": str(attempt_id), "source_observed_at": observed.isoformat(),
-                    "full_observed_at": full.isoformat(), "latest_message_change": latest.isoformat() if latest else None})
+        provenance=provenance)
+
+
+async def _link_unchanged(*, scope, session_factory, folder_path, inventory_id, source_snapshot_id, source_evidence, history):
+    """Publish an unchanged chat by linking its COMPLETE inventory (catalogue.publish_unchanged_inventory).
+    None when that is not possible; the caller then re-stages the items."""
+    from shared.config import settings
+    if not source_evidence or source_snapshot_id is None:
+        return None
+    version = settings.CHAT_OBSERVATION_HASH_VERSION
+
+    async def begin(session):
+        return await catalogue.begin_capture(session, scope=scope, folder_path=folder_path,
+                                             observation_hash_version=version)
+    lease = await run_catalogue_transaction(session_factory, begin)
+    now = datetime.now(timezone.utc).isoformat()
+    evidence = {**source_evidence, "started_at": now, "finished_at": now}
+
+    async def link(session):
+        return await catalogue.publish_unchanged_inventory(session, lease=lease, inventory_id=inventory_id,
+            source_snapshot_id=source_snapshot_id, evidence=evidence, history=history)
+    try:
+        result = await run_catalogue_transaction(session_factory, link)
+    except catalogue.ChatCatalogueIntegrityError:
+        result = None
+    if result is None:
+        async def discard(session):
+            await _discard_attempt(session, lease, scope, "chat_incremental_linked rejected")
+        await run_catalogue_transaction(session_factory, discard)
+        return None
+    logger.info("chat_incremental_linked attempt_id=%s chat=%s items=%s", lease.attempt_id, scope.chat_id, result.item_count)
+    return result
 
 
 @asynccontextmanager
