@@ -268,6 +268,15 @@ async def _insert_snapshot_items(
     from shared.snapshot_item_writes import CHAT_ITEM_TYPES, ordered_snapshot_item_rows
     if all(row["item_type"] in CHAT_ITEM_TYPES for row in rows):
         rows = ordered_snapshot_item_rows(rows)
+    else:
+        # One statement per column set: mail interleaves emails and their attachments (different
+        # columns), and splitting at every shape change wrote ~2-row INSERTs. Each statement is one
+        # protected-size journal event, so a 10-user run left the dashboard size an hour behind
+        # (Railway 2026-11-05). Stable, first-appearance order; chat rows keep conflict-key order.
+        shapes: Dict[frozenset, int] = {}
+        for row in rows:
+            shapes.setdefault(frozenset(row), len(shapes))
+        rows = sorted(rows, key=lambda row: shapes[frozenset(row)])
     from sqlalchemy.dialects.postgresql import insert as _pg_insert
     from sqlalchemy.exc import IntegrityError as _IntegrityError
     total = 0
