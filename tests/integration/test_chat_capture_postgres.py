@@ -1175,3 +1175,30 @@ async def test_parallel_capture_publishes_the_same_inventory_as_one_at_a_time(st
             await session.scalar(select(ChatInventory.membership_sha256).where(ChatInventory.id == r.inventory_id))
             for r in (serial, parallel)]
     assert serial.item_count == parallel.item_count and hashes[0] == hashes[1]
+
+
+async def test_reused_children_are_staged_in_batches_not_one_transaction_each(store, adapters, monkeypatch):
+    """Railway 2026-11-05: re-reading a 1,369-message chat after one edit took 5.8 min. Each reused
+    image/file was staged in its own transaction, and every staging locks the capture's inventory
+    row, so 8 parallel children queued on it (median 4.8 s per child)."""
+    from shared import chat_catalogue
+    messages = []
+    for i in range(5):
+        stamped = dict(message(hosted=True), id=f"message-{i}", lastModifiedDateTime="2026-11-01T10:00:00Z", etag=f"17800000000{i}")
+        stamped["_hosted"] = [{"id": f"image-{i}", "contentType": "image/png"}]
+        stamped["body"] = {"contentType": "html", "content": f'<img src="https://graph.microsoft.com/v1.0/chats/chat/messages/message-{i}/hostedContents/image-{i}/$value">'}
+        messages.append(stamped)
+    adapters.source.messages = messages
+    _, first = await run_capture(store, adapters)
+    assert first.outcome == "complete" and adapters.source.hosted_downloads == 5
+    batches = []
+    original = chat_catalogue.stage_versions
+
+    async def counted(session, *, lease, items):
+        batches.append([item.item_type for item in items])
+        return await original(session, lease=lease, items=items)
+    monkeypatch.setattr(chat_catalogue, "stage_versions", counted)
+    _, second = await run_capture(store, adapters)
+    assert second.outcome == "complete" and adapters.source.hosted_downloads == 5
+    single_child = [b for b in batches if b == ["CHAT_HOSTED_CONTENT"]]
+    assert single_child == [] and sum(b.count("CHAT_HOSTED_CONTENT") for b in batches) == 5

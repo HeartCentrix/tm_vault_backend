@@ -380,7 +380,8 @@ def _hosted_marker(message):
 
 
 async def _binary(*, scope, keeper, factory, storage, source_client, item_type,
-                  graph_id, parent_id, payload, stage, file_versions=None, hosted_marker=None, file_inflight=None):
+                  graph_id, parent_id, payload, stage, file_versions=None, hosted_marker=None, file_inflight=None,
+                  deferred=None):
     file = item_type == "CHAT_ATTACHMENT"
     raw = await source_client.resolve_file(payload.get("contentUrl")) if file else None
     payload = dict(payload)
@@ -400,7 +401,7 @@ async def _binary(*, scope, keeper, factory, storage, source_client, item_type,
         return await _binary_capture(scope=scope, keeper=keeper, factory=factory, storage=storage,
             source_client=source_client, item_type=item_type, graph_id=graph_id, parent_id=parent_id,
             payload=payload, stage=stage, file_versions=file_versions, file=file, raw=raw, source=source,
-            cache_key=cache_key)
+            cache_key=cache_key, deferred=deferred)
     finally:
         if owned is not None:
             file_inflight.pop(cache_key, None)
@@ -408,7 +409,12 @@ async def _binary(*, scope, keeper, factory, storage, source_client, item_type,
 
 
 async def _binary_capture(*, scope, keeper, factory, storage, source_client, item_type, graph_id, parent_id,
-                          payload, stage, file_versions, file, raw, source, cache_key):
+                          payload, stage, file_versions, file, raw, source, cache_key, deferred=None):
+    # Reused children go to the caller's batch (``deferred``): each staging locks the capture's
+    # inventory row, so one transaction per child queued 8 parallel children on it (Railway
+    # 2026-11-05: 4.8 s median per child, 5.8 min for one edit in a 1,369-message chat).
+    # stage_versions re-checks every object under lock, so a batch never links a retired one.
+    defer = stage and deferred is not None
     if file_versions is not None and cache_key in file_versions:
         content, content_type = file_versions[cache_key]
         file_versions.move_to_end(cache_key)
@@ -417,7 +423,9 @@ async def _binary_capture(*, scope, keeper, factory, storage, source_client, ite
         if content_type:
             payload.setdefault('captured_content_type', content_type)
         captured = CapturedChatItem(item_type, graph_id, parent_id, payload, content)
-        if stage:
+        if defer:
+            deferred.append(captured)
+        elif stage:
             await _stage(factory, keeper, [captured])
         return captured
 
@@ -442,9 +450,12 @@ async def _binary_capture(*, scope, keeper, factory, storage, source_client, ite
                         item.content.size if item.content else None, total, " ".join(f"{k}_ms={v}" for k, v in marks.items()))
         return remember(item)
     retained = await _retained(scope=scope, keeper=keeper, factory=factory, storage=storage,
-        item_type=item_type, graph_id=graph_id, parent_id=parent_id, payload=payload, source=source, stage=stage)
+        item_type=item_type, graph_id=graph_id, parent_id=parent_id, payload=payload, source=source,
+        stage=stage and not defer)
     mark("retained_lookup")
     if retained is not None:
+        if defer:
+            deferred.append(retained)
         return report(retained)
     opened = source_client.open_file(raw) if file else source_client.open_hosted(scope.chat_id, parent_id, graph_id)
     async with AsyncExitStack() as spools:
@@ -587,7 +598,8 @@ async def _observe(*, scope, keeper, factory, storage, source, ledger, observati
             captured = await _binary(scope=scope, keeper=keeper, factory=factory, storage=storage,
                 source_client=source, item_type=kind, graph_id=child["id"], parent_id=identifier,
                 payload=child, stage=observation == 0, file_versions=file_versions,
-                hosted_marker=marker if kind == "CHAT_HOSTED_CONTENT" else None, file_inflight=file_inflight)
+                hosted_marker=marker if kind == "CHAT_HOSTED_CONTENT" else None, file_inflight=file_inflight,
+                deferred=pending)
             if ledger.record(observation, captured):
                 stats.verified_binary += 1
         except _STOPS_CAPTURE:
