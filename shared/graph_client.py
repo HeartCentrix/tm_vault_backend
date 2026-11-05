@@ -3509,11 +3509,15 @@ class GraphClient:
             logger.warning("SharePoint supplemental list discovery failed: %s", type(exc).__name__)
         graph_result["_site_web_url"] = site_web_url
 
-        # Merge — prefer Graph's shape when both sources have the same id.
+        # Merge — prefer Graph's shape when both sources have the same id, keeping
+        # the REST item-change signal (Graph's list date does not track items).
         merged = list(graph_lists)
+        by_id = {gl.get("id"): gl for gl in merged if isinstance(gl, dict)}
         for rl in sp_lists:
             rl_id = rl.get("id")
-            if rl_id and rl_id not in seen_ids:
+            if rl_id in by_id:
+                by_id[rl_id]["_rest_signature"] = rl.get("_rest_signature")
+            elif rl_id and rl_id not in seen_ids:
                 merged.append(rl)
                 seen_ids.add(rl_id)
 
@@ -3701,7 +3705,7 @@ class GraphClient:
         """
         url = f"{site_web_url.rstrip('/')}/_api/web/lists"
         params = {"$top": "1000",
-            "$select": "Id,Title,Description,DefaultViewUrl,Created,LastItemModifiedDate,BaseTemplate,Hidden,IsCatalog,IsSystemList"}
+            "$select": "Id,Title,Description,DefaultViewUrl,Created,LastItemModifiedDate,LastItemDeletedDate,ItemCount,BaseTemplate,Hidden,IsCatalog,IsSystemList"}
         raw = []
         async for row in self._iter_sharepoint_rest_rows(hostname, url, params=params, stage="list_collection"):
             raw.append(row)
@@ -3728,6 +3732,8 @@ class GraphClient:
                 "webUrl": list_web_url,
                 "createdDateTime": lst.get("Created"),
                 "lastModifiedDateTime": lst.get("LastItemModifiedDate"),
+                # Item-level change signal: an incremental carries an unchanged list forward.
+                "_rest_signature": {"modified": lst.get("LastItemModifiedDate"), "deleted": lst.get("LastItemDeletedDate"), "count": lst.get("ItemCount"), "title": lst.get("Title")},
                 "lastModifiedBy": None,
                 "system": bool(lst.get("IsSystemList")),
                 "list": {

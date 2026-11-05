@@ -886,3 +886,21 @@ def test_shared_mailbox_carry_points_an_unchanged_mailbox_at_its_prior():
                   "not persist_failed_fids", "not gone_fids", "not fresh_count"):
         assert guard in flat[:call], guard
     assert "keep_folder_ids=keep_fids" in flat[call:call + 600]
+
+
+def test_sharepoint_rest_list_signature_survives_the_graph_merge():
+    gsrc = (pathlib.Path(__file__).resolve().parents[2] / "shared" / "graph_client.py").read_text()
+    flat = re.sub(r"\s+", " ", gsrc)
+    assert "LastItemDeletedDate,ItemCount" in flat
+    assert '"_rest_signature": {"modified": lst.get("LastItemModifiedDate"), "deleted": lst.get("LastItemDeletedDate"), "count": lst.get("ItemCount"), "title": lst.get("Title")}' in flat
+    assert 'by_id[rl_id]["_rest_signature"] = rl.get("_rest_signature")' in flat
+
+
+def test_sharepoint_list_producer_carries_an_unchanged_list_forward():
+    start = _SRC.index("previous_rows = await self._previous_sp_rest_rows(snapshot, site_id)")
+    flat = re.sub(r"\s+", " ", _SRC[start:start + 16000])
+    assert "await self._previous_sp_lists(snapshot, site_id)" in flat
+    assert "sp_list_reusable(_sig, prior_lists.get(lst_id)" in flat
+    assert '"rest_signature": _sig, "rest_walked_at": _reuse_walked or _walked_now' in flat
+    copy = flat.index("await self._copy_forward_sp_list_rows(snapshot.id, prior_lists_id, site_id, lst_id)")
+    assert copy < flat.index("iter_sharepoint_list_items_via_rest(", copy)

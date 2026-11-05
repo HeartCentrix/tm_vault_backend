@@ -3514,6 +3514,27 @@ def mail_carry_forward_excluded_paths(
     return sorted(out)
 
 
+def sp_list_reusable(signature, prior, now, max_age_hours=None):
+    """The prior full read time when a SharePoint list can be carried forward instead of re-read: its
+    REST item signature (last item modified / deleted date, item count, title) equals the prior
+    restore point's and that list was fully read within ``max_age_hours`` (SP_LIST_REUSE_MAX_AGE_HOURS,
+    default 168: column text such as a person's name can change without the list's date). Else None.
+    SP_LIST_UNCHANGED_REUSE_ENABLED=false always re-reads."""
+    if os.getenv("SP_LIST_UNCHANGED_REUSE_ENABLED", "true").strip().lower() in ("0", "false", "no", "off"):
+        return None
+    if not signature or not prior or not signature.get("modified") or prior.get("rest_signature") != signature:
+        return None
+    walked = prior.get("rest_walked_at")
+    try:
+        walked_at = datetime.fromisoformat(str(walked).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if walked_at.tzinfo is None:
+        walked_at = walked_at.replace(tzinfo=timezone.utc)
+    hours = float(max_age_hours if max_age_hours is not None else os.getenv("SP_LIST_REUSE_MAX_AGE_HOURS", "168"))
+    return walked if now - walked_at < timedelta(hours=hours) else None
+
+
 def mail_carry_forward_enabled(env: Optional[Dict[str, str]] = None) -> bool:
     """Kill switch for the mail carry-forward (both USER_MAIL and Tier-1).
     Default ON; ``MAIL_CARRY_FORWARD_ENABLED`` = 0/false/no/off disables it
@@ -22319,6 +22340,42 @@ class BackupWorker:
             "bytes_added": sum(r.get("bytes_added", 0) for r in results if isinstance(r, dict)),
         }
 
+    async def _previous_sp_lists(self, snapshot: Snapshot, site_id: str):
+        """(prior snapshot id, {list id: list row metadata}) of the latest earlier COMPLETED restore point
+        for this site's lists; (None, {}) when there is none. A PARTIAL prior may miss list rows."""
+        from sqlalchemy import text as _text
+        async with async_session_factory() as sess:
+            prev = (await sess.execute(_text("""
+                SELECT s.id, s.status::text FROM snapshots s WHERE s.resource_id = :rid AND s.id <> :sid
+                  AND s.created_at <= :at AND s.status IN ('COMPLETED', 'PARTIAL')
+                ORDER BY s.created_at DESC LIMIT 1"""),
+                {"rid": snapshot.resource_id, "sid": snapshot.id, "at": snapshot.created_at})).first()
+            if prev is None or prev[1] != "COMPLETED":
+                return None, {}
+            rows = (await sess.execute(_text("""
+                SELECT external_id, metadata FROM snapshot_items WHERE snapshot_id = :prev
+                  AND item_type = 'SHAREPOINT_LIST' AND metadata->>'site_id' = :site"""),
+                {"prev": prev[0], "site": site_id})).all()
+        return prev[0], {r[0]: (json.loads(r[1]) if isinstance(r[1], str) else r[1]) or {} for r in rows}
+
+    async def _copy_forward_sp_list_rows(self, snapshot_id, prior_snapshot_id, site_id: str, list_id: str) -> int:
+        """Copy an unchanged list's rows from the prior restore point in one statement (blobs are
+        retained, so their paths stay valid). Returns the rows copied."""
+        from sqlalchemy import text as _text
+        columns = [c.name for c in SnapshotItem.__table__.columns]
+        values = ["gen_random_uuid()" if c == "id" else "CAST(:sid AS uuid)" if c == "snapshot_id"
+                  else "now() AT TIME ZONE 'utc'" if c == "created_at" else "src." + c for c in columns]
+        async with async_session_factory() as sess:
+            copied = (await sess.execute(_text(
+                "INSERT INTO snapshot_items (" + ",".join(columns) + ") SELECT " + ",".join(values) + """
+                FROM snapshot_items src WHERE src.snapshot_id = CAST(:prior AS uuid)
+                  AND src.metadata->>'source' = 'sp_rest' AND src.metadata->>'site_id' = :site
+                  AND src.metadata->>'list_id' = :list
+                ON CONFLICT (snapshot_id, external_id, item_type) DO NOTHING"""),
+                {"sid": str(snapshot_id), "prior": str(prior_snapshot_id), "site": site_id, "list": list_id})).rowcount
+            await sess.commit()
+        return int(copied or 0)
+
     async def _previous_sp_rest_rows(self, snapshot: Snapshot, site_id: str) -> Dict[str, Dict[str, Any]]:
         """The latest earlier restore point's list rows for this site (every run re-reads every list)."""
         from sqlalchemy import text as _text
@@ -29328,6 +29385,11 @@ class BackupWorker:
                 previous_rows = {}
                 logger.warning("SharePoint previous list rows for %s unavailable: %s", site_label, exc)
             try:
+                prior_lists_id, prior_lists = await self._previous_sp_lists(snapshot, site_id)
+            except Exception as exc:
+                prior_lists_id, prior_lists = None, {}
+                logger.warning("SharePoint previous lists for %s unavailable: %s", site_label, exc)
+            try:
                 drive_urls: Optional[Set[str]] = _drive_web_urls(
                     await graph_client.list_sharepoint_site_drives(site_id))
             except Exception as exc:
@@ -29446,6 +29508,11 @@ class BackupWorker:
                 # maps to the column literally named "metadata" (see the
                 # _create_file_snapshot_item note — keying "extra_data" here
                 # raises CompileError "Unconsumed column names").
+                # Unchanged list (same item signature, full read within a week): carry its rows.
+                _sig = lst.get("_rest_signature")
+                _walked_now = datetime.now(timezone.utc).isoformat()
+                _reuse_walked = (sp_list_reusable(_sig, prior_lists.get(lst_id), datetime.now(timezone.utc))
+                                 if prior_lists_id else None)
                 list_row = {
                     "id": uuid.uuid4(),
                     "snapshot_id": snapshot.id,
@@ -29473,6 +29540,7 @@ class BackupWorker:
                         "is_library": is_library,
                         "web_url": lst.get("webUrl"),
                         "last_modified": lst.get("lastModifiedDateTime"),
+                        "rest_signature": _sig, "rest_walked_at": _reuse_walked or _walked_now,
                     },
                 }
                 try:
@@ -29507,6 +29575,16 @@ class BackupWorker:
                 if not (sp_hostname and sp_site_web_url):
                     logger.warning("Cannot derive SP site URL for %s, skipping list items", site_label)
                     continue
+                if _reuse_walked:
+                    try:
+                        _copied = await self._copy_forward_sp_list_rows(snapshot.id, prior_lists_id, site_id, lst_id)
+                        if _copied or not (_sig or {}).get("count"):
+                            stats["lists_reused"] = stats.get("lists_reused", 0) + 1
+                            stats["list_rows_reused"] = stats.get("list_rows_reused", 0) + _copied
+                            continue
+                    except Exception as exc:
+                        logger.warning("SharePoint list carry-forward failed for %s/%s, reading it: %s",
+                                       site_label, display, exc)
 
                 try:
                     # all_fields defaults to True now — every list returns
