@@ -670,6 +670,50 @@ async def test_delta_feed_silence_never_links_a_chat_whose_message_was_edited(st
     assert await chat_state(store, first.snapshot_id) == before
 
 
+async def test_bulk_link_uses_the_check_another_member_shared_for_this_run(store, source_adapter, monkeypatch):
+    """A group chat is checked once per run for all its members (Teams: 1 request/s per chat): when
+    another member already found it changed in this run, this member does not link it in bulk."""
+    from shared import chat_capture
+    from shared.graph_rate_limiter import graph_rate_limiter
+    data = {}
+
+    class Redis:
+        async def mget(self, keys):
+            return [data.get(k) for k in keys]
+        def pipeline(self, transaction=False):
+            class Pipe:
+                async def __aenter__(self):
+                    return self
+                async def __aexit__(self, *exc):
+                    return False
+                def set(self, key, value, ex=None, nx=False):
+                    data.setdefault(key, value)
+                async def execute(self):
+                    return None
+            return Pipe()
+    async def shared():
+        return Redis()
+    monkeypatch.setattr(graph_rate_limiter, "redis", shared)
+    source = source_adapter.source
+    source.chats.append({"id": "chat-beta", "topic": "Beta"})
+    source.messages["chat-beta"] = [{"id": "message-beta", "body": {"content": "b"}, "attachments": []}]
+    feed, rounds, checks = [set()], [], []
+    delta_source(source, feed, rounds, checks, latest_at=datetime(2020, 1, 1, tzinfo=timezone.utc))
+    first = await legacy_scope(store)
+    await source_adapter.run(first)
+    second = await store.new_scope()
+    async with store.factory() as session:
+        job = (await session.get(models.Snapshot, second.snapshot_id)).job_id
+    data[chat_capture._probe_key(str(job), str(second.tenant_id), "chat-beta")] = datetime.now(timezone.utc).isoformat()
+    assert (await source_adapter.run(second))["outcome"] == "complete"
+    async with store.factory() as session:
+        attempts = {a.chat_id: a for a in (await session.scalars(select(models.ChatCaptureAttempt).where(
+            models.ChatCaptureAttempt.snapshot_id == second.snapshot_id))).all()}
+    bulk = {cid for cid, a in attempts.items() if "delta_unchanged_since_snapshot" in str(a.evidence_history)}
+    assert bulk == {"chat-alpha"} and attempts["chat-beta"].state == "PUBLISHED"
+    assert checks.count("chat-alpha") == 1
+
+
 async def test_delta_feed_failure_falls_back_to_checking_each_chat(store, source_adapter):
     from shared.chat_capture_graph import ChatGraphError
     source = source_adapter.source

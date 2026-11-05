@@ -946,6 +946,53 @@ async def reuse_unchanged_chat(*, scope, graph_client, session_factory, folder_p
         provenance=provenance)
 
 
+_PROBE_TTL_S = 6 * 3600   # one key per chat per run; outlives any run
+
+
+def _probe_key(run_key: str, tenant_id: str, chat_id: str) -> str:
+    return "chat:probe:" + hashlib.sha256(f"{run_key}|{tenant_id}|{chat_id}".encode()).hexdigest()[:32]
+
+
+async def _shared_latest_changes(run_key, tenant_id, chat_ids, probe) -> dict:
+    """Newest message change per chat (None: no messages, False: the check failed), checked once per
+    chat per run for every member and worker through the shared Redis. Teams allows 1 request/s per
+    chat, so a group chat with hundreds of members must not be checked once per member. A new run
+    checks again; a failed check is never shared; without Redis each member checks."""
+    from shared.graph_rate_limiter import graph_rate_limiter
+    keys = {cid: _probe_key(str(run_key), str(tenant_id), cid) for cid in chat_ids}
+    redis, cached = None, {}
+    try:
+        redis = await graph_rate_limiter.redis()
+        if redis is not None and keys:
+            cached = {cid: v for cid, v in zip(keys, await redis.mget(list(keys.values()))) if v is not None}
+    except Exception as exc:
+        logger.warning("chat_probe_share_unavailable error=%s", type(exc).__name__)
+        redis, cached = None, {}
+    found = {cid: None if v == "none" else datetime.fromisoformat(v) for cid, v in cached.items()}
+    missing = [cid for cid in chat_ids if cid not in found]
+    slots = asyncio.Semaphore(8)
+
+    async def check(chat_id):
+        async with slots:
+            try:
+                return await probe(chat_id)
+            except ChatGraphError:
+                return False
+    found.update(zip(missing, await asyncio.gather(*(check(cid) for cid in missing))))
+    fresh = {keys[cid]: "none" if found[cid] is None else found[cid].isoformat()
+             for cid in missing if found[cid] is not False}
+    if redis is not None and fresh:
+        try:
+            async with redis.pipeline(transaction=False) as pipe:
+                for key, value in fresh.items():
+                    pipe.set(key, value, ex=_PROBE_TTL_S, nx=True)
+                await pipe.execute()
+        except Exception as exc:
+            logger.warning("chat_probe_share_unavailable error=%s", type(exc).__name__)
+    logger.info("chat_probe_shared checked=%s reused=%s", len(missing), len(cached))
+    return found
+
+
 async def link_unchanged_chats(*, scopes, folders, filter_hashes, session_factory, source_snapshot_id,
                                latest_change) -> set:
     """Publish, in one step, every chat of ``scopes`` that the principal's delta feed showed unchanged
@@ -953,7 +1000,10 @@ async def link_unchanged_chats(*, scopes, folders, filter_hashes, session_factor
     there. Same scope, observation version, weekly full-read deadline and one-request change check
     (``latest_change``) as reuse_unchanged_chat: the feed alone missed an edit of a 13-hour-old group
     message (Railway 2026-11-05). Chats that do not qualify are left for the per-chat path. Returns
-    the chat ids published."""
+    the chat ids published. The change check of each chat is shared by every member of the run
+    (_shared_latest_changes)."""
+    if not scopes:
+        return set()
     from shared.config import settings
     version = settings.CHAT_OBSERVATION_HASH_VERSION
     reconcile = timedelta(hours=float(os.getenv("CHAT_INCREMENTAL_RECONCILE_HOURS", "168")))
@@ -968,6 +1018,11 @@ async def link_unchanged_chats(*, scopes, folders, filter_hashes, session_factor
                    ChatCaptureAttempt.state == "PUBLISHED", ChatInventory.state == "COMPLETE",
                    ChatInventory.observation_hash_version == version,
                    SnapshotChatInventory.coverage_status == "COMPLETE"))).all()
+    from shared.models import Snapshot
+    any_scope = next(iter(scopes.values()))
+
+    async def run_of(session):
+        return await session.scalar(select(Snapshot.job_id).where(Snapshot.id == any_scope.snapshot_id))
     now = datetime.now(timezone.utc)
     eligible = []
     for attempt, inventory in await run_catalogue_transaction(session_factory, find):
@@ -979,16 +1034,12 @@ async def link_unchanged_chats(*, scopes, folders, filter_hashes, session_factor
             continue
         eligible.append((attempt, inventory, observed, full))
 
-    slots = asyncio.Semaphore(8)
-    async def check(chat_id):
-        async with slots:
-            try:
-                return await latest_change(chat_id)
-            except ChatGraphError:
-                return False
-    latest = await asyncio.gather(*(check(attempt.chat_id) for attempt, *_ in eligible))
+    run_key = await run_catalogue_transaction(session_factory, run_of) or any_scope.snapshot_id
+    latest = await _shared_latest_changes(run_key, any_scope.tenant_id,
+                                          [attempt.chat_id for attempt, *_ in eligible], latest_change)
     links = {}
-    for (attempt, inventory, observed, full), changed_at in zip(eligible, latest):
+    for attempt, inventory, observed, full in eligible:
+        changed_at = latest[attempt.chat_id]
         if changed_at is False or (changed_at is not None and changed_at > observed - overlap):
             continue
         provenance = {"reused_unchanged_from_attempt": str(attempt.id), "source_observed_at": observed.isoformat(),
