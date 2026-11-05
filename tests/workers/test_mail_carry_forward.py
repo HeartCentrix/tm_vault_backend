@@ -43,6 +43,7 @@ import importlib.util
 import os
 import pathlib
 import re
+from pathlib import Path
 import sys
 
 import pytest
@@ -176,8 +177,7 @@ def test_mail_carry_forward_helper_exists_and_takes_a_slot():
 
 
 def test_mail_carry_forward_sql_shape():
-    body = _fn_src("_carry_forward_prior_mail_snapshot_items")
-    flat = re.sub(r"\s+", " ", body)
+    flat = _carry_flat()
     assert "INSERT INTO snapshot_items" in flat
     assert "NOT EXISTS" in flat
     assert "status IN ('COMPLETED', 'PARTIAL')" in flat
@@ -232,8 +232,12 @@ def test_user_mail_carry_failure_rewinds_cursors():
 # ── review round 1 (2026-09-04) pins ──────────────────────────────────────
 
 def _carry_flat() -> str:
+    # The prior-snapshot selection lives in shared/mail_snapshot_reuse.py so the
+    # carry (its copy source) and the unchanged-mailbox reuse (its pointer) agree.
     body = _fn_src("_carry_forward_prior_mail_snapshot_items")
-    return re.sub(r"\s+", " ", body)
+    assert "MAIL_PRIOR_SNAPSHOT_SQL as prior_snapshot_sql" in body
+    shared = (Path(__file__).parents[2] / "shared" / "mail_snapshot_reuse.py").read_text()
+    return re.sub(r"\s+", " ", body + shared)
 
 
 def test_prior_snapshot_must_hold_rows_and_not_be_a_reuse_or_failed_carry():
@@ -823,3 +827,36 @@ def test_parked_evictions_use_atomic_sql_not_orm_read_modify_write():
 def test_failed_partitioned_rewind_also_parks_keys_on_the_resource():
     rf = _method_src("_rewind_failed_partitioned_user_mail")
     assert "_append_resource_pending_evictions(" in rf
+
+
+# ── unchanged mailbox reuse (2026-11-05) ──────────────────────────────────
+
+def test_unchanged_mailbox_points_at_prior_instead_of_carrying():
+    """Railway incremental #9: 10/10 mailboxes unchanged still copied 34k rows forward."""
+    flat = re.sub(r"\s+", " ", _user_mail_carry_block())
+    call = flat.index("reuse_if_unchanged(")
+    assert call < flat.index("_carry_forward_prior_mail_snapshot_items(", call)
+    unchanged = flat[flat.rindex("_mail_unchanged = (", 0, call):call]
+    for guard in ("not _cf_excluded", "not mail_tombstoned_ids", "not out", "not _mail_persisted_total",
+                  "not _mail_folders_missing", "not _mail_folders_token_evicted"):
+        assert guard in unchanged, guard
+    assert "_cf_rows = 0 if _mail_reused_prior else await _carry_forward_prior_mail_snapshot_items(" in flat
+
+
+def test_unchanged_reuse_has_a_kill_switch():
+    from shared.mail_snapshot_reuse import mail_unchanged_reuse_enabled
+    assert mail_unchanged_reuse_enabled({}) is True
+    assert mail_unchanged_reuse_enabled({"MAIL_UNCHANGED_REUSE_ENABLED": "false"}) is False
+
+
+def test_inline_finalize_counts_the_rows_a_pointer_resolves_to():
+    """A pointer owns no rows; recounting its own would zero the totals copied from the prior."""
+    end = _SRC.index("persisted_count = int(_row[0] or 0)")
+    block = _SRC[end - 1500:end]
+    assert "resolve_snapshot_items_target(" in block
+    assert "SnapshotItem.snapshot_id == _items_of" in block
+
+
+def test_orphan_reaper_counts_the_rows_a_pointer_resolves_to():
+    body = re.sub(r"\s+", " ", _method_src("_reap_orphan_snapshots_for_job"))
+    assert "FROM snapshot_items WHERE snapshot_id = COALESCE( (SELECT reuse_chain_root_id FROM snapshots WHERE id = :sid), :sid)" in body

@@ -153,3 +153,12 @@ __all__ = [
     "resolve_snapshot_items_target",
     "resolve_many",
 ]
+
+
+async def items_snapshot_id(session: AsyncSession, snapshot_id: UUIDLike) -> uuid.UUID:
+    """``resolve_snapshot_items_target(...).target_id``, or the id itself when the snapshot row is
+    gone (callers keep their own not-found handling)."""
+    try:
+        return (await resolve_snapshot_items_target(session, snapshot_id)).target_id
+    except SnapshotNotFound:
+        return _coerce_uuid(snapshot_id)

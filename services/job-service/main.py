@@ -2613,8 +2613,9 @@ async def trigger_restore(
                 )
                 total_bytes = int((await db.execute(q)).scalar() or 0)
             elif snapshot_ids:
+                from shared.snapshot_reuse import items_snapshot_id
                 q = sa_select(sa_func.coalesce(sa_func.sum(SnapshotItem.content_size), 0)).where(
-                    SnapshotItem.snapshot_id.in_([uuid.UUID(x) for x in snapshot_ids])
+                    SnapshotItem.snapshot_id.in_([await items_snapshot_id(db, x) for x in snapshot_ids])
                 )
                 total_bytes = int((await db.execute(q)).scalar() or 0)
         except Exception:
@@ -2824,8 +2825,9 @@ async def trigger_export(
                 )
                 total_bytes = int((await db.execute(q)).scalar() or 0)
             elif snapshot_ids:
+                from shared.snapshot_reuse import items_snapshot_id
                 q = sa_select(sa_func.coalesce(sa_func.sum(SnapshotItem.content_size), 0)).where(
-                    SnapshotItem.snapshot_id.in_([UUID(x) for x in snapshot_ids])
+                    SnapshotItem.snapshot_id.in_([await items_snapshot_id(db, x) for x in snapshot_ids])
                 )
                 total_bytes = int((await db.execute(q)).scalar() or 0)
         except Exception:

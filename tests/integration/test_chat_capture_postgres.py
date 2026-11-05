@@ -1120,6 +1120,50 @@ async def test_unchanged_chat_whose_earlier_rows_are_gone_is_restaged(store, ada
     assert result.outcome == "complete" and result.item_count == 2 and len(await chat_rows(store, scope.snapshot_id)) == 2
 
 
+async def _captured_with_recent_edit(store, adapters):
+    """A chat whose newest change (an edit 4 minutes ago) happened before its capture started."""
+    edited = datetime.now(timezone.utc) - timedelta(minutes=4)
+    adapters.source.messages = [dict(message("edited"), lastModifiedDateTime=edited.strftime("%Y-%m-%dT%H:%M:%S.") +
+                                     f"{edited.microsecond // 1000:03d}Z")]
+    first_scope, first = await run_capture(store, adapters)
+    return first_scope, first, edited.replace(microsecond=edited.microsecond // 1000 * 1000)
+
+
+async def test_change_already_in_the_last_read_does_not_reread_the_chat(store, adapters, monkeypatch):
+    """Railway 2026-11-05 incremental #8: an edit made 4 minutes before the last read started fell in
+    the 15-minute safety margin, so the next, unchanged run re-read the 3,955-message chat (6 min).
+    The newest change is a version that read already stored: nothing is newer, so it is reused."""
+    monkeypatch.setenv("CHAT_INCREMENTAL_REUSE", "true")
+    first_scope, first, edited = await _captured_with_recent_edit(store, adapters)
+    adapters.source.latest_change = edited
+    passes = adapters.source.passes
+    scope = replace(await store.new_scope(), chat_id=first_scope.chat_id)
+    result = await reuse(adapters, store, scope)
+    assert result is not None and result.outcome == "complete" and adapters.source.passes == passes
+
+
+async def test_newest_change_not_in_the_last_read_still_rereads_the_chat(store, adapters, monkeypatch):
+    monkeypatch.setenv("CHAT_INCREMENTAL_REUSE", "true")
+    first_scope, _, edited = await _captured_with_recent_edit(store, adapters)
+    scope = replace(await store.new_scope(), chat_id=first_scope.chat_id)
+    adapters.source.latest_change = edited + timedelta(seconds=30)     # another change, before the read, not stored
+    assert await reuse(adapters, store, scope) is None
+    adapters.source.latest_change = datetime.now(timezone.utc)         # changed after the read began
+    assert await reuse(adapters, store, scope) is None
+
+
+async def test_bulk_link_also_reuses_a_change_already_read(store, adapters, monkeypatch):
+    monkeypatch.setenv("CHAT_INCREMENTAL_REUSE", "true")
+    first_scope, first, edited = await _captured_with_recent_edit(store, adapters)
+    scope = replace(await store.new_scope(), chat_id=first_scope.chat_id)
+
+    async def probe(chat_id):
+        return edited
+    linked = await adapters.capture.link_unchanged_chats(scopes={scope.chat_id: scope}, folders={scope.chat_id: "chats/x"},
+        filter_hashes={}, session_factory=store.factory, source_snapshot_id=first_scope.snapshot_id, latest_change=probe)
+    assert linked == {scope.chat_id}
+
+
 async def test_changed_stale_or_disabled_chat_is_captured_normally(store, adapters, monkeypatch):
     adapters.source.messages = [message()]
     first_scope, _ = await run_capture(store, adapters)

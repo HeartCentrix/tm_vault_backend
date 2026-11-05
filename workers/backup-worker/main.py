@@ -1624,30 +1624,7 @@ async def _carry_forward_prior_mail_snapshot_items(
     # delta — must not restart the chain empty), is not a reuse-chain
     # pointer, and did not itself fail its carry-forward (its inventory is
     # known-incomplete).
-    prior_snapshot_sql = (
-        "(SELECT s2.id FROM snapshots s2 "
-        "  WHERE s2.resource_id = :rid "
-        "    AND s2.id <> :tsid "
-        "    AND s2.status IN ('COMPLETED', 'PARTIAL') "
-        "    AND s2.job_id IS DISTINCT FROM CAST(:jid AS UUID) "
-        "    AND s2.reuse_of_snapshot_id IS NULL "
-        "    AND s2.reuse_chain_root_id IS NULL "
-        "    AND COALESCE(s2.extra_data->>'mail_carry_forward_failed', 'false') <> 'true' "
-        "    AND COALESCE(s2.extra_data->>'mail_delta_only', 'false') <> 'true' "
-        "    AND COALESCE(s2.extra_data->>'mail_carry_forward_pending', 'false') <> 'true' "
-        "    AND s2.extra_data->>'cancelled_at' IS NULL "
-        "    AND s2.created_at < (SELECT t.created_at FROM snapshots t WHERE t.id = :tsid) "
-        "    AND (COALESCE(s2.extra_data->>'mail_union_carry_claimed', 'false') = 'true' "
-        "         OR NOT EXISTS (SELECT 1 FROM snapshot_partitions sp "
-        "                         WHERE sp.snapshot_id = s2.id "
-        "                           AND sp.partition_type = 'MAIL_FOLDERS' "
-        "                           AND (sp.payload::jsonb) ? 'carry_forward')) "
-        "    AND EXISTS (SELECT 1 FROM snapshot_items x "
-        "                 WHERE x.snapshot_id = s2.id "
-        "                   AND x.item_type IN ('EMAIL', 'EMAIL_ATTACHMENT')) "
-        "  ORDER BY s2.created_at DESC "
-        "  LIMIT 1)"
-    )
+    from shared.mail_snapshot_reuse import MAIL_PRIOR_SNAPSHOT_SQL as prior_snapshot_sql
     insert_prefix = (
         "INSERT INTO snapshot_items ("
         "  id, snapshot_id, tenant_id, item_type, external_id, "
@@ -8548,8 +8525,28 @@ class BackupWorker:
                                     f"not stamped: {_flag_err}"
                                 )
                     elif mail_carry_forward_enabled() and _cf_excluded is not None:
+                        # Nothing changed anywhere (no folder re-bootstrapped,
+                        # missing or evicted, no delete, no message, no row):
+                        # point at the prior snapshot instead of copying it.
+                        _mail_unchanged = (
+                            not _cf_excluded and not mail_tombstoned_ids and not out
+                            and not _mail_persisted_total and not _mail_folders_missing
+                            and not _mail_folders_token_evicted
+                        )
+                        from shared.mail_snapshot_reuse import reuse_if_unchanged
+                        _mail_reused_prior = await reuse_if_unchanged(
+                            async_session_factory, unchanged=_mail_unchanged,
+                            resource_id=str(resource.id), target_snapshot_id=str(snapshot.id),
+                            current_job_id=job_id,
+                        )
+                        if _mail_reused_prior:
+                            print(
+                                f"[{self.worker_id}] [USER_MAIL] "
+                                f"{resource.display_name or resource.id}: unchanged — "
+                                f"reusing prior snapshot {_mail_reused_prior} (no copy)"
+                            )
                         try:
-                            _cf_rows = await _carry_forward_prior_mail_snapshot_items(
+                            _cf_rows = 0 if _mail_reused_prior else await _carry_forward_prior_mail_snapshot_items(
                                 tenant_id=str(tenant.id),
                                 resource_id=str(resource.id),
                                 target_snapshot_id=str(snapshot.id),
@@ -13632,13 +13629,20 @@ class BackupWorker:
                     "CHAT_HOSTED_CONTENT",
                 )
                 async with async_session_factory() as _count_sess:
+                    # An unchanged mailbox's reuse snapshot owns no rows; count
+                    # the full snapshot it names (shared.snapshot_reuse).
+                    from shared.snapshot_reuse import resolve_snapshot_items_target, SnapshotNotFound
+                    try:
+                        _items_of = (await resolve_snapshot_items_target(_count_sess, snapshot.id)).target_id
+                    except SnapshotNotFound:
+                        _items_of = snapshot.id
                     _row = (await _count_sess.execute(
                         select(
                             func.count(SnapshotItem.id).filter(
                                 ~SnapshotItem.item_type.in_(CHILD_ITEM_TYPES)
                             ),
                             func.coalesce(func.sum(SnapshotItem.content_size), 0),
-                        ).where(SnapshotItem.snapshot_id == snapshot.id)
+                        ).where(SnapshotItem.snapshot_id == _items_of)
                     )).one()
                     persisted_count = int(_row[0] or 0)
                     persisted_bytes = int(_row[1] or 0)
@@ -30101,8 +30105,10 @@ class BackupWorker:
         ]
         if current_job_id is not None:
             filters.append(Snapshot.job_id != current_job_id)
+        # A reuse snapshot (unchanged mailbox) owns no rows: compare with the
+        # full snapshot it names, or the next run counts everything as new.
         prior = (await session.execute(
-            select(Snapshot.id, Snapshot.item_count, Snapshot.bytes_total)
+            select(func.coalesce(Snapshot.reuse_chain_root_id, Snapshot.id), Snapshot.item_count, Snapshot.bytes_total)
             .where(*filters)
             .order_by(desc(Snapshot.completed_at))
             .limit(1)
@@ -30430,7 +30436,9 @@ class BackupWorker:
                         text(f"""
                             SELECT count(*) AS n,
                                    COALESCE(sum(content_size), 0) AS b
-                            FROM snapshot_items WHERE snapshot_id = :sid
+                            -- a reuse snapshot (unchanged mailbox) owns no rows
+                            FROM snapshot_items WHERE snapshot_id = COALESCE(
+                                (SELECT reuse_chain_root_id FROM snapshots WHERE id = :sid), :sid)
                         """),
                         {"sid": sid},
                     )).first()

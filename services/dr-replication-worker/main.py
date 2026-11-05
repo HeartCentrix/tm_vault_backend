@@ -319,6 +319,21 @@ async def replicate_snapshot(snapshot: Snapshot, tenant: Tenant, session):
         await _replicate_catalogue_snapshot(snapshot, tenant, session)
         return
 
+    root_id = getattr(snapshot, "reuse_chain_root_id", None)
+    if root_id is not None:
+        # An unchanged mailbox's reuse snapshot owns no rows; its data is the
+        # full snapshot it names. Replicated once that one is; until then it
+        # stays pending (rescanned, no attempt spent).
+        root = await session.get(Snapshot, root_id)
+        if root is None or root.dr_replication_status != "replicated":
+            snapshot.dr_error = f"waiting for reused snapshot {root_id} to replicate"
+            return
+        snapshot.dr_replication_status = "replicated"
+        snapshot.dr_blob_path = root.dr_blob_path
+        snapshot.dr_replicated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        snapshot.dr_error = None
+        return
+
     snapshot.dr_replication_status = "in_progress"
     snapshot.dr_replication_attempts = (snapshot.dr_replication_attempts or 0) + 1
     await session.flush()

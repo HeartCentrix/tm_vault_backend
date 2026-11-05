@@ -19,7 +19,7 @@ from sqlalchemy.orm import aliased
 from shared.database import get_db, init_db, close_db, AsyncSession, async_session_factory
 from shared.models import Snapshot, SnapshotItem, Resource, SnapshotType, SnapshotStatus, ResourceType, ResourceStatus, Job, ChatItemVersion, SnapshotChatInventory, ChatCaptureAttempt, ChatThread, ChatThreadMessage, SnapshotChatPresentation
 from shared.chat_catalogue import materialize_chat_items, ChatCatalogueIntegrityError
-from shared.snapshot_reuse import resolve_snapshot_items_target, SnapshotNotFound
+from shared.snapshot_reuse import resolve_snapshot_items_target, SnapshotNotFound, items_snapshot_id
 from shared.audit import internal_audit_headers
 from shared.config import settings
 # Producer-only; on-demand archive enrichment nudge. Defensive so this read API
@@ -1976,7 +1976,7 @@ async def search_snapshot_items(
         Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL]),
     )
     if snapshot_id:
-        snapshot_ids_stmt = snapshot_ids_stmt.where(Snapshot.id == UUID(snapshot_id))
+        snapshot_ids_stmt = snapshot_ids_stmt.where(Snapshot.id == await items_snapshot_id(db, snapshot_id))
     snapshot_ids_result = await db.execute(snapshot_ids_stmt)
     # ``select(Snapshot.id)`` + ``.scalars()`` yields bare UUIDs, NOT ORM rows.
     # The old ``s.id`` therefore raised
@@ -2038,7 +2038,7 @@ async def get_snapshot_item_detail(snapshot_id: str, item_id: str, db: AsyncSess
         return _item_to_response(item)
 
     stmt = select(SnapshotItem).where(
-        SnapshotItem.snapshot_id == UUID(snapshot_id),
+        SnapshotItem.snapshot_id == await items_snapshot_id(db, snapshot_id),
         SnapshotItem.id == UUID(item_id),
     )
     result = await db.execute(stmt)
@@ -4521,7 +4521,7 @@ async def get_item_content(
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
 
-    if item.snapshot_id != UUID(snapshot_id):
+    if item.snapshot_id != await items_snapshot_id(db, snapshot_id):
         raise HTTPException(status_code=404, detail="Item not found")
     catalogue = await _catalogue_snapshot(db, snapshot_id)
     if catalogue is not None:
@@ -4731,6 +4731,7 @@ async def get_item_attachments(
     _iid = _safe_uuid(item_id)
     if _sid is None or _iid is None:
         return []
+    _sid = await items_snapshot_id(db, str(_sid))
     parent = await db.get(SnapshotItem, _iid)
     if not parent:
         raise HTTPException(status_code=404, detail="Item not found")

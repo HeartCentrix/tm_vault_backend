@@ -4075,6 +4075,8 @@ async def run_backup_verification():
                     Snapshot.status == SnapshotStatus.COMPLETED,
                     Snapshot.completed_at >= cutoff,
                     Snapshot.item_count > 0,
+                    # Reuse snapshots own no rows; the snapshot they name is sampled itself.
+                    Snapshot.reuse_of_snapshot_id.is_(None),
                 ))
                 .order_by(func.random())
                 .limit(BACKUP_VERIFY_SAMPLE_SIZE)

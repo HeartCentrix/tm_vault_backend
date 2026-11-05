@@ -18,7 +18,7 @@ import time
 from uuid import UUID
 from weakref import WeakKeyDictionary
 
-from sqlalchemy import and_, delete, exists, func, or_, select
+from sqlalchemy import and_, delete, exists, func, or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from shared import chat_catalogue as catalogue
@@ -995,6 +995,28 @@ async def derive_shared_chat(*, scope, session_factory, covers, folder_path=None
                     "full_observed_at": full.isoformat() if full else None})
 
 
+async def _changes_already_read(session_factory, candidates) -> set:
+    """``candidates``: chat id -> (inventory id, newest message change). The chats whose inventory already
+    holds a message version modified exactly then. Callers ask only for changes made before that read
+    started, inside the safety margin: nothing is newer, so that read saw the chat as it is now.
+    Railway 2026-11-05 #8: an edit 4 minutes before a read re-read the 3,955-message chat next run."""
+    if not candidates:
+        return set()
+    chats = list(candidates)
+
+    async def find(session):
+        return set((await session.scalars(text("""
+            SELECT c.chat FROM unnest(CAST(:chats AS text[]), CAST(:inventories AS uuid[]), CAST(:changes AS timestamptz[]))
+                AS c(chat, inventory, changed)
+            WHERE EXISTS (SELECT 1 FROM chat_inventory_items ii JOIN chat_item_versions v ON v.id = ii.version_id
+                WHERE ii.inventory_id = c.inventory AND v.item_type = ANY(CAST(:types AS text[]))
+                  AND CASE WHEN v.payload::jsonb->>'lastModifiedDateTime' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T'
+                           THEN (v.payload::jsonb->>'lastModifiedDateTime')::timestamptz END = c.changed)"""),
+            {"chats": chats, "inventories": [str(candidates[c][0]) for c in chats],
+             "changes": [candidates[c][1] for c in chats], "types": list(catalogue._MESSAGE_TYPES)})).all())
+    return await run_catalogue_transaction(session_factory, find)
+
+
 async def reuse_unchanged_chat(*, scope, graph_client, session_factory, folder_path=None,
                                exclude_message=None, scope_filter_hash=None):
     """Incremental: a chat with no message modified since this member's last COMPLETE capture of
@@ -1040,7 +1062,8 @@ async def reuse_unchanged_chat(*, scope, graph_client, session_factory, folder_p
     except ChatGraphError as exc:
         logger.warning("chat_incremental_check_failed chat=%s status=%s", scope.chat_id, getattr(exc, "status_code", None))
         return None
-    if latest is not None and latest > observed - overlap:
+    if latest is not None and latest > observed - overlap and not (
+            latest <= observed and await _changes_already_read(session_factory, {scope.chat_id: (inventory_id, latest)})):
         return None
     provenance = {"reused_unchanged_from_attempt": str(attempt_id), "source_observed_at": observed.isoformat(),
                   "full_observed_at": full.isoformat(), "latest_message_change": latest.isoformat() if latest else None}
@@ -1150,10 +1173,14 @@ async def link_unchanged_chats(*, scopes, folders, filter_hashes, session_factor
     run_key = await run_catalogue_transaction(session_factory, run_of) or any_scope.snapshot_id
     latest = await _shared_latest_changes(run_key, any_scope.tenant_id,
                                           [attempt.chat_id for attempt, *_ in eligible], latest_change)
+    already_read = await _changes_already_read(session_factory, {
+        attempt.chat_id: (inventory.id, latest[attempt.chat_id]) for attempt, inventory, observed, _ in eligible
+        if latest[attempt.chat_id] and observed - overlap < latest[attempt.chat_id] <= observed})
     links = {}
     for attempt, inventory, observed, full in eligible:
         changed_at = latest[attempt.chat_id]
-        if changed_at is False or (changed_at is not None and changed_at > observed - overlap):
+        if changed_at is False or (changed_at is not None and changed_at > observed - overlap
+                                   and attempt.chat_id not in already_read):
             continue
         provenance = {"reused_unchanged_from_attempt": str(attempt.id), "source_observed_at": observed.isoformat(),
                       "full_observed_at": full.isoformat(), "delta_unchanged_since_snapshot": str(source_snapshot_id),

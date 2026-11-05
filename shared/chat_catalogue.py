@@ -378,7 +378,8 @@ async def copy_versions(session, *, lease: CaptureLease, inventory_id, source_sn
     and its rows in ``source_snapshot_id`` with this capture's folder and default backend. Copying
     the edited 3,955-message chat to a second member re-staged it 200 rows per transaction (~25
     transactions, ~1 min; Railway 2026-11-05). Returns False, with nothing written, unless every
-    key was copied; publishing still validates the staged rows (``_staged``)."""
+    key was copied; publishing still validates the staged rows (``_staged``). Only ``keys`` are
+    linked, whatever else is already staged."""
     attempt, scope = await _attempt(session, lease)
     inventory = await _locked(session, ChatInventory, ChatInventory.id == lease.staged_inventory_id)
     if inventory is None or inventory.state != "STAGING":
@@ -401,9 +402,9 @@ async def copy_versions(session, *, lease: CaptureLease, inventory_id, source_sn
             si.chat_version_id, now() AT TIME ZONE 'utc'
         FROM chat_inventory_items ii JOIN chat_item_versions v ON v.id = ii.version_id
         JOIN snapshot_items si ON si.external_id = ii.logical_key AND si.chat_version_id = ii.version_id
-        WHERE ii.inventory_id = :staged AND si.snapshot_id = :source"""),
+        WHERE ii.inventory_id = :staged AND ii.logical_key = ANY(:keys) AND si.snapshot_id = :source"""),
         {"snapshot": scope.snapshot_id, "folder": attempt.folder_path, "backend": scope.backend_id,
-         "staged": inventory.id, "source": source_snapshot_id})).rowcount
+         "staged": inventory.id, "keys": keys, "source": source_snapshot_id})).rowcount
     if entries != len(keys) or links != len(keys):
         await nested.rollback()
         return False

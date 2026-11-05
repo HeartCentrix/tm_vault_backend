@@ -128,7 +128,9 @@ async def resolve_selection(
     if not clauses:
         return []
 
-    snap_uuid = uuid.UUID(snapshot_id)
+    # An unchanged mailbox's reuse snapshot owns no rows: select from the full one it names.
+    from shared.snapshot_reuse import items_snapshot_id
+    snap_uuid = await items_snapshot_id(session, snapshot_id)
     stmt = select(SnapshotItem).where(
         SnapshotItem.snapshot_id == snap_uuid,
         or_(*clauses),
