@@ -390,3 +390,18 @@ async def test_manifest_cannot_register_source_after_retention_claim(store):
         with pytest.raises(ValueError,match='source'):
             await running
     assert await store.rows()==[]
+
+
+async def test_batch_is_capped_by_stored_bytes_but_always_takes_one_row(store, monkeypatch):
+    # Inline mail attachments put ~1 MB of base64 in each row; 512 of them in
+    # one statement outran the 30 s copy statement timeout on every retry.
+    for ext in ("a", "b", "c"):
+        await store.add(ext, kind="EMAIL", metadata={"inline_b64": os.urandom(3000).hex()})
+    monkeypatch.setattr(executor(), "BATCH_MAX_BYTES", 8000)
+    task = await store.task("MAIL_CARRY")
+    await prepare(store, task)
+    first = await batch(store, task, 20)
+    assert (first["rows"], first["done"]) == (2, False)
+    monkeypatch.setattr(executor(), "BATCH_MAX_BYTES", 1)
+    assert (await batch(store, task, 20))["rows"] == 1
+    assert [r["external_id"] for r in await store.rows()] == ["a", "b", "c"]

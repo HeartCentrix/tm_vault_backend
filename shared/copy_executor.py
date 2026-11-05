@@ -329,6 +329,9 @@ async def prepare_manifest(session, task) -> None:
     task.params, task.prepared = dict(result["params"] or {}), True
 
 
+BATCH_MAX_BYTES = 8 * 1024 * 1024
+
+
 async def copy_manifest_batch(session, task, *, limit: int) -> dict:
     """Apply one phase/keyset batch. Caller persists returned checkpoint in this transaction."""
     if task.kind not in KINDS or not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
@@ -339,10 +342,14 @@ async def copy_manifest_batch(session, task, *, limit: int) -> dict:
     if task.kind in {'CHAT_LABELS', 'CHAT_PRESENTATION'}:
         from shared.chat_presentation_work import apply_label_batch
         return await apply_label_batch(session, task, limit=limit)
+    # Rows are also capped by stored payload bytes (always at least one row):
+    # inline mail attachments make a 512-row batch tens of MB.
     prefix = """WITH batch AS MATERIALIZED (
-        SELECT * FROM copy_work_items WHERE task_id=:task_id AND ordinal>:checkpoint
+        SELECT * FROM (SELECT w.*, sum(pg_column_size(w.payload)) OVER (ORDER BY w.ordinal) AS run_bytes
+          FROM (SELECT * FROM copy_work_items WHERE task_id=:task_id AND ordinal>:checkpoint
           AND phase=(SELECT phase FROM copy_work_items WHERE task_id=:task_id AND ordinal>:checkpoint ORDER BY ordinal LIMIT 1)
-         ORDER BY ordinal LIMIT :limit
+         ORDER BY ordinal LIMIT :limit) w) sized
+         WHERE run_bytes - pg_column_size(payload) < :max_bytes
     ), batch_validity AS MATERIALIZED (
         SELECT NOT EXISTS (
             SELECT 1 FROM batch b WHERE b.payload->>'item_type'='EMAIL_ATTACHMENT'
@@ -383,7 +390,7 @@ async def copy_manifest_batch(session, task, *, limit: int) -> dict:
             (SELECT count(*) FROM changed WHERE NOT :archive OR item_type='ARCHIVE_ITEM') AS rows,
             (SELECT COALESCE(sum(content_size),0) FROM changed) AS bytes
     """), {"task_id": task.id, "checkpoint": int(task.checkpoint or 0), "limit": limit,
-           "tsid": scope["target_snapshot_id"], "tid": scope["tenant_id"],
+           "max_bytes": BATCH_MAX_BYTES, "tsid": scope["target_snapshot_id"], "tid": scope["tenant_id"],
            "archive": task.kind == "ARCHIVE_CARRY", "legacy": bool(params.get("legacy_patterns_only", False))})).mappings().one()
     if not row["parents_valid"]:
         raise RuntimeError("required mail attachment parent is missing from target")
