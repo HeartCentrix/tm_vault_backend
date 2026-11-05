@@ -609,7 +609,7 @@ async def test_incremental_links_every_chat_the_delta_feed_shows_unchanged_at_on
     source.chats.append({"id": "chat-beta", "topic": "Beta"})
     source.messages["chat-beta"] = [{"id": "message-beta", "body": {"content": "b"}, "attachments": []}]
     feed, rounds, checks = [], [], []
-    delta_source(source, feed, rounds, checks)
+    delta_source(source, feed, rounds, checks, latest_at=datetime(2020, 1, 1, tzinfo=timezone.utc))
     first = await legacy_scope(store)
     assert (await source_adapter.run(first))["outcome"] == "complete"
     assert rounds == [None] and (await delta_cursor(store, first.resource_id))["link"] == "link-1"
@@ -618,7 +618,7 @@ async def test_incremental_links_every_chat_the_delta_feed_shows_unchanged_at_on
     feed.append(set())
     second = await store.new_scope()
     assert (await source_adapter.run(second))["outcome"] == "complete"
-    assert rounds == [None, "link-1"] and checks == [] and source.message_calls == reads
+    assert rounds == [None, "link-1"] and sorted(checks) == ["chat-alpha", "chat-beta"] and source.message_calls == reads
     before, after = await chat_state(store, first.snapshot_id), await chat_state(store, second.snapshot_id)
     assert after == before and len(after[0]) == 2
     async with store.factory() as session:
@@ -629,12 +629,45 @@ async def test_incremental_links_every_chat_the_delta_feed_shows_unchanged_at_on
     assert (await delta_cursor(store, first.resource_id)) == {"link": "link-2", "snapshot_id": str(second.snapshot_id),
         "principal": first.principal_id, "scope": source.permission_scope_hash}
 
+    async def latest(chat_id):
+        checks.append(chat_id)
+        return datetime.now(timezone.utc) if chat_id == "chat-beta" else datetime(2020, 1, 1, tzinfo=timezone.utc)
+    source.latest_message_change = latest
     feed.append({"chat-beta"})
     third = await store.new_scope()
     assert (await source_adapter.run(third))["outcome"] == "complete"
-    assert rounds[-1] == "link-2" and checks == ["chat-beta"]
+    assert rounds[-1] == "link-2" and sorted(checks[2:]) == ["chat-alpha", "chat-beta"]
     assert set(source.message_calls[len(reads):]) == {"chat-beta"}
     assert len((await chat_state(store, third.snapshot_id))[0]) == 2
+
+
+async def test_delta_feed_silence_never_links_a_chat_whose_message_was_edited(store, source_adapter):
+    """Railway 2026-11-05: a 13-hour-old message in a group chat was edited at 14:38; at 14:42 every
+    member's delta feed reported no change and all five linked the old version. Each chat the feed
+    shows unchanged is still checked with one request before it is linked."""
+    source = source_adapter.source
+    source.chats.append({"id": "chat-beta", "topic": "Beta"})
+    source.messages["chat-beta"] = [{"id": "message-beta", "body": {"content": "b"}, "attachments": []}]
+    old = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    feed, rounds, checks = [], [], []
+    delta_source(source, feed, rounds, checks, latest_at=old)
+    first = await legacy_scope(store)
+    await source_adapter.run(first)
+    before, reads = await chat_state(store, first.snapshot_id), len(source.message_calls)
+
+    source.messages["chat-beta"] = [{"id": "message-beta", "body": {"content": "edited"}, "attachments": []}]
+    async def latest(chat_id):
+        checks.append(chat_id)
+        return datetime.now(timezone.utc) if chat_id == "chat-beta" else old
+    source.latest_message_change = latest
+    feed.append(set())
+    second = await store.new_scope()
+    assert (await source_adapter.run(second))["outcome"] == "complete"
+    assert {"chat-alpha", "chat-beta"} <= set(checks)
+    assert set(source.message_calls[reads:]) == {"chat-beta"}
+    after = await chat_state(store, second.snapshot_id)
+    assert len(after[0]) == 2 and after[1] != before[1]
+    assert await chat_state(store, first.snapshot_id) == before
 
 
 async def test_delta_feed_failure_falls_back_to_checking_each_chat(store, source_adapter):
@@ -681,7 +714,7 @@ async def test_delta_run_skips_known_hosted_elsewhere_chats_and_already_linked_c
     source.home_tenant_id = "home-tenant"
     source.chats.append({"id": "external-meeting", "topic": "Vendor call", "tenantId": "other-tenant"})
     feed, rounds, checks = [set(), set()], [], []
-    delta_source(source, feed, rounds, checks)
+    delta_source(source, feed, rounds, checks, latest_at=datetime(2020, 1, 1, tzinfo=timezone.utc))
     plain = source.latest_message_change
 
     async def latest(chat_id):
@@ -695,7 +728,7 @@ async def test_delta_run_skips_known_hosted_elsewhere_chats_and_already_linked_c
     assert checks == ["external-meeting"]
     second = await store.new_scope()
     assert (await source_adapter.run(second))["outcome"] == "complete"
-    assert checks == ["external-meeting"]
+    assert checks.count("external-meeting") == 1
     async with store.factory() as session:
         record = (await session.get(models.Snapshot, second.snapshot_id)).extra_data["chat_catalogue_scopes"]["resource"]
     assert record["complete"] and record["external_tenant_chats"] == ["external-meeting"]
@@ -708,4 +741,4 @@ async def test_delta_run_skips_known_hosted_elsewhere_chats_and_already_linked_c
         return await published(session, scope)
     monkeypatch.setattr(chat_catalogue_entry, "_published_chat", counted)
     assert (await source_adapter.run(second))["outcome"] == "complete"   # a resumed turn of the same snapshot
-    assert walked == [] and checks == ["external-meeting"]
+    assert walked == [] and checks.count("external-meeting") == 1

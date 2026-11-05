@@ -633,7 +633,8 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                     linked = await link_unchanged_chats(scopes={cid: chat_scope(cid) for cid in unchanged},
                         folders={cid: chat_folder(chats[cid], principal) for cid in unchanged},
                         filter_hashes={cid: filters[cid][1] for cid in unchanged},
-                        session_factory=session_factory, source_snapshot_id=since_snapshot)
+                        session_factory=session_factory, source_snapshot_id=since_snapshot,
+                        latest_change=source.latest_message_change)
                     if linked:
                         completed += len(linked)
                         keys = [cid for cid in keys if cid not in linked]
