@@ -3671,6 +3671,31 @@ def _resource_has_incremental_cursor(extra_data: dict) -> bool:
     return any(extra_data.get(k) for k in INCREMENTAL_CURSOR_KEYS)
 
 
+async def _calendar_series_and_single_rows(graph_client, user_id, cal_id, cal_name, seen_ids):
+    """CALENDAR_EVENT rows for every series master and single event of a calendar that the
+    windowed calendarView did not return. calendarView only expands occurrences inside its window,
+    so restore had no master to rebuild most recurring series from (Railway 2026-11-05: 159 series
+    referenced, 60 masters stored) and events older than 2 years or over 1 year ahead were never
+    backed up. The plain events list has no window and returns masters and single events only."""
+    path = "events" if cal_id == "default" else f"calendars/{cal_id}/events"
+    rows = []
+    async for page in graph_client._iter_pages(f"{graph_client.GRAPH_URL}/users/{user_id}/{path}?$top=500", params=None):
+        for e in page.get("value", []) or []:
+            eid = e.get("id")
+            if not eid or eid in seen_ids:
+                continue
+            seen_ids.add(eid)
+            rows.append((
+                "CALENDAR_EVENT",
+                e.get("subject") or "(no subject)",
+                eid,
+                {"raw": e, "calendarId": cal_id, "calendarName": cal_name,
+                 "seriesMasterId": e.get("seriesMasterId"), "type": e.get("type")},
+                f"Calendar/{cal_name}",
+            ))
+    return rows
+
+
 def _should_skip_subcalendar(
     *,
     last_fetched_iso,
@@ -9040,6 +9065,12 @@ class BackupWorker:
                     SUB_REFRESH_HOURS = float(os.environ.get(
                         "CALENDAR_SUBCALENDAR_REFRESH_HOURS", "24",
                     ))
+                    # Full events sweep (masters + events outside the window): at most once per
+                    # refresh window per calendar, same clock as the sub-calendar throttle.
+                    swept_map: Dict[str, str] = dict(
+                        (resource.extra_data or {}).get("calendar_events_swept_at") or {}
+                    )
+                    new_swept_map: Dict[str, str] = {}
 
                     # 1) Enumerate calendars owned by the user.
                     try:
@@ -9212,6 +9243,33 @@ class BackupWorker:
                                 tzinfo=timezone.utc,
                             ).isoformat()
 
+                        # Every series master and single event, also outside the view window:
+                        # restore rebuilds a recurring series from its master, and events older
+                        # than 2 years or over 1 year ahead never appear in calendarView.
+                        # ponytail: re-reads the whole events list once per refresh window per
+                        # calendar; move to a cursor if very large calendars make it costly.
+                        if cal_stream_failed:
+                            pass
+                        elif _should_skip_subcalendar(
+                            last_fetched_iso=swept_map.get(cal_id),
+                            now_dt=now_utc,
+                            refresh_hours=SUB_REFRESH_HOURS,
+                        ):
+                            new_swept_map[cal_id] = swept_map[cal_id]
+                        else:
+                            try:
+                                _swept = await _calendar_series_and_single_rows(
+                                    graph_client, user_id, cal_id, cal_name,
+                                    {r[2] for r in out_rows},
+                                )
+                                out_rows.extend(_swept)
+                                new_swept_map[cal_id] = now_utc.isoformat()
+                                print(f"[{self.worker_id}]   [USER_CALENDAR] {cal_name}: "
+                                      f"{len(_swept)} series master(s)/event(s) outside the view added")
+                            except Exception as _se:
+                                print(f"[{self.worker_id}]   [USER_CALENDAR] events sweep failed for "
+                                      f"{cal_name}: {type(_se).__name__}: {_se}")
+
                     # STASH the per-calendar delta tokens and persist the
                     # sub-calendar fetched_at stamps for next run. The
                     # fetched_at map is only a throttle clock (a skipped
@@ -9225,7 +9283,7 @@ class BackupWorker:
                     #
                     # 410-expired tokens are the one exception: they are
                     # evicted from the ACTIVE map immediately (below).
-                    if new_delta_map or new_sub_fetched_map or _expired_delta_cal_ids:
+                    if new_delta_map or new_sub_fetched_map or new_swept_map or _expired_delta_cal_ids:
                         try:
                             async with async_session_factory() as _s:
                                 r = await _s.get(Resource, resource.id)
@@ -9257,6 +9315,10 @@ class BackupWorker:
                                         merged_sub = dict(ed.get("calendar_subcalendar_fetched_at") or {})
                                         merged_sub.update(new_sub_fetched_map)
                                         ed["calendar_subcalendar_fetched_at"] = merged_sub
+                                    if new_swept_map:
+                                        merged_swept = dict(ed.get("calendar_events_swept_at") or {})
+                                        merged_swept.update(new_swept_map)
+                                        ed["calendar_events_swept_at"] = merged_swept
                                     r.extra_data = ed
                                     await _s.commit()
                         except Exception as _e:

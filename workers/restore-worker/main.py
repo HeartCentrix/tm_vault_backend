@@ -397,6 +397,16 @@ def _ics_datetime(raw: dict) -> str:
     return compact  # consumers interpret per the TZID param on DTSTART
 
 
+def _series_children_restored_by_master(items, raw_of):
+    """Ids of occurrence/exception CALENDAR_EVENT rows whose series master is restored with them.
+    The master carries the recurrence and recreates the whole series, so posting its children as
+    well would duplicate every meeting (the PST writer already skips children)."""
+    masters = {it.external_id for it in items
+               if it.item_type == "CALENDAR_EVENT" and (raw_of(it) or {}).get("type") == "seriesMaster"}
+    return {it.id for it in items
+            if it.item_type == "CALENDAR_EVENT" and (raw_of(it) or {}).get("seriesMasterId") in masters}
+
+
 def _event_to_ics(event: dict) -> str:
     """Serialize a Graph event dict to a minimal VCALENDAR/VEVENT block."""
     if not isinstance(event, dict):
@@ -1710,6 +1720,8 @@ class RestoreWorker:
                 restored_count += a_summary.get("created", 0)
                 failed_count += a_summary.get("failed", 0)
 
+            series_children = _series_children_restored_by_master(
+                resource_items, lambda it: self._get_item_metadata(it).get("raw"))
             for item in resource_items:
                 try:
                     if item.item_type in ("EMAIL",):
@@ -1731,6 +1743,8 @@ class RestoreWorker:
                             session=session,
                         )
                     elif item.item_type == "CALENDAR_EVENT":
+                        if item.id in series_children:
+                            continue  # its series master recreates this occurrence
                         await self._restore_event_to_calendar(session, graph_client, resource, item)
                     elif item.item_type == "USER_CONTACT":
                         await self._restore_contact_to_mailbox(graph_client, resource, item)
