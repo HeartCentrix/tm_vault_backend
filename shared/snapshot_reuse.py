@@ -179,3 +179,20 @@ async def point_at(session: AsyncSession, *, target_snapshot_id: UUIDLike, prior
           AND NOT EXISTS (SELECT 1 FROM snapshot_items WHERE snapshot_id = t.id)
         RETURNING t.id"""), {"target": str(target_snapshot_id), "prior": str(prior_snapshot_id), "marker": marker})).first()
     return row is not None
+
+
+async def resolve_snapshot_ids(session: AsyncSession, snapshot_ids) -> list:
+    """Each id mapped to the snapshot whose rows it reads (itself, or the full snapshot a reuse snapshot
+    names), order kept; unknown or non-UUID ids are kept as given."""
+    def parsed(value):
+        try:
+            return _coerce_uuid(value)
+        except (ValueError, TypeError, AttributeError):
+            return None
+    values = list(snapshot_ids)
+    ids = [parsed(value) for value in values]
+    known = [str(i) for i in ids if i is not None]
+    rows = dict((await session.execute(text(
+        "SELECT id, COALESCE(reuse_chain_root_id, id) FROM snapshots WHERE id = ANY(CAST(:ids AS uuid[]))"),
+        {"ids": known})).all()) if known else {}
+    return [value if i is None else _coerce_uuid(rows.get(i, i)) for value, i in zip(values, ids)]

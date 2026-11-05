@@ -1392,3 +1392,64 @@ async def test_unchanged_messages_do_not_list_their_images_again(store, adapters
     _, result = await run_capture(store, adapters)
     assert result.outcome == "complete" and result.item_count == 200
     assert adapters.source.hosted_lists - before == 2   # only the edited message, once per pass
+
+
+async def _two_chat_backup(store, adapters):
+    """One USER_CHATS backup holding two complete chats, then marked COMPLETED."""
+    from shared.models import Snapshot, SnapshotStatus
+    adapters.source.messages = [message(attached=True)]
+    first = await store.new_scope()
+    for chat in ("chat-alpha", "chat-beta"):
+        await adapters.capture.capture_chat_inventory(scope=replace(first, chat_id=chat), graph_client=object(),
+            storage=adapters.storage, session_factory=store.factory, folder_path=f"chats/{chat}")
+    async with store.factory.begin() as session:
+        backup = await session.get(Snapshot, first.snapshot_id)
+        backup.status = SnapshotStatus.COMPLETED
+        backup.extra_data = {**(backup.extra_data or {}),   # as the catalogue finalize records it
+                             "chat_catalogue_scopes": {"resource": {"complete": True, "external_tenant_chats": []}}}
+    return first
+
+
+async def _link_all(adapters, store, first, scope, *, folders=None):
+    async def probe(chat_id):
+        return datetime(2020, 1, 1, tzinfo=timezone.utc)
+    chats = ("chat-alpha", "chat-beta")
+    return await adapters.capture.link_unchanged_chats(scopes={c: replace(scope, chat_id=c) for c in chats},
+        folders=folders or {c: f"chats/{c}" for c in chats}, filter_hashes={}, session_factory=store.factory,
+        source_snapshot_id=first.snapshot_id, latest_change=probe, whole_snapshot=True, external_chats=set())
+
+
+async def test_backup_whose_every_chat_is_unchanged_points_at_the_prior(store, adapters, monkeypatch):
+    """Every incremental copied each unchanged chat's rows (203,780 rows for 10 users per run). When
+    every chat of the backup is unchanged and identical to the prior backup's (same chats, inventories,
+    folders), the backup points at it; chat reads, selection and counts follow the pointer."""
+    from shared.models import Snapshot, SnapshotChatInventory
+    from shared.chat_catalogue_entry import catalogue_snapshot_result
+    from shared.chat_presentation import chat_message_statement
+    monkeypatch.setenv("CHAT_INCREMENTAL_REUSE", "true")
+    first = await _two_chat_backup(store, adapters)
+    scope = await store.new_scope()
+    assert await _link_all(adapters, store, first, scope) == {"chat-alpha", "chat-beta"}
+    async with store.factory() as session:
+        pointer = await session.get(Snapshot, scope.snapshot_id)
+        assert (pointer.reuse_of_snapshot_id, pointer.reuse_chain_root_id) == (first.snapshot_id, first.snapshot_id)
+        assert await session.scalar(select(func.count()).select_from(SnapshotItem).where(SnapshotItem.snapshot_id == scope.snapshot_id)) == 0
+        assert await session.scalar(select(func.count()).select_from(SnapshotChatInventory).where(SnapshotChatInventory.snapshot_id == scope.snapshot_id)) == 0
+        original = await catalogue_snapshot_result(session, first.snapshot_id, force_recount=True)
+        counts = await catalogue_snapshot_result(session, scope.snapshot_id, force_recount=True)
+        assert (counts["item_count"], counts["bytes_total"], counts["new_item_count"], counts["bytes_added"]) == (
+            original["item_count"], original["bytes_total"], 0, 0)
+        statement = await chat_message_statement(session, snapshot_ids=[str(scope.snapshot_id)], chat_id="chat-alpha")
+        assert {row.snapshot_id for row in (await session.scalars(statement)).all()} == {first.snapshot_id}
+
+
+async def test_renamed_chat_folder_copies_rows_instead_of_pointing(store, adapters, monkeypatch):
+    from shared.models import Snapshot
+    monkeypatch.setenv("CHAT_INCREMENTAL_REUSE", "true")
+    first = await _two_chat_backup(store, adapters)
+    scope = await store.new_scope()
+    renamed = {"chat-alpha": "chats/Renamed", "chat-beta": "chats/chat-beta"}
+    assert await _link_all(adapters, store, first, scope, folders=renamed) == {"chat-alpha", "chat-beta"}
+    async with store.factory() as session:
+        assert (await session.get(Snapshot, scope.snapshot_id)).reuse_of_snapshot_id is None
+    assert {row[5] for row in await chat_rows(store, scope.snapshot_id)} == {"chats/Renamed", "chats/chat-beta"}

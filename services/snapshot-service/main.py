@@ -344,6 +344,9 @@ async def _catalogue_snapshot(db, snapshot_id, *, resolve_chat_sibling=False):
     source = await db.get(Snapshot, UUID(str(snapshot_id)))
     if source is None:
         raise HTTPException(404, detail="Snapshot not found")
+    if source.reuse_chain_root_id is not None and (source.extra_data or {}).get("chat_inventory_format") == 1:
+        # Every chat was unchanged: the backup reuses this full backup's chats.
+        source = await db.get(Snapshot, source.reuse_chain_root_id) or source
     if (source.extra_data or {}).get("chat_inventory_format") == 1:
         if source.status == SnapshotStatus.PENDING_DELETION:
             raise HTTPException(404, detail="Snapshot is being deleted")

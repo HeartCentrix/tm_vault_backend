@@ -43,6 +43,7 @@ from shared.models import (
     Tenant,
 )
 from shared.security import get_current_user_from_token
+from shared.snapshot_reuse import resolve_snapshot_ids
 from shared.chat_presentation import (ChatSelectionError, chat_message_statement,
     captured_chat_path, message_chat_id, child_chat_id)
 
@@ -309,7 +310,7 @@ async def estimate(
     count, est_bytes, layout, _ = await _resolve_counts(
         sess,
         resource_id=req.resourceId,
-        snapshot_ids=req.snapshotIds,
+        snapshot_ids=[str(i) for i in await resolve_snapshot_ids(sess, req.snapshotIds or [])],
         thread_path=req.threadPath,
         item_ids=req.itemIds,
         chat_id=req.chatId,
@@ -397,7 +398,7 @@ async def trigger(
     count, est_bytes, layout, _ = await _resolve_counts(
         sess,
         resource_id=req.resourceId,
-        snapshot_ids=req.snapshotIds,
+        snapshot_ids=[str(i) for i in await resolve_snapshot_ids(sess, req.snapshotIds or [])],
         thread_path=req.threadPath,
         item_ids=req.itemIds,
         chat_id=req.chatId,

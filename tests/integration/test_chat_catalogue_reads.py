@@ -391,3 +391,19 @@ async def test_identical_selected_chat_versions_allow_unselected_chat_changes(st
             item_ids=[parent.id for parent in parents])
         assert len(resolved.messages) == 1
         assert resolved.messages[0].extra_data["raw"]["body"]["content"] == "same alpha"
+
+
+async def test_messages_of_a_backup_reusing_another_show_that_backups_chats(store, snapshot_api):
+    """A backup whose every chat was unchanged owns no rows and points at the backup it reuses."""
+    from shared.snapshot_reuse import point_at
+    scope, _, _ = await store.capture([captured_message("pointer needle")])
+    async with store.factory.begin() as db:
+        (await db.get(models.Snapshot, scope.snapshot_id)).status = models.SnapshotStatus.COMPLETED
+    pointer = await store.new_scope()
+    async with store.factory.begin() as db:
+        assert await point_at(db, target_snapshot_id=pointer.snapshot_id, prior_snapshot_id=scope.snapshot_id,
+                              marker="chat_reused_prior")
+    async with store.factory.begin() as db:
+        result = await snapshot_api.list_snapshot_messages(str(pointer.snapshot_id), page=1, size=10,
+            chatId=None, folder=None, search="needle", db=db)
+    assert result["totalElements"] == 1 and result["content"][0]["body"] == "pointer needle"

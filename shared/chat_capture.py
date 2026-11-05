@@ -1130,16 +1130,20 @@ async def _shared_latest_changes(run_key, tenant_id, chat_ids, probe) -> dict:
 
 
 async def link_unchanged_chats(*, scopes, folders, filter_hashes, session_factory, source_snapshot_id,
-                               latest_change) -> set:
+                               latest_change, whole_snapshot=False, external_chats=None) -> set:
     """Publish, in one step, every chat of ``scopes`` that the principal's delta feed showed unchanged
     since ``source_snapshot_id`` (whose run started the feed's cursor) from its COMPLETE publication
     there. Same scope, observation version, weekly full-read deadline and one-request change check
     (``latest_change``) as reuse_unchanged_chat: the feed alone missed an edit of a 13-hour-old group
     message (Railway 2026-11-05). Chats that do not qualify are left for the per-chat path. Returns
     the chat ids published. The change check of each chat is shared by every member of the run
-    (_shared_latest_changes)."""
+    (_shared_latest_changes). ``whole_snapshot``: ``scopes`` are every chat of this backup; when all of
+    them link and match the source backup exactly, the backup points at it instead (_point_at_source)."""
     if not scopes:
         return set()
+    from shared.snapshot_reuse import items_snapshot_id
+    source_snapshot_id = await run_catalogue_transaction(session_factory,
+        lambda session: items_snapshot_id(session, source_snapshot_id))
     from shared.config import settings
     version = settings.CHAT_OBSERVATION_HASH_VERSION
     reconcile = timedelta(hours=float(os.getenv("CHAT_INCREMENTAL_RECONCILE_HOURS", "168")))
@@ -1189,6 +1193,16 @@ async def link_unchanged_chats(*, scopes, folders, filter_hashes, session_factor
         links[attempt.chat_id] = (inventory.id, {**attempt.evidence, "started_at": now.isoformat(), "finished_at": now.isoformat()},
                                   [*([{"source_filter_sha256": recorded}] if recorded is not None else []), provenance])
 
+    if whole_snapshot and links and len(links) == len(scopes) and os.getenv(
+            "CHAT_UNCHANGED_REUSE_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off"):
+        async def point(session):
+            return await _point_at_source(session, scopes=scopes, links=links, folders=folders,
+                                          source_snapshot_id=source_snapshot_id, external_chats=external_chats or set())
+        if await run_catalogue_transaction(session_factory, point):
+            logger.info("chat_unchanged_backup_reused snapshot=%s source=%s chats=%s",
+                        next(iter(scopes.values())).snapshot_id, source_snapshot_id, len(scopes))
+            return set(scopes)
+
     async def publish(session):
         return await catalogue.publish_unchanged_inventories(session, scopes=scopes, links=links, folders=folders,
                                                              source_snapshot_id=source_snapshot_id)
@@ -1200,6 +1214,35 @@ async def link_unchanged_chats(*, scopes, folders, filter_hashes, session_factor
     logger.info("chat_delta_bulk_linked chats=%s eligible=%s checked_changed=%s candidates=%s",
                 len(linked), len(links), len(eligible) - len(links), len(scopes))
     return linked
+
+
+async def _point_at_source(session, *, scopes, links, folders, source_snapshot_id, external_chats):
+    """Point this backup at ``source_snapshot_id`` when it would be an exact copy: the source is a
+    COMPLETED chat backup holding exactly these chats, each with the inventory being linked and the same
+    folder, the same chats hosted in other tenants, and this backup holds nothing yet. Every unchanged
+    incremental copied each chat's rows (203,780 rows for 10 users per run)."""
+    from shared.models import Snapshot, SnapshotStatus
+    from shared.snapshot_reuse import point_at
+    first = next(iter(scopes.values()))
+    parents = await catalogue._lock_scope(session, first)
+    await catalogue._eligible(session, first, parents)
+    source = await session.get(Snapshot, source_snapshot_id)
+    record = ((source.extra_data or {}).get("chat_catalogue_scopes") or {}).get("resource") or {} if source else {}
+    if (source is None or source.status != SnapshotStatus.COMPLETED or source.resource_id != first.resource_id
+            or (source.extra_data or {}).get("chat_inventory_format") != 1 or (source.extra_data or {}).get("cancelled_at")
+            or not record.get("complete") or set(record.get("external_tenant_chats") or ()) != set(external_chats)):
+        return False
+    held = {row.chat_id: (row.inventory_id, row.folder_path) for row in (await session.execute(
+        select(SnapshotChatInventory.chat_id, SnapshotChatInventory.inventory_id, ChatCaptureAttempt.folder_path)
+        .join(ChatCaptureAttempt, ChatCaptureAttempt.id == SnapshotChatInventory.capture_attempt_id)
+        .where(SnapshotChatInventory.snapshot_id == source_snapshot_id))).all()}
+    if held != {cid: (links[cid][0], folders.get(cid)) for cid in scopes}:
+        return False
+    if await session.scalar(select(func.count()).select_from(SnapshotChatInventory)
+                            .where(SnapshotChatInventory.snapshot_id == first.snapshot_id)):
+        return False
+    return await point_at(session, target_snapshot_id=first.snapshot_id, prior_snapshot_id=source_snapshot_id,
+                          marker="chat_reused_prior")
 
 
 async def _link_unchanged(*, scope, session_factory, folder_path, inventory_id, source_snapshot_id, source_evidence, history):

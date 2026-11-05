@@ -161,13 +161,17 @@ async def catalogue_snapshot_result(session, snapshot_id, *, force_recount=False
             "outcome": snapshot.status.value.lower(), "failure_reason": extra.get("failure_reason") or extra.get("error"),
             "failed": snapshot.status == SnapshotStatus.FAILED}
     primary = SnapshotItem.item_type.notin_(["CHAT_ATTACHMENT", "CHAT_HOSTED_CONTENT"])
+    # A backup whose every chat was unchanged points at the full backup it reuses (no rows of its own).
     count, logical_bytes = (await session.execute(select(func.count().filter(primary),
-        func.coalesce(func.sum(SnapshotItem.content_size), 0)).where(SnapshotItem.snapshot_id == snapshot_id))).one()
-    prior = await session.scalar(select(Snapshot.id).where(Snapshot.resource_id == snapshot.resource_id,
+        func.coalesce(func.sum(SnapshotItem.content_size), 0)).where(
+            SnapshotItem.snapshot_id == (snapshot.reuse_chain_root_id or snapshot_id)))).one()
+    prior = None if snapshot.reuse_chain_root_id else await session.scalar(select(Snapshot.id).where(Snapshot.resource_id == snapshot.resource_id,
         Snapshot.id != snapshot_id, Snapshot.job_id != snapshot.job_id,
         Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL]),
         Snapshot.created_at <= snapshot.created_at).order_by(Snapshot.created_at.desc(), Snapshot.id.desc()).limit(1))
-    if prior is None:
+    if snapshot.reuse_chain_root_id:
+        new_count, new_bytes = 0, 0
+    elif prior is None:
         new_count, new_bytes = count, logical_bytes
     else:
         prior_versions = select(SnapshotItem.chat_version_id).where(SnapshotItem.snapshot_id == prior,
@@ -630,11 +634,13 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                 unchanged = [cid for cid in keys if changed is not None and cid not in changed and cid not in published]
                 if unchanged and since_snapshot and not full_backup:
                     from shared.chat_capture import link_unchanged_chats
+                    # First turn, every chat unchanged: the backup may point at its source (exact match only).
                     linked = await link_unchanged_chats(scopes={cid: chat_scope(cid) for cid in unchanged},
                         folders={cid: chat_folder(chats[cid], principal) for cid in unchanged},
                         filter_hashes={cid: filters[cid][1] for cid in unchanged},
                         session_factory=session_factory, source_snapshot_id=since_snapshot,
-                        latest_change=source.latest_message_change)
+                        latest_change=source.latest_message_change,
+                        whole_snapshot=not published and len(unchanged) == len(keys), external_chats=set(external))
                     if linked:
                         completed += len(linked)
                         keys = [cid for cid in keys if cid not in linked]

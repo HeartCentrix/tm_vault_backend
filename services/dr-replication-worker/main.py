@@ -315,10 +315,6 @@ async def replicate_snapshot(snapshot: Snapshot, tenant: Tenant, session):
         )
         return
 
-    if (getattr(snapshot, "extra_data", None) or {}).get("chat_inventory_format") == 1:
-        await _replicate_catalogue_snapshot(snapshot, tenant, session)
-        return
-
     root_id = getattr(snapshot, "reuse_chain_root_id", None)
     if root_id is not None:
         # An unchanged mailbox's reuse snapshot owns no rows; its data is the
@@ -332,6 +328,10 @@ async def replicate_snapshot(snapshot: Snapshot, tenant: Tenant, session):
         snapshot.dr_blob_path = root.dr_blob_path
         snapshot.dr_replicated_at = datetime.now(timezone.utc).replace(tzinfo=None)
         snapshot.dr_error = None
+        return
+
+    if (getattr(snapshot, "extra_data", None) or {}).get("chat_inventory_format") == 1:
+        await _replicate_catalogue_snapshot(snapshot, tenant, session)
         return
 
     snapshot.dr_replication_status = "in_progress"

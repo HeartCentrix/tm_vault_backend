@@ -85,7 +85,8 @@ async def chat_message_statement(session, *, snapshot_ids, chat_id=None,
     Path-only requests retain the exact old path subset. Ambiguous paths fail
     rather than combining conversations that happen to share a title.
     """
-    snapshots, items = _ids(snapshot_ids), _ids(item_ids)
+    from shared.snapshot_reuse import resolve_snapshot_ids
+    snapshots, items = _ids(await resolve_snapshot_ids(session, _ids(snapshot_ids))), _ids(item_ids)
     if (items and (chat_id or thread_path is not None)) or not (chat_id or thread_path is not None or items):
         raise ChatSelectionError("INVALID_SELECTION" if items else "SCOPE_EMPTY")
     if not snapshots:
@@ -192,7 +193,8 @@ async def filter_legacy_children(session, rows, chat_id):
 
 
 async def captured_chat_path(session, snapshot_id, chat_id):
-    snapshot = await session.get(Snapshot, UUID(str(snapshot_id)))
+    from shared.snapshot_reuse import resolve_snapshot_ids
+    snapshot = await session.get(Snapshot, (await resolve_snapshot_ids(session, [snapshot_id]))[0])
     if snapshot is None:
         raise ChatSelectionError('SNAPSHOT_UNAVAILABLE')
     metadata = snapshot.extra_data or {}

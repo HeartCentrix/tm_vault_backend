@@ -59,3 +59,11 @@ def test_pointer_is_replicated_with_the_snapshot_it_reuses():
     root = types.SimpleNamespace(id="root", dr_replication_status="replicated", dr_blob_path="dr/root")
     asyncio.run(_drw.replicate_snapshot(pointer, _TENANT, _Session(root)))
     assert (pointer.dr_replication_status, pointer.dr_blob_path) == ("replicated", "dr/root")
+
+
+def test_chat_pointer_follows_the_backup_it_reuses_not_the_catalogue_copy():
+    pointer = _pointer()
+    pointer.extra_data = {"chat_inventory_format": 1}
+    root = types.SimpleNamespace(id="root", dr_replication_status="replicated", dr_blob_path="dr/root")
+    asyncio.run(_drw.replicate_snapshot(pointer, _TENANT, _Session(root)))
+    assert (pointer.dr_replication_status, pointer.dr_blob_path) == ("replicated", "dr/root")
