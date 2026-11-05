@@ -563,6 +563,23 @@ _CHAT_THREAD_DRAIN_FRESHNESS_S = int(
 # treatment the CDN path in shared/graph_client.py gives them.
 _ONEDRIVE_RETRY_PERMANENT_STATUSES = (404, 410, 423)
 _ONEDRIVE_RETRY_THROTTLE_STATUSES = (429, 503)
+
+
+def _onedrive_download_retry_wait(status_code, retry_after_header, body, attempt) -> float:
+    """Seconds before retrying a throttled/failed OneDrive download, by the shared Graph rule
+    (shared.graph_ratelimit.retry_wait): 429, or 503 with a Retry-After (header, or Graph's body
+    retryAfterSeconds), backs off; any other 5xx waits a short fixed time, never above 10 s."""
+    from shared.graph_ratelimit import parse_retry_after, retry_wait
+    hint = parse_retry_after(retry_after_header)
+    if hint is None and body:
+        try:
+            parsed = json.loads(body)
+            if isinstance(parsed, dict):
+                found = (parsed.get("error") or {}).get("retryAfterSeconds") or parsed.get("retryAfterSeconds")
+                hint = float(found) if found is not None else None
+        except (ValueError, TypeError, AttributeError):
+            pass
+    return min(retry_wait(status_code, hint, attempt), 120.0)
 _ONEDRIVE_RETRY_AUTH_STATUSES = (401, 403)
 
 # The error strings this classifier sees are built by hand at several
@@ -23125,41 +23142,14 @@ class BackupWorker:
                             # immediately and the file was lost.
                             if resp.status_code in (429, 503):
                                 body = await bounded_error_body(resp)
-                                # Default backoff: exponential per resume
-                                # attempt (2s, 4s, 8s, 16s — cap 30s).
-                                # Replaces the prior fixed 10s default,
-                                # which made transient single-file SP
-                                # glitches gate the whole snapshot on
-                                # ~40s of sleep per slow file even when
-                                # SP would have served on retry-1 at 2s.
-                                # The header-supplied Retry-After /
-                                # retryAfterSeconds path overrides this
-                                # — SharePoint speaking authoritatively
-                                # about its own backoff wins, our
-                                # heuristic only fills the gap when SP
-                                # returns 429/503 with no advisory.
-                                retry_secs = float(min(30, 2 ** (resume_attempt + 1)))
-                                ra = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
-                                if ra:
-                                    try:
-                                        retry_secs = float(int(ra.strip()))
-                                    except (ValueError, AttributeError):
-                                        pass
-                                else:
-                                    try:
-                                        import json as _json
-                                        parsed = _json.loads(body)
-                                        if isinstance(parsed, dict):
-                                            err = parsed.get("error") or {}
-                                            cand = (
-                                                err.get("retryAfterSeconds")
-                                                or parsed.get("retryAfterSeconds")
-                                            )
-                                            if cand is not None:
-                                                retry_secs = float(cand)
-                                    except Exception:
-                                        pass
-                                retry_secs = min(max(retry_secs, 1.0), 120.0)
+                                # Shared Graph rule: 429, or 503 with a
+                                # Retry-After hint, is throttling and backs
+                                # off; a 503 without a hint is a server
+                                # error, retried after <= 10 s.
+                                retry_secs = _onedrive_download_retry_wait(
+                                    resp.status_code,
+                                    resp.headers.get("Retry-After") or resp.headers.get("retry-after"),
+                                    body, resume_attempt + 1)
                                 if resume_attempt >= max_resumes:
                                     raise RuntimeError(
                                         f"Graph download HTTP "
