@@ -143,11 +143,16 @@ async def _physical_guards(session, task, workflow, control):
         raise _Deferred('copy_aggregate_busy')
 
 
+# Same budget as the runtime's control statements: a forced checkpoint stalls every query
+# 4-9 s (Railway 2026-11-05 16:45:59: settlement timed out at the former 5 s).
+SETTLE_STATEMENT_MS = 30000
+
+
 async def _settle_once(factory, claim, *, status, error, queued_seconds=0.0, spend_attempt=True, execution_s=0.0):
     """Fresh transaction after rollback; never release a replacement's claim."""
     try:
         async with factory.begin() as session:
-            await _settings(session, claim, 5000, 1000)
+            await _settings(session, claim, SETTLE_STATEMENT_MS, 1000)
             try:
                 # A proven nonexecution release changes only the owned task. Reading
                 # parents is sufficient: the next execution still locks/fences them.

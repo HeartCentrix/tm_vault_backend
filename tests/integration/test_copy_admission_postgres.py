@@ -506,7 +506,7 @@ async def test_settlement_retry_exhaustion_is_reported_without_false_deferral(st
         await db.execute(text("DO $$ BEGIN RAISE EXCEPTION USING ERRCODE='40001'; END $$"))
     async def reject_settlement(db, claimed, statement_timeout_ms, lock_timeout_ms):
         await original_settings(db, claimed, statement_timeout_ms, lock_timeout_ms)
-        if statement_timeout_ms == 5000:
+        if statement_timeout_ms == module.SETTLE_STATEMENT_MS:
             settlement_calls.append(await db.scalar(text('SELECT txid_current()')))
             await db.execute(text(f"DO $$ BEGIN RAISE EXCEPTION USING ERRCODE='{sqlstate}'; END $$"))
     async def no_wait(delay):
@@ -538,7 +538,7 @@ async def test_unsettled_aborts_keep_conservative_budget_across_reclaim_and_rest
         await db.execute(text("DO $$ BEGIN RAISE EXCEPTION USING ERRCODE='40001'; END $$"))
     async def settlement_unavailable(db, claim, statement_timeout_ms, lock_timeout_ms):
         await original_settings(db, claim, statement_timeout_ms, lock_timeout_ms)
-        if blocked and statement_timeout_ms == 5000:
+        if blocked and statement_timeout_ms == module.SETTLE_STATEMENT_MS:
             await db.execute(text("DO $$ BEGIN RAISE EXCEPTION USING ERRCODE='55P03'; END $$"))
     async def no_wait(delay):
         pass
