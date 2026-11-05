@@ -373,6 +373,46 @@ async def stage_versions(session, *, lease: CaptureLease, items: list[CapturedCh
     return StageResult(len(entries), new_versions)
 
 
+async def copy_versions(session, *, lease: CaptureLease, inventory_id, source_snapshot_id, keys) -> bool:
+    """Stage ``keys`` of a published inventory into this capture inside the database: its entries,
+    and its rows in ``source_snapshot_id`` with this capture's folder and default backend. Copying
+    the edited 3,955-message chat to a second member re-staged it 200 rows per transaction (~25
+    transactions, ~1 min; Railway 2026-11-05). Returns False, with nothing written, unless every
+    key was copied; publishing still validates the staged rows (``_staged``)."""
+    attempt, scope = await _attempt(session, lease)
+    inventory = await _locked(session, ChatInventory, ChatInventory.id == lease.staged_inventory_id)
+    if inventory is None or inventory.state != "STAGING":
+        raise ChatCatalogueConflict("capture inventory is no longer staging")
+    await _check_expiry(session, attempt)
+    keys = list(keys)
+    nested = await session.begin_nested()
+    entries = (await session.execute(text("""
+        INSERT INTO chat_inventory_items (inventory_id, logical_key, version_id)
+        SELECT :staged, logical_key, version_id FROM chat_inventory_items
+        WHERE inventory_id = :inventory AND logical_key = ANY(:keys)"""),
+        {"staged": inventory.id, "inventory": inventory_id, "keys": keys})).rowcount
+    links = (await session.execute(text("""
+        INSERT INTO snapshot_items (id, snapshot_id, tenant_id, external_id, parent_external_id, item_type, name,
+            folder_path, content_hash, content_checksum, content_size, blob_path, encryption_key_id, backup_version,
+            metadata, is_deleted, backend_id, chat_version_id, created_at)
+        SELECT gen_random_uuid(), :snapshot, si.tenant_id, si.external_id, si.parent_external_id, si.item_type, si.name,
+            :folder, si.content_hash, si.content_checksum, si.content_size, si.blob_path, si.encryption_key_id,
+            si.backup_version, si.metadata, si.is_deleted, COALESCE((v.content->>'backend_id')::uuid, :backend),
+            si.chat_version_id, now() AT TIME ZONE 'utc'
+        FROM chat_inventory_items ii JOIN chat_item_versions v ON v.id = ii.version_id
+        JOIN snapshot_items si ON si.external_id = ii.logical_key AND si.chat_version_id = ii.version_id
+        WHERE ii.inventory_id = :staged AND si.snapshot_id = :source"""),
+        {"snapshot": scope.snapshot_id, "folder": attempt.folder_path, "backend": scope.backend_id,
+         "staged": inventory.id, "source": source_snapshot_id})).rowcount
+    if entries != len(keys) or links != len(keys):
+        await nested.rollback()
+        return False
+    await nested.commit()
+    attempt.state = "ENUMERATING"
+    await _check_expiry(session, attempt)
+    return True
+
+
 def _evidence_json(evidence):
     values = asdict(evidence)
     for name in ("started_at", "finished_at"):

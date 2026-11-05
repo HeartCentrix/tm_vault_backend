@@ -212,6 +212,7 @@ class _Pass:
     duplicate_messages: int = 0
     verified_binary: int = 0
     stage_s: float = 0.0
+    hosted_reused: int = 0
 
 
 class _CaptureLeaseKeeper:
@@ -675,12 +676,44 @@ async def _prefetched(pages):
                 await close()
 
 
+async def _known_hosted(factory, scope, messages):
+    """Stored hosted-content lists of published message versions identical to these Graph messages (same
+    id, etag and lastModifiedDateTime, children complete). Hosted images only change with their message,
+    so these need no hostedContents request (a 3,955-message chat listed 77 per pass at 1 request/s)."""
+    wanted = {m["id"]: (m.get("etag"), m.get("lastModifiedDateTime")) for m in messages
+              if isinstance(m.get("id"), str) and m.get("etag") and m.get("lastModifiedDateTime")}
+    if not wanted:
+        return {}
+
+    async def find(session):
+        return (await session.execute(select(ChatItemVersion.graph_id, ChatItemVersion.payload).where(
+            ChatItemVersion.tenant_id == scope.tenant_id, ChatItemVersion.chat_id == scope.chat_id,
+            ChatItemVersion.item_type == "TEAMS_CHAT_MESSAGE",
+            func.md5(ChatItemVersion.graph_id).in_([hashlib.md5(i.encode()).hexdigest() for i in wanted]),
+            ChatItemVersion.graph_id.in_(list(wanted)),
+            # Only lists an earlier published backup verified: pass 2 must still observe what pass 1 staged.
+            exists(select(ChatInventoryItem.version_id).join(ChatInventory, ChatInventory.id == ChatInventoryItem.inventory_id)
+                   .where(ChatInventoryItem.version_id == ChatItemVersion.id, ChatInventory.state.in_(("COMPLETE", "PARTIAL")))))
+            .order_by(ChatItemVersion.created_at.desc()))).all()
+    found = {}
+    for graph_id, payload in await run_catalogue_transaction(factory, find):
+        if graph_id in found or not isinstance(payload, dict):
+            continue
+        hosted = payload.get("hostedContents")
+        complete = (payload.get("chat_catalogue_expected_children") or {}).get("complete") is True
+        if complete and isinstance(hosted, list) and (payload.get("etag"), payload.get("lastModifiedDateTime")) == wanted[graph_id]:
+            found[graph_id] = hosted
+    return found
+
+
 async def _observe_pages(*, scope, keeper, factory, source, ledger, observation, exclude_message, folder_path,
                          stats, home_tenant, pool, pending, flush, capture_binary):
     try:
         async for page in _prefetched(source.iter_message_pages(scope.chat_id)):
             keeper.check()
             prepared, parents = [], []
+            known = await _known_hosted(factory, scope, [raw for raw in page if isinstance(raw, dict)
+                                                           and message_references_hosted_content(raw)])
             try:
                 for raw in page:
                     parent = _without_home_tenant(stable_attachment_references(dict(raw)), home_tenant)
@@ -696,7 +729,10 @@ async def _observe_pages(*, scope, keeper, factory, source, ledger, observation,
                     if not valid:
                         stats.unresolved += 1
                     hosted, hosted_complete = [], True
-                    if message_references_hosted_content(raw):
+                    if identifier in known:
+                        hosted = copy.deepcopy(known[identifier])
+                        stats.hosted_reused += 1
+                    elif message_references_hosted_content(raw):
                         try:
                             stats.hosted_lists += 1
                             async for child in source.iter_hosted_contents(scope.chat_id, identifier):
@@ -748,9 +784,9 @@ async def _observe_pages(*, scope, keeper, factory, source, ledger, observation,
             stats.pages += 1
             logger.info(
                 "chat_capture_progress attempt_id=%s observation=%s pages=%s messages_observed=%s "
-                "hosted_enumerations=%s duplicate_messages_skipped=%s verified_binary=%s unresolved=%s stage_s=%.1f",
+                "hosted_enumerations=%s duplicate_messages_skipped=%s verified_binary=%s unresolved=%s stage_s=%.1f hosted_reused=%s",
                 keeper.lease.attempt_id, observation + 1, stats.pages, stats.messages,
-                stats.hosted_lists, stats.duplicate_messages, stats.verified_binary, stats.unresolved, stats.stage_s)
+                stats.hosted_lists, stats.duplicate_messages, stats.verified_binary, stats.unresolved, stats.stage_s, stats.hosted_reused)
         await pool.drain()
         await flush()
         stats.complete = True
@@ -834,11 +870,14 @@ def _inventory_items(session, inventory_id):
         ChatInventoryItem.version_id == ChatItemVersion.id).where(ChatInventoryItem.inventory_id == inventory_id))
 
 
-async def _publish_copy(*, scope, session_factory, items, folder_path, exclude_message, scope_filter_hash, provenance, label):
+async def _publish_copy(*, scope, session_factory, items, folder_path, exclude_message, scope_filter_hash, provenance, label,
+                        source=None):
     """Publish this member's inventory from already-captured items (another member's capture or
     its own unchanged one), re-applying its visibility. The normal staging locks every object and
     rejects retired ones; the catalogue's own validation is checked before publishing. Any
-    mismatch discards the attempt and returns None so the caller captures from Graph."""
+    mismatch discards the attempt and returns None so the caller captures from Graph. ``source``
+    (inventory id, snapshot id) of a publication holding these items lets the database copy them
+    instead of re-staging every row; staging remains the fallback."""
     from shared.config import settings
     version = settings.CHAT_OBSERVATION_HASH_VERSION
     kept, selected = set(), []
@@ -868,7 +907,15 @@ async def _publish_copy(*, scope, session_factory, items, folder_path, exclude_m
 
     lease = await run_catalogue_transaction(session_factory, begin)
     try:
-        for start in range(0, len(selected), 200):
+        copied = False
+        if source is not None:
+            async def bulk(session):
+                nonlocal lease
+                lease = await catalogue.renew_capture(session, lease=lease)
+                return await catalogue.copy_versions(session, lease=lease, inventory_id=source[0], source_snapshot_id=source[1],
+                    keys=[qualified_chat_item_key(scope.chat_id, item.item_type, item.graph_id, item.parent_graph_id) for item in selected])
+            copied = await run_catalogue_transaction(session_factory, bulk)
+        for start in range(0, 0 if copied else len(selected), 200):
             async def stage(session, batch=selected[start:start + 200]):
                 nonlocal lease
                 lease = await catalogue.renew_capture(session, lease=lease)
@@ -943,7 +990,7 @@ async def derive_shared_chat(*, scope, session_factory, covers, folder_path=None
     donor, observed, full, items = found
     return await _publish_copy(scope=scope, session_factory=session_factory, items=items, folder_path=folder_path,
         exclude_message=exclude_message, scope_filter_hash=scope_filter_hash, label="chat_shared_capture_derived",
-        provenance={"derived_from_attempt": str(donor.id), "derived_from_principal": donor.principal_id,
+        source=(donor.staged_inventory_id, donor.snapshot_id), provenance={"derived_from_attempt": str(donor.id), "derived_from_principal": donor.principal_id,
                     "source_observed_at": observed.isoformat() if observed else None,
                     "full_observed_at": full.isoformat() if full else None})
 

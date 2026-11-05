@@ -892,6 +892,50 @@ async def test_derived_copy_keeps_only_the_members_visible_history(store, adapte
     assert len(kept) == 1 and all("old" not in key for key in kept)
 
 
+def _link_rows(session, snapshot_id):
+    columns = (SnapshotItem.external_id, SnapshotItem.parent_external_id, SnapshotItem.item_type, SnapshotItem.name,
+               SnapshotItem.content_hash, SnapshotItem.content_checksum, SnapshotItem.content_size,
+               SnapshotItem.blob_path, SnapshotItem.encryption_key_id, SnapshotItem.backup_version,
+               SnapshotItem.backend_id, SnapshotItem.chat_version_id, SnapshotItem.extra_data, SnapshotItem.is_deleted)
+    return session.execute(select(*columns).where(SnapshotItem.snapshot_id == snapshot_id)
+                           .order_by(SnapshotItem.external_id))
+
+
+async def test_member_copy_of_a_large_chat_is_one_bulk_copy(store, adapters, monkeypatch):
+    """Railway 2026-11-05: copying the edited 3,955-message chat to the other member re-staged it
+    200 rows per transaction (~25 transactions, ~1 min). Its rows already exist in the donor's
+    publication; they are copied inside the database and the catalogue still checks them."""
+    from shared import chat_catalogue as catalogue
+    adapters.source.messages = [*_stamped_messages(150), dict(message(attached=True), id="with-file")]
+    beta_scope = await member_scope(store, "chat-alpha")
+    alpha_scope, alpha = await run_capture(store, adapters)
+    calls, stage = [], catalogue.stage_versions
+
+    async def counting(session, **kwargs):
+        calls.append(len(kwargs["items"]))
+        return await stage(session, **kwargs)
+
+    monkeypatch.setattr(catalogue, "stage_versions", counting)
+    beta = await derive(adapters, store, beta_scope)
+    assert beta.outcome == "complete" and beta.item_count == alpha.item_count == 302 and calls == []
+    async with store.factory() as session:
+        assert (await _link_rows(session, beta_scope.snapshot_id)).all() == (await _link_rows(session, alpha_scope.snapshot_id)).all()
+        folders = set((await session.scalars(select(SnapshotItem.folder_path).where(
+            SnapshotItem.snapshot_id == beta_scope.snapshot_id))).all())
+    assert folders == {"chats/Member view"}
+
+
+async def test_member_copy_still_stages_when_the_donor_rows_are_gone(store, adapters):
+    from sqlalchemy import delete
+    adapters.source.messages = [message(attached=True), dict(message(hosted=True), id="with-image")]
+    beta_scope = await member_scope(store, "chat-alpha")
+    alpha_scope, _ = await run_capture(store, adapters)
+    async with store.factory.begin() as session:
+        await session.execute(delete(SnapshotItem).where(SnapshotItem.snapshot_id == alpha_scope.snapshot_id))
+    beta = await derive(adapters, store, beta_scope)
+    assert beta.outcome == "complete" and beta.item_count == 4
+
+
 async def test_stale_or_non_covering_capture_is_not_a_donor(store, adapters):
     adapters.source.messages = [message()]
     beta_scope = await member_scope(store, "chat-alpha")
@@ -1290,3 +1334,17 @@ async def test_next_page_is_fetched_while_this_page_is_staged(store, adapters, m
     _, result = await run_capture(store, adapters)
     assert result.outcome == "complete"
     assert events.index("fetched 2") < events.index("staged")
+
+
+async def test_unchanged_messages_do_not_list_their_images_again(store, adapters):
+    """Railway 2026-11-05: re-reading a 3,955-message chat asked Microsoft for 77 image lists per
+    pass (1 request/s per chat). Hosted images only change with their message, so a message whose
+    etag and lastModifiedDateTime match its stored version reuses the stored list."""
+    adapters.source.messages = _stamped_messages(100)
+    await run_capture(store, adapters)
+    before = adapters.source.hosted_lists
+    adapters.source.messages[40]["etag"] = "edited"
+    adapters.source.messages[40]["lastModifiedDateTime"] = "2026-11-02T10:00:00Z"
+    _, result = await run_capture(store, adapters)
+    assert result.outcome == "complete" and result.item_count == 200
+    assert adapters.source.hosted_lists - before == 2   # only the edited message, once per pass
