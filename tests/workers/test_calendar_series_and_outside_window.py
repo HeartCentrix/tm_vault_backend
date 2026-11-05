@@ -68,3 +68,18 @@ def test_restore_skips_children_whose_master_is_restored_with_them():
         item(5, "single", {"type": "singleInstance"}),
     ]
     assert children_to_skip(items, lambda it: it.raw) == {2, 3}
+
+
+def test_daily_sweep_does_not_store_again_events_already_stored_unchanged():
+    # Incremental runs: the delta stream returns only changed events, so without this every sweep
+    # (once per 24 h) stored every master and single event again (TM: 38,223 events in one calendar).
+    graph = Graph([
+        {"id": "M1", "type": "seriesMaster", "subject": "Standup", "changeKey": "k1"},
+        {"id": "M2", "type": "seriesMaster", "subject": "Edited series", "changeKey": "k2-new"},
+        {"id": "OLD", "type": "singleInstance", "subject": "Kickoff 2021", "changeKey": "k3"},
+        {"id": "NEW", "type": "singleInstance", "subject": "Never stored", "changeKey": "k4"},
+    ])
+    stored = {"M1": "k1", "M2": "k2-old", "OLD": "k3"}
+    rows = asyncio.run(rows_for(graph, "user-1", "default", "Calendar", set(), stored))
+    assert [r[2] for r in rows] == ["M2", "NEW"]
+    assert graph.urls == ["https://graph.microsoft.com/v1.0/users/user-1/events?$top=500"]

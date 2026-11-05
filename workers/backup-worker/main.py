@@ -3680,18 +3680,24 @@ def _resource_has_incremental_cursor(extra_data: dict) -> bool:
     return any(extra_data.get(k) for k in INCREMENTAL_CURSOR_KEYS)
 
 
-async def _calendar_series_and_single_rows(graph_client, user_id, cal_id, cal_name, seen_ids):
+async def _calendar_series_and_single_rows(graph_client, user_id, cal_id, cal_name, seen_ids, stored=None):
     """CALENDAR_EVENT rows for every series master and single event of a calendar that the
     windowed calendarView did not return. calendarView only expands occurrences inside its window,
     so restore had no master to rebuild most recurring series from (Railway 2026-11-05: 159 series
     referenced, 60 masters stored) and events older than 2 years or over 1 year ahead were never
-    backed up. The plain events list has no window and returns masters and single events only."""
+    backed up. The plain events list has no window and returns masters and single events only.
+    `stored` ({event id: changeKey} of the newest stored copy) skips events already backed up
+    unchanged: Recovery and restore read the newest copy across the resource's snapshots, and
+    re-storing them on every sweep would duplicate whole calendars daily."""
     path = "events" if cal_id == "default" else f"calendars/{cal_id}/events"
+    stored = stored or {}
     rows = []
     async for page in graph_client._iter_pages(f"{graph_client.GRAPH_URL}/users/{user_id}/{path}?$top=500", params=None):
         for e in page.get("value", []) or []:
             eid = e.get("id")
             if not eid or eid in seen_ids:
+                continue
+            if e.get("changeKey") and stored.get(eid) == e.get("changeKey"):
                 continue
             seen_ids.add(eid)
             rows.append((
@@ -3703,6 +3709,20 @@ async def _calendar_series_and_single_rows(graph_client, user_id, cal_id, cal_na
                 f"Calendar/{cal_name}",
             ))
     return rows
+
+
+async def _stored_calendar_change_keys(resource_id, current_snapshot_id) -> Dict[str, str]:
+    """{event id: changeKey} of each event's newest stored copy for this calendar resource, over the
+    snapshots Recovery and restore read (FAILED / PENDING_DELETION excluded)."""
+    async with async_session_factory() as session:
+        rows = await session.execute(text("""
+            SELECT DISTINCT ON (si.external_id) si.external_id, si.metadata->'raw'->>'changeKey'
+            FROM snapshot_items si JOIN snapshots s ON s.id = si.snapshot_id
+            WHERE s.resource_id = :r AND s.id IS DISTINCT FROM :cur
+              AND si.item_type::text = 'CALENDAR_EVENT'
+              AND s.status::text NOT IN ('FAILED', 'PENDING_DELETION')
+            ORDER BY si.external_id, si.created_at DESC"""), {"r": resource_id, "cur": current_snapshot_id})
+        return {eid: ck for eid, ck in rows if ck}
 
 
 def _should_skip_subcalendar(
@@ -9080,6 +9100,7 @@ class BackupWorker:
                         (resource.extra_data or {}).get("calendar_events_swept_at") or {}
                     )
                     new_swept_map: Dict[str, str] = {}
+                    stored_change_keys: Optional[Dict[str, str]] = None
 
                     # 1) Enumerate calendars owned by the user.
                     try:
@@ -9267,14 +9288,19 @@ class BackupWorker:
                             new_swept_map[cal_id] = swept_map[cal_id]
                         else:
                             try:
+                                if stored_change_keys is None:
+                                    stored_change_keys = await _stored_calendar_change_keys(
+                                        resource.id, getattr(snapshot, "id", None),
+                                    )
                                 _swept = await _calendar_series_and_single_rows(
                                     graph_client, user_id, cal_id, cal_name,
-                                    {r[2] for r in out_rows},
+                                    {r[2] for r in out_rows}, stored_change_keys,
                                 )
                                 out_rows.extend(_swept)
                                 new_swept_map[cal_id] = now_utc.isoformat()
                                 print(f"[{self.worker_id}]   [USER_CALENDAR] {cal_name}: "
-                                      f"{len(_swept)} series master(s)/event(s) outside the view added")
+                                      f"{len(_swept)} series master(s)/event(s) outside the view added "
+                                      f"({len(stored_change_keys)} already stored)")
                             except Exception as _se:
                                 print(f"[{self.worker_id}]   [USER_CALENDAR] events sweep failed for "
                                       f"{cal_name}: {type(_se).__name__}: {_se}")
