@@ -61,7 +61,9 @@ class CopyWorkRunner:
 
     @staticmethod
     async def _short_settings(session):
-        await session.execute(text("SELECT set_config('statement_timeout','5000ms',true),"
+        # Control statements take milliseconds, but a forced checkpoint stalls every query for
+        # 4-9 s (Railway 2026-11-05); a 5 s budget cancelled every worker's orphan scan at once.
+        await session.execute(text("SELECT set_config('statement_timeout','30000ms',true),"
                                    "set_config('lock_timeout','500ms',true)"))
 
     async def _enabled(self):
@@ -186,7 +188,7 @@ class CopyWorkRunner:
             async with self._slots:
                 if self._closing or not await self._enabled():
                     return None
-                async with asyncio.timeout(10):
+                async with asyncio.timeout(40):
                     async with self.factory.begin() as session:
                         await self._short_settings(session)
                         if self._closing:

@@ -308,3 +308,12 @@ async def test_orphan_recovery_is_not_blocked_by_completed_provider_receipts(sto
     runner = api().CopyWorkRunner(store.factory, completer(store, []))
     assert (workflow_id in await runner._orphan_candidates()) is expected
     await runner.close()
+
+
+async def test_control_queries_outlast_a_checkpoint_stall(store):
+    """Railway 2026-11-05 (08:41, 12:16, 15:59): forced checkpoints stalled every query for 4-9 s, and
+    the 5 s control budget cancelled every worker's orphan scan at once (TM log signature #20)."""
+    from sqlalchemy import text
+    async with store.factory() as session:
+        await api().CopyWorkRunner._short_settings(session)
+        await session.execute(text("SELECT pg_sleep(6)"))
