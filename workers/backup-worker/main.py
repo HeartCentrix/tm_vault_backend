@@ -3549,10 +3549,11 @@ def tier1_mail_delta_enabled(resource_id: Any, env: Optional[Dict[str, str]] = N
 
     Pure function; pinned by tests/workers/test_tier1_mail_delta.py.
 
-    Default OFF: MAILBOX / SHARED_MAILBOX / ROOM_MAILBOX keep the verbatim
-    legacy full walk (``_backup_mailbox_fullwalk``). ``TIER1_MAIL_DELTA_ENABLED``
-    = true/1/yes switches the fleet; ``TIER1_MAIL_DELTA_RESOURCE_IDS`` (comma
-    separated resource ids, case-insensitive) pilots individual mailboxes.
+    Default ON: MAILBOX / SHARED_MAILBOX / ROOM_MAILBOX read per-folder deltas
+    instead of re-downloading the whole mailbox every run.
+    ``TIER1_MAIL_DELTA_ENABLED`` = false/0/no/off restores the legacy full walk
+    (``_backup_mailbox_fullwalk``) fleet-wide; ``TIER1_MAIL_DELTA_RESOURCE_IDS``
+    (comma separated resource ids, case-insensitive) limits delta to those.
     """
     e = os.environ if env is None else env
     flag = str(e.get("TIER1_MAIL_DELTA_ENABLED", "") or "").strip().lower()
@@ -3562,7 +3563,7 @@ def tier1_mail_delta_enabled(resource_id: Any, env: Optional[Dict[str, str]] = N
         return True
     allow = str(e.get("TIER1_MAIL_DELTA_RESOURCE_IDS", "") or "")
     wanted = {p.strip().lower() for p in allow.split(",") if p.strip()}
-    return str(resource_id).strip().lower() in wanted
+    return not wanted or str(resource_id).strip().lower() in wanted
 
 
 def snapshot_counters_from_result(result: Optional[Dict[str, Any]]) -> Tuple[int, int, int, int]:
