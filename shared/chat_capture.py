@@ -946,6 +946,51 @@ async def reuse_unchanged_chat(*, scope, graph_client, session_factory, folder_p
         provenance=provenance)
 
 
+async def link_unchanged_chats(*, scopes, folders, filter_hashes, session_factory, source_snapshot_id) -> set:
+    """Publish, in one step, every chat of ``scopes`` that the principal's delta feed showed unchanged
+    since ``source_snapshot_id`` (whose run started the feed's cursor) from its COMPLETE publication
+    there. Same scope, observation version and weekly full-read deadline as reuse_unchanged_chat;
+    chats that do not qualify are left for the per-chat path. Returns the chat ids published."""
+    from shared.config import settings
+    version = settings.CHAT_OBSERVATION_HASH_VERSION
+    reconcile = timedelta(hours=float(os.getenv("CHAT_INCREMENTAL_RECONCILE_HOURS", "168")))
+
+    async def find(session):
+        return (await session.execute(select(ChatCaptureAttempt, ChatInventory)
+            .join(ChatInventory, ChatInventory.id == ChatCaptureAttempt.staged_inventory_id)
+            .join(SnapshotChatInventory, and_(SnapshotChatInventory.snapshot_id == ChatCaptureAttempt.snapshot_id,
+                                              SnapshotChatInventory.capture_attempt_id == ChatCaptureAttempt.id))
+            .where(ChatCaptureAttempt.snapshot_id == source_snapshot_id, ChatCaptureAttempt.chat_id.in_(list(scopes)),
+                   ChatCaptureAttempt.state == "PUBLISHED", ChatInventory.state == "COMPLETE",
+                   ChatInventory.observation_hash_version == version,
+                   SnapshotChatInventory.coverage_status == "COMPLETE"))).all()
+    now = datetime.now(timezone.utc)
+    links = {}
+    for attempt, inventory in await run_catalogue_transaction(session_factory, find):
+        scope = scopes[attempt.chat_id]
+        observed, full = _observed_times(attempt)
+        if (attempt.principal_id != scope.principal_id or not attempt.evidence or observed is None or full is None
+                or now - full >= reconcile
+                or inventory.authentication_context_sha256 != authentication_context_fingerprint(scope)):
+            continue
+        provenance = {"reused_unchanged_from_attempt": str(attempt.id), "source_observed_at": observed.isoformat(),
+                      "full_observed_at": full.isoformat(), "delta_unchanged_since_snapshot": str(source_snapshot_id)}
+        recorded = filter_hashes.get(attempt.chat_id)
+        links[attempt.chat_id] = (inventory.id, {**attempt.evidence, "started_at": now.isoformat(), "finished_at": now.isoformat()},
+                                  [*([{"source_filter_sha256": recorded}] if recorded is not None else []), provenance])
+
+    async def publish(session):
+        return await catalogue.publish_unchanged_inventories(session, scopes=scopes, links=links, folders=folders,
+                                                             source_snapshot_id=source_snapshot_id)
+    try:
+        linked = await run_catalogue_transaction(session_factory, publish) if links else set()
+    except (catalogue.ChatCatalogueIntegrityError, catalogue.ChatCatalogueConflict) as exc:
+        logger.warning("chat_delta_bulk_link_rejected chats=%s reason=%s", len(links), exc)
+        linked = set()
+    logger.info("chat_delta_bulk_linked chats=%s eligible=%s candidates=%s", len(linked), len(links), len(scopes))
+    return linked
+
+
 async def _link_unchanged(*, scope, session_factory, folder_path, inventory_id, source_snapshot_id, source_evidence, history):
     """Publish an unchanged chat by linking its COMPLETE inventory (catalogue.publish_unchanged_inventory).
     None when that is not possible; the caller then re-stages the items."""

@@ -569,3 +569,102 @@ async def test_chat_hosted_elsewhere_completes_its_provider_unit(store, source_a
     source.iter_message_pages = denied
     assert (await source_adapter.run(await legacy_scope(store)))["outcome"] == "complete"
     assert units == ["COMPLETED", "COMPLETED"]
+
+
+def delta_source(source, feed, rounds, checks, *, latest_at=None):
+    """Fake per-user delta feed (/users/{id}/chats/getAllMessages/delta) and per-chat check."""
+    async def delta(link, *, since=None):
+        rounds.append(link)
+        changed = feed.pop(0) if link else set()
+        if isinstance(changed, Exception):
+            raise changed
+        return changed, f"link-{len(rounds)}"
+
+    async def latest(chat_id):
+        checks.append(chat_id)
+        return latest_at or datetime.now(timezone.utc)
+    source.message_delta, source.latest_message_change = delta, latest
+
+
+async def chat_state(store, snapshot_id):
+    async with store.factory() as session:
+        links = sorted((await session.execute(select(models.SnapshotChatInventory.chat_id, models.SnapshotChatInventory.inventory_id)
+            .where(models.SnapshotChatInventory.snapshot_id == snapshot_id))).all())
+        rows = sorted((await session.execute(select(models.SnapshotItem.external_id, models.SnapshotItem.chat_version_id)
+            .where(models.SnapshotItem.snapshot_id == snapshot_id))).all())
+    return links, rows
+
+
+async def delta_cursor(store, resource_id):
+    async with store.factory() as session:
+        return ((await session.get(models.Resource, resource_id)).extra_data or {}).get("chat_delta_cursor")
+
+
+async def test_incremental_links_every_chat_the_delta_feed_shows_unchanged_at_once(store, source_adapter):
+    """Codex 2026-11-05: Microsoft's per-user delta feed reports new, edited and deleted messages
+    across all of a user's chats, group chats included. An incremental links every chat the feed
+    shows unchanged in one step (Railway 2026-11-05: 1,107 chats linked one by one took 6-12 min
+    per user); only chats the feed reports changed take the per-chat path."""
+    source = source_adapter.source
+    source.chats.append({"id": "chat-beta", "topic": "Beta"})
+    source.messages["chat-beta"] = [{"id": "message-beta", "body": {"content": "b"}, "attachments": []}]
+    feed, rounds, checks = [], [], []
+    delta_source(source, feed, rounds, checks)
+    first = await legacy_scope(store)
+    assert (await source_adapter.run(first))["outcome"] == "complete"
+    assert rounds == [None] and (await delta_cursor(store, first.resource_id))["link"] == "link-1"
+    reads = list(source.message_calls)
+
+    feed.append(set())
+    second = await store.new_scope()
+    assert (await source_adapter.run(second))["outcome"] == "complete"
+    assert rounds == [None, "link-1"] and checks == [] and source.message_calls == reads
+    before, after = await chat_state(store, first.snapshot_id), await chat_state(store, second.snapshot_id)
+    assert after == before and len(after[0]) == 2
+    async with store.factory() as session:
+        attempts = (await session.scalars(select(models.ChatCaptureAttempt).where(
+            models.ChatCaptureAttempt.snapshot_id == second.snapshot_id))).all()
+    assert {a.state for a in attempts} == {"PUBLISHED"} and all(a.reused_inventory for a in attempts)
+    assert all(any("reused_unchanged_from_attempt" in e for e in a.evidence_history) for a in attempts)
+    assert (await delta_cursor(store, first.resource_id)) == {"link": "link-2", "snapshot_id": str(second.snapshot_id),
+        "principal": first.principal_id, "scope": source.permission_scope_hash}
+
+    feed.append({"chat-beta"})
+    third = await store.new_scope()
+    assert (await source_adapter.run(third))["outcome"] == "complete"
+    assert rounds[-1] == "link-2" and checks == ["chat-beta"]
+    assert set(source.message_calls[len(reads):]) == {"chat-beta"}
+    assert len((await chat_state(store, third.snapshot_id))[0]) == 2
+
+
+async def test_delta_feed_failure_falls_back_to_checking_each_chat(store, source_adapter):
+    from shared.chat_capture_graph import ChatGraphError
+    source = source_adapter.source
+    feed, rounds, checks = [ChatGraphError("Graph capture metadata failed with HTTP 410", status_code=410)], [], []
+    delta_source(source, feed, rounds, checks, latest_at=datetime(2020, 1, 1, tzinfo=timezone.utc))
+    first = await legacy_scope(store)
+    await source_adapter.run(first)
+    second = await store.new_scope()
+    assert (await source_adapter.run(second))["outcome"] == "complete"
+    assert rounds == [None, "link-1", None] and checks == ["chat-alpha"]
+    assert (await delta_cursor(store, first.resource_id))["link"] == "link-3"
+
+
+async def test_a_run_that_is_not_complete_does_not_advance_the_delta_cursor(store, source_adapter):
+    from shared.chat_capture_graph import ChatGraphError
+    source = source_adapter.source
+    feed, rounds, checks = [], [], []
+    delta_source(source, feed, rounds, checks)
+    first = await legacy_scope(store)
+    await source_adapter.run(first)
+    source.chats.append({"id": "same-tenant-denied", "topic": "Ours"})
+    original = source.iter_message_pages
+    async def denied(chat_id):
+        if chat_id == "same-tenant-denied":
+            raise ChatGraphError("Graph capture metadata failed with HTTP 403", status_code=403)
+        async for page in original(chat_id):
+            yield page
+    source.iter_message_pages = denied
+    feed.append(set())
+    assert (await source_adapter.run(await store.new_scope()))["outcome"] == "partial"
+    assert await delta_cursor(store, first.resource_id) is None

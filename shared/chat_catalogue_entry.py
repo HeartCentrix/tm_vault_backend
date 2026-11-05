@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import logging
@@ -10,7 +10,7 @@ import os
 import time
 from uuid import UUID
 
-from sqlalchemy import cast, func, or_, select
+from sqlalchemy import cast, func, or_, select, text
 from sqlalchemy.dialects.postgresql import JSONB
 
 from shared.chat_catalogue import ChatCatalogueConflict, ChatCatalogueIntegrityError, ChatCatalogueWorkLeaseMoved
@@ -367,6 +367,55 @@ async def _refused_elsewhere(source, chat, home_tenant):
     return None
 
 
+def _delta_enabled() -> bool:
+    return os.getenv("CHAT_DELTA_BULK_LINK", "true").strip().lower() not in ("0", "false", "no", "off")
+
+
+async def _merge_resource_metadata(session, resource_id, add: dict, drop=()):
+    """Merge keys into a resource's metadata in the database (other writers keep theirs)."""
+    await session.execute(text("""UPDATE resources SET metadata = ((COALESCE(metadata::jsonb, '{}'::jsonb)
+        - CAST(:drop AS text[])) || CAST(:add AS jsonb))::json WHERE id = :resource"""),
+        {"resource": resource_id, "drop": list(drop), "add": json.dumps(add)})
+
+
+async def _chat_delta_round(session_factory, source, *, resource_id, snapshot_id, principal, since):
+    """This snapshot's round of the principal's chat-message delta feed, recorded on the resource so a
+    resumed turn reuses it: (ids of chats changed since the snapshot whose run started the saved
+    cursor, or None when unknown; that snapshot's id). The new cursor is promoted only when this
+    snapshot completes. None when the feed is not used."""
+    if not _delta_enabled() or not hasattr(source, "message_delta"):
+        return None
+    async with session_factory() as session:
+        metadata = (await session.get(Resource, resource_id)).extra_data or {}
+    pending, saved = metadata.get("chat_delta_pending") or {}, metadata.get("chat_delta_cursor") or {}
+    if pending.get("snapshot_id") == str(snapshot_id):
+        changed = pending.get("changed")
+        return (None if changed is None else set(changed)), pending.get("since_snapshot")
+    changed = link = None
+    if saved.get("link") and saved.get("principal") == principal and saved.get("scope") == source.permission_scope_hash:
+        try:
+            changed, link = await source.message_delta(saved["link"])
+        except Exception as exc:
+            logging.getLogger(__name__).warning("chat_delta_resume_failed resource=%s error=%s %s",
+                                                resource_id, type(exc).__name__, str(exc)[:200])
+            changed = None
+    if link is None:
+        try:
+            _, link = await source.message_delta(None, since=since - timedelta(minutes=5))
+        except Exception as exc:
+            logging.getLogger(__name__).warning("chat_delta_start_failed resource=%s error=%s %s",
+                                                resource_id, type(exc).__name__, str(exc)[:200])
+    since_snapshot = saved.get("snapshot_id") if changed is not None else None
+    pending = {"snapshot_id": str(snapshot_id), "link": link, "since_snapshot": since_snapshot,
+               "changed": sorted(changed) if changed is not None else None,
+               "principal": principal, "scope": source.permission_scope_hash}
+
+    async def record(session):
+        await _merge_resource_metadata(session, resource_id, {"chat_delta_pending": pending})
+    await run_catalogue_transaction(session_factory, record)
+    return changed, since_snapshot
+
+
 async def _chat_list(source):
     chats = {}
     async for chat in source.iter_chats():
@@ -556,6 +605,25 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                         chats.get(cid), getattr(source, "home_tenant_id", None), result)
                     await checkpoint_unit(receipt_id=str(result.inventory_id), state='COMPLETED' if done else 'FAILED')
                     return result
+            if partition_id is None and allowed is None:
+                delta = await _chat_delta_round(session_factory, source, resource_id=resource_id,
+                    snapshot_id=snapshot_id, principal=principal, since=started)
+                changed, since_snapshot = delta if delta is not None else (None, None)
+                unchanged = [cid for cid in keys if changed is not None and cid not in changed and cid not in published]
+                if unchanged and since_snapshot and not full_backup:
+                    from shared.chat_capture import link_unchanged_chats
+                    linked = await link_unchanged_chats(scopes={cid: chat_scope(cid) for cid in unchanged},
+                        folders={cid: chat_folder(chats[cid], principal) for cid in unchanged},
+                        filter_hashes={cid: filters[cid][1] for cid in unchanged},
+                        session_factory=session_factory, source_snapshot_id=since_snapshot)
+                    if linked:
+                        completed += len(linked)
+                        keys = [cid for cid in keys if cid not in linked]
+                        try:
+                            await run_catalogue_transaction(session_factory,
+                                lambda session: refresh_catalogue_progress(session, chat_scope(next(iter(linked)))))
+                        except Exception as exc:
+                            logging.getLogger(__name__).warning("chat live progress refresh failed (%s)", type(exc).__name__)
             remaining, postponed = iter(keys), []
             yield_requested, processed = False, 0
             # A turn handed back for fairness still waits for captures already running. Free
@@ -654,6 +722,13 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
         known = await session.scalar(select(func.count()).select_from(SnapshotChatInventory)
             .where(SnapshotChatInventory.snapshot_id == snapshot_id)) or 0
         complete = not errors and completed == planned
+        if partition_id is None and allowed is None and _delta_enabled():
+            pending = ((await session.get(Resource, resource_id)).extra_data or {}).get("chat_delta_pending") or {}
+            cursor = ({"link": pending["link"], "snapshot_id": str(snapshot_id), "principal": pending["principal"],
+                       "scope": pending["scope"]} if complete and pending.get("snapshot_id") == str(snapshot_id)
+                      and pending.get("link") else None)
+            await _merge_resource_metadata(session, resource_id, {"chat_delta_cursor": cursor} if cursor else {},
+                                           drop=("chat_delta_pending", "chat_delta_cursor"))
         outcome = "complete" if complete else ("partial" if known or result["item_count"] else "failed")
         reason = "; ".join(dict.fromkeys(errors))[:1500] if errors else None
         unavailable = await session.scalar(select(func.count()).select_from(SnapshotChatInventory)

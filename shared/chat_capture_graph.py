@@ -330,6 +330,32 @@ class StrictChatGraphSource:
                 raise ChatGraphError("Graph message page changed collection scope")
             yield page
 
+    async def message_delta(self, delta_link: str | None, *, since=None):
+        """One round of this principal's chat-message delta feed: (ids of chats with a new, edited or
+        deleted message, next deltaLink). The per-user route covers one-on-one, group and meeting
+        chats; /chats/{id}/messages/delta answers 400 (Codex 2026-11-05). A new feed starts at
+        ``since`` (lastModifiedDateTime gt, the route's only filter; 50 per page at most)."""
+        if delta_link is None:
+            url = f"{self._client.GRAPH_URL}/users/{_component(self.principal_id)}/chats/getAllMessages/delta"
+            params = {"$top": "50", "$filter": f"lastModifiedDateTime gt {since:%Y-%m-%dT%H:%M:%S.000Z}"}
+        else:
+            url, params = delta_link, None
+        changed = set()
+        for _ in range(100_000):
+            data = await self._json(url, params=params)
+            params = None
+            for row in data.get("value") or []:
+                chat_id = row.get("chatId") if isinstance(row, dict) else None
+                if not isinstance(chat_id, str) or not chat_id:
+                    raise ChatGraphError("delta record has no chat")
+                changed.add(chat_id)
+            if isinstance(data.get("@odata.deltaLink"), str):
+                return changed, data["@odata.deltaLink"]
+            url = data.get("@odata.nextLink")
+            if not isinstance(url, str):
+                raise ChatGraphError("delta round ended without a cursor")
+        raise ChatGraphError("delta round did not finish")
+
     async def latest_message_change(self, chat_id: str):
         """Modification time of the chat's most recently modified message (None when empty):
         one request, used by the incremental unchanged-chat check."""

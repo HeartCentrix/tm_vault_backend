@@ -677,6 +677,78 @@ async def publish_unchanged_inventory(session, *, lease: CaptureLease, inventory
     return _result(attempt, association, inventory, 0)
 
 
+async def publish_unchanged_inventories(session, *, scopes, links, folders, source_snapshot_id) -> set:
+    """Publish many chats of one snapshot as their unchanged COMPLETE inventories in one transaction:
+    attempts and associations as multi-row inserts, rows copied from their publication in
+    ``source_snapshot_id`` with one statement. The per-user delta feed showed these chats unchanged;
+    one by one, 1,107 linked chats took 6-12 min per user (Railway 2026-11-05). ``links``: chat id ->
+    (inventory id, evidence, history). Returns the published chat ids; chats already attempted in
+    this snapshot or whose inventory no longer matches are left out for the per-chat path."""
+    if not links:
+        return set()
+    first = scopes[next(iter(links))]
+    parents = await _lock_scope(session, first)
+    await _eligible(session, first, parents)
+    job, snapshot, _ = parents
+    wanted = list(links)
+    taken = set((await session.scalars(select(ChatCaptureAttempt.chat_id).where(
+        ChatCaptureAttempt.snapshot_id == first.snapshot_id, ChatCaptureAttempt.chat_id.in_(wanted)))).all())
+    taken |= set((await session.scalars(select(SnapshotChatInventory.chat_id).where(
+        SnapshotChatInventory.snapshot_id == first.snapshot_id, SnapshotChatInventory.chat_id.in_(wanted)))).all())
+    inventories = {inventory.id: inventory for inventory in (await session.scalars(select(ChatInventory).where(
+        ChatInventory.id.in_({links[cid][0] for cid in wanted})).with_for_update(read=True, key_share=True))).all()}
+    now = await session.scalar(select(func.clock_timestamp()))
+    attempts, associations, chosen, expected = [], [], [], 0
+    for cid in wanted:
+        scope, (inventory_id, evidence, history) = scopes[cid], links[cid]
+        inventory = inventories.get(inventory_id)
+        try:
+            observed = _evidence(evidence)
+        except (KeyError, TypeError, ValueError):
+            observed = None
+        if (cid in taken or observed is None or inventory is None or inventory.state != "COMPLETE" or
+                inventory.chat_id != cid or inventory.tenant_id != scope.tenant_id or scope.partition_id is not None or
+                scope.snapshot_id != first.snapshot_id or
+                inventory.authentication_context_sha256 != authentication_context_fingerprint(scope)):
+            continue
+        attempt_id = uuid4()
+        attempts.append(dict(id=attempt_id, snapshot_id=scope.snapshot_id, resource_id=scope.resource_id,
+            tenant_id=scope.tenant_id, chat_id=cid, folder_path=folders[cid], principal_id=scope.principal_id,
+            permission_scope_hash=scope.permission_scope_hash,
+            authentication_context_sha256=inventory.authentication_context_sha256, backend_id=scope.backend_id,
+            partition_id=None, snapshot_lease_token=int(snapshot.lease_token or 0),
+            job_lease_token=int(job.lease_token or 0), partition_lease_token=None, generation=1, state="PUBLISHED",
+            expires_at=now + timedelta(minutes=5), staged_inventory_id=inventory.id, evidence=evidence,
+            evidence_history=[*history, evidence], failure_reason=None, reused_inventory=True))
+        associations.append(dict(snapshot_id=scope.snapshot_id, chat_id=cid, tenant_id=scope.tenant_id,
+            inventory_id=inventory.id, capture_attempt_id=attempt_id, coverage_status="COMPLETE",
+            started_at=observed.started_at, finished_at=observed.finished_at, failure_reason=None, uploaded_bytes=0))
+        chosen.append((cid, inventory.id, folders[cid]))
+        expected += inventory.item_count
+    if not chosen:
+        return set()
+    for start in range(0, len(attempts), 500):  # ~22 binds a row; Postgres allows 32,767 per statement
+        await session.execute(insert(ChatCaptureAttempt.__table__).values(attempts[start:start + 500]))
+        await session.execute(insert(SnapshotChatInventory.__table__).values(associations[start:start + 500]))
+    copied = (await session.execute(text("""
+        INSERT INTO snapshot_items (id, snapshot_id, tenant_id, external_id, parent_external_id, item_type, name,
+            folder_path, content_hash, content_checksum, content_size, blob_path, encryption_key_id, backup_version,
+            metadata, is_deleted, backend_id, chat_version_id, created_at)
+        SELECT gen_random_uuid(), :snapshot, si.tenant_id, si.external_id, si.parent_external_id, si.item_type, si.name,
+            c.folder, si.content_hash, si.content_checksum, si.content_size, si.blob_path, si.encryption_key_id,
+            si.backup_version, si.metadata, si.is_deleted, si.backend_id, si.chat_version_id, now() AT TIME ZONE 'utc'
+        FROM unnest(CAST(:inventories AS uuid[]), CAST(:folders AS text[])) AS c(inventory_id, folder)
+        JOIN chat_inventory_items ii ON ii.inventory_id = c.inventory_id
+        JOIN snapshot_items si ON si.snapshot_id = :source AND si.external_id = ii.logical_key
+             AND si.chat_version_id = ii.version_id"""),
+        {"snapshot": first.snapshot_id, "source": source_snapshot_id,
+         "inventories": [inventory_id for _, inventory_id, _ in chosen],
+         "folders": [folder for _, _, folder in chosen]})).rowcount
+    if copied != expected:
+        raise ChatCatalogueIntegrityError("unchanged chats' earlier rows differ from their inventories")
+    return {cid for cid, _, _ in chosen}
+
+
 async def suspend_capture(session, *, lease, claim, unit_key, next_eligible_at):
     """Supersede only this unpublished attempt and retain its pending receipt."""
     from shared import provider_work
