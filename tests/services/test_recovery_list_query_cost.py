@@ -363,7 +363,7 @@ class _ChatDB(_FakeDB):
 def _chat_fakes(sibs):
     snap = SimpleNamespace(
         id=sibs[0], resource_id=uuid.uuid4(),
-        status=SimpleNamespace(value="COMPLETED"), extra_data={},
+        status=SimpleNamespace(value="COMPLETED"), extra_data={}, reuse_chain_root_id=None,
         created_at=datetime(2026, 8, 11, 18, 11, 57),
     )
     res = SimpleNamespace(
