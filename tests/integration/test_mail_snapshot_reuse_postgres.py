@@ -232,3 +232,21 @@ async def test_folder_selection_of_a_pointer_sizes_the_prior_snapshots_rows(mail
         rows = await resolve_selection(session, snapshot_id=str(pointer), item_ids=[], folder_paths=["Inbox"],
                                        excluded_item_ids=[])
     assert sum(r.content_size for r in rows) == 30
+
+
+async def test_folder_whitelisted_reuse_requires_every_prior_row_in_a_kept_folder(mail):
+    """Shared/room mailboxes carry only rows of folders still in the tree (and no pathless rows); a
+    pointer must not keep rows that copy would have dropped."""
+    from shared.mail_snapshot_reuse import reuse_unchanged_mail_snapshot
+    prior, _ = await mail.snapshot(models.SnapshotStatus.COMPLETED, rows=2, item_count=2)
+    async with mail.factory.begin() as session:
+        await session.execute(text("""UPDATE snapshot_items SET metadata = CAST(:m AS json) WHERE snapshot_id = :s"""),
+                              {"s": prior, "m": '{"raw": {"parentFolderId": "inbox"}}'})
+    target, job = await mail.snapshot()
+
+    async def reuse(keep):
+        async with mail.factory.begin() as session:
+            return await reuse_unchanged_mail_snapshot(session, resource_id=(await mail.row(prior)).resource_id,
+                target_snapshot_id=target, current_job_id=job, keep_folder_ids=keep)
+    assert await reuse(["archive"]) is None
+    assert await reuse(["inbox", "archive"]) == prior

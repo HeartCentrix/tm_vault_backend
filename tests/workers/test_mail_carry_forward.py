@@ -860,3 +860,29 @@ def test_inline_finalize_counts_the_rows_a_pointer_resolves_to():
 def test_orphan_reaper_counts_the_rows_a_pointer_resolves_to():
     body = re.sub(r"\s+", " ", _method_src("_reap_orphan_snapshots_for_job"))
     assert "FROM snapshot_items WHERE snapshot_id = COALESCE( (SELECT reuse_chain_root_id FROM snapshots WHERE id = :sid), :sid)" in body
+
+
+def test_partitioned_union_carry_points_an_unchanged_mailbox_at_its_prior():
+    flat = re.sub(r"\s+", " ", _method_src("_carry_forward_partitioned_user_mail_inner"))
+    call = flat.index("reuse_if_unchanged(")
+    assert call < flat.index("_carry_forward_prior_mail_snapshot_items(", call)
+    assert "unchanged=not union_paths and not union_tombs" in flat
+    assert "copied = 0 if _reused else await _carry_forward_prior_mail_snapshot_items(" in flat
+
+
+def test_partitioned_finalize_counts_the_rows_a_pointer_resolves_to():
+    """Its own rows are 0 for a pointer: the count would zero the totals and mark it FAILED."""
+    flat = re.sub(r"\s+", " ", _method_src("_finalize_partitioned_snapshot"))
+    assert "resolve_snapshot_items_target(" in flat
+    assert ".where(SnapshotItem.snapshot_id == _items_of)" in flat
+
+
+def test_shared_mailbox_carry_points_an_unchanged_mailbox_at_its_prior():
+    start = _SRC.index("fresh_complete = {f for f in bootstrapped if f in ok_keys}")
+    flat = re.sub(r"\s+", " ", _SRC[start:start + 3000])
+    call = flat.index("reuse_if_unchanged(")
+    assert call < flat.index("_carry_forward_prior_mail_snapshot_items(", call)
+    for guard in ("not items", "not tombstoned", "not failed", "not evicted", "not fresh_complete",
+                  "not persist_failed_fids", "not gone_fids", "not fresh_count"):
+        assert guard in flat[:call], guard
+    assert "keep_folder_ids=keep_fids" in flat[call:call + 600]

@@ -18260,7 +18260,17 @@ class BackupWorker:
             )
             return 0
         try:
-            copied = await _carry_forward_prior_mail_snapshot_items(
+            # No shard re-bootstrapped a folder or saw a delete, and no shard
+            # wrote a row (checked by the reuse itself): point, don't copy.
+            from shared.mail_snapshot_reuse import reuse_if_unchanged
+            _reused = await reuse_if_unchanged(
+                async_session_factory,
+                unchanged=not union_paths and not union_tombs
+                and all(bool(cf.get("resumed_any")) for cf in recorded),
+                resource_id=str(head[1]), target_snapshot_id=str(snapshot_id),
+                current_job_id=head[2],
+            )
+            copied = 0 if _reused else await _carry_forward_prior_mail_snapshot_items(
                 tenant_id=str(head[0]),
                 resource_id=str(head[1]),
                 target_snapshot_id=str(snapshot_id),
@@ -18675,13 +18685,20 @@ class BackupWorker:
                 "EMAIL_ATTACHMENT",
                 "CHAT_HOSTED_CONTENT",
             )
+            # An unchanged mailbox's reuse snapshot owns no rows; count the
+            # full snapshot it names (shared.snapshot_reuse).
+            from shared.snapshot_reuse import resolve_snapshot_items_target, SnapshotNotFound
+            try:
+                _items_of = (await resolve_snapshot_items_target(session, snapshot_id)).target_id
+            except SnapshotNotFound:
+                _items_of = snapshot_id
             _row = (await session.execute(
                 select(
                     func.count(SnapshotItem.id).filter(
                         ~SnapshotItem.item_type.in_(CHILD_ITEM_TYPES)
                     ),
                     func.coalesce(func.sum(SnapshotItem.content_size), 0),
-                ).where(SnapshotItem.snapshot_id == snapshot_id)
+                ).where(SnapshotItem.snapshot_id == _items_of)
             )).one()
             persisted_count = int(_row[0] or 0)
             persisted_bytes = int(_row[1] or 0)
@@ -28232,7 +28249,21 @@ class BackupWorker:
         keep_fids = sorted(set(primary_tree) - fresh_complete)
         if saved and keep_fids and mail_carry_forward_enabled():
             try:
-                carried = await _carry_forward_prior_mail_snapshot_items(
+                # Nothing changed (no message, delete, failed/evicted/bootstrapped
+                # or vanished folder, no row): point at the prior, don't copy.
+                _tier1_unchanged = (
+                    not items and not tombstoned and not failed and not evicted
+                    and not fresh_complete and not persist_failed_fids and not gone_fids
+                    and not fresh_count
+                )
+                from shared.mail_snapshot_reuse import reuse_if_unchanged
+                _reused = await reuse_if_unchanged(
+                    async_session_factory, unchanged=_tier1_unchanged,
+                    resource_id=str(resource.id), target_snapshot_id=str(snapshot.id),
+                    current_job_id=getattr(snapshot, "job_id", None),
+                    keep_folder_ids=keep_fids,
+                )
+                carried = 0 if _reused else await _carry_forward_prior_mail_snapshot_items(
                     tenant_id=str(tenant.id),
                     resource_id=str(resource.id),
                     target_snapshot_id=str(snapshot.id),

@@ -40,18 +40,26 @@ MAIL_PRIOR_SNAPSHOT_SQL = (
 )
 
 
-async def reuse_unchanged_mail_snapshot(session, *, resource_id, target_snapshot_id, current_job_id):
+async def reuse_unchanged_mail_snapshot(session, *, resource_id, target_snapshot_id, current_job_id,
+                                        keep_folder_ids=None):
     """Point ``target_snapshot_id`` (which wrote no rows) at the carry-forward's prior snapshot and copy
     its totals (nothing new, nothing added). Returns the prior id, or None with nothing written when
     there is no prior, the prior is PARTIAL (a pointer may only name a COMPLETED snapshot; an older
     COMPLETED one would miss the PARTIAL run's mail), or the target already owns rows. Pointers
-    always name a full snapshot, so a chain is never more than one hop."""
+    always name a full snapshot, so a chain is never more than one hop. ``keep_folder_ids`` (the
+    shared/room mailbox carry's folder whitelist): every prior message must sit in one of them, as
+    that copy drops the rest and pathless rows."""
     params = {"rid": str(resource_id), "tsid": str(target_snapshot_id),
               "jid": str(current_job_id) if current_job_id else None}
     prior = (await session.execute(text(
         "SELECT p.id, p.status::text AS status, p.item_count, p.bytes_total FROM snapshots p "
         f"WHERE p.id = {MAIL_PRIOR_SNAPSHOT_SQL}"), params)).first()
     if prior is None or prior.status != "COMPLETED":
+        return None
+    if keep_folder_ids is not None and await session.scalar(text(
+            "SELECT EXISTS (SELECT 1 FROM snapshot_items x WHERE x.snapshot_id = CAST(:prior AS UUID) "
+            "AND x.item_type = 'EMAIL' AND COALESCE(x.metadata::jsonb->'raw'->>'parentFolderId', '') "
+            "<> ALL(CAST(:keep AS TEXT[])))"), {"prior": str(prior.id), "keep": list(keep_folder_ids)}):
         return None
     pointed = (await session.execute(text("""
         UPDATE snapshots SET reuse_of_snapshot_id = CAST(:prior AS UUID), reuse_chain_root_id = CAST(:prior AS UUID),
@@ -73,7 +81,8 @@ def mail_unchanged_reuse_enabled(env=None) -> bool:
     return flag not in ("0", "false", "no", "off")
 
 
-async def reuse_if_unchanged(session_factory, *, unchanged, resource_id, target_snapshot_id, current_job_id):
+async def reuse_if_unchanged(session_factory, *, unchanged, resource_id, target_snapshot_id, current_job_id,
+                             keep_folder_ids=None):
     """The worker's entry point: the prior id when this unchanged run now points at it, else None and the
     caller carries forward as before (a failure here never fails the backup)."""
     if not unchanged or not mail_unchanged_reuse_enabled():
@@ -82,7 +91,7 @@ async def reuse_if_unchanged(session_factory, *, unchanged, resource_id, target_
     try:
         async with session_factory() as session:
             prior = await reuse_unchanged_mail_snapshot(session, resource_id=resource_id,
-                target_snapshot_id=target_snapshot_id, current_job_id=current_job_id)
+                target_snapshot_id=target_snapshot_id, current_job_id=current_job_id, keep_folder_ids=keep_folder_ids)
             await session.commit()
     except Exception as exc:
         logging.getLogger(__name__).warning("mail_unchanged_reuse_failed snapshot=%s error=%s: %s",
