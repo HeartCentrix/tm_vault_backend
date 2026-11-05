@@ -1202,3 +1202,91 @@ async def test_reused_children_are_staged_in_batches_not_one_transaction_each(st
     assert second.outcome == "complete" and adapters.source.hosted_downloads == 5
     single_child = [b for b in batches if b == ["CHAT_HOSTED_CONTENT"]]
     assert single_child == [] and sum(b.count("CHAT_HOSTED_CONTENT") for b in batches) == 5
+
+
+def _file_changes_at_pass_two(source, *, message_too=False):
+    def moving(n):
+        if n == 2:
+            source.data, source.etag, source.ctag = b"new PDF version", "etag-v2", "ctag-v2"
+        if message_too and n == 2:
+            return [message("edited between passes", attached=True)]
+        return [message(attached=True)] if not message_too or n != 2 else source.messages
+    source.movement = moving
+
+
+async def test_file_changed_between_passes_refetches_only_that_file(store, adapters):
+    """Railway 2026-11-05: an .xlsx attached in a 3,955-message chat was edited while the chat was
+    read; pass 2 saw the new file version and the whole chat (12.5 min) was read again. Only the
+    changed file is fetched again, and it must match what pass 2 saw."""
+    import hashlib
+    adapters.source.messages = [message(attached=True)]
+    _file_changes_at_pass_two(adapters.source)
+    scope, result = await run_capture(store, adapters)
+    assert result.outcome == "complete" and adapters.source.passes == 2
+    async with store.factory() as session:
+        stored = await session.scalar(select(SnapshotItem.content_hash).where(
+            SnapshotItem.snapshot_id == scope.snapshot_id, SnapshotItem.item_type == "CHAT_ATTACHMENT"))
+    assert stored == hashlib.sha256(b"new PDF version").hexdigest()
+
+
+async def test_message_and_file_changed_between_passes_still_rereads_the_chat(store, adapters):
+    adapters.source.messages = [message(attached=True)]
+    _file_changes_at_pass_two(adapters.source, message_too=True)
+    _, result = await run_capture(store, adapters)
+    assert result.outcome == "complete" and adapters.source.passes == 4
+
+
+def _stamped_messages(count):
+    values = []
+    for i in range(count):
+        value = dict(message(hosted=True), id=f"m{i}", lastModifiedDateTime="2026-11-01T10:00:00Z", etag=f"e{i}")
+        value["_hosted"] = [{"id": f"img{i}", "contentType": "image/png"}]
+        value["body"] = {"contentType": "html", "content": f'<img src="https://graph.microsoft.com/v1.0/chats/chat/messages/m{i}/hostedContents/img{i}/$value">'}
+        values.append(value)
+    return values
+
+
+async def test_a_reread_stages_each_page_in_one_transaction(store, adapters, monkeypatch):
+    """Railway 2026-11-05: pass 1 of a 3,955-message chat ran 7.3 s/page against 2.1 s in pass 2.
+    Each page staged its messages and then its reused children in two transactions, each first
+    re-validating the whole capture fence (~14 statements at 62 ms). Children now ride along
+    with the next page's messages."""
+    from shared import chat_catalogue
+    adapters.source.messages = _stamped_messages(150)   # 3 pages
+    await run_capture(store, adapters)
+    calls = []
+    original = chat_catalogue.stage_versions
+
+    async def counted(session, *, lease, items):
+        calls.append(len(items))
+        return await original(session, lease=lease, items=items)
+    monkeypatch.setattr(chat_catalogue, "stage_versions", counted)
+    adapters.source.messages[75]["etag"] = "edited"          # forces a full two-pass re-read
+    _, result = await run_capture(store, adapters)
+    assert result.outcome == "complete" and result.item_count == 300
+    assert len(calls) <= 3 + 1
+
+
+async def test_next_page_is_fetched_while_this_page_is_staged(store, adapters, monkeypatch):
+    from shared import chat_catalogue
+    adapters.source.messages = _stamped_messages(100)   # 2 pages
+    events = []
+    original_pages = adapters.source.iter_message_pages
+
+    async def pages(chat_id):
+        number = 0
+        async for page in original_pages(chat_id):
+            number += 1
+            events.append(f"fetched {number}")
+            yield page
+    monkeypatch.setattr(adapters.source, "iter_message_pages", pages)
+    original = chat_catalogue.stage_versions
+
+    async def staged(session, *, lease, items):
+        result = await original(session, lease=lease, items=items)
+        events.append("staged")
+        return result
+    monkeypatch.setattr(chat_catalogue, "stage_versions", staged)
+    _, result = await run_capture(store, adapters)
+    assert result.outcome == "complete"
+    assert events.index("fetched 2") < events.index("staged")

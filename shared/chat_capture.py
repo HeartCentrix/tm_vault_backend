@@ -63,7 +63,8 @@ class ChatObservationLedger:
         self.path = handle.name
         handle.close()
         self.db = sqlite3.connect(self.path)
-        self.db.execute("CREATE TABLE observed (pass INTEGER, key TEXT, semantic TEXT, binary INTEGER, PRIMARY KEY(pass,key))")
+        self.db.execute("CREATE TABLE observed (pass INTEGER, key TEXT, semantic TEXT, binary INTEGER, item_type TEXT, "
+                        "graph_id TEXT, parent_graph_id TEXT, file_payload TEXT, PRIMARY KEY(pass,key))")
         self.db.execute("CREATE TABLE expected (pass INTEGER, key TEXT, required INTEGER, PRIMARY KEY(pass,key))")
         self.db.execute("CREATE TABLE failures (pass INTEGER, phase TEXT, error_type TEXT, status INTEGER, graph_id TEXT, parent_graph_id TEXT, provider_code TEXT, provider_inner_code TEXT, provider_request_id TEXT)")
         self.db.execute("CREATE TABLE source_messages (pass INTEGER, message_id TEXT, source_sha256 TEXT NOT NULL, PRIMARY KEY(pass,message_id))")
@@ -104,7 +105,10 @@ class ChatObservationLedger:
             if old[0] != semantic:
                 raise ChatSourceMovement("conflicting source versions during enumeration")
             return False
-        self.db.execute("INSERT INTO observed VALUES (?,?,?,?)", (observation, key, semantic, int(content is not None)))
+        payload = (json.dumps(_payload(item.payload), sort_keys=True, separators=(",", ":"))
+                   if item.item_type == "CHAT_ATTACHMENT" else None)
+        self.db.execute("INSERT INTO observed VALUES (?,?,?,?,?,?,?,?)", (observation, key, semantic, int(content is not None),
+                        item.item_type, item.graph_id, item.parent_graph_id, payload))
         return True
 
     def fingerprint(self, observation):
@@ -123,8 +127,26 @@ class ChatObservationLedger:
         """Copy one pass's observations to another (single-pass reuse of a verified state)."""
         for table in ("observed", "expected"):
             self.db.execute(f"DELETE FROM {table} WHERE pass=?", (target,))
-        self.db.execute("INSERT INTO observed SELECT ?, key, semantic, binary FROM observed WHERE pass=?", (target, source))
+        self.db.execute("INSERT INTO observed SELECT ?, key, semantic, binary, item_type, graph_id, parent_graph_id, file_payload "
+                        "FROM observed WHERE pass=?", (target, source))
         self.db.execute("INSERT INTO expected SELECT ?, key, required FROM expected WHERE pass=?", (target, source))
+
+    def changed_files(self, limit=20):
+        """The two passes saw the same items and differ only in file attachments (a file edited while
+        the chat was read): [(key, graph_id, parent_graph_id, payload, second-pass semantic)], else None."""
+        differs = self.db.execute("""SELECT a.key, b.item_type, b.graph_id, b.parent_graph_id, b.file_payload, b.semantic
+            FROM observed a JOIN observed b ON b.pass=1 AND b.key=a.key WHERE a.pass=0 AND a.semantic<>b.semantic""").fetchall()
+        missing = sum(self.db.execute(query).fetchone()[0] for query in (
+            "SELECT COUNT(*) FROM observed a LEFT JOIN observed b ON b.pass=1 AND b.key=a.key WHERE a.pass=0 AND b.key IS NULL",
+            "SELECT COUNT(*) FROM observed b LEFT JOIN observed a ON a.pass=0 AND a.key=b.key WHERE b.pass=1 AND a.key IS NULL"))
+        if (missing or not differs or len(differs) > limit
+                or any(row[1] != "CHAT_ATTACHMENT" or not row[4] for row in differs)):
+            return None
+        return [(key, graph_id, parent, json.loads(payload), semantic) for key, _, graph_id, parent, payload, semantic in differs]
+
+    def adopt(self, key, semantic):
+        """Pass 1's entry takes the version both pass 2 and a fresh re-fetch observed."""
+        self.db.execute("UPDATE observed SET semantic=? WHERE pass=0 AND key=?", (semantic, key))
 
     def item_count(self, observation):
         return self.db.execute("SELECT COUNT(*) FROM observed WHERE pass=?", (observation,)).fetchone()[0]
@@ -189,6 +211,7 @@ class _Pass:
     hosted_lists: int = 0
     duplicate_messages: int = 0
     verified_binary: int = 0
+    stage_s: float = 0.0
 
 
 class _CaptureLeaseKeeper:
@@ -473,9 +496,11 @@ async def _binary_capture(*, scope, keeper, factory, storage, source_client, ite
             mark("refresh")
         retained = await _retained(scope=scope, keeper=keeper, factory=factory, storage=storage,
             item_type=item_type, graph_id=graph_id, parent_id=parent_id, payload=payload,
-            source=source, checksum=spooled.sha256, stage=stage)
+            source=source, checksum=spooled.sha256, stage=stage and not defer)
         mark("retained_checksum")
         if retained is not None:
+            if defer:
+                deferred.append(retained)
             return report(retained)
         if stage:
             content = await upload_capture_content(scope=scope, lease=keeper.lease,
@@ -625,10 +650,35 @@ async def _observe(*, scope, keeper, factory, storage, source, ledger, observati
     return stats
 
 
+async def _prefetched(pages):
+    """One page of lookahead: the next Graph page is fetched while this one is staged and verified
+    (pass 1 of a 3,955-message chat waited on staging before asking for each next page)."""
+    iterator = pages.__aiter__()
+    following = asyncio.ensure_future(iterator.__anext__())
+    try:
+        while True:
+            try:
+                page = await following
+            except StopAsyncIteration:
+                return
+            following = asyncio.ensure_future(iterator.__anext__())
+            yield page
+    finally:
+        if not following.done():
+            following.cancel()
+            await asyncio.wait([following])
+        if not following.cancelled():
+            following.exception()   # a lookahead failure after the consumer stopped is not raised
+        close = getattr(iterator, "aclose", None)
+        if close is not None:
+            with suppress(Exception):
+                await close()
+
+
 async def _observe_pages(*, scope, keeper, factory, source, ledger, observation, exclude_message, folder_path,
                          stats, home_tenant, pool, pending, flush, capture_binary):
     try:
-        async for page in source.iter_message_pages(scope.chat_id):
+        async for page in _prefetched(source.iter_message_pages(scope.chat_id)):
             keeper.check()
             prepared, parents = [], []
             try:
@@ -672,8 +722,13 @@ async def _observe_pages(*, scope, keeper, factory, source, ledger, observation,
             finally:
                 # Parent rows must already exist before any child upload/link;
                 # interruption then leaves a readable partial message inventory.
-                if parents:
-                    await _stage(factory, keeper, parents)
+                # Earlier pages' reused children ride along: one staging per page.
+                batch = parents + pending[:]
+                del pending[:]
+                if batch:
+                    began = time.monotonic()
+                    await _stage(factory, keeper, batch)
+                    stats.stage_s += time.monotonic() - began
             for identifier, attachments, hosted, marker in prepared:
                 for kind, values in (("CHAT_ATTACHMENT", attachments), ("CHAT_HOSTED_CONTENT", hosted)):
                     for child in values:
@@ -690,13 +745,12 @@ async def _observe_pages(*, scope, keeper, factory, source, ledger, observation,
                         else:
                             await pool.submit(capture_binary(kind, child, identifier, marker))
                         await flush(200)
-            await flush()
             stats.pages += 1
             logger.info(
                 "chat_capture_progress attempt_id=%s observation=%s pages=%s messages_observed=%s "
-                "hosted_enumerations=%s duplicate_messages_skipped=%s verified_binary=%s unresolved=%s",
+                "hosted_enumerations=%s duplicate_messages_skipped=%s verified_binary=%s unresolved=%s stage_s=%.1f",
                 keeper.lease.attempt_id, observation + 1, stats.pages, stats.messages,
-                stats.hosted_lists, stats.duplicate_messages, stats.verified_binary, stats.unresolved)
+                stats.hosted_lists, stats.duplicate_messages, stats.verified_binary, stats.unresolved, stats.stage_s)
         await pool.drain()
         await flush()
         stats.complete = True
@@ -1119,6 +1173,31 @@ async def _source(client, principal_id):
 _CAPTURE_SLOTS = WeakKeyDictionary()
 
 
+async def _refetch_changed_files(*, scope, keeper, factory, storage, source, ledger, observation_hash_version) -> bool:
+    """Only file attachments differ between the passes (a file edited while the chat was read): fetch
+    those files again instead of the whole chat (Railway 2026-11-05: one .xlsx edit re-read a
+    3,955-message chat, 12.5 min). True only when every re-fetch matches what pass 2 saw."""
+    changed = ledger.changed_files()
+    if not changed or any(metadata_only_attachment(payload) for _, _, _, payload, _ in changed):
+        return False
+    try:
+        for key, graph_id, parent_id, payload, seen in changed:
+            await _remove_staged_item(factory, keeper, scope, key)
+            captured = await _binary(scope=scope, keeper=keeper, factory=factory, storage=storage, source_client=source,
+                item_type="CHAT_ATTACHMENT", graph_id=graph_id, parent_id=parent_id, payload=payload, stage=True)
+            semantic = observation_semantic(captured, observation_hash_version)
+            if semantic != seen:
+                return False
+            ledger.adopt(key, semantic)
+    except _STOPS_CAPTURE:
+        raise
+    except Exception as exc:
+        logger.warning("chat_file_refetch_failed attempt_id=%s chat=%s error=%s", keeper.lease.attempt_id, scope.chat_id, type(exc).__name__)
+        return False
+    logger.info("chat_file_movement_refetched attempt_id=%s chat=%s files=%s", keeper.lease.attempt_id, scope.chat_id, len(changed))
+    return ledger.fingerprint(0) == ledger.fingerprint(1)
+
+
 async def capture_chat_inventory(*, scope, graph_client, storage, session_factory,
                                  folder_path=None, exclude_message=None, scope_filter_hash=None) -> CaptureResult:
     """Bound open chat ledgers and preserve their iterators across local waits."""
@@ -1187,6 +1266,9 @@ async def _capture_chat_inventory(*, scope, graph_client, storage, session_facto
                                 source=source, ledger=ledger, observation=1, exclude_message=exclude_message, folder_path=folder_path)
                         movement = (first.complete and second.complete and not first.unresolved and not second.unresolved and
                                     ledger.fingerprint(0) != ledger.fingerprint(1))
+                        if movement:
+                            movement = not await _refetch_changed_files(scope=scope, keeper=keeper, factory=session_factory,
+                                storage=storage, source=source, ledger=ledger, observation_hash_version=lease.observation_hash_version)
                     except ChatSourceMovement as exc:
                         movement, first.conflicts, movement_reason = True, 1, str(exc)
                     if movement:
