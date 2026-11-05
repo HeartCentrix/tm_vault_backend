@@ -227,3 +227,39 @@ async def test_member_does_not_wait_at_the_end_for_a_backup_that_never_started(s
     _, y_snap = await snapshot(Y, batch, resource=y_resource)
     sources[Y] = Source(Y, [GROUP])
     assert (await run(y_resource, y_snap))["outcome"] == "complete" and GROUP in sources[Y].reads
+
+
+class FailingGroupSource(Source):
+    async def iter_message_pages(self, chat_id):
+        self.reads.append(chat_id)
+        if chat_id == GROUP:
+            from shared.chat_capture_graph import ChatGraphError
+            raise ChatGraphError("Graph capture messages failed with HTTP 403", status_code=403)
+        yield [message("x-only", "2026-07-01T00:00:00Z")]
+
+
+async def test_member_does_not_wait_for_a_capturer_whose_own_attempt_at_the_chat_failed(store, members):
+    """Railway 2026-11-05: capturers whose own attempt at a chat failed (Microsoft 403/423) never
+    publish it, so the members waiting for their copy deferred every 60 s for good, several of them
+    waiting on each other, and no chat backup finished. A capturer that tried and failed is not
+    going to capture the chat: the member captures it itself."""
+    sources, snapshot, job, run = members
+    batch = await job()
+    x_resource, x_snap = await snapshot(X, batch)          # X's backup stays in progress
+    sources[X] = FailingGroupSource(X, [GROUP])
+    await run(x_resource, x_snap)
+    async with store.factory() as session:
+        assert (await session.scalar(select(models.ChatCaptureAttempt.state).where(
+            models.ChatCaptureAttempt.snapshot_id == x_snap, models.ChatCaptureAttempt.chat_id == GROUP))) == "FAILED"
+    y_resource, y_snap = await snapshot(Y, batch)
+    gate = asyncio.Event()
+    sources[Y] = Source(Y, [GROUP, Y_ONLY], gate=gate)
+    y_run = asyncio.create_task(run(y_resource, y_snap))
+    for _ in range(200):                                    # while Y's own chat is held, its other lane
+        if GROUP in sources[Y].reads:                       # captures the group chat instead of leaving it
+            break
+        await asyncio.sleep(0.01)
+    reads_while_held = list(sources[Y].reads)
+    gate.set()
+    await y_run
+    assert GROUP in reads_while_held

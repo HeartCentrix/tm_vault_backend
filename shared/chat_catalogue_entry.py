@@ -483,8 +483,14 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                         return not final
                     if theirs.status != SnapshotStatus.IN_PROGRESS:
                         return False
-                    return await session.scalar(select(SnapshotChatInventory.chat_id).where(
-                        SnapshotChatInventory.snapshot_id == theirs.id, SnapshotChatInventory.chat_id == cid).limit(1)) is None
+                    if await session.scalar(select(SnapshotChatInventory.chat_id).where(
+                            SnapshotChatInventory.snapshot_id == theirs.id, SnapshotChatInventory.chat_id == cid).limit(1)) is not None:
+                        return False
+                    # Its own attempt failed (Microsoft 403/423...): it will not publish the chat, and members
+                    # waiting on such capturers waited on each other for good (Railway 2026-11-05).
+                    return await session.scalar(select(ChatCaptureAttempt.state).where(
+                        ChatCaptureAttempt.snapshot_id == theirs.id, ChatCaptureAttempt.chat_id == cid)
+                        .order_by(ChatCaptureAttempt.created_at.desc()).limit(1)) != "FAILED"
             async def capture(cid, final=True):
                 await cancel_check()
                 scope = chat_scope(cid)
