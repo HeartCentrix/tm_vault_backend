@@ -512,6 +512,39 @@ async def test_requested_full_backup_reads_every_chat_even_when_unchanged(store,
     assert len(source.message_calls) == reads
 
 
+async def test_chat_hosted_elsewhere_is_settled_by_one_request_without_a_capture_attempt(store, source_adapter):
+    """Railway 2026-11-05 incremental: Rohit's 92 chats hosted in other organizations' tenants were
+    attempted again on every run, postponed behind other members and failed at the end (~7 of his
+    25 minutes). One request now proves Microsoft refuses them: no capture attempt, nothing to wait on.
+    A chat listed under another tenant that Microsoft does let us read is still captured."""
+    from shared.chat_capture_graph import ChatGraphError
+    source = source_adapter.source
+    source.home_tenant_id = "home-tenant"
+    source.chats += [{"id": "external-meeting", "topic": "Vendor call", "tenantId": "other-tenant"},
+                     {"id": "unlabelled-external", "topic": None, "chatType": "unknownFutureValue"},
+                     {"id": "readable-external", "topic": "Shared channel", "tenantId": "other-tenant"}]
+    source.messages["readable-external"] = [{"id": "message-ext", "body": {"content": "hi"}, "attachments": []}]
+    checks = []
+
+    async def latest(chat_id):
+        checks.append(chat_id)
+        if chat_id in ("external-meeting", "unlabelled-external"):
+            raise ChatGraphError("Graph capture metadata failed with HTTP 403", status_code=403)
+        return datetime.now(timezone.utc)
+    source.latest_message_change = latest
+    scope = await legacy_scope(store)
+    result = await source_adapter.run(scope)
+    assert result["outcome"] == "complete" and result["item_count"] == 2
+    assert checks.count("external-meeting") == checks.count("unlabelled-external") == 1
+    assert {"external-meeting", "unlabelled-external"}.isdisjoint(source.message_calls)
+    async with store.factory() as session:
+        attempted = set((await session.scalars(select(models.ChatCaptureAttempt.chat_id).where(
+            models.ChatCaptureAttempt.snapshot_id == scope.snapshot_id))).all())
+        record = (await session.get(models.Snapshot, scope.snapshot_id)).extra_data["chat_catalogue_scopes"]["resource"]
+    assert attempted == {"chat-alpha", "readable-external"}
+    assert record["complete"] and record["external_tenant_chats"] == ["external-meeting", "unlabelled-external"]
+
+
 async def test_chat_hosted_elsewhere_completes_its_provider_unit(store, source_adapter, monkeypatch):
     """Railway 2026-11-04: Divyansh's chat snapshot was COMPLETED but its provider work PARTIAL:
     the two chats Microsoft refuses (another organization's tenant) marked their units FAILED

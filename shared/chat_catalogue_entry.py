@@ -339,12 +339,32 @@ def _hosted_elsewhere(chat, home_tenant, result) -> bool:
     (it answers app access with 403): listed as hosted elsewhere, not our failure. Graph lists
     some cross-organization chats as chatType unknownFutureValue with no tenantId at all
     (Railway 2026-11-04: every such chat answered 403 InsufficientPrivileges)."""
+    return _listed_elsewhere(chat, home_tenant) and result.outcome == "failed" and not result.item_count
+
+
+def _listed_elsewhere(chat, home_tenant) -> bool:
     chat = chat or {}
     tenant = chat.get("tenantId")
     elsewhere = (tenant.lower() != home_tenant.lower() if isinstance(tenant, str) and tenant
                  else chat.get("chatType") == "unknownFutureValue")
-    return (isinstance(home_tenant, str) and bool(home_tenant) and elsewhere
-            and result.outcome == "failed" and not result.item_count)
+    return isinstance(home_tenant, str) and bool(home_tenant) and elsewhere
+
+
+async def _refused_elsewhere(source, chat, home_tenant):
+    """One request settles a chat listed under another organization that Microsoft refuses (403):
+    no capture attempt, so nothing is postponed or waited on (Railway 2026-11-05: Rohit's 92 such
+    chats were re-attempted every run, ~7 of a 25-minute incremental). None means capture it."""
+    if not _listed_elsewhere(chat, home_tenant):
+        return None
+    from shared.chat_capture_graph import ChatGraphError
+    try:
+        await source.latest_message_change(chat["id"])
+    except ChatGraphError as exc:
+        if exc.status_code == 403:
+            now = datetime.now(timezone.utc)
+            return CaptureResult("failed", None, False, 0, 0, 0, now, now,
+                                 "hosted in another organization's tenant; Microsoft refuses app access")
+    return None
 
 
 async def _chat_list(source):
@@ -496,6 +516,8 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                 scope = chat_scope(cid)
                 async with session_factory() as session:
                     previous = await _published_chat(session, scope)
+                if previous is None:
+                    previous = await _refused_elsewhere(source, chats[cid], getattr(source, "home_tenant_id", None))
                 busy = False
                 if previous is None and shared_capture:
                     previous = await derive_shared_chat(scope=scope, session_factory=session_factory,
