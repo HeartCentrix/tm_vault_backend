@@ -668,3 +668,44 @@ async def test_a_run_that_is_not_complete_does_not_advance_the_delta_cursor(stor
     feed.append(set())
     assert (await source_adapter.run(await store.new_scope()))["outcome"] == "partial"
     assert await delta_cursor(store, first.resource_id) is None
+
+
+async def test_delta_run_skips_known_hosted_elsewhere_chats_and_already_linked_chats(store, source_adapter, monkeypatch):
+    """Railway 2026-11-05 branch incremental: Rohit's 243 chats were linked in 30 s, but his run went on
+    for minutes: 92 chats hosted in other tenants were probed again, and a resumed turn walked the
+    243 linked chats one by one. A chat hosted elsewhere at the cursor's snapshot that the feed shows
+    unchanged is listed hosted elsewhere again without a request; linked chats are not walked again."""
+    from shared import chat_catalogue_entry
+    from shared.chat_capture_graph import ChatGraphError
+    source = source_adapter.source
+    source.home_tenant_id = "home-tenant"
+    source.chats.append({"id": "external-meeting", "topic": "Vendor call", "tenantId": "other-tenant"})
+    feed, rounds, checks = [set(), set()], [], []
+    delta_source(source, feed, rounds, checks)
+    plain = source.latest_message_change
+
+    async def latest(chat_id):
+        if chat_id == "external-meeting":
+            checks.append(chat_id)
+            raise ChatGraphError("Graph capture metadata failed with HTTP 403", status_code=403)
+        return await plain(chat_id)
+    source.latest_message_change = latest
+    first = await legacy_scope(store)
+    await source_adapter.run(first)
+    assert checks == ["external-meeting"]
+    second = await store.new_scope()
+    assert (await source_adapter.run(second))["outcome"] == "complete"
+    assert checks == ["external-meeting"]
+    async with store.factory() as session:
+        record = (await session.get(models.Snapshot, second.snapshot_id)).extra_data["chat_catalogue_scopes"]["resource"]
+    assert record["complete"] and record["external_tenant_chats"] == ["external-meeting"]
+
+    walked = []
+    published = chat_catalogue_entry._published_chat
+
+    async def counted(session, scope):
+        walked.append(scope.chat_id)
+        return await published(session, scope)
+    monkeypatch.setattr(chat_catalogue_entry, "_published_chat", counted)
+    assert (await source_adapter.run(second))["outcome"] == "complete"   # a resumed turn of the same snapshot
+    assert walked == [] and checks == ["external-meeting"]

@@ -10,7 +10,7 @@ import os
 import time
 from uuid import UUID
 
-from sqlalchemy import cast, func, or_, select, text
+from sqlalchemy import Text, cast, func, or_, select, text
 from sqlalchemy.dialects.postgresql import JSONB
 
 from shared.chat_catalogue import ChatCatalogueConflict, ChatCatalogueIntegrityError, ChatCatalogueWorkLeaseMoved
@@ -609,6 +609,24 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                 delta = await _chat_delta_round(session_factory, source, resource_id=resource_id,
                     snapshot_id=snapshot_id, principal=principal, since=started)
                 changed, since_snapshot = delta if delta is not None else (None, None)
+                if changed is not None and not full_backup:
+                    # A resumed turn does not walk chats this snapshot already linked, and a chat hosted in
+                    # another tenant at the cursor's snapshot that the feed shows unchanged is listed again
+                    # without a request (Railway 2026-11-05: Rohit's 243 linked chats were walked again and
+                    # his 92 hosted-elsewhere chats probed again after a fair hand-back).
+                    async with session_factory() as session:
+                        linked_before = set((await session.scalars(select(ChatCaptureAttempt.chat_id).where(
+                            ChatCaptureAttempt.snapshot_id == snapshot_id, ChatCaptureAttempt.state == "PUBLISHED",
+                            cast(ChatCaptureAttempt.evidence_history, Text).like("%delta_unchanged_since_snapshot%")))).all()) if published else set()
+                        since = await session.get(Snapshot, since_snapshot) if since_snapshot else None
+                    known_external = set((((since.extra_data or {}).get("chat_catalogue_scopes") or {}).get("resource") or {})
+                                         .get("external_tenant_chats") or []) if since is not None else set()
+                    home = getattr(source, "home_tenant_id", None)
+                    still_external = {cid for cid in (known_external & set(keys)) - changed if _listed_elsewhere(chats[cid], home)}
+                    done_before = (linked_before & set(keys)) | still_external
+                    completed += len(done_before)
+                    external.extend(sorted(still_external))
+                    keys = [cid for cid in keys if cid not in done_before]
                 unchanged = [cid for cid in keys if changed is not None and cid not in changed and cid not in published]
                 if unchanged and since_snapshot and not full_backup:
                     from shared.chat_capture import link_unchanged_chats
