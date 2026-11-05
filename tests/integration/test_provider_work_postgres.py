@@ -490,24 +490,40 @@ async def test_only_work_no_free_worker_picked_up_makes_a_turn_hand_back(store):
     finally:
         _EXECUTION.reset(token)
 
-async def test_lease_renewal_takes_its_snapshot_before_its_work_row(store):
-    """Railway 2026-11-05 07:23:27 deadlock: a lease renewal locked its work row, then updated the
-    snapshot's lease, while another transaction had already written that snapshot and was locking
-    the same work row. Renewal now takes the snapshot first, the order the other writers use."""
+async def renew_concurrently(store, owner):
+    async def renew():
+        async with store.factory.begin() as db:
+            await work.renew_work(db, owner)
+    import asyncio
+    return asyncio.create_task(renew())
+
+
+async def test_lease_renewal_never_waits_for_a_snapshot_another_writer_holds(store):
+    """Railway 2026-11-05 07:23:27 deadlock: a lease renewal locked its work row, then waited to update
+    the snapshot's lease, while another transaction had already written that snapshot and was
+    locking the same work row. A busy snapshot keeps its lease until the next renewal."""
     import asyncio
     from sqlalchemy import text
     await enqueue(store)
     owner = await claim(store)
-
-    async def renew():
-        async with store.factory.begin() as db:
-            await work.renew_work(db, owner)
     async with store.factory.begin() as a:
         await a.execute(update(models.Snapshot).where(models.Snapshot.id == owner.snapshot_id)
             .values(extra_data={'written': 'first'}))
-        renewal = asyncio.create_task(renew())
-        await asyncio.sleep(0.5)
-        assert not renewal.done()
+        renewal = await renew_concurrently(store, owner)
+        await asyncio.wait_for(asyncio.shield(renewal), 5)
         await a.execute(text("SET LOCAL lock_timeout='250ms'"))
         await a.execute(select(models.ProviderWork.id).where(models.ProviderWork.id == owner.work_id).with_for_update())
-    await renewal
+
+
+async def test_lease_renewal_and_a_work_row_first_counter_flush_both_finish(store):
+    """Railway 2026-11-05 11:15-11:33, 7 deadlocks: OneDrive/mail counter flushes lock their work row,
+    then update the snapshot's counters; a renewal that took the snapshot first deadlocked with them."""
+    import asyncio
+    await enqueue(store)
+    owner = await claim(store)
+    async with store.factory.begin() as a:
+        await a.execute(select(models.ProviderWork.id).where(models.ProviderWork.id == owner.work_id).with_for_update())
+        renewal = await renew_concurrently(store, owner)
+        await asyncio.sleep(0.5)
+        await a.execute(update(models.Snapshot).where(models.Snapshot.id == owner.snapshot_id).values(item_count=7))
+    await asyncio.wait_for(renewal, 5)
