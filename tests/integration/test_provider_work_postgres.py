@@ -489,3 +489,25 @@ async def test_only_work_no_free_worker_picked_up_makes_a_turn_hand_back(store):
         assert await other_provider_work_waiting()
     finally:
         _EXECUTION.reset(token)
+
+async def test_lease_renewal_takes_its_snapshot_before_its_work_row(store):
+    """Railway 2026-11-05 07:23:27 deadlock: a lease renewal locked its work row, then updated the
+    snapshot's lease, while another transaction had already written that snapshot and was locking
+    the same work row. Renewal now takes the snapshot first, the order the other writers use."""
+    import asyncio
+    from sqlalchemy import text
+    await enqueue(store)
+    owner = await claim(store)
+
+    async def renew():
+        async with store.factory.begin() as db:
+            await work.renew_work(db, owner)
+    async with store.factory.begin() as a:
+        await a.execute(update(models.Snapshot).where(models.Snapshot.id == owner.snapshot_id)
+            .values(extra_data={'written': 'first'}))
+        renewal = asyncio.create_task(renew())
+        await asyncio.sleep(0.5)
+        assert not renewal.done()
+        await a.execute(text("SET LOCAL lock_timeout='250ms'"))
+        await a.execute(select(models.ProviderWork.id).where(models.ProviderWork.id == owner.work_id).with_for_update())
+    await renewal

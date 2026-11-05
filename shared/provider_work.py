@@ -105,7 +105,7 @@ def _receipt(row):
         row.snapshot_lease_token, row.job_lease_token, row.weight)
 
 
-async def _parents(session, snapshot_id, partition_id=None, *, skip_locked=False, share_job=False):
+async def _parents(session, snapshot_id, partition_id=None, *, skip_locked=False, share_job=False, leaf_write=False):
     hint = await session.get(Snapshot, _uuid(snapshot_id))
     if hint is None:
         raise ProviderWorkConflict('provider snapshot removed')
@@ -116,14 +116,16 @@ async def _parents(session, snapshot_id, partition_id=None, *, skip_locked=False
         .execution_options(populate_existing=True))
     if job is None:
         raise ProviderWorkConflict('provider parent locked or removed')
-    # Leaf rows are validated here; writers UPDATE afterwards (implicit NO KEY UPDATE).
+    # Leaf rows are validated here. A caller that writes them after locking its work row
+    # (leaf_write) takes the write lock now: upgrading after the work row deadlocked against a
+    # transaction that wrote the snapshot first, then locked that row (Railway 2026-11-05 07:23:27).
     snapshot = await session.scalar(select(Snapshot).where(Snapshot.id == hint.id)
-        .with_for_update(skip_locked=skip_locked, read=True, key_share=True)
+        .with_for_update(skip_locked=skip_locked, read=not leaf_write, key_share=True)
         .execution_options(populate_existing=True))
     if snapshot is None:
         raise ProviderWorkConflict('provider parent locked or removed')
     partition = await session.scalar(select(SnapshotPartition).where(SnapshotPartition.id == _uuid(partition_id))
-        .with_for_update(skip_locked=skip_locked, read=True, key_share=True).execution_options(populate_existing=True)) if partition_id else None
+        .with_for_update(skip_locked=skip_locked, read=not leaf_write, key_share=True).execution_options(populate_existing=True)) if partition_id else None
     if partition_id and partition is None:
         raise ProviderWorkConflict('provider parent locked or removed')
     return job, snapshot, partition
@@ -191,8 +193,9 @@ async def ensure_work(session, *, snapshot_id, snapshot_token, job_token, partit
     return _receipt(row)
 
 
-async def _owned(session, claim, *, allow_terminal=False, share_job=True):
-    job, snapshot, partition = await _parents(session, claim.snapshot_id, claim.partition_id, share_job=share_job)
+async def _owned(session, claim, *, allow_terminal=False, share_job=True, leaf_write=False):
+    job, snapshot, partition = await _parents(session, claim.snapshot_id, claim.partition_id, share_job=share_job,
+                                              leaf_write=leaf_write)
     row = await session.scalar(select(ProviderWork).where(ProviderWork.id == claim.work_id).with_for_update()
         .execution_options(populate_existing=True))
     leaf = partition or snapshot
@@ -233,7 +236,7 @@ async def claim_due_work(session, *, owner_id, lease_seconds=120, _clamp_rounds=
     for hint in candidates:
         try:
             job, snapshot, partition = await _parents(session, hint.snapshot_id, hint.partition_id,
-                skip_locked=True, share_job=True)
+                skip_locked=True, share_job=True, leaf_write=True)
         except ProviderWorkConflict:
             continue
         row = await session.scalar(select(ProviderWork).where(ProviderWork.id == hint.id).with_for_update(skip_locked=True)
@@ -334,7 +337,7 @@ async def claim_due_work(session, *, owner_id, lease_seconds=120, _clamp_rounds=
 
 
 async def renew_work(session, claim, *, lease_seconds=120):
-    row, _, snapshot, partition = await _owned(session, claim, allow_terminal=True, share_job=True)
+    row, _, snapshot, partition = await _owned(session, claim, allow_terminal=True, share_job=True, leaf_write=True)
     expiry = await session.scalar(select(func.clock_timestamp())) + timedelta(seconds=lease_seconds)
     row.lease_expires_at = (partition or snapshot).lease_expires_at = expiry
     return claim
@@ -379,7 +382,7 @@ async def suspend_current_work(session, claim, *, next_eligible_at, reason, cont
     hint = await session.get(ProviderWork, claim.work_id)
     if hint and hint.state == 'WAITING' and hint.suspension_generation == claim.generation:
         return _receipt(hint)
-    row, job, snapshot, partition = await _owned(session, claim, share_job=False)
+    row, job, snapshot, partition = await _owned(session, claim, share_job=False, leaf_write=True)
     leaf = partition or snapshot
     job.result = {**(job.result or {}), 'provider_phase': 'WAITING', 'provider_next_eligible_at': next_eligible_at.isoformat()}
     snapshot.extra_data = {**(snapshot.extra_data or {}), 'provider_phase': 'WAITING', 'provider_next_eligible_at': next_eligible_at.isoformat()}
