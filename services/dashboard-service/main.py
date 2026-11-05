@@ -263,8 +263,8 @@ def datasource_batch_trigger_label(service_type: str) -> str:
 
 def format_bytes(bytes_val: int) -> str:
     if bytes_val < 1024**3:
-        return f"{bytes_val / 1024**2:.1f} MB"
-    return f"{bytes_val / 1024**3:.1f} GB"
+        return f"{bytes_val / 1024**2:.1f} MiB"
+    return f"{bytes_val / 1024**3:.1f} GiB"
 
 
 @app.get("/health")
