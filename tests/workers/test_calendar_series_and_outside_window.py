@@ -70,16 +70,24 @@ def test_restore_skips_children_whose_master_is_restored_with_them():
     assert children_to_skip(items, lambda it: it.raw) == {2, 3}
 
 
-def test_daily_sweep_does_not_store_again_events_already_stored_unchanged():
-    # Incremental runs: the delta stream returns only changed events, so without this every sweep
-    # (once per 24 h) stored every master and single event again (TM: 38,223 events in one calendar).
-    graph = Graph([
-        {"id": "M1", "type": "seriesMaster", "subject": "Standup", "changeKey": "k1"},
-        {"id": "M2", "type": "seriesMaster", "subject": "Edited series", "changeKey": "k2-new"},
-        {"id": "OLD", "type": "singleInstance", "subject": "Kickoff 2021", "changeKey": "k3"},
-        {"id": "NEW", "type": "singleInstance", "subject": "Never stored", "changeKey": "k4"},
-    ])
-    stored = {"M1": "k1", "M2": "k2-old", "OLD": "k3"}
-    rows = asyncio.run(rows_for(graph, "user-1", "default", "Calendar", set(), stored))
-    assert [r[2] for r in rows] == ["M2", "NEW"]
-    assert graph.urls == ["https://graph.microsoft.com/v1.0/users/user-1/events?$top=500"]
+
+drop_unchanged = _load("workers/backup-worker/main.py", "_drop_unchanged_calendar_rows")
+
+
+def test_calendar_rows_already_stored_unchanged_are_not_stored_again():
+    # Sub-calendars have no delta, so each 24 h refresh re-pulls the whole window, and the events
+    # sweep re-lists every master and single event (Railway 2026-11-05: 550 unchanged events
+    # re-stored for 10 users in one refresh; TM: 38,223 events in one calendar). Recovery and
+    # restore read the newest stored copy, so an unchanged event needs no new row.
+    def row(eid, raw):
+        return ("CALENDAR_EVENT", "s", eid, {"raw": {"id": eid, **raw}}, "Calendar/Holidays")
+    rows = [
+        row("SAME", {"type": "singleInstance", "changeKey": "k1"}),
+        row("EDITED", {"type": "seriesMaster", "changeKey": "k2-new"}),
+        row("OCC", {"type": "occurrence", "changeKey": "k3"}),
+        row("NEW", {"type": "singleInstance", "changeKey": "k4"}),
+        row("STUB", {"type": "occurrence"}),               # delta occurrence stub: no changeKey
+        row("GONE", {"@removed": {"reason": "deleted"}}),  # tombstone
+    ]
+    stored = {"SAME": "k1", "EDITED": "k2-old", "OCC": "k3", "STUB": None, "GONE": "k9"}
+    assert [r[2] for r in drop_unchanged(rows, stored)] == ["EDITED", "NEW", "STUB", "GONE"]
