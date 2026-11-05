@@ -162,3 +162,20 @@ async def items_snapshot_id(session: AsyncSession, snapshot_id: UUIDLike) -> uui
         return (await resolve_snapshot_items_target(session, snapshot_id)).target_id
     except SnapshotNotFound:
         return _coerce_uuid(snapshot_id)
+
+
+async def point_at(session: AsyncSession, *, target_snapshot_id: UUIDLike, prior_snapshot_id: UUIDLike,
+                   marker: str) -> bool:
+    """Make ``target`` a reuse snapshot of the full snapshot ``prior``: no rows of its own, the prior's
+    totals, nothing new; ``extra_data[marker]`` names the prior. False, with nothing written, when the
+    target already owns rows or points elsewhere. The validation trigger requires ``prior`` to be a
+    COMPLETED full snapshot of the same resource, started earlier."""
+    row = (await session.execute(text("""
+        UPDATE snapshots t SET reuse_of_snapshot_id = p.id, reuse_chain_root_id = p.id,
+            item_count = p.item_count, bytes_total = p.bytes_total, new_item_count = 0, bytes_added = 0,
+            extra_data = (COALESCE(t.extra_data::jsonb, '{}'::jsonb) || jsonb_build_object(CAST(:marker AS text), p.id::text))::json
+        FROM snapshots p
+        WHERE t.id = CAST(:target AS UUID) AND p.id = CAST(:prior AS UUID) AND t.reuse_of_snapshot_id IS NULL
+          AND NOT EXISTS (SELECT 1 FROM snapshot_items WHERE snapshot_id = t.id)
+        RETURNING t.id"""), {"target": str(target_snapshot_id), "prior": str(prior_snapshot_id), "marker": marker})).first()
+    return row is not None

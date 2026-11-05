@@ -88,11 +88,11 @@ async def test_same_names_and_changed_identity_do_not_heal_gaps(store):
     assert (await ledger.manifest_batch())[0]['state'] == 'failed'
 
 
-async def observed_item(ledger, *, iid='i', ck='a'):
+async def observed_item(ledger, *, iid='i', ck='a', more=()):
     root = await ledger.claim_scope()
     await ledger.page(root, {'value': [{'id': 'f', 'childFolderCount': 0}]}, BASE)
     scope = await ledger.claim_scope()
-    await ledger.page(scope, {'value': [{'id': iid, 'changeKey': ck}]}, scope['next_url'])
+    await ledger.page(scope, {'value': [{'id': iid, 'changeKey': ck}, *more]}, scope['next_url'])
 
 
 def content_row(store, ledger, *, iid='i', ck='a', checksum='hash', path='opaque'):
@@ -141,10 +141,10 @@ async def test_copy_pins_and_attachments_resolve_only_after_actual_copy(store, m
             external_id='attachment', parent_external_id='i', item_type='ARCHIVE_ATTACHMENT', name='file',
             content_hash='att', blob_path='att-path', backend_id=store.backend, content_size=4))
     current = await capture(store)
-    await observed_item(current)
+    await observed_item(current, more=[{'id': 'new', 'changeKey': 'n'}])   # one new item: copy, not reuse
     with copy_workflow.copy_collection(current.fence.snapshot_id, expected_snapshot_token=0, expected_job_token=0) as collection:
         await current.classify(prior.fence.snapshot_id, copy_collection=collection)
-        assert (await current.summary())['files_failed'] == 1
+        assert (await current.summary())['files_failed'] == 2
         async with store.factory() as db:
             task = await db.scalar(select(models.CopyWorkTask))
             assert (await db.scalar(select(models.CopyWorkItem).where(models.CopyWorkItem.task_id == task.id))).source_snapshot_id == prior.fence.snapshot_id
@@ -161,10 +161,52 @@ async def test_copy_pins_and_attachments_resolve_only_after_actual_copy(store, m
     async with store.factory.begin() as db:
         snap = await db.get(models.Snapshot, current.fence.snapshot_id)
         result = await archive_final_gate(db, snap, generation=current.generation)
-        assert result['files_failed'] == 0
+        assert result['files_failed'] == 1   # the new item still awaits its export
         assert result['bytes_total'] == 7
         assert await db.scalar(select(models.SnapshotItem).where(models.SnapshotItem.snapshot_id == snap.id,
             models.SnapshotItem.item_type == 'ARCHIVE_ATTACHMENT'))
+
+
+async def _completed_prior(store, *, ck='a'):
+    from uuid import uuid4
+    prior = await capture(store)
+    await observed_item(prior, ck=ck)
+    await prior.commit_rows([content_row(store, prior, ck=ck)])
+    async with store.factory.begin() as db:
+        snap = await db.get(models.Snapshot, prior.fence.snapshot_id)
+        snap.status, snap.item_count, snap.bytes_total = models.SnapshotStatus.COMPLETED, 1, 7
+        db.add(models.SnapshotItem(id=uuid4(), snapshot_id=snap.id, tenant_id=store.tenant,
+            external_id='attachment', parent_external_id='i', item_type='ARCHIVE_ATTACHMENT', name='file',
+            content_hash='att', blob_path='att-path', backend_id=store.backend, content_size=4))
+    return prior
+
+
+async def test_unchanged_archive_points_at_its_prior_instead_of_copying(store):
+    """Every incremental copied the whole archive forward (ARCHIVE_CARRY), even unchanged: TM's largest
+    is 1.1 M items. A complete census whose every item is unchanged and one-to-one with the prior
+    points at it; every item is stored through the pointer and nothing counts as new."""
+    from shared.archive_capture import archive_final_gate
+    prior = await _completed_prior(store)
+    current = await capture(store)
+    await observed_item(current)
+    await current.classify(prior.fence.snapshot_id)
+    async with store.factory.begin() as db:
+        snap = await db.get(models.Snapshot, current.fence.snapshot_id)
+        result = await archive_final_gate(db, snap, generation=current.generation)
+        assert (snap.reuse_of_snapshot_id, snap.reuse_chain_root_id) == (prior.fence.snapshot_id,) * 2
+        own = await db.scalar(select(models.SnapshotItem.id).where(models.SnapshotItem.snapshot_id == snap.id))
+        tasks = await db.scalar(select(models.CopyWorkTask.id))
+    assert own is None and tasks is None
+    assert (result['files_succeeded'], result['files_failed'], result['new_item_count'], result['bytes_total']) == (1, 0, 0, 7)
+
+
+async def test_changed_archive_item_is_not_reused(store):
+    prior = await _completed_prior(store)
+    current = await capture(store)
+    await observed_item(current, ck='changed')
+    await current.classify(prior.fence.snapshot_id)
+    async with store.factory() as db:
+        assert (await db.get(models.Snapshot, current.fence.snapshot_id)).reuse_of_snapshot_id is None
 
 
 async def test_repaired_children_invalidate_old_subtree_observations(store):

@@ -108,7 +108,7 @@ async def test_review_null_legacy_copy_version_becomes_permanent_gap(store, monk
         snap.item_count = 1
         await db.execute(update(models.SnapshotItem).where(models.SnapshotItem.id == original['id']).values(backup_version=None))
     current = await capture(store)
-    await observed_item(current)
+    await observed_item(current, more=[{'id': 'new', 'changeKey': 'n'}])   # one new item: copy, not reuse
     with copy_workflow.copy_collection(current.fence.snapshot_id, expected_snapshot_token=0, expected_job_token=0) as collection:
         await current.classify(prior.fence.snapshot_id, copy_collection=collection)
         await copy_workflow.seal_current_copy({'resume_kind': 'archive', 'archive_capture_generation': str(current.generation)})
@@ -123,7 +123,7 @@ async def test_review_null_legacy_copy_version_becomes_permanent_gap(store, monk
         summary = await archive_final_gate(db, snap, generation=current.generation)
         copied = await db.scalar(select(models.SnapshotItem).where(models.SnapshotItem.snapshot_id == snap.id))
         assert copied.backup_version == 1
-        assert summary['files_failed'] == 0 and summary['files_succeeded'] == 1
+        assert summary['files_failed'] == 1 and summary['files_succeeded'] == 1   # the new item awaits export
 
 async def test_review_baseline_drops_existing_row_count_floor(store, monkeypatch):
     from test_archive_runner_postgres import archive
@@ -197,13 +197,13 @@ async def test_attachment_changed_after_inline_copy_is_detected_by_final_gate(st
             external_id='attachment', parent_external_id='i', item_type='ARCHIVE_ATTACHMENT', name='file',
             content_hash='expected', blob_path='bytes', backend_id=store.backend, content_size=4))
     current = await capture(store)
-    await observed_item(current)
+    await observed_item(current, more=[{'id': 'new', 'changeKey': 'n'}])   # one new item: copy, not reuse
     await current.classify(prior.fence.snapshot_id)
     async with store.factory.begin() as db:
         await db.execute(update(models.SnapshotItem).where(models.SnapshotItem.snapshot_id == current.fence.snapshot_id,
             models.SnapshotItem.item_type == 'ARCHIVE_ATTACHMENT').values(content_hash='changed'))
         snap = await db.get(models.Snapshot, current.fence.snapshot_id)
-        assert (await archive_final_gate(db, snap, generation=current.generation))['files_failed'] == 1
+        assert (await archive_final_gate(db, snap, generation=current.generation))['files_failed'] == 2   # + the new item
 
 async def test_archive_finalizer_preserves_required_copy_failure(store, monkeypatch, worker_module):
     ledger = await capture(store)

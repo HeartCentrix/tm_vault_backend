@@ -61,15 +61,9 @@ async def reuse_unchanged_mail_snapshot(session, *, resource_id, target_snapshot
             "AND x.item_type = 'EMAIL' AND COALESCE(x.metadata::jsonb->'raw'->>'parentFolderId', '') "
             "<> ALL(CAST(:keep AS TEXT[])))"), {"prior": str(prior.id), "keep": list(keep_folder_ids)}):
         return None
-    pointed = (await session.execute(text("""
-        UPDATE snapshots SET reuse_of_snapshot_id = CAST(:prior AS UUID), reuse_chain_root_id = CAST(:prior AS UUID),
-            item_count = :items, bytes_total = :bytes, new_item_count = 0, bytes_added = 0,
-            extra_data = (COALESCE(extra_data::jsonb, '{}'::jsonb)
-                          || jsonb_build_object('mail_reused_prior', CAST(:prior AS text)))::json
-        WHERE id = CAST(:tsid AS UUID) AND reuse_of_snapshot_id IS NULL
-          AND NOT EXISTS (SELECT 1 FROM snapshot_items WHERE snapshot_id = CAST(:tsid AS UUID))
-        RETURNING id"""), {"prior": str(prior.id), "items": prior.item_count or 0, "bytes": prior.bytes_total or 0,
-                           "tsid": params["tsid"]})).first()
+    from shared.snapshot_reuse import point_at
+    pointed = await point_at(session, target_snapshot_id=target_snapshot_id, prior_snapshot_id=prior.id,
+                             marker="mail_reused_prior")
     return prior.id if pointed else None
 
 
