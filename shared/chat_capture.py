@@ -910,11 +910,6 @@ async def _publish_copy(*, scope, session_factory, items, folder_path, exclude_m
     # Parents before children: a child link needs its parent's staged row.
     selected += [item for item in items if item.item_type not in catalogue._MESSAGE_TYPES
                  and (item.parent_graph_id is None or item.parent_graph_id in kept)]
-    required = sum(1 for item in selected if item.item_type in ("CHAT_ATTACHMENT", "CHAT_HOSTED_CONTENT")
-                   and (item.item_type == "CHAT_HOSTED_CONTENT" or not metadata_only_attachment(item.payload))
-                   and item.payload.get(SOURCE_UNAVAILABLE_FIELD) is not True)
-    durable = sum(1 for item in selected if item.content is not None)
-    fingerprint = source_inventory_fingerprint(scope=scope, items=selected, observation_hash_version=version)
     started = datetime.now(timezone.utc)
 
     async def begin(session):
@@ -941,27 +936,47 @@ async def _publish_copy(*, scope, session_factory, items, folder_path, exclude_m
                 lease = await catalogue.renew_capture(session, lease=lease)
                 await catalogue.stage_versions(session, lease=lease, items=batch)
             await run_catalogue_transaction(session_factory, stage)
-        evidence = CaptureEvidence(True, True, fingerprint, fingerprint, 0, required, durable, 0,
-                                   started, datetime.now(timezone.utc), observation_hash_version=version)
+    except catalogue.ChatCatalogueIntegrityError:
+        return await _reject(scope, session_factory, lease, label, provenance)
+    return await _publish_staged(scope=scope, session_factory=session_factory, lease=lease, items=selected,
+                                 started=started, label=label, provenance=provenance)
 
-        async def finish(session):
-            attempt, _ = await catalogue._attempt(session, lease)
-            staged = await catalogue._staged(session, await session.get(ChatInventory, attempt.staged_inventory_id), scope)
-            if staged.gaps or staged.source_hash != fingerprint or (staged.required, staged.durable) != (required, durable):
-                return None
-            await catalogue.record_capture_evidence(session, lease=lease, evidence=evidence)
-            return await catalogue.publish_inventory(session, lease=lease)
 
+async def _reject(scope, session_factory, lease, label, provenance):
+    async def discard(session):
+        await _discard_attempt(session, lease, scope, f"{label} rejected")
+    await run_catalogue_transaction(session_factory, discard)
+    logger.warning("%s_rejected chat=%s provenance=%s", label, scope.chat_id, provenance)
+    return None
+
+
+async def _publish_staged(*, scope, session_factory, lease, items, started, label, provenance):
+    """Publish a capture whose ``items`` are staged, when the catalogue's own validation of the staged
+    rows (fingerprint, child coverage, required/durable content) agrees; else discard it (None)."""
+    version = lease.observation_hash_version
+    required = sum(1 for item in items if item.item_type in ("CHAT_ATTACHMENT", "CHAT_HOSTED_CONTENT")
+                   and (item.item_type == "CHAT_HOSTED_CONTENT" or not metadata_only_attachment(item.payload))
+                   and item.payload.get(SOURCE_UNAVAILABLE_FIELD) is not True)
+    durable = sum(1 for item in items if item.content is not None)
+    fingerprint = source_inventory_fingerprint(scope=scope, items=items, observation_hash_version=version)
+    evidence = CaptureEvidence(True, True, fingerprint, fingerprint, 0, required, durable, 0,
+                               started, datetime.now(timezone.utc), observation_hash_version=version)
+
+    async def finish(session):
+        attempt, _ = await catalogue._attempt(session, lease)
+        staged = await catalogue._staged(session, await session.get(ChatInventory, attempt.staged_inventory_id), scope)
+        if staged.gaps or staged.source_hash != fingerprint or (staged.required, staged.durable) != (required, durable):
+            return None
+        await catalogue.record_capture_evidence(session, lease=lease, evidence=evidence)
+        return await catalogue.publish_inventory(session, lease=lease)
+
+    try:
         result = await run_catalogue_transaction(session_factory, finish)
     except catalogue.ChatCatalogueIntegrityError:
         result = None
     if result is None:
-        async def discard(session):
-            await _discard_attempt(session, lease, scope, f"{label} rejected")
-        await run_catalogue_transaction(session_factory, discard)
-        logger.warning("%s_rejected chat=%s provenance=%s", label, scope.chat_id, provenance)
-        return None
-    logger.info("%s attempt_id=%s chat=%s items=%s", label, lease.attempt_id, scope.chat_id, len(selected))
+        return await _reject(scope, session_factory, lease, label, provenance)
+    logger.info("%s attempt_id=%s chat=%s items=%s", label, lease.attempt_id, scope.chat_id, len(items))
     return result
 
 
@@ -1100,6 +1115,165 @@ async def reuse_unchanged_chat(*, scope, graph_client, session_factory, folder_p
     return await _publish_copy(scope=scope, session_factory=session_factory, items=items, folder_path=folder_path,
         exclude_message=exclude_message, scope_filter_hash=scope_filter_hash, label="chat_incremental_reused",
         provenance=provenance)
+
+
+def _changed_only_enabled():
+    return os.getenv("CHAT_CHANGED_ONLY_READ", "true").strip().lower() not in ("0", "false", "no", "off")
+
+
+class _FeedMessages:
+    """The source, except that the chat's messages are the delta feed's records (pages of 50):
+    hosted contents and files of those messages go through the normal per-message capture."""
+
+    def __init__(self, source, messages):
+        self._source, self._messages = source, messages
+
+    def __getattr__(self, name):
+        return getattr(self._source, name)
+
+    async def iter_message_pages(self, chat_id):
+        for start in range(0, len(self._messages), 50):
+            yield copy.deepcopy(self._messages[start:start + 50])
+
+
+def _feed_messages(chat_id, records):
+    """{message id: newest record} when every record is a plain message of this chat that a full read
+    would list the same way; else (None, reason). Replies, system events (member changes...) and
+    @removed tombstones cannot be placed: a full read decides what they mean."""
+    from shared.chat_catalogue_entry import _graph_time
+    newest = {}
+    for record in records or ():
+        if not isinstance(record, dict) or "@removed" in record:
+            return None, "removed_record"
+        identifier, modified = record.get("id"), _graph_time(record.get("lastModifiedDateTime"))
+        if record.get("chatId") != chat_id or not isinstance(identifier, str) or not identifier or modified is None:
+            return None, "unplaced_record"
+        if record.get("replyToId") or record.get("messageType", "message") != "message":
+            return None, "reply_or_system_event"
+        if identifier not in newest or modified >= newest[identifier][0]:
+            newest[identifier] = (modified, record)
+    if not newest:
+        return None, "no_feed_records"
+    return newest, None
+
+
+async def capture_changed_only(*, scope, source, records, since_snapshot_id, session_factory, storage,
+                               folder_path=None, exclude_message=None, scope_filter_hash=None):
+    """A chat the delta feed reports changed, rebuilt from this member's COMPLETE capture published in
+    ``since_snapshot_id`` (the backup whose run started the feed's cursor) with the feed's records
+    (full chatMessage payloads) in place of the messages they name: only those messages' hosted
+    contents and files are read, every other message keeps its captured version (a 1,369-message
+    chat re-read ~28 pages for one edit). Kill switch CHAT_CHANGED_ONLY_READ=false.
+
+    None (the caller reads the whole chat) on any doubt: records it cannot place, no prior capture
+    there with the same scope/principal/authentication/observation version, the weekly
+    CHAT_INCREMENTAL_RECONCILE_HOURS full read due, the one-request check showing a change newer than
+    the newest record (the feed alone once missed an edit, Railway 2026-11-05), or a capture that
+    does not verify complete."""
+    def fallback(reason):
+        logger.info("chat_changed_only_fallback chat=%s reason=%s", scope.chat_id, reason)
+        return None
+    if not _changed_only_enabled():
+        return None
+    if records is None:
+        return fallback("feed_records_unavailable")
+    newest, reason = _feed_messages(scope.chat_id, records)
+    if newest is None:
+        return fallback(reason)
+    from shared.config import settings
+    from shared.snapshot_reuse import items_snapshot_id
+    version = settings.CHAT_OBSERVATION_HASH_VERSION
+    reconcile = timedelta(hours=float(os.getenv("CHAT_INCREMENTAL_RECONCILE_HOURS", "168")))
+
+    async def find(session):
+        snapshot = await items_snapshot_id(session, since_snapshot_id)
+        row = (await session.execute(select(ChatCaptureAttempt, ChatInventory)
+            .join(ChatInventory, ChatInventory.id == ChatCaptureAttempt.staged_inventory_id)
+            .join(SnapshotChatInventory, and_(SnapshotChatInventory.snapshot_id == ChatCaptureAttempt.snapshot_id,
+                                              SnapshotChatInventory.capture_attempt_id == ChatCaptureAttempt.id))
+            .where(ChatCaptureAttempt.snapshot_id == snapshot, ChatCaptureAttempt.chat_id == scope.chat_id,
+                   ChatCaptureAttempt.state == "PUBLISHED", ChatInventory.state == "COMPLETE",
+                   SnapshotChatInventory.coverage_status == "COMPLETE"))).first()
+        if row is None:
+            return None
+        attempt, inventory = row
+        return attempt, inventory, [catalogue._captured(v) for v in (await _inventory_items(session, inventory.id)).all()]
+
+    found = await run_catalogue_transaction(session_factory, find) if since_snapshot_id else None
+    if found is None:
+        return fallback("no_prior_complete_capture")
+    attempt, inventory, prior = found
+    observed, full = _observed_times(attempt)
+    if (attempt.principal_id != scope.principal_id or inventory.observation_hash_version != version
+            or inventory.authentication_context_sha256 != authentication_context_fingerprint(scope)
+            or _recorded_filter(attempt) != scope_filter_hash):
+        return fallback("scope_changed")
+    if observed is None or full is None or datetime.now(timezone.utc) - full >= reconcile:
+        return fallback("reconcile_due")
+    checked_at = datetime.now(timezone.utc)
+    try:
+        latest = await source.latest_message_change(scope.chat_id)
+    except ChatGraphError as exc:
+        return fallback(f"check_failed_{getattr(exc, 'status_code', None)}")
+    if latest is None or latest > max(modified for modified, _ in newest.values()):
+        return fallback("check_newer_than_feed")
+
+    changed = set(newest)
+    reused = [item for item in prior if (item.graph_id if item.item_type in catalogue._MESSAGE_TYPES
+                                         else item.parent_graph_id) not in changed]
+    provenance = {"changed_only_from_attempt": str(attempt.id), "changed_messages": len(changed),
+                  "source_observed_at": checked_at.isoformat(), "full_observed_at": full.isoformat()}
+    started = datetime.now(timezone.utc)
+
+    async def begin(session):
+        lease = await catalogue.begin_capture(session, scope=scope, folder_path=folder_path, observation_hash_version=version)
+        record = await session.get(ChatCaptureAttempt, lease.attempt_id)
+        record.evidence_history = [*([{"source_filter_sha256": scope_filter_hash}] if scope_filter_hash is not None else []),
+                                   provenance]
+        return lease
+    keeper = _CaptureLeaseKeeper(session_factory, await run_catalogue_transaction(session_factory, begin))
+    renewer = asyncio.create_task(keeper.run())
+    label = "chat_changed_only_capture"
+    try:
+        with ChatObservationLedger(scope, observation_hash_version=version) as ledger:
+            stats = await _observe(scope=scope, keeper=keeper, factory=session_factory, storage=storage,
+                source=_FeedMessages(source, [record for _, record in newest.values()]), ledger=ledger,
+                observation=0, exclude_message=exclude_message, folder_path=folder_path)
+        if not stats.complete or stats.unresolved:
+            await _reject(scope, session_factory, keeper.lease, label, provenance)
+            return fallback("changed_messages_incomplete")
+        keys = [qualified_chat_item_key(scope.chat_id, i.item_type, i.graph_id, i.parent_graph_id) for i in reused]
+
+        async def bulk(session):
+            keeper.lease = await catalogue.renew_capture(session, lease=keeper.lease)
+            return await catalogue.copy_versions(session, lease=keeper.lease, inventory_id=inventory.id,
+                                                 source_snapshot_id=attempt.snapshot_id, keys=keys)
+        if keys and not await run_catalogue_transaction(session_factory, bulk):
+            await _stage(session_factory, keeper, reused)
+
+        async def load(session):
+            return [catalogue._captured(v) for v in (await _inventory_items(session, keeper.lease.staged_inventory_id)).all()]
+        items = await run_catalogue_transaction(session_factory, load)
+        keeper.check()
+        result = await _publish_staged(scope=scope, session_factory=session_factory, lease=keeper.lease, items=items,
+                                       started=started, label=label, provenance=provenance)
+    except (asyncio.CancelledError, catalogue.ChatCatalogueConflict):
+        raise
+    except Exception as exc:
+        # Source movement, a staging integrity refusal, a Graph error: the full read decides.
+        with suppress(Exception):
+            await _reject(scope, session_factory, keeper.lease, label, provenance)
+        return fallback(f"capture_failed_{type(exc).__name__}")
+    finally:
+        renewer.cancel()
+        with suppress(asyncio.CancelledError):
+            await renewer
+    if result is None:
+        return fallback("verification_rejected")
+    deleted = sum(1 for _, record in newest.values() if record.get("deletedDateTime"))
+    logger.info("chat_changed_only_capture chat=%s changed=%s deleted=%s reused=%s",
+                scope.chat_id, len(changed) - deleted, deleted, len(reused))
+    return result
 
 
 _PROBE_TTL_S = 6 * 3600   # one key per chat per run; outlives any run

@@ -25,7 +25,9 @@ def test_new_round_starts_at_since_and_collects_chats_across_pages():
     ])
     changed, link = asyncio.run(StrictChatGraphSource.message_delta(
         source, None, since=datetime(2026, 11, 5, 8, 30, tzinfo=timezone.utc)))
-    assert changed == {"19:a", "19:b"} and link == "https://graph.microsoft.com/v1.0/delta-2"
+    assert set(changed) == {"19:a", "19:b"} and link == "https://graph.microsoft.com/v1.0/delta-2"
+    # The records themselves are kept per chat: a changed chat is rebuilt from them (changed-only read).
+    assert changed["19:a"] == [{"id": "m1", "chatId": "19:a"}, {"id": "m3", "chatId": "19:a"}]
     assert calls[0] == ("https://graph.microsoft.com/v1.0/users/user-1/chats/getAllMessages/delta",
                         {"$top": "50", "$filter": "lastModifiedDateTime gt 2026-11-05T08:30:00.000Z"})
     assert calls[1] == ("https://graph.microsoft.com/v1.0/next", None)
