@@ -240,7 +240,7 @@ class Settings:
         # ONEDRIVE_LARGE_FILE_SEGMENT_CONCURRENCY=8 could feed it.
         self.ONPREM_UPLOAD_CONCURRENCY = int(os.getenv("ONPREM_UPLOAD_CONCURRENCY", "16"))
         self.ONPREM_MULTIPART_THRESHOLD_MB = int(os.getenv("ONPREM_MULTIPART_THRESHOLD_MB", "100"))
-        self.ONPREM_RETRY_MAX = int(os.getenv("ONPREM_RETRY_MAX", "3"))
+        self.ONPREM_RETRY_MAX = int(os.getenv("ONPREM_RETRY_MAX", "5"))
 
         # Azure ARM (Azure Resource Manager) credentials for VM/SQL/PostgreSQL backup
         # Service Principal for ARM API access
@@ -590,8 +590,8 @@ class Settings:
         self.ONEDRIVE_BACKUP_FILE_CONCURRENCY = int(os.getenv("ONEDRIVE_BACKUP_FILE_CONCURRENCY", "16"))
         self.MAX_CONCURRENT_ONEDRIVE_BACKUPS_PER_WORKER = int(os.getenv("MAX_CONCURRENT_ONEDRIVE_BACKUPS_PER_WORKER", "4"))
         self.ONEDRIVE_BACKUP_FILE_TIMEOUT_SECONDS = int(os.getenv("ONEDRIVE_BACKUP_FILE_TIMEOUT_SECONDS", "21600"))
-        self.ONEDRIVE_BACKUP_CHECKPOINT_EVERY_FILES = int(os.getenv("ONEDRIVE_BACKUP_CHECKPOINT_EVERY_FILES", "500"))
-        self.ONEDRIVE_BACKUP_CHECKPOINT_EVERY_BYTES = int(os.getenv("ONEDRIVE_BACKUP_CHECKPOINT_EVERY_BYTES", str(1024 * 1024 * 1024)))
+        self.ONEDRIVE_BACKUP_CHECKPOINT_EVERY_FILES = int(os.getenv("ONEDRIVE_BACKUP_CHECKPOINT_EVERY_FILES", "50"))
+        self.ONEDRIVE_BACKUP_CHECKPOINT_EVERY_BYTES = int(os.getenv("ONEDRIVE_BACKUP_CHECKPOINT_EVERY_BYTES", str(256 * 1024 * 1024)))
         # Parallel Range-GET for huge files: files above this size use
         # N concurrent Range requests against the Graph pre-signed URL
         # to saturate enterprise bandwidth (single TCP caps ~80 MB/s).
@@ -630,17 +630,17 @@ class Settings:
             "ONEDRIVE_PARTITION_ENABLED", "true",
         ).lower() in ("true", "1", "yes")
         self.ONEDRIVE_PARTITION_MIN_BYTES = int(os.getenv(
-            "ONEDRIVE_PARTITION_MIN_BYTES", str(5 * 1024 * 1024 * 1024),
+            "ONEDRIVE_PARTITION_MIN_BYTES", str(1024 * 1024 * 1024),
         ))
         self.ONEDRIVE_PARTITION_MIN_FILES = int(os.getenv(
-            "ONEDRIVE_PARTITION_MIN_FILES", "200",
+            "ONEDRIVE_PARTITION_MIN_FILES", "50",
         ))
         self.ONEDRIVE_PARTITION_MAX_SHARDS = int(os.getenv(
-            "ONEDRIVE_PARTITION_MAX_SHARDS", "4",
+            "ONEDRIVE_PARTITION_MAX_SHARDS", "8",
         ))
         self.ONEDRIVE_PARTITION_TARGET_BYTES_PER_SHARD = int(os.getenv(
             "ONEDRIVE_PARTITION_TARGET_BYTES_PER_SHARD",
-            str(20 * 1024 * 1024 * 1024),
+            str(128 * 1024 * 1024),
         ))
         # Partition consumer's per-shard timeout. Default 6h matches the
         # legacy per-file timeout; a stuck shard past this triggers
@@ -860,7 +860,7 @@ class Settings:
         # whale chats from monopolizing every partition slot on a
         # replica when other tenants also want service.
         self.MAX_CONCURRENT_PARTITIONS_PER_TENANT = int(os.getenv(
-            "MAX_CONCURRENT_PARTITIONS_PER_TENANT", "2",
+            "MAX_CONCURRENT_PARTITIONS_PER_TENANT", "16",
         ))
         # Stale-sweep retry budget — once retry_count crosses this
         # threshold, the partition row is marked FAILED and stops

@@ -3646,7 +3646,7 @@ def snapshot_counters_from_result(result: Optional[Dict[str, Any]]) -> Tuple[int
     return item_count, new_item_count, bytes_added, bytes_total
 
 
-def mailbox_parallel_folders(raw: Optional[str], default: int = 4, ceiling: int = 16) -> int:
+def mailbox_parallel_folders(raw: Optional[str], default: int = 8, ceiling: int = 16) -> int:
     """How many primary-mailbox folders the Tier-1 delta path drains at once.
 
     Pure function; pinned by tests/workers/test_tier1_mail_delta.py. Clamped

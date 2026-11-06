@@ -92,10 +92,10 @@ def test_snapshot_counters_missing_keys_are_zero():
 
 
 def test_mailbox_parallel_folders_clamp():
-    assert _bw.mailbox_parallel_folders(None) == 4
+    assert _bw.mailbox_parallel_folders(None) == 8  # Railway MAILBOX_PARALLEL_FOLDERS=8
     assert _bw.mailbox_parallel_folders("0") == 1
     assert _bw.mailbox_parallel_folders("99") == 16
-    assert _bw.mailbox_parallel_folders("abc") == 4
+    assert _bw.mailbox_parallel_folders("abc") == 8
 
 
 # ── behaviour: the per-folder drain against a fake Graph client ──────────
