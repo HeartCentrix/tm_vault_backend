@@ -98,6 +98,37 @@ _JOB = text("""
 """)
 
 
+# The Activity batch row reads backup_batches.status, set once by batch_rollup._finalize_batch_if_complete
+# (PARTIAL if any snapshot of its resources created after the batch start is PARTIAL/FAILED). Re-apply that
+# rule to PARTIAL batches covering this resource; batches of the resource's later runs are included because
+# the rule also counts snapshots (e.g. an AUTO_RETRY) taken after the batch began.
+_BATCH = text("""
+    UPDATE backup_batches b
+       SET status = 'COMPLETED'
+     WHERE b.status = 'PARTIAL'
+       AND b.created_at <= (SELECT created_at FROM snapshots WHERE id = :sid)
+       AND EXISTS (SELECT 1 FROM jobs j JOIN snapshots s ON s.job_id = j.id
+                    WHERE coalesce(j.spec::jsonb ->> 'batch_id', '') = b.id::text
+                      AND s.resource_id = :rid)
+       AND NOT EXISTS (
+             SELECT 1 FROM snapshots s2
+              WHERE s2.created_at > b.created_at
+                AND s2.status::text IN ('PARTIAL', 'FAILED')
+                AND s2.resource_id IN (SELECT s3.resource_id FROM jobs j3 JOIN snapshots s3 ON s3.job_id = j3.id
+                                        WHERE coalesce(j3.spec::jsonb ->> 'batch_id', '') = b.id::text))
+       AND NOT EXISTS (
+             SELECT 1 FROM jobs j4
+              WHERE coalesce(j4.spec::jsonb ->> 'batch_id', '') = b.id::text
+                AND j4.status::text <> 'COMPLETED')
+""")
+
+
+async def reroll_batches_for_resource(session, snapshot_id, resource_id) -> int:
+    """PARTIAL batch rows covering ``resource_id`` → COMPLETED once nothing in them is PARTIAL/FAILED."""
+    res = await session.execute(_BATCH, {"sid": snapshot_id, "rid": resource_id})
+    return res.rowcount or 0
+
+
 async def settle_rescued_onedrive_snapshot(session, snapshot_id) -> bool:
     """FAILED/PARTIAL → COMPLETED once every lost file is rescued. Caller commits."""
     # Lock parent first: concurrent last rescues must count committed siblings,
@@ -112,4 +143,5 @@ async def settle_rescued_onedrive_snapshot(session, snapshot_id) -> bool:
     await session.execute(_CURSOR, params)
     await session.execute(_STAMP, params)
     await session.execute(_JOB, params)
+    await reroll_batches_for_resource(session, snapshot_id, row.resource_id)
     return True

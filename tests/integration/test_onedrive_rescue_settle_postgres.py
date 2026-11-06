@@ -211,3 +211,34 @@ def test_auto_retry_waits_for_outstanding_file_rescues():
     sweep = (REPO / "services/backup-scheduler/main.py").read_text()
     body = sweep[sweep.index("async def _job_retry_tick"):sweep.index("async def start_job_retry_loop")]
     assert "onedrive_file_retries" in body and "'PENDING','IN_PROGRESS'" in body.replace(" ", "")
+
+
+# The Activity "10 users" row reads backup_batches.status, which _finalize_batch_if_complete
+# sets once (PARTIAL if any leaf snapshot after the batch start was PARTIAL/FAILED) and never
+# revisits — so it stayed PARTIAL after the snapshot settled (Railway 2026-11-06, batch 59fa062e).
+async def with_batch(factory, ids, extra_bad=False):
+    batch = uuid4()
+    async with factory.begin() as s:
+        s.add(models.BackupBatch(id=batch, tenant_id=ids["tenant"], source="manual_bulk",
+            scope_user_ids=[ids["resource"]], status="PARTIAL",
+            created_at=__import__("datetime").datetime(2020, 1, 1)))
+        await s.execute(text("UPDATE jobs SET spec = CAST(:sp AS json) WHERE id = :j"),
+                        {"sp": '{"batch_id": "%s"}' % batch, "j": ids["job"]})
+        if extra_bad:
+            other = uuid4()
+            s.add(models.Resource(id=other, tenant_id=ids["tenant"], type=models.ResourceType.USER_MAIL,
+                external_id="mail", display_name="Mail — Synthetic"))
+            await s.flush()
+            s.add(models.Snapshot(id=uuid4(), resource_id=other, job_id=ids["job"], backend_id=ids["backend"],
+                status=models.SnapshotStatus.PARTIAL))
+    return batch
+
+
+@pytest.mark.parametrize("extra_bad,expected", [(False, "COMPLETED"), (True, "PARTIAL")])
+async def test_settle_re_rolls_the_batch_the_activity_row_reads(factory, extra_bad, expected):
+    ids = await scenario(factory)
+    batch = await with_batch(factory, ids, extra_bad)
+    async with factory.begin() as s:
+        assert await settle_rescued_onedrive_snapshot(s, ids["snap"]) is True
+    async with factory() as s:
+        assert (await s.get(models.BackupBatch, batch)).status == expected
