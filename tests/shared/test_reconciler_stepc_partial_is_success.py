@@ -50,9 +50,9 @@ def test_partial_snapshot_counts_as_job_success():
     # The COMPLETED branch must match snapshots in COMPLETED OR PARTIAL —
     # either an IN list or two explicit comparisons.
     has_in_list = re.search(
-        r"s\.status\s+IN\s*\(\s*'COMPLETED'[^)]*'PARTIAL'", case
+        r"s\.status(?:::text)?\s+IN\s*\(\s*'COMPLETED'[^)]*'PARTIAL'", case
     ) or re.search(
-        r"s\.status\s+IN\s*\(\s*'PARTIAL'[^)]*'COMPLETED'", case
+        r"s\.status(?:::text)?\s+IN\s*\(\s*'PARTIAL'[^)]*'COMPLETED'", case
     )
     has_both_eq = ("= 'COMPLETED'" in case or "'COMPLETED'::snapshotstatus" in case) and (
         "= 'PARTIAL'" in case or "'PARTIAL'::snapshotstatus" in case
