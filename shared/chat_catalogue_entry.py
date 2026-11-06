@@ -85,6 +85,19 @@ async def adopt_chat_catalogue(session, *, resource_id, snapshot_id, writer_enab
     snapshot_format = (snapshot.extra_data or {}).get("chat_inventory_format")
     if snapshot_format == 1 and snapshot.status in {SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL, SnapshotStatus.FAILED}:
         return True
+    effective_policy = policy_id or resource.sla_policy_id
+    policy = await session.scalar(select(SlaPolicy).where(SlaPolicy.id == effective_policy)
+        .with_for_update(read=True)) if writer_enabled and effective_policy else None
+    protection = policy is not None and next((name for name, on in (("legal_hold", policy.legal_hold_enabled),
+        ("immutability", str(policy.immutability_mode or "None").lower() != "none"),
+        ("customer_key", str(policy.encryption_mode or "VAULT_MANAGED").upper() == "CUSTOMER_KEY")) if on), None)
+    if protection and resource_format != 1 and snapshot_format != 1:
+        # The catalogue writes every chat into one deduplicated tenant store
+        # (chat-catalogue-<tenant>) that gets no per-policy WORM, legal hold or
+        # CMK scope, so keep never-adopted resources on the legacy writer.
+        logging.getLogger(__name__).warning("chat_catalogue_legacy_fallback resource=%s snapshot=%s reason=%s",
+            resource_id, snapshot_id, protection)
+        writer_enabled = False
     if not writer_enabled:
         if resource_format == 1 or snapshot_format == 1:
             raise ChatCatalogueSuspended("catalogue writer is disabled for an adopted chat resource")
@@ -100,11 +113,7 @@ async def adopt_chat_catalogue(session, *, resource_id, snapshot_id, writer_enab
             snapshot.status != SnapshotStatus.IN_PROGRESS or resource.archived_at is not None or
             resource.deletion_queued_at is not None or str(getattr(resource.status, "value", resource.status)) == "PENDING_DELETION"):
         raise ChatCatalogueAdoptionError("capture snapshot, job or resource is no longer eligible")
-    effective_policy = policy_id or resource.sla_policy_id
-    policy = await session.scalar(select(SlaPolicy).where(SlaPolicy.id == effective_policy)
-        .with_for_update(read=True)) if effective_policy else None
-    if policy is not None and (policy.legal_hold_enabled or str(policy.immutability_mode or "None").lower() != "none" or
-            str(policy.encryption_mode or "VAULT_MANAGED").upper() == "CUSTOMER_KEY"):
+    if protection:
         raise ChatCatalogueProtectionUnsupported("catalogue capture does not yet support native legal hold, immutability or CUSTOMER_KEY policy")
     if snapshot_format != 1:
         other = await session.scalar(select(Snapshot.id).where(Snapshot.resource_id == resource_id,
