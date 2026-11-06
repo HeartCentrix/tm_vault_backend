@@ -526,7 +526,7 @@ async def finish_parent_settlement(factory, workflow_id):
         if not workflow.parent_settle_pending: return True
         if workflow.state in ACTIVE_WORKFLOWS: return False
         if snapshot is None or job is None: return False
-        if snapshot.status.value not in ('COMPLETED','PARTIAL','FAILED') or job.status.value not in ('COMPLETED','FAILED','CANCELLED'):
+        if snapshot.status.value not in ('COMPLETED','PARTIAL','FAILED') or job.status.value not in ('COMPLETED','PARTIAL','FAILED','CANCELLED'):
             return False
         workflow.parent_settle_pending=False
         task_ids=select(CopyWorkTask.id).where(CopyWorkTask.workflow_id==workflow.id)

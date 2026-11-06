@@ -169,7 +169,7 @@ _SCHEMA = [
     "CREATE TYPE snapshotstatus AS ENUM ('IN_PROGRESS','COMPLETED','FAILED',"
     "'PARTIAL','PENDING_DELETION')",
     "CREATE TYPE jobstatus AS ENUM ('QUEUED','PENDING','RUNNING','COMPLETED',"
-    "'FAILED','CANCELLED','CANCELLING','RETRYING')",
+    "'PARTIAL','FAILED','CANCELLED','CANCELLING','RETRYING')",
     """CREATE TABLE snapshot_partitions (
         id               uuid PRIMARY KEY,
         snapshot_id      uuid NOT NULL,

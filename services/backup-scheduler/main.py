@@ -25,6 +25,7 @@ import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from shared.database import async_session_factory
+from shared.batch_rollup import job_partial_sql
 from shared.copy_workflow import (
     copy_source_pinned_sql, initialize_copy_guards, pending_copy_sql,
 )
@@ -751,7 +752,8 @@ async def startup():
                                    COALESCE(array_length(batch_resource_ids, 1), 0) AS n
                             FROM jobs
                             WHERE status NOT IN (
-                                'COMPLETED'::jobstatus, 'FAILED'::jobstatus,
+                                'COMPLETED'::jobstatus, 'PARTIAL'::jobstatus,
+                                'FAILED'::jobstatus,
                                 'CANCELLED'::jobstatus, 'CANCELLING'::jobstatus
                             )
                               AND batch_resource_ids IS NOT NULL
@@ -779,14 +781,14 @@ async def startup():
                             GROUP BY s.job_id
                         )
                         UPDATE jobs j SET
-                            -- Terminal-status mapping matches jobstatus
-                            -- enum (COMPLETED / FAILED only — no PARTIAL
-                            -- at the Job level). Mixed-outcome bulks
-                            -- flip to COMPLETED with c.failed in result;
-                            -- only an all-failed bulk lands at FAILED.
+                            -- Same mapping as the worker finalizer: only
+                            -- an all-failed bulk lands at FAILED; any
+                            -- PARTIAL/FAILED child makes it PARTIAL.
                             status = (CASE
                                 WHEN c.completed = 0 AND c.partial = 0
                                     THEN 'FAILED'::jobstatus
+                                WHEN c.partial > 0 OR c.failed > 0
+                                    THEN 'PARTIAL'::jobstatus
                                 ELSE 'COMPLETED'::jobstatus
                             END),
                             completed_at = NOW(),
@@ -809,7 +811,8 @@ async def startup():
                           AND j.id = c.job_id
                           AND c.terminal >= bj.n
                           AND j.status NOT IN (
-                              'COMPLETED'::jobstatus, 'FAILED'::jobstatus,
+                              'COMPLETED'::jobstatus, 'PARTIAL'::jobstatus,
+                              'FAILED'::jobstatus,
                               'CANCELLED'::jobstatus, 'CANCELLING'::jobstatus
                           )
                         RETURNING j.id, j.status::text
@@ -846,7 +849,8 @@ async def startup():
                                    bytes_processed AS prev_bytes
                             FROM jobs
                             WHERE status IN (
-                                'COMPLETED'::jobstatus, 'FAILED'::jobstatus
+                                'COMPLETED'::jobstatus, 'PARTIAL'::jobstatus,
+                                'FAILED'::jobstatus
                             )
                               AND batch_resource_ids IS NOT NULL
                               AND array_length(batch_resource_ids, 1) > 0
@@ -1825,7 +1829,9 @@ async def startup():
                           AND cardinality(j.batch_resource_ids) > 0
                     )
                     UPDATE jobs j SET
-                        status = 'COMPLETED'::jobstatus,
+                        status = (CASE WHEN {job_partial_sql('j.id')}
+                                       THEN 'PARTIAL' ELSE 'COMPLETED'
+                                  END)::jobstatus,
                         progress_pct = 100,
                         completed_at = NOW(),
                         updated_at = NOW(),
@@ -1903,8 +1909,10 @@ async def startup():
                           AND (j.lease_expires_at IS NULL OR j.lease_expires_at < NOW())
                     )
                     UPDATE jobs j SET
+                        -- Resources are missing by definition here, so a
+                        -- run that captured anything is PARTIAL.
                         status = (CASE WHEN t.n_completed > 0
-                                       THEN 'COMPLETED' ELSE 'FAILED'
+                                       THEN 'PARTIAL' ELSE 'FAILED'
                                   END)::jobstatus,
                         progress_pct = 100,
                         completed_at = NOW(),
@@ -2005,6 +2013,7 @@ async def startup():
                     WITH agg AS (
                         SELECT s.job_id,
                                COUNT(*) FILTER (WHERE s.status IN ('COMPLETED','PARTIAL')) AS n_ok,
+                               COUNT(*) FILTER (WHERE s.status IN ('PARTIAL','FAILED')) AS n_warn,
                                COUNT(*) FILTER (WHERE s.status NOT IN
                                    ('COMPLETED','PARTIAL','FAILED','PENDING_DELETION')) AS n_pending,
                                MAX(s.completed_at) AS last_settled,
@@ -2014,7 +2023,8 @@ async def startup():
                         GROUP BY s.job_id
                     )
                     UPDATE jobs j SET
-                        status = (CASE WHEN a.n_ok > 0
+                        status = (CASE WHEN a.n_ok > 0 AND a.n_warn > 0 THEN 'PARTIAL'
+                                       WHEN a.n_ok > 0
                                        THEN 'COMPLETED' ELSE 'FAILED'
                                   END)::jobstatus,
                         progress_pct = 100,

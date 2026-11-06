@@ -179,8 +179,7 @@ async def test_partition_mail_union_is_queued_once_before_any_terminal_snapshot_
         assert snapshot.extra_data["mail_carry_forward_pending"] is False
         assert workflow.state == ("PARTIAL" if failed else "COMPLETED")
         assert not workflow.parent_settle_pending and workflow.lease_owner_id is None
-        assert job.status == (models.JobStatus.FAILED if expected == models.SnapshotStatus.FAILED
-            else models.JobStatus.COMPLETED)
+        assert job.status.value == expected.value
         if failed:
             assert snapshot.extra_data["copy_required_failed"] is True
             assert snapshot.extra_data["degraded_reason"] == "required database copy did not complete"

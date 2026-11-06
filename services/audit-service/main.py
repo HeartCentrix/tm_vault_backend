@@ -95,7 +95,7 @@ def _compute_details(job: Job) -> str:
     )
 
     # Terminal states: never show "Progress: X%" — the job is finished.
-    if job.status == JobStatus.COMPLETED:
+    if job.status in (JobStatus.COMPLETED, JobStatus.PARTIAL):
         if total_data > 0:
             return f"{_fmt_bytes(data_backed_up or total_data)} backed up"
         if data_backed_up > 0:
@@ -194,7 +194,7 @@ def _group_batch_jobs(
         )
         any_failed = any(s == JobStatus.FAILED for s in statuses)
         all_cancelled = all(s == JobStatus.CANCELLED for s in statuses)
-        all_completed = all(s == JobStatus.COMPLETED for s in statuses)
+        all_completed = all(s in (JobStatus.COMPLETED, JobStatus.PARTIAL) for s in statuses)
 
         if any_active:
             group_status = "In Progress"
@@ -203,7 +203,7 @@ def _group_batch_jobs(
         elif all_cancelled:
             group_status = "Canceled"
         elif all_completed:
-            group_status = "Done"
+            group_status = "Partial" if JobStatus.PARTIAL in statuses else "Done"
         else:
             group_status = status_reverse_map.get(statuses[0], "In Progress")
 
@@ -247,7 +247,7 @@ def _group_batch_jobs(
         completed_at = [c.completed_at for c in children if c.completed_at]
         finish_iso = max(completed_at).isoformat() if completed_at and not any_active else ""
 
-        if group_status == "Done":
+        if group_status in ("Done", "Partial"):
             if total_data > 0:
                 details = f"{_fmt_bytes(data_backed_up or total_data)} backed up"
             elif data_backed_up > 0:
@@ -946,7 +946,7 @@ def _batch_activity_sources(operation, status):
     if status == "Warning":
         include_backup = False
         include_discovery = False
-    elif status in ("Done", "In Progress", "Failed", "Canceled"):
+    elif status in ("Done", "Partial", "In Progress", "Failed", "Canceled"):
         include_warnings = False
     return include_backup, include_discovery, include_warnings
 
@@ -986,7 +986,11 @@ async def _batch_backup_activity_rows(db, *, tenant_id, start_date, end_date, li
     for r in rows:
         row = shape_batch_row(r)
         if status and status != "Warning":
-            if row.get("status") != status:
+            w = row.get("warnings")
+            # "Partial" = Done with partial/failed warnings, the feed's view of a PARTIAL job.
+            partial = (row.get("status") == "Done" and isinstance(w, dict)
+                       and (w.get("partial") or 0) + (w.get("failed") or 0) > 0)
+            if row.get("status") != status and not (status == "Partial" and partial):
                 continue
         items.append(row)
     return items
@@ -1496,6 +1500,7 @@ async def list_activities(
             "In Progress": JobStatus.RUNNING,
             "Failed": JobStatus.FAILED,
             "Canceled": JobStatus.CANCELLED,
+            "Partial": JobStatus.PARTIAL,
         }
         include_job_items = status != "Warning"
         include_warning_items = (not operation or operation.upper() == "BACKUP") and (not status or status == "Warning")
@@ -1629,6 +1634,7 @@ async def list_activities(
             JobStatus.RUNNING: "In Progress",
             JobStatus.FAILED: "Failed",
             JobStatus.CANCELLED: "Canceled",
+            JobStatus.PARTIAL: "Partial",
             JobStatus.QUEUED: "In Progress",
             JobStatus.RETRYING: "In Progress",
         }
@@ -2066,6 +2072,7 @@ async def export_activity_csv(
         "In Progress": JobStatus.RUNNING,
         "Failed": JobStatus.FAILED,
         "Canceled": JobStatus.CANCELLED,
+        "Partial": JobStatus.PARTIAL,
     }
 
     async with async_session_factory() as db:
@@ -2223,7 +2230,7 @@ async def get_batch_children(batch_id: str):
                 job_statuses.append(str(status or "").upper())
                 for rid in (rids or []):
                     res_ids.add(rid)
-            if job_statuses and all(s in {"COMPLETED", "FAILED", "CANCELLED"} for s in job_statuses):
+            if job_statuses and all(s in {"COMPLETED", "PARTIAL", "FAILED", "CANCELLED"} for s in job_statuses):
                 batch_status = "COMPLETED"
 
         if not res_ids:

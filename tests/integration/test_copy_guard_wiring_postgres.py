@@ -25,7 +25,7 @@ async def copy_guard_db(monkeypatch):
         await conn.execute(text(f'CREATE SCHEMA "{schema}"'))
         for ddl in (
             "CREATE TYPE snapshotstatus AS ENUM ('IN_PROGRESS','COMPLETED','PARTIAL','FAILED','PENDING_DELETION')",
-            "CREATE TYPE jobstatus AS ENUM ('QUEUED','RUNNING','COMPLETED','FAILED','CANCELLED','CANCELLING','RETRYING')",
+            "CREATE TYPE jobstatus AS ENUM ('QUEUED','RUNNING','COMPLETED','PARTIAL','FAILED','CANCELLED','CANCELLING','RETRYING')",
             "CREATE TABLE resources (id uuid PRIMARY KEY, type text DEFAULT 'USER_MAILBOX', archived_at timestamp, sla_policy_id uuid)",
             "CREATE TABLE backup_batches (id uuid PRIMARY KEY, status text DEFAULT 'IN_PROGRESS', "
             "created_at timestamp DEFAULT NOW()-INTERVAL '3 days', scope_user_ids uuid[], completed_at timestamp)",

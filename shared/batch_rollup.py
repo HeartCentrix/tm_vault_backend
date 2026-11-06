@@ -289,6 +289,17 @@ def derive_batch_status(
     return ("Done", warnings or None)
 
 
+def job_partial_sql(job_expr: str) -> str:
+    """SQL predicate: the job left a PARTIAL or FAILED snapshot.
+
+    The job-level twin of derive_batch_status's "Done with warnings", which
+    counts the same rows (snapshots by job_id). A job that would finish
+    COMPLETED finishes PARTIAL when this holds; FAILED stays FAILED.
+    """
+    return (f"EXISTS (SELECT 1 FROM snapshots ps WHERE ps.job_id = {job_expr} "
+            "AND ps.status::text IN ('PARTIAL','FAILED'))")
+
+
 def archive_backup_enabled() -> bool:
     """Whether Online Archive backup is on (default ON — mirrors
     archive_graph). Gates USER_ARCHIVE in both the batch DISPLAY rollup and the
@@ -495,8 +506,8 @@ def build_batch_rollup_query(
             ARRAY_AGG(j.id ORDER BY j.created_at)                  AS job_ids,
             BOOL_OR(j.status::text = 'CANCELLED')                  AS any_cancelled,
             BOOL_OR(j.status::text = 'FAILED')                     AS any_job_failed,
-            BOOL_OR(j.status::text = 'COMPLETED')                  AS any_job_completed,
-            BOOL_AND(j.status::text IN ('COMPLETED','FAILED','CANCELLED'))
+            BOOL_OR(j.status::text IN ('COMPLETED','PARTIAL'))     AS any_job_completed,
+            BOOL_AND(j.status::text IN ('COMPLETED','PARTIAL','FAILED','CANCELLED'))
                                                                     AS all_jobs_terminal,
             -- For non-bulk single-Job batches (no batch_resource_ids),
             -- carry through job.resource_id so we can resolve a real

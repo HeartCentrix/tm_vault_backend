@@ -75,7 +75,8 @@ async def test_concurrent_partition_continuations_complete_parent_after_barrier(
     async with store.factory() as db:
         snapshot = await db.get(models.Snapshot, scope.snapshot_id)
         assert snapshot.status == (models.SnapshotStatus.PARTIAL if source_loss else models.SnapshotStatus.COMPLETED)
-        assert (await db.get(models.Job, snapshot.job_id)).status == models.JobStatus.COMPLETED
+        assert (await db.get(models.Job, snapshot.job_id)).status == (
+            models.JobStatus.PARTIAL if source_loss else models.JobStatus.COMPLETED)
         assert not any(w.parent_settle_pending for w in
             (await db.scalars(select(models.CopyWorkflow).where(models.CopyWorkflow.id.in_(workflows)))).all())
 

@@ -372,8 +372,8 @@ def _roll_up_group_outcome(children):
     Buckets mirror the per-Job semantics of the old query but applied
     to the whole batch:
       * success   — every child COMPLETED with no failed/skipped items
-      * warnings  — at least one child COMPLETED with failed/skipped
-                    items, OR at least one child RETRYING (mid-retry)
+      * warnings  — at least one child PARTIAL or COMPLETED with
+                    failed/skipped items, OR at least one child RETRYING
       * failures  — at least one child FAILED
       * inflight  — at least one child still RUNNING/QUEUED and no
                     child has failed yet. Counted nowhere (the card
@@ -386,8 +386,8 @@ def _roll_up_group_outcome(children):
     any_failed = any(s == JobStatus.FAILED for s in statuses)
     any_retrying = any(s == JobStatus.RETRYING for s in statuses)
     any_running = any(s in (JobStatus.RUNNING, JobStatus.QUEUED) for s in statuses)
-    any_completed = any(s == JobStatus.COMPLETED for s in statuses)
-    any_partial = any(
+    any_completed = any(s in (JobStatus.COMPLETED, JobStatus.PARTIAL) for s in statuses)
+    any_partial = JobStatus.PARTIAL in statuses or any(
         int(r.get("failed_count") or 0) > 0
         or int(r.get("skipped_count") or 0) > 0
         for r in results

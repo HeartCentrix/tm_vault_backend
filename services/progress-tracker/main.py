@@ -139,7 +139,7 @@ async def stream_resource_progress(resource_id: str):
 
                         # If job is done, stop streaming
                         status = job.status.value if hasattr(job.status, 'value') else str(job.status)
-                        if status in ("COMPLETED", "FAILED", "CANCELLED"):
+                        if status in ("COMPLETED", "PARTIAL", "FAILED", "CANCELLED"):
                             yield f"data: {json.dumps({'done': True})}\n\n"
                             break
 
@@ -198,7 +198,7 @@ async def update_progress(request: dict):
                     try:
                         new_status = JobStatus(status_val)
                         # Never downgrade a terminal status back to a non-terminal one
-                        terminal = {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}
+                        terminal = {JobStatus.COMPLETED, JobStatus.PARTIAL, JobStatus.FAILED, JobStatus.CANCELLED}
                         if job.status not in terminal:
                             job.status = new_status
                     except ValueError:

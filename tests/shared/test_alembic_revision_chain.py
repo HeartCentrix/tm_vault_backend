@@ -65,6 +65,7 @@ EXPECTED_CHAIN = [
     ('0016', '0015'),
     ('0017', '0016'),
     ('0018', '0017'),
+    ('0019', '0018'),            # PARTIAL job status
 ]
 
 # Substring that must appear in the module docstring of each pending revision,
@@ -82,6 +83,7 @@ PENDING_SUBJECTS = {
     "0016": "Persist archive folder coverage",
     "0017": "Durable provider continuation",
     "0018": "an archive may point at a PARTIAL prior",
+    "0019": "PARTIAL job status",
 }
 
 

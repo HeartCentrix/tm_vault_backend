@@ -22,6 +22,7 @@ from typing import List, Optional
 
 from sqlalchemy import text
 
+from shared.batch_rollup import job_partial_sql
 from shared.copy_workflow import pending_copy_sql
 
 
@@ -781,14 +782,11 @@ async def sweep_orphans(session) -> SweepStats:
         await session.execute(
             text(
                 f"""
-                -- jobstatus enum values: QUEUED, PENDING, RUNNING,
-                -- COMPLETED, FAILED, CANCELLED, CANCELLING, RETRYING.
-                -- *No* PARTIAL — that lives on snapshotstatus only.
-                -- Mixed-outcome roll-up is the batch row's job (see
-                -- shared.batch_rollup.derive_batch_status), so at the
-                -- job level we collapse to:
-                --   any snapshot COMPLETED or PARTIAL     → COMPLETED
-                --   zero COMPLETED/PARTIAL (all FAILED)   → FAILED
+                -- Job-level roll-up (same rule as every job finalizer and
+                -- the activity feed's "Done with warnings"):
+                --   zero COMPLETED/PARTIAL (all FAILED)       → FAILED
+                --   any snapshot PARTIAL or FAILED            → PARTIAL
+                --   otherwise                                 → COMPLETED
                 -- PARTIAL is an accepted, restorable outcome (the worker
                 -- honesty gates settle degraded-but-usable runs PARTIAL),
                 -- so it counts as job-level success — matching the worker's
@@ -812,15 +810,16 @@ async def sweep_orphans(session) -> SweepStats:
                 -- 5k-user scale.)
                 UPDATE jobs j
                    SET status = CASE
-                           WHEN EXISTS (
+                           WHEN NOT EXISTS (
                                SELECT 1 FROM snapshots s
                                 WHERE s.job_id = j.id
                                   AND s.status IN (
                                       'COMPLETED'::snapshotstatus,
                                       'PARTIAL'::snapshotstatus
                                   )
-                           ) THEN 'COMPLETED'::jobstatus
-                           ELSE 'FAILED'::jobstatus
+                           ) THEN 'FAILED'::jobstatus
+                           WHEN {job_partial_sql('j.id')} THEN 'PARTIAL'::jobstatus
+                           ELSE 'COMPLETED'::jobstatus
                        END,
                        completed_at     = NOW(),
                        lease_owner_id   = NULL,

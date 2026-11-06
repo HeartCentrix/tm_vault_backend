@@ -154,6 +154,10 @@ class JobStatus(str, enum.Enum):
     PENDING = "PENDING"  # T0 migration: chat-export PENDING (queued-but-idempotency-safe)
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
+    # Finished, but a snapshot ended PARTIAL/FAILED: the activity feed's
+    # "Done with warnings" (shared.batch_rollup.job_partial_sql). Terminal
+    # wherever COMPLETED is. Migration 0019.
+    PARTIAL = "PARTIAL"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
     CANCELLING = "CANCELLING"  # T0 migration: transient state while worker wraps up

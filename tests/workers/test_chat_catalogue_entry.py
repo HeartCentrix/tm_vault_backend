@@ -118,11 +118,12 @@ async def test_parallel_wrapper_returns_catalogue_counters_and_propagates_moved_
 async def test_catalogue_partial_job_is_terminal_and_cannot_reverse_cancellation(bw):
     result = {"chat_inventory_format": 1, "status": "PARTIAL", "snapshots_partial": 1}
     job = SimpleNamespace(status=bw.JobStatus.RUNNING, completed_at=None, progress_pct=12)
-    session = SimpleNamespace(get=AsyncMock(return_value=job), commit=AsyncMock())
+    # scalar: the job's PARTIAL snapshot answers the job-level warning probe.
+    session = SimpleNamespace(get=AsyncMock(return_value=job), commit=AsyncMock(), scalar=AsyncMock(return_value=True))
     worker = bw.BackupWorker.__new__(bw.BackupWorker)
     worker.worker_id = "test"
     await worker.update_job_status(session, uuid4(), bw.JobStatus.COMPLETED, result)
-    assert job.status == bw.JobStatus.COMPLETED and job.result["snapshots_partial"] == 1
+    assert job.status == bw.JobStatus.PARTIAL and job.result["snapshots_partial"] == 1
     assert job.completed_at is not None and job.progress_pct == 100
     job.status = bw.JobStatus.CANCELLED
     await worker.update_job_status(session, uuid4(), bw.JobStatus.COMPLETED, result)

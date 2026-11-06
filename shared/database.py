@@ -309,6 +309,7 @@ async def _ensure_enum_values() -> None:
         # CANCELLING is the transient state while the worker wraps up.
         "ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'PENDING';",
         "ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'CANCELLING';",
+        "ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'PARTIAL';",
         "ALTER TYPE snapshottype ADD VALUE IF NOT EXISTS 'FULL';",
         "ALTER TYPE snapshottype ADD VALUE IF NOT EXISTS 'INCREMENTAL';",
         "ALTER TYPE snapshottype ADD VALUE IF NOT EXISTS 'PREEMPTIVE';",

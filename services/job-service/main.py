@@ -867,7 +867,7 @@ def _project_job_progress(job: "Job", roll: Optional[Dict]) -> int:
     pruned would show 0%.
     """
     status = job.status.value if hasattr(job.status, "value") else str(job.status)
-    if status == "COMPLETED":
+    if status in ("COMPLETED", "PARTIAL"):
         return 100
     if status == "FAILED":
         # Best of: rollup (if there are some completed snapshots, surface

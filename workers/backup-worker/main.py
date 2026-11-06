@@ -32445,11 +32445,15 @@ class BackupWorker:
                     f"{getattr(status, 'name', status)} ignored — job is {_cur}"
                 )
                 return
+            from shared.batch_rollup import job_partial_sql
+            if status == JobStatus.COMPLETED and await session.scalar(
+                    text(f"SELECT {job_partial_sql(':jid')}"), {"jid": job_id}):
+                status = JobStatus.PARTIAL
             job.status = status
             job.result = result
-            if status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
+            if status in (JobStatus.COMPLETED, JobStatus.PARTIAL, JobStatus.FAILED, JobStatus.CANCELLED):
                 job.completed_at = datetime.utcnow()
-            if status == JobStatus.COMPLETED:
+            if status in (JobStatus.COMPLETED, JobStatus.PARTIAL):
                 job.progress_pct = 100
             await session.commit()
 
@@ -32511,18 +32515,14 @@ class BackupWorker:
         is NULL) the bulk path was never used, so this helper is a
         no-op and the caller falls back to the legacy
         ``update_job_status`` flip. Returns the terminal status the
-        parent landed in ('COMPLETED' or 'FAILED') if we flipped,
-        else None.
+        parent landed in ('COMPLETED', 'PARTIAL' or 'FAILED') if we
+        flipped, else None.
 
-        Terminal-status mapping — only the two values the
-        ``jobstatus`` enum actually has (COMPLETED, FAILED). The
-        codebase has never had a Job-level PARTIAL. Snapshots CAN
-        be PARTIAL (snapshot-level outcome of a single resource),
-        but the bulk Job rolls up to: COMPLETED if any child made
-        progress (counts.completed > 0 or counts.partial > 0);
-        FAILED only when every single child failed. Operators see
-        the per-resource breakdown via the snapshots table — Job
-        status is the coarse outcome.
+        Terminal-status mapping: FAILED only when every single child
+        failed; otherwise PARTIAL when any child is PARTIAL/FAILED or
+        never got a snapshot row (the activity feed's "Done with
+        warnings"), else COMPLETED. Operators see the per-resource
+        breakdown via the snapshots table.
 
         Late-finalize reconcile (Bug B fix): partition consumers
         commit their snapshot.bytes_added AFTER the snapshot's
@@ -32630,11 +32630,13 @@ class BackupWorker:
                         -- has reached COMPLETED/FAILED.
                         status = (CASE
                             WHEN e.prev_status IN (
-                                'COMPLETED','FAILED','CANCELLED','CANCELLING'
+                                'COMPLETED','PARTIAL','FAILED','CANCELLED','CANCELLING'
                             ) THEN j.status
                             WHEN c.terminal < e.n THEN j.status
                             WHEN p.n_pending > 0 THEN j.status
                             WHEN c.completed = 0 AND c.partial = 0 THEN 'FAILED'::jobstatus
+                            WHEN c.partial > 0 OR c.failed > 0 OR m.n_missing > 0
+                                THEN 'PARTIAL'::jobstatus
                             ELSE 'COMPLETED'::jobstatus
                         END),
                         completed_at = (CASE
@@ -32644,7 +32646,7 @@ class BackupWorker:
                         END),
                         progress_pct = (CASE
                             WHEN e.prev_status IN (
-                                'COMPLETED','FAILED','CANCELLED','CANCELLING'
+                                'COMPLETED','PARTIAL','FAILED','CANCELLED','CANCELLING'
                             ) THEN COALESCE(j.progress_pct, 100)
                             ELSE GREATEST(
                                 COALESCE(j.progress_pct, 0),
@@ -32728,9 +32730,9 @@ class BackupWorker:
             # terminal). Late-arriving bytes-only reconcile calls fire
             # silently — they update bytes_processed but don't flip
             # status, so logging them every time would be noise.
-            terminal_states = {"COMPLETED", "FAILED", "CANCELLED", "CANCELLING"}
+            terminal_states = {"COMPLETED", "PARTIAL", "FAILED", "CANCELLED", "CANCELLING"}
             if (prev_status not in terminal_states
-                and new_status in ("COMPLETED", "FAILED")
+                and new_status in ("COMPLETED", "PARTIAL", "FAILED")
                 and int(terminal) >= int(expected)
                 and int(parts_pending) == 0):
                 print(
