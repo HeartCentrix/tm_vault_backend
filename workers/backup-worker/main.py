@@ -16998,7 +16998,10 @@ class BackupWorker:
             return False
         print(f"[{self.worker_id}]   [DEDUP] {what}: backed up by {resource_type} {owner}, skipped here")
         if snapshot is not None:
-            await self._patch_snapshot_extra_data(snapshot.id, {f"covered_by_{what}": owner})
+            marker = {f"covered_by_{what}": owner}
+            await self._patch_snapshot_extra_data(snapshot.id, marker)
+            # The terminal write persists the in-memory extra_data, not row-only keys.
+            snapshot.extra_data = {**(snapshot.extra_data or {}), **marker}
         return True
 
     async def _note_no_mailbox(self, graph_client, user_id, snapshot, kind, exc=None) -> bool:
@@ -17017,6 +17020,8 @@ class BackupWorker:
         print(f"[{self.worker_id}]   [{kind}] {user_id}: {reason} — completing with 0 items")
         if snapshot is not None:
             await self._patch_snapshot_extra_data(snapshot.id, {"no_mailbox": reason})
+            # The terminal write persists the in-memory extra_data, not row-only keys.
+            snapshot.extra_data = {**(getattr(snapshot, "extra_data", None) or {}), "no_mailbox": reason}
         return True
 
     async def _patch_snapshot_extra_data(
