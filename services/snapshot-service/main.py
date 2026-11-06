@@ -4467,6 +4467,8 @@ async def list_snapshot_contacts(
         folder=folder, search=search,
         sort_sql="LOWER(COALESCE(si.name, ''))", sort_dir="ASC",
         page=page, size=size,
+        # a contact whose newest row is a delta deletion is gone from this point on
+        exclude_deleted=True,
     )
 
     def fmt(i):

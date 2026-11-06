@@ -687,10 +687,11 @@ async def _post_export_notification(url: str, payload: Dict) -> None:
         )
 
 
-# A drive file Graph reported deleted is stored as an is_deleted row with no blob (OneDrive
-# ONEDRIVE_RECORD_DELETIONS, SharePoint library tombstones). As the newest row of its item it means
-# "deleted by this point": recovery hides it and restore must not try to write it.
-_FILE_TOMBSTONE_TYPES = ("ONEDRIVE_FILE", "FILE")
+# A drive file, calendar event or contact Graph reported deleted is stored as an is_deleted row with no
+# blob (ONEDRIVE_RECORD_DELETIONS, SharePoint library tombstones, CALENDAR_/CONTACTS_RECORD_DELETIONS). As
+# the newest row of its item it means "deleted by this point": recovery hides it and restore must not
+# try to write it.
+_FILE_TOMBSTONE_TYPES = ("ONEDRIVE_FILE", "FILE", "CALENDAR_EVENT", "USER_CONTACT", "CONTACT")
 
 
 def _is_file_tombstone(item) -> bool:
