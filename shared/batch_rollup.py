@@ -661,7 +661,18 @@ def build_batch_rollup_query(
             b.batch_id,
             COUNT(*) FILTER (WHERE sp.status::text NOT IN ('COMPLETED','FAILED'))
                                                                     AS parts_pending,
-            MAX(sp.completed_at)                                    AS parts_max_completed_at
+            MAX(sp.completed_at)                                    AS parts_max_completed_at,
+            BOOL_AND(sp.partition_type = 'ONEDRIVE_FILES')            AS capture_is_onedrive,
+            BOOL_OR(sp.payload->'onedrive_capture_progress'->>'version' = '1')
+                                                                    AS capture_progress_known,
+            COALESCE(SUM(sp.total_bytes_est), 0)                     AS capture_expected_bytes,
+            COALESCE(SUM(sp.total_files), 0)                         AS capture_expected_files,
+            COALESCE(SUM(COALESCE(
+                (sp.payload->'onedrive_capture_progress'->>'bytes')::bigint,
+                sp.bytes_uploaded, 0)), 0)                          AS capture_bytes,
+            COALESCE(SUM(COALESCE(
+                (sp.payload->'onedrive_capture_progress'->>'files')::bigint,
+                sp.files_uploaded, 0)), 0)                          AS capture_files
         FROM batches b
         LEFT JOIN snapshot_partitions sp ON sp.job_id = ANY(b.job_ids)
         GROUP BY 1
@@ -1025,6 +1036,12 @@ def build_batch_rollup_query(
         COALESCE(sr.snap_failed, 0)         AS snap_failed,
         COALESCE(sr.snap_pending, 0)        AS snap_pending,
         COALESCE(pr.parts_pending, 0)       AS parts_pending,
+        COALESCE(pr.capture_is_onedrive, FALSE) AS capture_is_onedrive,
+        COALESCE(pr.capture_progress_known, FALSE) AS capture_progress_known,
+        COALESCE(pr.capture_expected_bytes, 0) AS capture_expected_bytes,
+        COALESCE(pr.capture_expected_files, 0) AS capture_expected_files,
+        COALESCE(pr.capture_bytes, 0)        AS capture_bytes,
+        COALESCE(pr.capture_files, 0)        AS capture_files,
         COALESCE(f.missing_t2, 0)           AS missing_t2,
         COALESCE(ls.skipped_no_license, 0)  AS skipped_no_license,
         COALESCE(te.expected_count, 0)      AS expected_count,
@@ -1207,6 +1224,22 @@ def shape_batch_row(row: Any) -> Dict[str, Any]:
             progress_pct = min(100, int(100 * terminal / denom))
         else:
             progress_pct = 0
+    # Compact, committed shard receipts provide live capture progress for a
+    # single OneDrive. Bulk runs retain resource weighting. Settlement still
+    # owns success/failure, and no inventory scan is needed on Activity polls.
+    total_data = 0
+    if (status == "In Progress" and single_type == "USER_ONEDRIVE"
+            and counts.snap_total == 1
+            and getattr(row, "capture_is_onedrive", False)
+            and getattr(row, "capture_progress_known", False)):
+        bytes_added = max(0, int(row.capture_bytes or 0))
+        total_data = max(0, int(row.capture_expected_bytes or 0))
+        captured_files = max(0, int(row.capture_files or 0))
+        expected_files = max(0, int(row.capture_expected_files or 0))
+        if total_data > 0:
+            progress_pct = min(99, 100 * bytes_added // total_data)
+        elif expected_files > 0:
+            progress_pct = min(99, 100 * captured_files // expected_files)
     # Clamp below 100 while still "In Progress" so status and percent
     # agree. The Tier-1=10/Tier-2=90 split makes the natural ceiling
     # 99 (e.g. Tier-1 done + 98 / 99 Tier-2 children done = 10 + 89 = 99),
@@ -1238,10 +1271,9 @@ def shape_batch_row(row: Any) -> Dict[str, Any]:
         "finish_time":    finish_iso,
         "details":        _format_details(status, bytes_added, counts),
         "data_backed_up": bytes_added,
-        # No true bytes_expected today — emit 0 instead of echoing
-        # bytes_added (which forced any "X of Y bytes" UI to a fake
-        # 100 %). Clients already treat 0 as "unknown total".
-        "total_data":     0,
+        # Unknown totals remain zero; never manufacture a denominator from
+        # bytes already captured. For shard captures this is the planned work.
+        "total_data":     total_data,
         "phase":          phase,
         "counts": {
             "total":       counts.snap_total,
