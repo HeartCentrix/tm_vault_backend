@@ -813,10 +813,8 @@ async def sweep_orphans(session) -> SweepStats:
                            WHEN NOT EXISTS (
                                SELECT 1 FROM snapshots s
                                 WHERE s.job_id = j.id
-                                  AND s.status IN (
-                                      'COMPLETED'::snapshotstatus,
-                                      'PARTIAL'::snapshotstatus
-                                  )
+                                  -- SKIPPED: concurrency placeholder, done not failed
+                                  AND s.status::text IN ('COMPLETED', 'PARTIAL', 'SKIPPED')
                            ) THEN 'FAILED'::jobstatus
                            WHEN {job_partial_sql('j.id')} THEN 'PARTIAL'::jobstatus
                            ELSE 'COMPLETED'::jobstatus

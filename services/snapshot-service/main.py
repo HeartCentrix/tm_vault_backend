@@ -2321,7 +2321,7 @@ _LIST_CACHE_TTL_S = int(os.getenv("SNAPSHOT_LIST_CACHE_TTL_S", "900"))
 # fingerprint containing either must not be cached (the id+status pair
 # wouldn't change while the rows do). FAILED appears only for an
 # explicitly-requested failed snapshot (post-mortem view) — inert rows.
-_CACHEABLE_SNAPSHOT_STATES = frozenset({"COMPLETED", "FAILED", "PARTIAL"})
+_CACHEABLE_SNAPSHOT_STATES = frozenset({"COMPLETED", "FAILED", "PARTIAL", "SKIPPED"})
 
 # Session factory for the concurrent COUNT in _paged_latest_items —
 # module-level indirection so unit tests can substitute a fake without

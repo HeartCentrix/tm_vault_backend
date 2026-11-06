@@ -879,7 +879,7 @@ def build_batch_rollup_query(
             COALESCE(u.users_total, 0)                     AS tier1_total,
             COUNT(DISTINCT s.resource_id) FILTER (
                 WHERE r.type::text = 'ENTRA_USER'
-                  AND s.status::text IN ('COMPLETED','PARTIAL','FAILED')
+                  AND s.status::text IN ('COMPLETED','PARTIAL','FAILED','SKIPPED')
             )                                              AS tier1_terminal,
             -- Tier-2 denominator: must always be ≥ the numerator so the
             -- fraction can't exceed 1.0.
@@ -921,7 +921,7 @@ def build_batch_rollup_query(
             COUNT(DISTINCT s.resource_id) FILTER (
                 WHERE r.type IS NOT NULL
                   AND r.type::text <> 'ENTRA_USER'
-                  AND s.status::text IN ('COMPLETED','PARTIAL','FAILED')
+                  AND s.status::text IN ('COMPLETED','PARTIAL','FAILED','SKIPPED')
             )                                              AS tier2_terminal
         FROM batches b
         LEFT JOIN tier1_users   u ON u.batch_id = b.batch_id
@@ -1336,10 +1336,10 @@ async def _finalize_batch_if_complete(batch_id, session) -> Optional[str]:
          check (treated as direct leaves).
       2. Every Tier-2 child has a snapshot with ``created_at >
          batch.created_at`` AND ``status::text IN
-         ('COMPLETED','PARTIAL','FAILED')``.
+         ('COMPLETED','PARTIAL','FAILED','SKIPPED')``.
       3. Every ENTRA_USER itself has a snapshot with ``created_at >
          batch.created_at`` AND ``status::text IN
-         ('COMPLETED','PARTIAL','FAILED')``. Non-ENTRA scope entries
+         ('COMPLETED','PARTIAL','FAILED','SKIPPED')``. Non-ENTRA scope entries
          use this rule directly.
       4. No ``snapshot_partitions`` row for any of those snapshots has
          ``status::text IN ('QUEUED','IN_PROGRESS')``.
@@ -1480,7 +1480,7 @@ async def _finalize_batch_if_complete(batch_id, session) -> Optional[str]:
           FROM leaves l
           LEFT JOIN latest la ON la.resource_id = l.rid
          WHERE la.resource_id IS NULL
-            OR la.status NOT IN ('COMPLETED','PARTIAL','FAILED')
+            OR la.status NOT IN ('COMPLETED','PARTIAL','FAILED','SKIPPED')
             OR NOT la.copy_ready
     """), {"lids": leaf_ids, "created": batch_created_at})).all()
     if pending:

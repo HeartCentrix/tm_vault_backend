@@ -124,12 +124,14 @@ logger = logging.getLogger(__name__)
 
 # A snapshot in one of these statuses is finished — no worker will write to
 # it again, so retention may delete it. PENDING_DELETION is included: that
-# status *asks* for the row to go away.
+# status *asks* for the row to go away. SKIPPED is the 0-item concurrency
+# placeholder.
 _TERMINAL_STATUSES = frozenset({
     SnapshotStatus.COMPLETED.value,
     SnapshotStatus.FAILED.value,
     SnapshotStatus.PARTIAL.value,
     SnapshotStatus.PENDING_DELETION.value,
+    SnapshotStatus.SKIPPED.value,
 })
 
 # ...and in one of these its snapshot_items are restorable content. PARTIAL

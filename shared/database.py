@@ -272,6 +272,7 @@ async def _ensure_enum_values() -> None:
         "ALTER TYPE snapshotstatus ADD VALUE IF NOT EXISTS 'FAILED';",
         "ALTER TYPE snapshotstatus ADD VALUE IF NOT EXISTS 'PARTIAL';",
         "ALTER TYPE snapshotstatus ADD VALUE IF NOT EXISTS 'PENDING_DELETION';",
+        "ALTER TYPE snapshotstatus ADD VALUE IF NOT EXISTS 'SKIPPED';",  # alembic 0022
         "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'ENTRA_SERVICE_PRINCIPAL';",
         "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'AZURE_POSTGRESQL_SINGLE';",
         "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'ENTRA_ROLE';",

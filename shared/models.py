@@ -177,6 +177,10 @@ class SnapshotStatus(str, enum.Enum):
     FAILED = "FAILED"
     PARTIAL = "PARTIAL"
     PENDING_DELETION = "PENDING_DELETION"
+    # Cross-job concurrency placeholder: another job was already backing the
+    # resource up, so this job captured nothing (extra_data.skipped_concurrent
+    # stays set). Terminal, never a restore point; counts as done for the job.
+    SKIPPED = "SKIPPED"
 
     @classmethod
     def terminal(cls) -> tuple["SnapshotStatus", ...]:
@@ -191,7 +195,7 @@ class SnapshotStatus(str, enum.Enum):
         status lists from this method rather than hand-typing SQL literals
         (a stray 'CANCELLED' literal crashed the reaper via enum coercion).
         """
-        return (cls.COMPLETED, cls.FAILED, cls.PARTIAL, cls.PENDING_DELETION)
+        return (cls.COMPLETED, cls.FAILED, cls.PARTIAL, cls.PENDING_DELETION, cls.SKIPPED)
 
 
 class Organization(Base):

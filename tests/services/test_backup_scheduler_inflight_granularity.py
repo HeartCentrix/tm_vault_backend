@@ -108,7 +108,7 @@ def test_ids_query_is_resource_granular_with_a_per_job_snapshot_anti_join():
         "NOT IN over a subquery returns zero rows on one NULL and would "
         "silently release every hold"
     )
-    assert "snapshots.status in ('completed', 'partial', 'failed')" in low
+    assert "snapshots.status in ('completed', 'partial', 'failed', 'skipped')" in low
     assert "snapshots.status = 'in_progress'" in low
     assert "skipped_concurrent" in low
     # The old job-granular shape must be gone.
@@ -117,9 +117,9 @@ def test_ids_query_is_resource_granular_with_a_per_job_snapshot_anti_join():
     assert "sla_policy_id" not in low
 
 
-def test_terminal_statuses_are_exactly_the_three_settled_outcomes():
+def test_terminal_statuses_are_exactly_the_settled_outcomes():
     S = dp.SnapshotStatus
-    assert set(dp.SNAPSHOT_TERMINAL_STATUSES) == {S.COMPLETED, S.PARTIAL, S.FAILED}
+    assert set(dp.SNAPSHOT_TERMINAL_STATUSES) == {S.COMPLETED, S.PARTIAL, S.FAILED, S.SKIPPED}
     assert S.IN_PROGRESS not in dp.SNAPSHOT_TERMINAL_STATUSES
 
 
@@ -134,7 +134,7 @@ def test_count_query_is_policy_scoped_and_counts_distinct_in_flight_members():
     assert str(PID) in sql
     # Same anti-join as the id set.
     assert "not (exists (select 1" in low
-    assert "snapshots.status in ('completed', 'partial', 'failed')" in low
+    assert "snapshots.status in ('completed', 'partial', 'failed', 'skipped')" in low
     assert "skipped_concurrent" in low
     # array_length(batch_resource_ids) is job-granular: it kept a bulk
     # job's COMPLETED members charged against the cap until its slowest

@@ -763,12 +763,13 @@ async def startup():
                             SELECT
                                 s.job_id,
                                 COUNT(*) FILTER (
-                                    WHERE s.status IN (
-                                        'COMPLETED','FAILED','PARTIAL'
+                                    WHERE s.status::text IN (
+                                        'COMPLETED','FAILED','PARTIAL','SKIPPED'
                                     )
                                 ) AS terminal,
                                 COUNT(*) FILTER (WHERE s.status='FAILED') AS failed,
-                                COUNT(*) FILTER (WHERE s.status='COMPLETED') AS completed,
+                                -- SKIPPED (concurrency placeholder) is done, not failed.
+                                COUNT(*) FILTER (WHERE s.status::text IN ('COMPLETED','SKIPPED')) AS completed,
                                 COUNT(*) FILTER (WHERE s.status='PARTIAL') AS partial,
                                 COALESCE(SUM(s.item_count) FILTER (
                                     WHERE s.status IN ('COMPLETED','PARTIAL')
@@ -859,7 +860,7 @@ async def startup():
                         counts AS (
                             SELECT
                                 s.job_id,
-                                COUNT(*) FILTER (WHERE s.status='COMPLETED') AS completed,
+                                COUNT(*) FILTER (WHERE s.status::text IN ('COMPLETED','SKIPPED')) AS completed,
                                 COUNT(*) FILTER (WHERE s.status='FAILED')    AS failed,
                                 COUNT(*) FILTER (WHERE s.status='PARTIAL')   AS partial,
                                 COALESCE(SUM(s.item_count) FILTER (
@@ -1814,10 +1815,10 @@ async def startup():
                                cardinality(j.batch_resource_ids) AS n_resources,
                                (SELECT count(*) FROM snapshots s
                                 WHERE s.job_id = j.id
-                                  AND s.status IN ('COMPLETED','FAILED','PARTIAL')) AS n_terminal,
+                                  AND s.status::text IN ('COMPLETED','FAILED','PARTIAL','SKIPPED')) AS n_terminal,
                                (SELECT count(*) FROM snapshots s
                                 WHERE s.job_id = j.id
-                                  AND s.status = 'COMPLETED') AS n_completed,
+                                  AND s.status::text IN ('COMPLETED','SKIPPED')) AS n_completed,
                                (SELECT COALESCE(SUM(s.item_count), 0) FROM snapshots s
                                 WHERE s.job_id = j.id) AS items_total,
                                (SELECT COALESCE(SUM(s.bytes_total), 0) FROM snapshots s
@@ -1889,12 +1890,12 @@ async def startup():
                                 WHERE s.job_id = j.id) AS n_existing,
                                (SELECT count(*) FROM snapshots s
                                 WHERE s.job_id = j.id
-                                  AND s.status NOT IN
+                                  AND s.status::text NOT IN
                                       ('COMPLETED','FAILED','PARTIAL',
-                                       'PENDING_DELETION')) AS n_nonterminal,
+                                       'PENDING_DELETION','SKIPPED')) AS n_nonterminal,
                                (SELECT count(*) FROM snapshots s
                                 WHERE s.job_id = j.id
-                                  AND s.status = 'COMPLETED') AS n_completed,
+                                  AND s.status::text IN ('COMPLETED','SKIPPED')) AS n_completed,
                                (SELECT COALESCE(SUM(s.item_count), 0)
                                 FROM snapshots s
                                 WHERE s.job_id = j.id) AS items_total,
@@ -2012,10 +2013,11 @@ async def startup():
                 result = await session.execute(text(f"""
                     WITH agg AS (
                         SELECT s.job_id,
-                               COUNT(*) FILTER (WHERE s.status IN ('COMPLETED','PARTIAL')) AS n_ok,
+                               -- SKIPPED: concurrency placeholder, terminal and done.
+                               COUNT(*) FILTER (WHERE s.status::text IN ('COMPLETED','PARTIAL','SKIPPED')) AS n_ok,
                                COUNT(*) FILTER (WHERE s.status IN ('PARTIAL','FAILED')) AS n_warn,
-                               COUNT(*) FILTER (WHERE s.status NOT IN
-                                   ('COMPLETED','PARTIAL','FAILED','PENDING_DELETION')) AS n_pending,
+                               COUNT(*) FILTER (WHERE s.status::text NOT IN
+                                   ('COMPLETED','PARTIAL','FAILED','PENDING_DELETION','SKIPPED')) AS n_pending,
                                MAX(s.completed_at) AS last_settled,
                                COALESCE(SUM(s.item_count), 0)  AS items_total,
                                COALESCE(SUM(s.bytes_total), 0) AS bytes_total

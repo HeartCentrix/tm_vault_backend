@@ -5269,7 +5269,7 @@ class BackupWorker:
                 await self._finalize_partitioned_snapshot(snapshot.id, job_id=job.id)
             async with async_session_factory() as session:
                 current = await session.get(Snapshot, snapshot.id)
-                if current.status not in (SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL, SnapshotStatus.FAILED):
+                if current.status not in (SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL, SnapshotStatus.FAILED, SnapshotStatus.SKIPPED):
                     return False
                 if job.batch_resource_ids:
                     await self._finalize_bulk_parent_if_complete(session, job.id)
@@ -5429,7 +5429,7 @@ class BackupWorker:
                 await self._finalize_partitioned_snapshot(snapshot.id, tenant, resource, job.id)
             async with async_session_factory() as session:
                 current = await session.get(Snapshot, snapshot.id)
-                if current.status not in (SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL, SnapshotStatus.FAILED):
+                if current.status not in (SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL, SnapshotStatus.FAILED, SnapshotStatus.SKIPPED):
                     return False
                 if job.batch_resource_ids:
                     await self._finalize_bulk_parent_if_complete(session, job.id)
@@ -6523,8 +6523,9 @@ class BackupWorker:
             other_id, other_job, other_started = other_active
             # Create the snapshot row so this job's FANOUT/FINALIZE math
             # balances (consumer count must equal the bulk_fanout_seen
-            # expectation), then immediately mark it COMPLETED with
-            # skipped_concurrent so operators can see why no items were
+            # expectation), then immediately mark it SKIPPED (terminal,
+            # never a restore point) with skipped_concurrent so operators
+            # can see why no items were
             # ingested for this (job, resource) pair.
             try:
                 snapshot = await self.create_snapshot(resource, message, job_id)
@@ -6534,7 +6535,7 @@ class BackupWorker:
                 async with async_session_factory() as _skip_s:
                     _live = await _skip_s.get(Snapshot, snapshot.id)
                     if _live and _live.status == SnapshotStatus.IN_PROGRESS:
-                        _live.status = SnapshotStatus.COMPLETED
+                        _live.status = SnapshotStatus.SKIPPED
                         _live.completed_at = datetime.utcnow()
                         _live.duration_secs = 0
                         _live.item_count = 0
@@ -6549,14 +6550,14 @@ class BackupWorker:
             except Exception as _skip_exc:
                 print(
                     f"[{self.worker_id}] [SKIP_CONCURRENT] couldn't mark "
-                    f"skip-snapshot COMPLETED for resource={resource.id}: "
+                    f"skip-snapshot SKIPPED for resource={resource.id}: "
                     f"{_skip_exc}"
                 )
             print(
                 f"[{self.worker_id}] [SKIP_CONCURRENT] resource={resource.id} "
                 f"active in job={other_job} since {other_started} "
                 f"(this job={job_id}); created skip-snapshot {snapshot.id} "
-                f"COMPLETED skipped_concurrent=true."
+                f"SKIPPED skipped_concurrent=true."
             )
             return
 
@@ -32492,7 +32493,7 @@ class BackupWorker:
         that died mid-run (the scheduler reconciler settles those rows
         FAILED, worker-side nothing ran). A resource a sibling job carried
         to COMPLETED / PARTIAL / IN_PROGRESS meanwhile, or whose
-        skipped_concurrent husk is COMPLETED, is left alone. last_backup_at
+        skipped_concurrent husk is SKIPPED, is left alone. last_backup_at
         is NOT touched — see update_resource_backup_info. Own session: the
         caller's may be the dead connection that just made the flip retry.
         Plan: jobs_pkey → resources_pkey ANY(batch_resource_ids) → anti-join
@@ -32635,10 +32636,11 @@ class BackupWorker:
                     counts AS (
                         SELECT
                           COUNT(*) FILTER (
-                              WHERE status IN ('COMPLETED','FAILED','PARTIAL')
+                              WHERE status::text IN ('COMPLETED','FAILED','PARTIAL','SKIPPED')
                           ) AS terminal,
                           COUNT(*) FILTER (WHERE status = 'FAILED') AS failed,
-                          COUNT(*) FILTER (WHERE status = 'COMPLETED') AS completed,
+                          -- SKIPPED (concurrency placeholder) is done, not failed.
+                          COUNT(*) FILTER (WHERE status::text IN ('COMPLETED','SKIPPED')) AS completed,
                           COUNT(*) FILTER (WHERE status = 'PARTIAL') AS partial,
                           COALESCE(SUM(item_count) FILTER (
                               WHERE status IN ('COMPLETED','PARTIAL')), 0) AS items,

@@ -524,7 +524,7 @@ async def finish_parent_settlement(session, work_id):
             raise ProviderWorkConflict('provider settlement ownership changed')
     if row.state not in TERMINAL:
         raise ProviderWorkConflict('provider work has not finished')
-    if (snapshot.status.value not in ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELLED')
+    if (snapshot.status.value not in ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELLED', 'SKIPPED')
             or job.status.value not in ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELLED')):
         return False
     row.parent_settle_pending = False
