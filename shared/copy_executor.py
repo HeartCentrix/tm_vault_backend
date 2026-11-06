@@ -152,9 +152,12 @@ def _selection(kind, params):
         "FILE_VERSIONS": "src.item_type='FILE_VERSION' AND src.parent_external_id=ANY(CAST(:file_ids AS text[]))",
         "ARCHIVE_CARRY": "((src.item_type='ARCHIVE_ITEM' AND src.external_id=ANY(CAST(:external_ids AS text[]))) OR (src.item_type='ARCHIVE_ATTACHMENT' AND src.parent_external_id=ANY(CAST(:external_ids AS text[]))))",
     }
+    # An archive prior may be an overlay: its inventory is base + own rows (docs/mail-overlay-snapshots.md).
+    source = ("source_choice p CROSS JOIN LATERAL snapshot_items_effective(p.id) src" if kind == "ARCHIVE_CARRY"
+              else "snapshot_items src JOIN source_choice p ON src.snapshot_id=p.id")
     return (prior + """, selected AS MATERIALIZED (
         SELECT src.snapshot_id AS source_snapshot_id,0 AS phase,to_jsonb(src) AS payload
-          FROM snapshot_items src JOIN source_choice p ON src.snapshot_id=p.id
+          FROM """ + source + """
          WHERE """ + filters[kind] + ")", "true")
 
 

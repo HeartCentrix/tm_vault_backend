@@ -22737,8 +22737,9 @@ class BackupWorker:
         }
 
     async def _previous_sp_lists(self, snapshot: Snapshot, site_id: str):
-        """(prior snapshot id, {list id: list row metadata}) of the latest earlier COMPLETED restore point
-        for this site's lists; (None, {}) when there is none. A PARTIAL prior may miss list rows."""
+        """(prior snapshot id, {list id: list row metadata}) of the latest earlier restore point for this
+        site's lists; (None, {}) when there is none. A PARTIAL prior may miss list rows: it offers only the
+        lists its run marked complete (_mark_sp_lists_complete), so the others are re-read, not all."""
         from sqlalchemy import text as _text
         async with async_session_factory() as sess:
             prev = (await sess.execute(_text("""
@@ -22746,13 +22747,26 @@ class BackupWorker:
                   AND s.created_at <= :at AND s.status IN ('COMPLETED', 'PARTIAL')
                 ORDER BY s.created_at DESC LIMIT 1"""),
                 {"rid": snapshot.resource_id, "sid": snapshot.id, "at": snapshot.created_at})).first()
-            if prev is None or prev[1] != "COMPLETED":
+            if prev is None:
                 return None, {}
             rows = (await sess.execute(_text("""
                 SELECT external_id, metadata FROM snapshot_items WHERE snapshot_id = :prev
-                  AND item_type = 'SHAREPOINT_LIST' AND metadata->>'site_id' = :site"""),
-                {"prev": prev[0], "site": site_id})).all()
+                  AND item_type = 'SHAREPOINT_LIST' AND metadata->>'site_id' = :site
+                  AND (:completed OR metadata->>'rest_complete' = 'true')"""),
+                {"prev": prev[0], "site": site_id, "completed": prev[1] == "COMPLETED"})).all()
         return prev[0], {r[0]: (json.loads(r[1]) if isinstance(r[1], str) else r[1]) or {} for r in rows}
+
+    async def _mark_sp_lists_complete(self, snapshot_id, incomplete) -> None:
+        """Mark this snapshot's list rows complete except ``incomplete`` ({(site id, list id)}: a REST read
+        or a row that failed). Run after the REST queue drained."""
+        from sqlalchemy import text as _text
+        async with async_session_factory() as sess:
+            await sess.execute(_text("""
+                UPDATE snapshot_items SET metadata = (metadata::jsonb || '{"rest_complete": true}'::jsonb)::json
+                WHERE snapshot_id = CAST(:sid AS uuid) AND item_type = 'SHAREPOINT_LIST'
+                  AND NOT ((COALESCE(metadata->>'site_id', '') || ' ' || external_id) = ANY(:incomplete))"""),
+                {"sid": str(snapshot_id), "incomplete": [f"{site} {lst}" for site, lst in incomplete]})
+            await sess.commit()
 
     async def _copy_forward_sp_list_rows(self, snapshot_id, prior_snapshot_id, site_id: str, list_id: str,
                                          skip_external_ids=()) -> int:
@@ -29689,6 +29703,9 @@ class BackupWorker:
         # items. At 2048 × ~2KB per drive-item dict that's ~4 MB peak.
         drive_queue: asyncio.Queue = asyncio.Queue(maxsize=2048)
         rest_queue: asyncio.Queue = asyncio.Queue(maxsize=512)
+        # (site id, list id) whose REST read or a row failed this run: not marked complete, so a PARTIAL
+        # snapshot's next run re-reads only these lists (_previous_sp_lists).
+        sp_lists_incomplete: Set[Tuple[str, str]] = set()
 
         stats = {
             "drive_ok": 0, "drive_bytes": 0, "drive_fail": 0, "drive_excluded": 0,
@@ -30037,6 +30054,7 @@ class BackupWorker:
                     continue
                 if not (sp_hostname and sp_site_web_url):
                     logger.warning("Cannot derive SP site URL for %s, skipping list items", site_label)
+                    sp_lists_incomplete.add((site_id, lst_id))
                     continue
                 if _reuse_walked:
                     try:
@@ -30095,6 +30113,7 @@ class BackupWorker:
                         await rest_queue.put(_rest_work(row))
                 except Exception as exc:
                     stats["rest_enum_fail"] = stats.get("rest_enum_fail", 0) + 1
+                    sp_lists_incomplete.add((site_id, lst_id))
                     logger.warning("SP REST stream failed for list %s/%s: %s", site_label, display, exc)
 
         # --- Consumers ----------------------------------------------------
@@ -30176,10 +30195,13 @@ class BackupWorker:
                         )
                     except Exception as exc:
                         stats["rest_fail"] += 1
+                        work["failed"] = True
                         print(f"[{self.worker_id}]   [SP_LIST_ITEM FAIL] "
                               f"{work.get('site_label','?')}/{work.get('list_display','?')}: "
                               f"{type(exc).__name__}: {exc}")
                 finally:
+                    if work is not None and work.get("failed"):
+                        sp_lists_incomplete.add((work["site_id"], work["lst_id"]))
                     rest_queue.task_done()
 
         # --- Orchestrate --------------------------------------------------
@@ -30224,6 +30246,12 @@ class BackupWorker:
         for _ in range(num_rest_consumers):
             await rest_queue.put(None)
         await asyncio.gather(*drive_consumer_tasks, *rest_consumer_tasks, return_exceptions=True)
+        if _sp_owns_inventory:
+            try:
+                await self._mark_sp_lists_complete(snapshot.id, sp_lists_incomplete)
+            except Exception as exc:
+                # Unmarked lists are re-read after a PARTIAL run: slower, never wrong.
+                logger.warning("SharePoint list completeness marks for %s failed: %s", snapshot.id, exc)
 
         total_items = stats["drive_ok"] + stats["list_folders"] + stats["rest_rows"]
         total_bytes = stats["drive_bytes"] + stats["rest_bytes"]
@@ -30515,6 +30543,7 @@ class BackupWorker:
             except Exception as exc:
                 stats["rest_rows_meta_fail"] += 1
                 stats["rest_fail"] += 1
+                work["failed"] = True   # the list is incomplete: re-read next run
                 logger.warning("SP REST file metadata failed: %s", type(exc).__name__)
                 file_info = None
 
@@ -30568,6 +30597,7 @@ class BackupWorker:
                         blob_path = blob_path_candidate
                     else:
                         stats["rest_fail"] += 1
+                        work["failed"] = True   # the list is incomplete: re-read next run
                 except Exception as exc:
                     content_hash = None
                     # Record possible template-backed files separately; missing
@@ -30652,6 +30682,7 @@ class BackupWorker:
                 stats["rest_bytes"] += downloaded_bytes
         except Exception as exc:
             stats["rest_fail"] += 1
+            work["failed"] = True   # the list is incomplete: re-read next run
             logger.warning("sp_rest_row persist failed for %s/%s/%s: %s", site_label, display, name, exc)
 
     @staticmethod
@@ -30737,15 +30768,23 @@ class BackupWorker:
         # full-inventory reuse snapshots (only the grown rows are absent).
         # Matches item_count's CHILD_ITEM_TYPES exclusion for the count;
         # bytes sums all types like bytes_total.
+        # Inventories, not own rows: an overlay owns only what changed since its base. But compared with
+        # its own base or the prior it was built from, every row it inherits is already in that prior
+        # (each overlay hides at least what its prior hid), so only its own rows can be new: reading the
+        # whole inventory cost O(mailbox) per run.
+        overlay = (await session.execute(text(
+            "SELECT overlay_base_id, extra_data->>'mail_overlay_prior', extra_data->>'overlay_prior' "
+            "FROM snapshots WHERE id = CAST(:cur AS uuid)"), {"cur": str(snapshot_id)})).first()
+        own_only = bool(overlay and overlay[0] and str(prior_id) in {str(overlay[0]), overlay[1], overlay[2]})
         row = (await session.execute(
             text(
                 "SELECT "
                 "  count(*) FILTER (WHERE cur.item_type NOT IN "
                 "    ('CHAT_ATTACHMENT','EMAIL_ATTACHMENT','CHAT_HOSTED_CONTENT')), "
                 "  COALESCE(SUM(cur.content_size), 0) "
-                # Inventories, not own rows: an overlay owns only what changed since its base.
-                "FROM snapshot_items_effective(CAST(:cur AS uuid)) cur "
-                "WHERE NOT EXISTS ("
+                + ("FROM snapshot_items cur WHERE cur.snapshot_id = CAST(:cur AS uuid) AND " if own_only
+                   else "FROM snapshot_items_effective(CAST(:cur AS uuid)) cur WHERE ")
+                + "NOT EXISTS ("
                 "    SELECT 1 FROM snapshot_items_effective(CAST(:pri AS uuid)) pri "
                 "    WHERE pri.external_id = cur.external_id "
                 "      AND pri.item_type = cur.item_type "
@@ -30754,7 +30793,10 @@ class BackupWorker:
                 # Only file types — other hashes may cover volatile JSON.
                 "      AND NOT (cur.item_type IN ('ONEDRIVE_FILE','FILE') "
                 "               AND NULLIF(cur.content_hash, '') IS DISTINCT FROM pri.content_hash "
-                "               AND NULLIF(cur.content_hash, '') IS NOT NULL))"
+                "               AND NULLIF(cur.content_hash, '') IS NOT NULL)"
+                # OFFSET 0 keeps the probe a per-row subplan: the row's key then reaches the function's
+                # UNION ALL as an index condition. As an anti-join it scanned the prior's whole inventory.
+                + (" OFFSET 0)" if own_only else ")")
             ),
             {"cur": str(snapshot_id), "pri": str(prior_id)},
         )).first()

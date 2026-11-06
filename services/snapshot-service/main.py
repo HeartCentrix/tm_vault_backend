@@ -1176,15 +1176,15 @@ async def get_snapshot_folders(
                 sql = _text("""
                     WITH latest AS (
                       SELECT DISTINCT ON (external_id)
-                             external_id, COALESCE(folder_path, '') AS path
+                             external_id, COALESCE(folder_path, '') AS path, is_deleted
                       FROM snapshot_items
                       WHERE snapshot_id = ANY(:snaps)
-                        AND COALESCE(is_deleted, false) = false
                         {type_filter}
                       ORDER BY external_id, created_at DESC
                     )
+                    -- newest row decides: a deletion (tombstone) hides the item from then on
                     SELECT path, COUNT(*) AS cnt
-                    FROM latest
+                    FROM latest WHERE is_deleted IS NOT TRUE
                     GROUP BY path
                     ORDER BY path
                 """.format(
@@ -1629,13 +1629,13 @@ CONTENT_TAB_TO_TYPE: Dict[str, str] = {
 _CONTENT_ROLLUP_SQL = """
     SELECT COUNT(*) AS cnt, COALESCE(SUM(size), 0) AS bytes
     FROM (
-      SELECT (array_agg(si.content_size ORDER BY si.created_at DESC))[1] AS size
+      SELECT (array_agg(si.content_size ORDER BY si.created_at DESC))[1] AS size,
+             (array_agg(COALESCE(si.is_deleted, false) ORDER BY si.created_at DESC))[1] AS deleted
       FROM snapshot_items si
       WHERE si.snapshot_id = ANY(:snaps)
         {type_filter}
-        AND COALESCE(si.is_deleted, false) = false
       GROUP BY COALESCE(si.external_id, si.id::text)
-    ) latest
+    ) latest WHERE NOT latest.deleted
 """
 
 # Rollup cache keyed by (child resource, its latest COMPLETED snapshot,
@@ -2460,8 +2460,10 @@ async def _paged_latest_items(
     if search:
         where_parts.append("si.name ILIKE :search")
         params["search"] = f"%{search}%"
-    if exclude_deleted:
-        where_parts.append("si.is_deleted IS NOT TRUE")
+    # exclude_deleted hides an item whose NEWEST row is a deletion (OneDrive delta tombstone): the
+    # newest-wins dedup runs first, the filter after - filtering rows before it let the older live
+    # row win and the deleted file kept showing.
+    live = "si.is_deleted IS NOT TRUE" if exclude_deleted else "true"
     # Caller-supplied row predicate (currently the OneDrive recency window —
     # see list_snapshot_onedrive). Applied INSIDE the dedup subquery so the
     # COUNT and the page agree, and folded into both cache keys below so a
@@ -2511,7 +2513,10 @@ async def _paged_latest_items(
             f"SELECT COUNT(*) AS n FROM ("
             f"  SELECT 1 FROM snapshot_items si WHERE {where_sql}"
             f"  GROUP BY {dedup_key}"
-            f") dedup"
+            # newest row live: no deletion at or after the newest live capture
+            + (" HAVING max(si.created_at) FILTER (WHERE si.is_deleted IS NOT TRUE)"
+               " > COALESCE(max(si.created_at) FILTER (WHERE si.is_deleted), '-infinity')" if exclude_deleted else "")
+            + ") dedup"
         )
 
         async def _run_count_on(count_db) -> int:
@@ -2570,17 +2575,17 @@ async def _paged_latest_items(
                     f"  SELECT DISTINCT ON ({dedup_key}) si.id"
                     f"  FROM snapshot_items si WHERE {where_sql}"
                     f"  ORDER BY {dedup_key}, si.created_at DESC"
-                    f") latest JOIN snapshot_items si ON si.id = latest.id "
+                    f") latest JOIN snapshot_items si ON si.id = latest.id WHERE {live} "
                     f"ORDER BY ({sort_expr}) {sort_dir}, si.id "
                     f"LIMIT :limit OFFSET :offset"
                 )
             else:
                 page_sql = (
                     f"SELECT latest.id FROM ("
-                    f"  SELECT DISTINCT ON ({dedup_key}) si.id, ({sort_expr}) AS _sk"
+                    f"  SELECT DISTINCT ON ({dedup_key}) si.id, ({sort_expr}) AS _sk, ({live}) AS _live"
                     f"  FROM snapshot_items si WHERE {where_sql}"
                     f"  ORDER BY {dedup_key}, si.created_at DESC"
-                    f") latest "
+                    f") latest WHERE latest._live "
                     f"ORDER BY latest._sk {sort_dir}, latest.id "
                     f"LIMIT :limit OFFSET :offset"
                 )
@@ -4296,22 +4301,24 @@ async def list_onedrive_ids_by_prefix(
             (SnapshotItem.folder_path == prefix) | (SnapshotItem.folder_path.like(f"{escaped}/%", escape="\\")),
         ]
     rows = (await db.execute(
-        select(SnapshotItem.id, SnapshotItem.external_id, SnapshotItem.created_at)
+        select(SnapshotItem.id, SnapshotItem.external_id, SnapshotItem.is_deleted)
         .where(*filters)
         .order_by(SnapshotItem.external_id, SnapshotItem.created_at.desc())
     )).all()
     # Newest-wins dedup by external_id. Rows without external_id are
     # passed through (e.g. legacy ones); they can't collide with each
-    # other meaningfully since `id` is unique anyway.
+    # other meaningfully since `id` is unique anyway. A newest row that is a
+    # deletion (tombstone, no blob) hides the file: never send it to restore.
     seen: set = set()
     deduped_ids: list = []
-    for row_id, ext_id, _created in rows:
+    for row_id, ext_id, deleted in rows:
         key = ext_id if ext_id else str(row_id)
         if ext_id and key in seen:
             continue
         if ext_id:
             seen.add(key)
-        deduped_ids.append(str(row_id))
+        if not deleted:
+            deduped_ids.append(str(row_id))
     return {"ids": deduped_ids, "count": len(deduped_ids)}
 
 

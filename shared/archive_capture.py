@@ -518,13 +518,14 @@ class ArchiveCapture:
                 return (UUID(context['prior_snapshot_id']) if context.get('prior_snapshot_id') else None, context['baseline_count'])
             result = (await db.execute(text('''SELECT s.id, s.item_count FROM snapshots s
                 WHERE s.resource_id=:rid AND s.id<>:sid AND s.status IN ('COMPLETED','PARTIAL')
-                AND EXISTS (SELECT 1 FROM snapshot_items i WHERE i.snapshot_id=s.id AND i.item_type='ARCHIVE_ITEM')
+                AND (s.overlay_base_id IS NOT NULL
+                     OR EXISTS (SELECT 1 FROM snapshot_items i WHERE i.snapshot_id=s.id AND i.item_type='ARCHIVE_ITEM'))
                 ORDER BY (s.created_at > NOW()-make_interval(days=>:days)) DESC,s.item_count DESC NULLS LAST,s.created_at DESC LIMIT 1'''),
                 {'rid': self.fence.resource_id, 'sid': self.fence.snapshot_id, 'days': days})).first()
             chosen = (result[0], int(result[1] or 0)) if result else (None, 0)
             if chosen[0]:
-                retained = await db.scalar(select(func.count(func.distinct(SnapshotItem.external_id))).where(
-                    SnapshotItem.snapshot_id == chosen[0], SnapshotItem.item_type == 'ARCHIVE_ITEM'))
+                retained = await db.scalar(text('''SELECT count(DISTINCT external_id) FROM
+                    snapshot_items_effective(CAST(:p AS uuid)) WHERE item_type='ARCHIVE_ITEM' '''), {'p': chosen[0]})
                 chosen = (chosen[0], max(chosen[1], int(retained or 0)))
             context.update(prior_snapshot_id=str(chosen[0]) if chosen[0] else None, baseline_count=chosen[1])
             snap.extra_data = {**snap.extra_data, 'archive_capture': context}
@@ -546,14 +547,14 @@ class ArchiveCapture:
                     GROUP BY i.external_id)
                     UPDATE archive_item_work i SET state=CASE WHEN c.proofs>1 OR c.failed THEN 'failed'
                         WHEN NOT :full AND i.change_key IS NOT NULL AND EXISTS (
-                          SELECT 1 FROM snapshot_items p WHERE p.snapshot_id=:prior AND p.item_type='ARCHIVE_ITEM'
+                          SELECT 1 FROM snapshot_items_effective(CAST(:prior AS uuid)) p WHERE p.item_type='ARCHIVE_ITEM'
                           AND p.external_id=i.external_id AND COALESCE(p.metadata->>'changeKey',p.metadata->>'change_key')=i.change_key
                           AND p.blob_path IS NOT NULL AND p.content_hash IS NOT NULL AND NOT COALESCE(p.is_deleted,false))
                           THEN 'copy_pending' ELSE 'export_pending' END,
                         gap_kind=CASE WHEN c.proofs>1 OR c.failed THEN 'identity_conflict' ELSE NULL END
                     FROM current c WHERE i.snapshot_id=:sid AND i.capture_generation=:gen AND i.external_id=c.external_id
                     AND i.state='discovered' '''), self.params(ids=ids, prior=prior_id, full=force_full))
-        if not prior_id or (not force_full and await self._point_at_prior(prior_id)):
+        if not prior_id or (not force_full and await self._point_at_prior(prior_id)) or await self._overlay(prior_id):
             return
         after = ''
         while batch := await self.manifest_batch(after=after):
@@ -596,8 +597,8 @@ class ArchiveCapture:
                 FROM archive_item_work i JOIN archive_folder_work f ON f.snapshot_id=i.snapshot_id
                   AND f.capture_generation=i.capture_generation AND f.scope_key=i.scope_key AND f.scope_generation=i.scope_generation
                 WHERE i.snapshot_id=:sid AND i.capture_generation=:gen AND f.state<>'excluded' '''), self.params())).one()
-            prior_items = await db.scalar(text('''SELECT count(*) FROM snapshot_items
-                WHERE snapshot_id=:prior AND item_type='ARCHIVE_ITEM' '''), {'prior': prior_id})
+            prior_items = await db.scalar(text('''SELECT count(*) FROM snapshot_items_effective(CAST(:prior AS uuid))
+                WHERE item_type='ARCHIVE_ITEM' '''), {'prior': prior_id})
             if counts.changed or counts.items != prior_items:
                 return False
             if not await point_at(db, target_snapshot_id=self.fence.snapshot_id, prior_snapshot_id=prior_id,
@@ -611,10 +612,114 @@ class ArchiveCapture:
                 receipt=json_build_object('kind','reuse','change_key',i.change_key,'hash',s.content_hash,'size',s.content_size,
                     'blob_path',s.blob_path,'backend_id',s.backend_id::text,'encryption_key_id',s.encryption_key_id,
                     'backup_version',s.backup_version,'reused_snapshot_id',CAST(:prior AS text))
-                FROM snapshot_items s WHERE i.snapshot_id=:sid AND i.capture_generation=:gen AND i.state='copy_pending'
-                  AND s.snapshot_id=:prior AND s.item_type='ARCHIVE_ITEM' AND s.external_id=i.external_id'''),
+                FROM snapshot_items_effective(CAST(:prior AS uuid)) s WHERE i.snapshot_id=:sid AND i.capture_generation=:gen
+                  AND i.state='copy_pending' AND s.item_type='ARCHIVE_ITEM' AND s.external_id=i.external_id'''),
                 self.params(prior=prior_id))
         return True
+
+    async def _overlay(self, prior_id):
+        """A changed archive becomes an OVERLAY of a full base (docs/mail-overlay-snapshots.md) instead
+        of ARCHIVE_CARRY copying every unchanged row: TM's largest archive is 1.1 M items, a few hundred
+        change a day. The target owns this run's exports plus the prior overlay's still-current own rows
+        (copied, as the carry would); every other base row whose item is not an unchanged census item is
+        a removal, so snapshot_items_effective() reads exactly what the full copy would hold. Declined
+        (False, nothing written) past ARCHIVE_OVERLAY_MAX_RATIO churn of the base's items or
+        ARCHIVE_OVERLAY_MAX_AGE_DAYS since it, so a chain re-bases on a full copy.
+        ARCHIVE_OVERLAY_ENABLED=false copies as before."""
+        import os
+        if os.getenv('ARCHIVE_OVERLAY_ENABLED', 'true').strip().lower() in ('0', 'false', 'no', 'off'):
+            return False
+
+        def knob(name, default):
+            try:
+                return float(os.getenv(name) or default)
+            except ValueError:
+                return default
+
+        class Declined(Exception):
+            pass
+
+        pending = """SELECT DISTINCT i.external_id FROM archive_item_work i JOIN archive_folder_work f
+            ON f.snapshot_id=i.snapshot_id AND f.capture_generation=i.capture_generation AND f.scope_key=i.scope_key
+            AND f.scope_generation=i.scope_generation WHERE i.snapshot_id=:sid AND i.capture_generation=:gen
+            AND f.state<>'excluded' AND i.state='copy_pending' AND i.copy_task_id IS NULL"""
+        try:
+            async with self.factory.begin() as db:
+                snap = await self.lock(db)
+                if snap.overlay_base_id is not None:
+                    return True     # built by an earlier attempt of this capture
+                prior = (await db.execute(text("""SELECT id, overlay_base_id FROM snapshots WHERE id=:prior
+                    AND resource_id=:rid AND status IN ('COMPLETED','PARTIAL') AND extra_data->>'cancelled_at' IS NULL
+                    AND COALESCE(extra_data->>'copy_required_failed','false')<>'true' FOR SHARE"""),
+                    {'prior': prior_id, 'rid': self.fence.resource_id})).first()
+                if prior is None or snap.reuse_of_snapshot_id is not None:
+                    return False
+                base_id = prior.overlay_base_id or prior.id
+                # KEY SHARE: retention's DELETE of the base waits for this transaction, then sees the dependent.
+                base = (await db.execute(text("""SELECT created_at, item_count FROM snapshots WHERE id=:base
+                    AND status IN ('COMPLETED','PARTIAL') AND extra_data->>'cancelled_at' IS NULL FOR KEY SHARE"""),
+                    {'base': base_id})).first()
+                if base is None or (snap.created_at - base.created_at).total_seconds() > knob(
+                        'ARCHIVE_OVERLAY_MAX_AGE_DAYS', 7.0) * 86400:
+                    return False
+                # A database still on the mail-only snapshot_items_effective() would not inherit archive rows.
+                if 'ARCHIVE_ATTACHMENT' not in (await db.scalar(text(
+                        "SELECT pg_get_functiondef('snapshot_items_effective(uuid)'::regprocedure)")) or ''):
+                    logger.warning('[ARCHIVE] overlay skipped: snapshot_items_effective() predates archive overlays')
+                    return False
+                p = self.params(prior=prior.id, base=base_id, base_text=str(base_id))
+                # Rows the target already holds for an item it would inherit cannot be verified against the
+                # base (the carry's attachment receipts would fail them): copy instead.
+                if await db.scalar(text('SELECT EXISTS (SELECT 1 FROM snapshot_items o WHERE o.snapshot_id=:sid '
+                        "AND o.item_type IN ('ARCHIVE_ITEM','ARCHIVE_ATTACHMENT') AND CASE o.item_type WHEN 'ARCHIVE_ITEM' "
+                        "THEN o.external_id ELSE COALESCE(o.parent_external_id, split_part(o.external_id, '::', 1)) END "
+                        'IN (' + pending + '))'), p) or await db.scalar(text(
+                        'SELECT EXISTS (SELECT 1 FROM archive_item_work WHERE snapshot_id=:sid '
+                        'AND capture_generation=:gen AND copy_task_id IS NOT NULL)'), p):
+                    return False     # (a queued copy task means an earlier attempt chose the full copy)
+                await db.execute(text('UPDATE snapshots SET overlay_base_id=:base, extra_data=(COALESCE(extra_data::jsonb, '
+                                      "'{}'::jsonb) || jsonb_build_object('overlay_prior', CAST(:prior_text AS text)))::json "
+                                      'WHERE id=:sid'), {**p, 'prior_text': str(prior.id)})
+                if prior.overlay_base_id is not None:
+                    columns = [c.name for c in SnapshotItem.__table__.columns]
+                    exprs = ['gen_random_uuid()' if c == 'id' else ':sid' if c == 'snapshot_id' else 'src.' + c
+                             for c in columns]
+                    await db.execute(text('INSERT INTO snapshot_items (' + ','.join(columns) + ') SELECT '
+                        + ','.join(exprs) + """ FROM snapshot_items src WHERE src.snapshot_id=:prior
+                        AND src.item_type IN ('ARCHIVE_ITEM','ARCHIVE_ATTACHMENT')
+                        AND CASE src.item_type WHEN 'ARCHIVE_ITEM' THEN src.external_id
+                            ELSE COALESCE(src.parent_external_id, split_part(src.external_id, '::', 1)) END IN ("""
+                        + pending + ') ON CONFLICT (snapshot_id,external_id,item_type) DO NOTHING'), p)
+                await db.execute(text("""INSERT INTO snapshot_overlay_removals (snapshot_id, item_type, external_id)
+                    SELECT :sid, b.item_type, b.external_id FROM snapshot_items b WHERE b.snapshot_id=:base
+                    AND b.item_type IN ('ARCHIVE_ITEM','ARCHIVE_ATTACHMENT') AND NOT EXISTS (
+                        SELECT 1 FROM (""" + pending + """) k WHERE k.external_id = CASE b.item_type WHEN 'ARCHIVE_ITEM'
+                            THEN b.external_id ELSE COALESCE(b.parent_external_id, split_part(b.external_id, '::', 1)) END
+                        AND NOT EXISTS (SELECT 1 FROM snapshot_items o WHERE o.snapshot_id=:sid
+                            AND o.item_type='ARCHIVE_ITEM' AND o.external_id=k.external_id))
+                    ON CONFLICT DO NOTHING"""), p)
+                await db.execute(text("""UPDATE archive_item_work i SET state='stored', receipt_item_id=s.id,
+                    receipt=json_build_object('kind','overlay','change_key',i.change_key,'hash',s.content_hash,
+                        'size',s.content_size,'blob_path',s.blob_path,'backend_id',s.backend_id::text,
+                        'encryption_key_id',s.encryption_key_id,'backup_version',s.backup_version,
+                        'overlay_base_id',CAST(:base_text AS text))
+                    FROM snapshot_items_effective(CAST(:sid AS uuid)) s
+                    WHERE i.snapshot_id=:sid AND i.capture_generation=:gen AND i.state='copy_pending'
+                      AND i.copy_task_id IS NULL AND s.item_type='ARCHIVE_ITEM' AND s.external_id=i.external_id"""), p)
+                churn = await db.scalar(text("""SELECT count(*) FROM (
+                    SELECT external_id FROM snapshot_items WHERE snapshot_id=:sid AND item_type='ARCHIVE_ITEM'
+                    UNION SELECT external_id FROM snapshot_overlay_removals WHERE snapshot_id=:sid AND item_type='ARCHIVE_ITEM'
+                    UNION SELECT external_id FROM archive_item_work WHERE snapshot_id=:sid AND capture_generation=:gen
+                      AND state='export_pending') changed"""), p)
+                ratio = knob('ARCHIVE_OVERLAY_MAX_RATIO', 0.25)
+                if churn > ratio * (base.item_count or 0):
+                    raise Declined(f'{churn} changed items exceed {ratio:g} x {base.item_count} base items')
+                logger.info('[ARCHIVE] snapshot %s overlays base %s: %d changed items',
+                            self.fence.snapshot_id, base_id, churn)
+                return True
+        except Declined as reason:
+            logger.info('[ARCHIVE] full copy into snapshot %s (compaction): %s', self.fence.snapshot_id, reason)
+            return False
 
     @staticmethod
     async def _failed_folders(db, snapshot_id, generation):
@@ -673,8 +778,8 @@ class ArchiveCapture:
 
     async def missing_samples(self, prior, limit=60):
         async with self.factory() as db:
-            return list((await db.scalars(text('''SELECT external_id FROM (SELECT p.external_id, p.folder_path, row_number() OVER (PARTITION BY p.folder_path ORDER BY p.external_id) AS ordinal FROM snapshot_items p
-                WHERE p.snapshot_id=:prior AND p.item_type='ARCHIVE_ITEM' AND NOT EXISTS (
+            return list((await db.scalars(text('''SELECT external_id FROM (SELECT p.external_id, p.folder_path, row_number() OVER (PARTITION BY p.folder_path ORDER BY p.external_id) AS ordinal FROM snapshot_items_effective(CAST(:prior AS uuid)) p
+                WHERE p.item_type='ARCHIVE_ITEM' AND NOT EXISTS (
                     SELECT 1 FROM archive_item_work i JOIN archive_folder_work f ON f.snapshot_id=i.snapshot_id AND f.capture_generation=i.capture_generation
                     AND f.scope_key=i.scope_key AND f.scope_generation=i.scope_generation
                     WHERE i.snapshot_id=:sid AND i.capture_generation=:gen AND i.external_id=p.external_id AND f.state<>'excluded')
@@ -707,7 +812,7 @@ class ArchiveCapture:
               AND COALESCE(s.metadata->>'changeKey',s.metadata->>'change_key') IS NOT DISTINCT FROM i.change_key) AS stored
             FROM archive_item_work i JOIN archive_folder_work f ON f.snapshot_id=i.snapshot_id AND f.capture_generation=i.capture_generation
               AND f.scope_key=i.scope_key AND f.scope_generation=i.scope_generation
-            LEFT JOIN snapshot_items s ON s.id=i.receipt_item_id AND s.snapshot_id=COALESCE((SELECT x.reuse_chain_root_id FROM snapshots x WHERE x.id=i.snapshot_id), i.snapshot_id) AND s.external_id=i.external_id AND s.item_type='ARCHIVE_ITEM'
+            LEFT JOIN snapshot_items_effective(CAST(:sid AS uuid)) s ON s.id=i.receipt_item_id AND s.external_id=i.external_id AND s.item_type='ARCHIVE_ITEM'
             WHERE i.snapshot_id=:sid AND i.capture_generation=:gen AND f.state<>'excluded' GROUP BY i.external_id)
             SELECT count(*) AS items_enumerated,count(*) FILTER (WHERE stored) AS files_succeeded,
               count(*) FILTER (WHERE NOT COALESCE(stored,false)) AS items_failed FROM current'''), self.params())).mappings().one()
@@ -732,8 +837,7 @@ class ArchiveCapture:
             result['folders_failed'] += missing_members
             result['folder_failures'].append({'phase': 'membership', 'kind': 'required_folder_not_covered',
                 'count': missing_members})
-        totals = (await db.execute(text('''SELECT COALESCE(sum(content_size),0) FROM snapshot_items WHERE snapshot_id=
-            COALESCE((SELECT reuse_chain_root_id FROM snapshots WHERE id=:sid), :sid)'''),
+        totals = (await db.execute(text('''SELECT COALESCE(sum(content_size),0) FROM snapshot_items_effective(CAST(:sid AS uuid))'''),
             {'sid': self.fence.snapshot_id})).scalar()
         exported = (await db.execute(text('''SELECT count(*),COALESCE(sum(size),0) FROM (
             SELECT DISTINCT i.external_id,(i.receipt->>'size')::bigint AS size FROM archive_item_work i
@@ -758,8 +862,9 @@ class ArchiveCapture:
                 or (prior.extra_data or {}).get('cancelled_at') or (prior.extra_data or {}).get('copy_required_failed')):
             raise ArchiveConflict('archive predecessor no longer retained')
         pending_ids = sorted({i.external_id for i in pending})
+        from shared.snapshot_reuse import items_scope
         source = {p.external_id: p for p in (await db.scalars(select(SnapshotItem).where(
-            SnapshotItem.snapshot_id == prior_id, SnapshotItem.item_type == 'ARCHIVE_ITEM',
+            await items_scope(db, prior_id), SnapshotItem.item_type == 'ARCHIVE_ITEM',
             SnapshotItem.external_id.in_(pending_ids)))).all()}
         attachment_receipts = await self._attachment_receipts(db, prior_id, pending_ids, normalize_version=collection is not None)
         for item in pending:
@@ -787,18 +892,19 @@ class ArchiveCapture:
             columns = [c.name for c in SnapshotItem.__table__.columns]
             expressions = ['gen_random_uuid()' if c == 'id' else ':sid' if c == 'snapshot_id' else 'src.' + c for c in columns]
             await db.execute(text('INSERT INTO snapshot_items (' + ','.join(columns) + ') SELECT ' + ','.join(expressions) + '''
-                FROM snapshot_items src WHERE src.snapshot_id=:prior AND ((src.item_type='ARCHIVE_ITEM' AND src.external_id=ANY(:ids))
+                FROM snapshot_items_effective(CAST(:prior AS uuid)) src WHERE ((src.item_type='ARCHIVE_ITEM' AND src.external_id=ANY(:ids))
                   OR (src.item_type='ARCHIVE_ATTACHMENT' AND src.parent_external_id=ANY(:ids)))
                 ON CONFLICT (snapshot_id,external_id,item_type) DO NOTHING'''), {'sid': self.fence.snapshot_id, 'prior': prior_id, 'ids': pending_ids})
         await db.flush()
         await self.resolve_copies(db, ids=pending_ids)
 
     async def _attachment_receipts(self, db, snapshot_id, ids, *, normalize_version=False):
+        from shared.snapshot_reuse import items_scope
         evidence = {iid: [hashlib.sha256(), 0] for iid in ids}
         rows = await db.stream(select(SnapshotItem.parent_external_id, SnapshotItem.external_id,
             SnapshotItem.content_hash, SnapshotItem.blob_path, SnapshotItem.content_size,
             SnapshotItem.backend_id, SnapshotItem.encryption_key_id, SnapshotItem.backup_version)
-            .where(SnapshotItem.snapshot_id == snapshot_id, SnapshotItem.item_type == 'ARCHIVE_ATTACHMENT',
+            .where(await items_scope(db, snapshot_id), SnapshotItem.item_type == 'ARCHIVE_ATTACHMENT',
                 SnapshotItem.parent_external_id.in_(ids)).order_by(SnapshotItem.parent_external_id,
                 SnapshotItem.external_id).execution_options(yield_per=128))
         async for row in rows:

@@ -468,10 +468,10 @@ SNAPSHOT_REUSE_VALIDATE_FUNCTION = """CREATE OR REPLACE FUNCTION validate_snapsh
         $$ LANGUAGE plpgsql;"""
 
 
-# Overlay mail snapshots (docs/mail-overlay-snapshots.md). The ONE definition of a snapshot's
+# Overlay snapshots (docs/mail-overlay-snapshots.md; mail and in-place archive). The ONE definition of a snapshot's
 # inventory: a pointer resolves to its chain root; the root's own rows; plus, for an overlay, the
-# mail rows of its full base that it neither owns (by item_type, external_id) nor removed, and
-# whose parent email (attachments) is visible. A full snapshot's second branch is empty. LANGUAGE
+# mail / archive rows of its full base that it neither owns (by item_type, external_id) nor removed, and
+# whose parent email / archive item (attachments) is visible. A full snapshot's second branch is empty. LANGUAGE
 # sql + STABLE + single SELECT so the planner inlines it and pushes the caller's predicates down.
 SNAPSHOT_ITEMS_EFFECTIVE_FUNCTION = """CREATE OR REPLACE FUNCTION snapshot_items_effective(p_snapshot_id uuid)
         RETURNS SETOF snapshot_items LANGUAGE sql STABLE AS $$
@@ -483,7 +483,7 @@ SNAPSHOT_ITEMS_EFFECTIVE_FUNCTION = """CREATE OR REPLACE FUNCTION snapshot_items
          WHERE b.snapshot_id = (SELECT t.overlay_base_id FROM snapshots s
                                   JOIN snapshots t ON t.id = COALESCE(s.reuse_chain_root_id, s.id)
                                  WHERE s.id = p_snapshot_id)
-           AND b.item_type IN ('EMAIL', 'EMAIL_ATTACHMENT')
+           AND b.item_type IN ('EMAIL', 'EMAIL_ATTACHMENT', 'ARCHIVE_ITEM', 'ARCHIVE_ATTACHMENT')
            AND NOT EXISTS (SELECT 1 FROM snapshot_items o
                             WHERE o.snapshot_id = (SELECT COALESCE(s.reuse_chain_root_id, s.id) FROM snapshots s
                                                     WHERE s.id = p_snapshot_id)
@@ -492,22 +492,22 @@ SNAPSHOT_ITEMS_EFFECTIVE_FUNCTION = """CREATE OR REPLACE FUNCTION snapshot_items
                             WHERE r.snapshot_id = (SELECT COALESCE(s.reuse_chain_root_id, s.id) FROM snapshots s
                                                     WHERE s.id = p_snapshot_id)
                               AND r.item_type = b.item_type AND r.external_id = b.external_id)
-           AND (b.item_type = 'EMAIL'
+           AND (b.item_type IN ('EMAIL', 'ARCHIVE_ITEM')
                 OR EXISTS (SELECT 1 FROM snapshot_items o
                             WHERE o.snapshot_id = (SELECT COALESCE(s.reuse_chain_root_id, s.id) FROM snapshots s
                                                     WHERE s.id = p_snapshot_id)
-                              AND o.item_type = 'EMAIL'
+                              AND o.item_type = CASE b.item_type WHEN 'ARCHIVE_ATTACHMENT' THEN 'ARCHIVE_ITEM' ELSE 'EMAIL' END
                               AND o.external_id = COALESCE(b.parent_external_id, split_part(b.external_id, '::', 1)))
                 OR (EXISTS (SELECT 1 FROM snapshot_items p
                              WHERE p.snapshot_id = (SELECT t.overlay_base_id FROM snapshots s
                                                       JOIN snapshots t ON t.id = COALESCE(s.reuse_chain_root_id, s.id)
                                                      WHERE s.id = p_snapshot_id)
-                               AND p.item_type = 'EMAIL'
+                               AND p.item_type = CASE b.item_type WHEN 'ARCHIVE_ATTACHMENT' THEN 'ARCHIVE_ITEM' ELSE 'EMAIL' END
                                AND p.external_id = COALESCE(b.parent_external_id, split_part(b.external_id, '::', 1)))
                     AND NOT EXISTS (SELECT 1 FROM snapshot_overlay_removals r
                                      WHERE r.snapshot_id = (SELECT COALESCE(s.reuse_chain_root_id, s.id)
                                                               FROM snapshots s WHERE s.id = p_snapshot_id)
-                                       AND r.item_type = 'EMAIL'
+                                       AND r.item_type = CASE b.item_type WHEN 'ARCHIVE_ATTACHMENT' THEN 'ARCHIVE_ITEM' ELSE 'EMAIL' END
                                        AND r.external_id = COALESCE(b.parent_external_id,
                                                                     split_part(b.external_id, '::', 1)))))
         $$;"""

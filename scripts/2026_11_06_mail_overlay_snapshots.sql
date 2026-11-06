@@ -1,4 +1,5 @@
--- Overlay mail snapshots (docs/mail-overlay-snapshots.md) — alembic revision 0021.
+-- Overlay mail snapshots (docs/mail-overlay-snapshots.md) — alembic revisions 0021 + 0023 (archive overlays).
+-- Re-apply after 0023: CREATE OR REPLACE brings snapshot_items_effective() to the archive-aware body.
 -- Railway runs DB_SCHEMA_MODE=verify (no alembic): apply this once, as the schema owner (no
 -- superuser needed), BEFORE deploying code that has the overlay column in its models.
 -- Idempotent. Generated from shared.database.MAIL_OVERLAY_DDL (tests/shared/test_mail_overlay_schema.py
@@ -23,7 +24,7 @@ CREATE OR REPLACE FUNCTION snapshot_items_effective(p_snapshot_id uuid)
          WHERE b.snapshot_id = (SELECT t.overlay_base_id FROM snapshots s
                                   JOIN snapshots t ON t.id = COALESCE(s.reuse_chain_root_id, s.id)
                                  WHERE s.id = p_snapshot_id)
-           AND b.item_type IN ('EMAIL', 'EMAIL_ATTACHMENT')
+           AND b.item_type IN ('EMAIL', 'EMAIL_ATTACHMENT', 'ARCHIVE_ITEM', 'ARCHIVE_ATTACHMENT')
            AND NOT EXISTS (SELECT 1 FROM snapshot_items o
                             WHERE o.snapshot_id = (SELECT COALESCE(s.reuse_chain_root_id, s.id) FROM snapshots s
                                                     WHERE s.id = p_snapshot_id)
@@ -32,22 +33,22 @@ CREATE OR REPLACE FUNCTION snapshot_items_effective(p_snapshot_id uuid)
                             WHERE r.snapshot_id = (SELECT COALESCE(s.reuse_chain_root_id, s.id) FROM snapshots s
                                                     WHERE s.id = p_snapshot_id)
                               AND r.item_type = b.item_type AND r.external_id = b.external_id)
-           AND (b.item_type = 'EMAIL'
+           AND (b.item_type IN ('EMAIL', 'ARCHIVE_ITEM')
                 OR EXISTS (SELECT 1 FROM snapshot_items o
                             WHERE o.snapshot_id = (SELECT COALESCE(s.reuse_chain_root_id, s.id) FROM snapshots s
                                                     WHERE s.id = p_snapshot_id)
-                              AND o.item_type = 'EMAIL'
+                              AND o.item_type = CASE b.item_type WHEN 'ARCHIVE_ATTACHMENT' THEN 'ARCHIVE_ITEM' ELSE 'EMAIL' END
                               AND o.external_id = COALESCE(b.parent_external_id, split_part(b.external_id, '::', 1)))
                 OR (EXISTS (SELECT 1 FROM snapshot_items p
                              WHERE p.snapshot_id = (SELECT t.overlay_base_id FROM snapshots s
                                                       JOIN snapshots t ON t.id = COALESCE(s.reuse_chain_root_id, s.id)
                                                      WHERE s.id = p_snapshot_id)
-                               AND p.item_type = 'EMAIL'
+                               AND p.item_type = CASE b.item_type WHEN 'ARCHIVE_ATTACHMENT' THEN 'ARCHIVE_ITEM' ELSE 'EMAIL' END
                                AND p.external_id = COALESCE(b.parent_external_id, split_part(b.external_id, '::', 1)))
                     AND NOT EXISTS (SELECT 1 FROM snapshot_overlay_removals r
                                      WHERE r.snapshot_id = (SELECT COALESCE(s.reuse_chain_root_id, s.id)
                                                               FROM snapshots s WHERE s.id = p_snapshot_id)
-                                       AND r.item_type = 'EMAIL'
+                                       AND r.item_type = CASE b.item_type WHEN 'ARCHIVE_ATTACHMENT' THEN 'ARCHIVE_ITEM' ELSE 'EMAIL' END
                                        AND r.external_id = COALESCE(b.parent_external_id,
                                                                     split_part(b.external_id, '::', 1)))))
         $$;;
