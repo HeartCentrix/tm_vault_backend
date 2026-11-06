@@ -2683,6 +2683,22 @@ def suppressed_units_note(
     )[:300]
 
 
+def no_mailbox_reason(exc: BaseException) -> Optional[str]:
+    """Graph's answer for a user without an Exchange Online mailbox: 404 MailboxNotEnabledForRESTAPI
+    (live 2026-11-06: 28/28 such users, on mailFolders, calendar and contacts alike). That is a fact
+    about the tenant, not a failed backup: the run completes with 0 items and records this reason."""
+    response = getattr(exc, "response", None)
+    if getattr(response, "status_code", None) != 404:
+        return None
+    try:
+        code = ((response.json() or {}).get("error") or {}).get("code")
+    except Exception:
+        return None
+    if code != "MailboxNotEnabledForRESTAPI":
+        return None
+    return "No Exchange Online mailbox (Microsoft 404 MailboxNotEnabledForRESTAPI)"
+
+
 def evaluate_drain_honesty(
     *,
     planned: int,
@@ -7473,6 +7489,9 @@ class BackupWorker:
                     except Exception as e:
                         print(f"[{self.worker_id}] [USER_MAIL] folder tree fetch failed for {user_id}: {e}")
                         folder_tree_full = {}
+                    # The tree reader turns 403/404 into {}: a user without a mailbox is no failure.
+                    if not folder_tree_full and await self._note_no_mailbox(graph_client, user_id, snapshot, "USER_MAIL"):
+                        return []
                     # Path-only view for downstream code that just needs
                     # folder_tree[fid] → "/Inbox/Subfolder".
                     folder_tree: Dict[str, str] = {
@@ -8989,6 +9008,8 @@ class BackupWorker:
                         prior_deltas=_prior_contact_deltas,
                         enumeration_errors=_contact_enum_errors,
                     )
+                    if _contact_enum_errors and not out_rows and await self._note_no_mailbox(graph_client, user_id, snapshot, "USER_CONTACTS"):
+                        return []
                     folder_names = sorted({r[4] for r in out_rows})
                     # STASH the new delta links as PENDING — only the ones
                     # the helper successfully captured a deltaLink for.
@@ -9134,6 +9155,8 @@ class BackupWorker:
                         )
                         calendars = (cal_page or {}).get("value", []) or []
                     except Exception as _e:
+                        if await self._note_no_mailbox(graph_client, user_id, snapshot, "USER_CALENDAR", exc=_e):
+                            return []
                         # Fallback: at least hit the default calendar so we
                         # don't return zero events on a permissions blip.
                         logger.warning("[%s] Calendars enumeration failed for %s: %s", self.worker_id, user_id, _e)
@@ -16957,6 +16980,24 @@ class BackupWorker:
             ledger = {}
             self._shard_enum_failures = ledger
         return ledger
+
+    async def _note_no_mailbox(self, graph_client, user_id, snapshot, kind, exc=None) -> bool:
+        """True (reason logged and recorded on the snapshot) when the user has no mailbox. Without
+        ``exc`` one probe classifies it; the caller then completes the run with 0 items."""
+        if exc is None:
+            try:
+                await graph_client._get(f"{graph_client.GRAPH_URL}/users/{user_id}/mailFolders",
+                                        params={"$top": "1", "$select": "id"})
+                return False
+            except Exception as probe_exc:
+                exc = probe_exc
+        reason = no_mailbox_reason(exc)
+        if not reason:
+            return False
+        print(f"[{self.worker_id}]   [{kind}] {user_id}: {reason} — completing with 0 items")
+        if snapshot is not None:
+            await self._patch_snapshot_extra_data(snapshot.id, {"no_mailbox": reason})
+        return True
 
     async def _patch_snapshot_extra_data(
         self, snapshot_id: uuid.UUID, patch: Dict[str, Any],
