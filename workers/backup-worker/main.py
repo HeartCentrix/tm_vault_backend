@@ -4305,18 +4305,37 @@ class AuditLogger:
     HTTP only — this aligns backup-worker with that convention.
     """
 
+    # Strong refs so in-flight sends are not garbage-collected mid-post.
+    # ponytail: sends still pending at worker shutdown are dropped; add a
+    # drain-on-shutdown if audit completeness across restarts matters.
+    _pending: set = set()
+
     def __init__(self):
         self.audit_url = f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log"
 
     async def log(self, **kwargs):
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post(
-                    self.audit_url, json=kwargs,
-                    headers=internal_audit_headers(),
-                )
-        except Exception as e:
-            print(f"[AuditLogger] HTTP failed: {e}")
+        """Schedule the POST and return at once: a slow or down
+        audit-service must never block or fail the backup."""
+        task = asyncio.create_task(self._send(kwargs))
+        AuditLogger._pending.add(task)
+        task.add_done_callback(AuditLogger._pending.discard)
+
+    async def _send(self, payload: dict) -> None:
+        action = payload.get("action")
+        for attempt in (1, 2):
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    await client.post(
+                        self.audit_url, json=payload,
+                        headers=internal_audit_headers(),
+                    )
+                return
+            except httpx.TransportError as e:  # includes every timeout
+                # Type + repr only: never the payload or headers.
+                print(f"[AuditLogger] {action} attempt {attempt}/2 failed: {type(e).__name__} {e!r}")
+            except Exception as e:
+                print(f"[AuditLogger] {action} failed: {type(e).__name__} {e!r}")
+                return
 
 
 #: Marker for the SharePoint catalog libraries (Web Part Gallery, Master Page
