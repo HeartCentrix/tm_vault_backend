@@ -28094,78 +28094,31 @@ class BackupWorker:
         #    Recovery right-pane can render them without N×M refetches.
         if "GROUPS" in _ep_categories:
             groups = await _safe_fetch(f"{base}/groups", {"$top": "999", "$select": "id,displayName,mail,description,groupTypes,securityEnabled,mailEnabled,visibility,membershipRule,createdDateTime"})
-            # Bulk-resolve owners + members via /v1.0/$batch (perf #6
-            # 2026-05-17): was 2 serial Graph calls per group (N groups
-            # = 2N round-trips). graph_client.batch chunks at
-            # GRAPH_BATCH_MAX_SIZE internally, so a tenant with 200
-            # groups goes from 400 sequential calls to ~20 $batch posts.
-            from shared.graph_batch import BatchRequest as _BReq
+            # Owners + members are paged reads (_get follows @odata.nextLink), 8 groups at a
+            # time. A $batch cannot follow nextLink inside a sub-response, so graph_batch
+            # rejects these $top URLs — the old $batch attempt always raised and fell back here.
             _gids = [g.get("id") for g in groups if g.get("id")]
             _gowners_by_gid: Dict[str, List[Dict[str, Any]]] = {}
             _gmembers_by_gid: Dict[str, List[Dict[str, Any]]] = {}
-            if _gids:
-                _gbt0 = time.monotonic()
-                _g_reqs: List[_BReq] = []
-                for _gid in _gids:
-                    _g_reqs.append(_BReq(
-                        id=f"own::{_gid}", method="GET",
-                        url=(
-                            f"/groups/{_gid}/owners?$top=50"
-                            f"&$select=id,displayName,userPrincipalName,mail"
-                        ),
-                    ))
-                    _g_reqs.append(_BReq(
-                        id=f"mem::{_gid}", method="GET",
-                        url=(
-                            f"/groups/{_gid}/members?$top=50"
-                            f"&$select=id,displayName,userPrincipalName,mail"
-                        ),
-                    ))
-                try:
-                    _g_resp = await graph_client.batch(_g_reqs)
-                    for _rid, _r in _g_resp.items():
-                        if not (200 <= _r.status < 300):
-                            continue
-                        _vals = ((_r.body or {}).get("value") or [])
-                        if _rid.startswith("own::"):
-                            _gowners_by_gid[_rid[5:]] = _vals
-                        elif _rid.startswith("mem::"):
-                            _gmembers_by_gid[_rid[5:]] = _vals
-                    print(
-                        f"[{self.worker_id}] [PERF] entra groups owners+"
-                        f"members $batch: {len(_gids)} groups in "
-                        f"{time.monotonic() - _gbt0:.2f}s"
-                    )
-                except Exception as _ge:
-                    logger.warning(
-                        "[%s] [ENTRA_DIR] groups $batch owners/members "
-                        "failed (%s) — falling back to parallel per-group "
-                        "(asyncio.gather sem=8)",
-                        self.worker_id, _ge,
-                    )
-                    _gsem = asyncio.Semaphore(8)
+            _gsem = asyncio.Semaphore(8)
 
-                    async def _one_gid(_gid: str):
-                        async with _gsem:
-                            _o = await _safe_fetch(
-                                f"{base}/groups/{_gid}/owners",
-                                {"$top": "50", "$select": "id,displayName,userPrincipalName,mail"},
-                            )
-                            _m = await _safe_fetch(
-                                f"{base}/groups/{_gid}/members",
-                                {"$top": "50", "$select": "id,displayName,userPrincipalName,mail"},
-                            )
-                            return _gid, _o, _m
-
-                    _g_par_results = await asyncio.gather(
-                        *(_one_gid(_g) for _g in _gids),
-                        return_exceptions=True,
+            async def _one_gid(_gid: str):
+                async with _gsem:
+                    _o = await _safe_fetch(
+                        f"{base}/groups/{_gid}/owners",
+                        {"$top": "999", "$select": "id,displayName,userPrincipalName,mail"},
                     )
-                    for _r in _g_par_results:
-                        if isinstance(_r, tuple):
-                            _gid, _o, _m = _r
-                            _gowners_by_gid[_gid] = _o
-                            _gmembers_by_gid[_gid] = _m
+                    _m = await _safe_fetch(
+                        f"{base}/groups/{_gid}/members",
+                        {"$top": "999", "$select": "id,displayName,userPrincipalName,mail"},
+                    )
+                    return _gid, _o, _m
+
+            for _r in await asyncio.gather(*(_one_gid(_g) for _g in _gids), return_exceptions=True):
+                if isinstance(_r, tuple):
+                    _gid, _o, _m = _r
+                    _gowners_by_gid[_gid] = _o
+                    _gmembers_by_gid[_gid] = _m
 
             for g in groups:
                 gid = g.get("id")
