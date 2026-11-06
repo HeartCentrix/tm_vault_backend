@@ -99,3 +99,27 @@ async def test_rows_read_again_are_left_out_of_the_carry_forward(store, monkeypa
         rows = (await db.execute(select(models.SnapshotItem.external_id)
                 .where(models.SnapshotItem.snapshot_id == current.snapshot_id).order_by(models.SnapshotItem.external_id))).scalars().all()
     assert rows == ["list-a:0", "list-a:2"]
+
+
+async def test_partial_prior_forces_a_reread_only_of_its_incomplete_lists(store, monkeypatch):
+    """SharePoint sites often settle PARTIAL for reasons unrelated to lists (a library file failed); that
+    re-read every list of the site. A list whose rows all landed is marked complete at the end of its run,
+    and a PARTIAL prior offers only those for reuse."""
+    worker_module = _worker()
+    monkeypatch.setattr(worker_module, "async_session_factory", store.factory)
+    worker = worker_module.BackupWorker.__new__(worker_module.BackupWorker)
+    prior = await store.new_scope()
+    async with store.factory.begin() as db:
+        for list_id in ("list-ok", "list-failed", "list-unread"):
+            db.add(models.SnapshotItem(snapshot_id=prior.snapshot_id, tenant_id=store.tenant, backend_id=store.backend,
+                external_id=list_id, item_type="SHAREPOINT_LIST", name=list_id, folder_path="site/lists",
+                content_size=0, extra_data={"site_id": "site-1", "rest_signature": SIG}))
+    await worker._mark_sp_lists_complete(prior.snapshot_id, {("site-1", "list-failed"), ("site-1", "list-unread")})
+    async with store.factory.begin() as db:
+        snap = await db.get(models.Snapshot, prior.snapshot_id)
+        snap.status, snap.created_at = models.SnapshotStatus.PARTIAL, datetime(2026, 11, 5)
+    current = await store.new_scope()
+    async with store.factory() as db:
+        current_snap = await db.get(models.Snapshot, current.snapshot_id)
+    prior_id, lists = await worker._previous_sp_lists(current_snap, "site-1")
+    assert prior_id == prior.snapshot_id and sorted(lists) == ["list-ok"]
