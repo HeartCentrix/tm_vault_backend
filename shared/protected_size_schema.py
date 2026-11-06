@@ -65,6 +65,57 @@ DDL = (
 )
 
 
+# Built by migration 0014 before its transaction (build_index_online), so its own
+# CREATE INDEX IF NOT EXISTS below finds them and does not lock writes on big tables.
+ONLINE_INDEXES = (
+    ("ix_protected_size_snapshot_items_identity", "snapshot_items", "(id)"),
+    ("ix_protected_size_snapshot_items_page", "snapshot_items", "(snapshot_id,id)"),
+    ("ix_protected_size_snapshots_page", "snapshots", "(id)"),
+)
+
+
+def build_index_online(conn, name, table, columns):
+    """Create index ``name`` without blocking writes; ``conn`` is a sync connection in autocommit.
+
+    A plain CREATE INDEX blocks writes for the whole build (TM: snapshot_items ~532M rows).
+    PostgreSQL cannot build on a partitioned parent CONCURRENTLY, so a partitioned table gets an
+    ON ONLY parent index plus one concurrent build per partition, attached (the parent turns valid
+    when every partition is attached). Idempotent; an invalid index left by an interrupted
+    concurrent build is dropped and rebuilt."""
+    from sqlalchemy import text as _t
+
+    def validity(index):
+        return conn.execute(_t("SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass(:n)"),
+                            {"n": index}).scalar()
+
+    def attached(index):
+        return conn.execute(_t("SELECT 1 FROM pg_inherits WHERE inhrelid = to_regclass(:c)"), {"c": index}).scalar()
+
+    def build(index, relation):
+        state = validity(index)
+        if state is True:
+            return
+        if state is False and attached(index):  # an attached partition index cannot be dropped alone
+            conn.execute(_t(f'REINDEX INDEX CONCURRENTLY "{index}"'))
+            return
+        if state is False:
+            conn.execute(_t(f'DROP INDEX CONCURRENTLY IF EXISTS "{index}"'))
+        conn.execute(_t(f'CREATE INDEX CONCURRENTLY IF NOT EXISTS "{index}" ON {relation} {columns}'))
+
+    partitions = conn.execute(_t(
+        "SELECT i.inhrelid::regclass::text FROM pg_inherits i WHERE i.inhparent = to_regclass(:t) "
+        "ORDER BY i.inhrelid::regclass::text"), {"t": table}).scalars().all()
+    if not partitions:
+        build(name, table)
+        return
+    conn.execute(_t(f'CREATE INDEX IF NOT EXISTS "{name}" ON ONLY {table} {columns}'))
+    for n, partition in enumerate(partitions):
+        child = f"{name}_p{n}"
+        build(child, partition)
+        if not attached(child):
+            conn.execute(_t(f'ALTER INDEX "{name}" ATTACH PARTITION "{child}"'))
+
+
 def event_trigger_names(schema):
     suffix = hashlib.sha256(schema.encode()).hexdigest()[:20]
     return ("protected_size_ddl_" + suffix, "protected_size_drop_" + suffix)
