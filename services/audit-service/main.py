@@ -32,6 +32,7 @@ import httpx
 from shared.database import async_session_factory, Base
 from shared.models import AuditEvent, Resource, Tenant, Organization, Job, JobStatus, SlaPolicy, ResourceType
 from shared.config import settings
+from shared.batch_rollup import SNAPSHOT_REASON_SQL, job_issues_sql
 from shared.graph_client import GraphClient
 from shared.multi_app_manager import multi_app_manager
 from shared.message_bus import message_bus
@@ -77,7 +78,18 @@ def _fmt_bytes(b: int) -> str:
     return f"{b:.1f} PB"
 
 
-def _compute_details(job: Job) -> str:
+async def _job_issue_texts(db, jobs) -> Dict[str, str]:
+    """Why each PARTIAL job is partial (TM #35), keyed by job id."""
+    ids = [str(j.id) for j in jobs if j.status == JobStatus.PARTIAL]
+    if not ids:
+        return {}
+    rows = (await db.execute(text(
+        "SELECT x.id::text AS job_id, i.* FROM unnest(CAST(:ids AS uuid[])) AS x(id) "
+        "CROSS JOIN LATERAL (" + job_issues_sql("j.id = x.id") + ") i"), {"ids": ids})).all()
+    return {r.job_id: _ab_mod.issue_text(r) for r in rows}
+
+
+def _compute_details(job: Job, issue: str = "") -> str:
     """Compute the per-row details string.
 
     Branches on terminal status first so a completed job never shows a
@@ -97,10 +109,12 @@ def _compute_details(job: Job) -> str:
     # Terminal states: never show "Progress: X%" — the job is finished.
     if job.status in (JobStatus.COMPLETED, JobStatus.PARTIAL):
         if total_data > 0:
-            return f"{_fmt_bytes(data_backed_up or total_data)} backed up"
-        if data_backed_up > 0:
-            return f"{_fmt_bytes(data_backed_up)} backed up"
-        return "Completed"
+            done = f"{_fmt_bytes(data_backed_up or total_data)} backed up"
+        elif data_backed_up > 0:
+            done = f"{_fmt_bytes(data_backed_up)} backed up"
+        else:
+            done = "Completed"
+        return f"{done} · {issue}" if issue else done
     if job.status == JobStatus.FAILED:
         return job.error_message or "Failed"
     if job.status == JobStatus.CANCELLED:
@@ -1296,8 +1310,11 @@ async def _list_activities_batch_v2(
                   AND s.created_at > b.created_at)                AS bytes_done,
               (SELECT array_agg(DISTINCT j.id)
                  FROM jobs j
-                WHERE COALESCE(j.spec::jsonb->>'batch_id','') = b.id::text) AS job_ids
+                WHERE COALESCE(j.spec::jsonb->>'batch_id','') = b.id::text) AS job_ids,
+              iss.issue_count, iss.issue_name, iss.issue_reason
               FROM backup_batches b
+              LEFT JOIN LATERAL ({job_issues_sql(
+                  "b.status IN ('PARTIAL','FAILED') AND COALESCE(j.spec::jsonb->>'batch_id','') = b.id::text")}) iss ON true
              WHERE {' AND '.join(where_clauses)}
              ORDER BY b.created_at DESC
              LIMIT :size
@@ -1347,7 +1364,8 @@ async def _list_activities_batch_v2(
                 "status": status_label,
                 "operation": "BACKUP",
                 "object": object_label,
-                "details": "",
+                # PARTIAL/FAILED say why (TM #35); others take the live rollup's text in the merge.
+                "details": _ab_mod.issue_details(r, bytes_done) if r.status in ("PARTIAL", "FAILED") else "",
                 "batchSource": r.source,
                 "jobIds": [str(j) for j in (r.job_ids or [])],
                 "progressPct": progress_pct,
@@ -1643,6 +1661,7 @@ async def list_activities(
         single_jobs = [j for j in jobs if j.resource_id is not None]
         batch_jobs = [j for j in jobs if j.resource_id is None]
 
+        issues = await _job_issue_texts(db, single_jobs)
         for job in single_jobs:
             resource_name = "Bulk Operation"
             resource = await db.get(Resource, job.resource_id)
@@ -1659,7 +1678,7 @@ async def list_activities(
                 "object": resource_name,
                 "status": status_reverse_map.get(job.status, "In Progress"),
                 "finish_time": job.completed_at.isoformat() if job.completed_at else "",
-                "details": _compute_details(job),
+                "details": _compute_details(job, issues.get(str(job.id), "")),
                 "data_backed_up": data_backed_up,
                 "total_data": total_data,
             })
@@ -1799,8 +1818,11 @@ async def list_activities(
                   (SELECT COUNT(*)
                      FROM batch_pending_users bpu
                     WHERE bpu.batch_id = b.id
-                      AND bpu.state = 'WAITING_DISCOVERY')          AS waiting_discovery_count
+                      AND bpu.state = 'WAITING_DISCOVERY')          AS waiting_discovery_count,
+                  iss.issue_count, iss.issue_name, iss.issue_reason
                 FROM backup_batches b
+                LEFT JOIN LATERAL (""" + job_issues_sql(
+                    "b.status IN ('PARTIAL','FAILED') AND COALESCE(j.spec::jsonb->>'batch_id','') = b.id::text") + """) iss ON true
                 WHERE b.id::text = ANY(:bids)
             """), {"bids": batched_group_keys})).all()
             items.extend(shape_activity_row(r) for r in bb_rows)
@@ -2128,6 +2150,7 @@ async def export_activity_csv(
             "ID", "Start Time", "Operation", "Object",
             "Status", "Finish Time", "Details"
         ])
+        issues = await _job_issue_texts(db, jobs)
         for job in jobs:
             writer.writerow([
                 str(job.id),
@@ -2136,7 +2159,7 @@ async def export_activity_csv(
                 str(job.resource_id) if job.resource_id else "Bulk",
                 job.status.value if hasattr(job.status, 'value') else str(job.status),
                 job.completed_at.isoformat() if job.completed_at else "",
-                _compute_details(job),
+                _compute_details(job, issues.get(str(job.id), "")),
             ])
 
         output.seek(0)
@@ -2307,7 +2330,8 @@ async def get_batch_children(batch_id: str):
                         THEN COALESCE(s.bytes_total, 0)
                         ELSE SUM(s.bytes_added) OVER (PARTITION BY s.resource_id) END
                                                                  AS bytes_added,
-                   s.bytes_total                                 AS bytes_total
+                   s.bytes_total                                 AS bytes_total,
+                   """ + SNAPSHOT_REASON_SQL.replace("ps.", "s.") + """ AS reason
               FROM snapshots s
               JOIN jobs j ON j.id = s.job_id
              WHERE s.resource_id = ANY(CAST(:rids AS UUID[]))
@@ -2327,6 +2351,8 @@ async def get_batch_children(batch_id: str):
                 "bytesAdded":     int(sr.bytes_added or 0),
                 "bytesTotal":     int(sr.bytes_total or 0),
             }
+            if sr.status in ("PARTIAL", "FAILED"):
+                snap_by_rid[sr.resource_id]["reason"] = sr.reason or "no reason recorded"
 
         snap_ids = [v["snapshotId"] for v in snap_by_rid.values()]
         parts_by_sid: Dict[str, Dict[str, int]] = {}

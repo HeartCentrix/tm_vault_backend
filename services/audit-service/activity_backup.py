@@ -68,6 +68,26 @@ def scope_label(count: int, types=None) -> str:
     return ", ".join(parts[:3]) + (f" +{len(parts) - 3} more" if len(parts) > 3 else "")
 
 
+def issue_text(row) -> str:
+    """Why a batch or job is PARTIAL/FAILED, from shared.batch_rollup.job_issues_sql columns
+    (issue_count, issue_name, issue_reason); "" when none."""
+    count = int(getattr(row, "issue_count", 0) or 0)
+    if not count:
+        return ""
+    reason = " ".join(str(getattr(row, "issue_reason", None) or "no reason recorded").split())
+    first = f"{getattr(row, 'issue_name', None) or 'a resource'}: {reason}"
+    if len(first) > 200:
+        first = first[:199] + "…"
+    return first if count == 1 else f"{count} resources with issues; first: {first}"
+
+
+def issue_details(row, bytes_done: int) -> str:
+    """Details text of a PARTIAL or FAILED backup batch row, with the reason."""
+    if row.status == "FAILED":
+        return " — ".join(filter(None, ("Failed", issue_text(row))))
+    return " · ".join(filter(None, (f"Partial — {_fmt_bytes(bytes_done)} backed up", issue_text(row))))
+
+
 def shape_activity_row(row) -> Dict[str, Any]:
     """Build one Activity-feed dict from a backup_batches row.
 
@@ -96,12 +116,10 @@ def shape_activity_row(row) -> Dict[str, Any]:
         details = (
             f"{_fmt_bytes(bytes_done)} backed up" if bytes_done else "Completed"
         )
-    elif row.status == "FAILED":
-        details = "Failed"
+    elif row.status in ("FAILED", "PARTIAL"):
+        details = issue_details(row, bytes_done)
     elif row.status == "CANCELLED":
         details = "Cancelled"
-    elif row.status == "PARTIAL":
-        details = f"Partial — {_fmt_bytes(bytes_done)} backed up"
     else:
         # IN_PROGRESS — bytes-only progress hint, no percent. The UI
         # already renders the percent in the dedicated progress bar +

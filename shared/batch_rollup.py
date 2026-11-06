@@ -300,6 +300,22 @@ def job_partial_sql(job_expr: str) -> str:
             "AND ps.status::text IN ('PARTIAL','FAILED'))")
 
 
+SNAPSHOT_REASON_SQL = ("COALESCE(ps.extra_data->>'failure_reason', ps.extra_data->>'degraded_reason', "
+                       "ps.extra_data->>'error')")
+
+
+def job_issues_sql(job_match: str) -> str:
+    """One row: how many resources of the matching jobs (``job_match`` filters ``j``) left a PARTIAL or
+    FAILED snapshot, and the first such resource's name and reason (failure_reason, else
+    degraded_reason, else error). TM #35: a PARTIAL backup must say why."""
+    order = f"({SNAPSHOT_REASON_SQL}) IS NULL, ps.created_at, ps.id"
+    return ("SELECT count(DISTINCT ps.resource_id) AS issue_count, "
+            f"(array_agg(r.display_name ORDER BY {order}))[1] AS issue_name, "
+            f"(array_agg({SNAPSHOT_REASON_SQL} ORDER BY {order}))[1] AS issue_reason "
+            "FROM snapshots ps JOIN jobs j ON j.id = ps.job_id JOIN resources r ON r.id = ps.resource_id "
+            f"WHERE ps.status::text IN ('PARTIAL','FAILED') AND {job_match}")
+
+
 def archive_backup_enabled() -> bool:
     """Whether Online Archive backup is on (default ON — mirrors
     archive_graph). Gates USER_ARCHIVE in both the batch DISPLAY rollup and the
