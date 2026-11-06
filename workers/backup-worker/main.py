@@ -3867,6 +3867,83 @@ def _drop_unchanged_calendar_rows(rows, stored):
     return [row for row in rows if not unchanged(row)]
 
 
+_RECORD_DELETIONS_FLAG = {"CALENDAR_EVENT": "CALENDAR_RECORD_DELETIONS", "USER_CONTACT": "CONTACTS_RECORD_DELETIONS"}
+
+
+def _records_deletion(item_type, extra) -> bool:
+    """A calendar / contact delta deletion is stored as an is_deleted row: Recovery and restore union the
+    sparse snapshots newest-wins and then hide it, so it is gone from this restore point on while older ones
+    keep the live row. CALENDAR_RECORD_DELETIONS / CONTACTS_RECORD_DELETIONS=false store it as a plain row."""
+    extra = extra or {}
+    if not (extra.get("is_deleted") or "@removed" in (extra.get("raw") or {})):
+        return False
+    flag = _RECORD_DELETIONS_FLAG.get(item_type)
+    return bool(flag) and os.getenv(flag, "true").strip().lower() in ("1", "true", "yes", "on")
+
+
+async def _calendar_series_tombstones(graph_client, user_id, resource_id, snapshot_id, rows, win_start, win_end):
+    """Deletion rows for occurrences a recurring series no longer has, and for a deleted series.
+
+    Deleting one occurrence can reach the delta only as the re-expanded series (Railway 2026-11-06: 131
+    occurrences, no @removed), and deleting a whole series as @removed occurrence ids that do not name it.
+    For every series this run's rows touch (live occurrences, or @removed ids whose stored row names one),
+    the series' /instances over the view window is its authoritative occurrence list: a stored live
+    occurrence inside the window it omits is deleted; a 404 on the master means the whole series (master and
+    every occurrence) is. Any other Graph error leaves that series alone."""
+    run_ids = {r[2] for r in rows}
+    series = {r[3].get("seriesMasterId") for r in rows if r[3].get("seriesMasterId") and not r[3].get("is_deleted")}
+    removed = [r[2] for r in rows if r[3].get("is_deleted")]
+    if not series and not removed:
+        return []
+    async with async_session_factory() as session:
+        stored = (await session.execute(text("""
+            WITH snaps AS (
+                SELECT id FROM snapshots WHERE resource_id = :r AND id IS DISTINCT FROM :cur
+                   AND status::text NOT IN ('FAILED', 'PENDING_DELETION')),
+            series AS (
+                SELECT unnest(CAST(:series AS text[])) AS id
+                UNION SELECT si.metadata->'raw'->>'seriesMasterId' FROM snapshot_items si
+                 WHERE si.snapshot_id IN (SELECT id FROM snaps) AND si.item_type::text = 'CALENDAR_EVENT'
+                   AND si.external_id = ANY(CAST(:removed AS text[]))),
+            members AS (
+                SELECT DISTINCT si.external_id FROM snapshot_items si
+                 WHERE si.snapshot_id IN (SELECT id FROM snaps) AND si.item_type::text = 'CALENDAR_EVENT'
+                   AND (si.metadata->'raw'->>'seriesMasterId' IN (SELECT id FROM series)
+                        OR si.external_id IN (SELECT id FROM series)))
+            -- newest row per member decides (a tombstone row carries no seriesMasterId)
+            SELECT DISTINCT ON (si.external_id) si.external_id, si.name, si.folder_path, si.is_deleted,
+                   COALESCE(si.metadata->'raw'->>'seriesMasterId', si.external_id) AS series,
+                   si.metadata->'raw'->'start'->>'dateTime' AS start
+              FROM snapshot_items si
+             WHERE si.snapshot_id IN (SELECT id FROM snaps) AND si.item_type::text = 'CALENDAR_EVENT'
+               AND si.external_id IN (SELECT external_id FROM members)
+             ORDER BY si.external_id, si.created_at DESC"""),
+            {"r": resource_id, "cur": snapshot_id, "series": sorted(series), "removed": removed})).all()
+    out = []
+    for sid in sorted({s.series for s in stored if not s.is_deleted}):
+        try:
+            instances = {i.get("id") async for page in graph_client._iter_pages(
+                f"{graph_client.GRAPH_URL}/users/{user_id}/events/{sid}/instances"
+                f"?startDateTime={win_start}&endDateTime={win_end}&$select=id&$top=999", params=None)
+                for i in page.get("value", []) or []}
+            gone = False
+        except Exception as e:
+            if getattr(getattr(e, "response", None), "status_code", None) != 404:
+                continue
+            instances, gone = set(), True
+        for s in stored:
+            if s.series != sid or s.is_deleted or s.external_id in run_ids:
+                continue
+            # occurrences only, strictly inside the window by date (start is in the event's own time zone)
+            in_window = s.external_id != sid and win_start[:10] < (s.start or "")[:10] < win_end[:10]
+            if gone or (in_window and s.external_id not in instances):
+                out.append(("CALENDAR_EVENT", s.name, s.external_id,
+                            {"raw": {"id": s.external_id, "@removed": {"reason": "deleted"}},
+                             "removed": True, "is_deleted": True, "removed_reason": "series"},
+                            s.folder_path))
+    return out
+
+
 def _should_skip_subcalendar(
     *,
     last_fetched_iso,
@@ -9458,6 +9535,7 @@ class BackupWorker:
                         # (silent cross-user data loss both ways).
                         cal_delta_link: Optional[str] = None
                         cal_stream_failed = False
+                        cal_first_row = len(out_rows)
                         try:
                             async for page in graph_client._iter_pages(stream_url, params=stream_params):
                                 if "@odata.deltaLink" in page:
@@ -9534,6 +9612,23 @@ class BackupWorker:
                         # this run missed.
                         if cal_delta_link and not cal_stream_failed:
                             new_delta_map[cal_id] = cal_delta_link
+
+                        # A resumed delta reports a deleted occurrence as its re-expanded series and a
+                        # deleted series as bare @removed ids: tombstone what the series no longer has.
+                        if (saved_delta and is_default and not cal_stream_failed and snapshot is not None
+                                and _records_deletion("CALENDAR_EVENT", {"is_deleted": True})):
+                            try:
+                                _series_tombs = await _calendar_series_tombstones(
+                                    graph_client, user_id, resource.id, snapshot.id,
+                                    out_rows[cal_first_row:], win_start, win_end,
+                                )
+                                out_rows.extend(_series_tombs)
+                                if _series_tombs:
+                                    print(f"[{self.worker_id}]   [USER_CALENDAR] {cal_name}: "
+                                          f"{len(_series_tombs)} deleted series occurrence(s) recorded")
+                            except Exception as _ste:
+                                print(f"[{self.worker_id}]   [USER_CALENDAR] series deletion check failed for "
+                                      f"{cal_name}: {type(_ste).__name__}: {_ste}")
 
                         # Stamp this sub-calendar's fetched_at so the
                         # throttle on the next run knows to skip it.
@@ -13407,6 +13502,7 @@ class BackupWorker:
                             "content_hash": body_hash,
                             "extra_data": extra,
                             "content_checksum": None,
+                            "is_deleted": _records_deletion(item_type, extra),
                         })
                     if db_rows:
                         if resource.type == ResourceType.USER_CHATS:

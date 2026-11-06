@@ -56,11 +56,13 @@ async def _retire(db, doomed):
         return await _delete_snapshots(session, set(doomed))
 
 
-async def _assert_folded(db, view, restored, snaps, *, tombstones_hide=True):
+async def _assert_folded(db, view, restored, snaps, *, view_inc3=None):
     full, inc1, inc2, inc3 = snaps
     before = {s: (await view(s), await restored(s)) for s in (full, inc3)}
-    if tombstones_hide:   # restore hides only file tombstones (_FILE_TOMBSTONE_TYPES)
-        assert before[inc3][1] == [("A", "a-v1"), ("B", "b-v2"), ("D", "d-v3")]
+    # C's tombstone hides it at inc3, and still does once folded into inc3 (asserted below)
+    assert before[inc3][1] == [("A", "a-v1"), ("B", "b-v2"), ("D", "d-v3")]
+    if view_inc3 is not None:
+        assert before[inc3][0] == view_inc3
     assert await _retire(db, [inc1, inc2]) == 2
     assert {s: (await view(s), await restored(s)) for s in (full, inc3)} == before
 
@@ -126,8 +128,19 @@ async def test_calendar_retention_folds_deleted_incrementals(db, monkeypatch):
     async def view(sid):
         async with db.factory() as session:
             body = await api.list_snapshot_calendar(str(sid), page=1, size=1000, search=None, db=session)
-        return sorted(e["externalId"] if isinstance(e, dict) else e.externalId for e in body["content"])
-    await _assert_folded(db, view, restored, snaps, tombstones_hide=False)
+        return sorted((e["externalId"], e["subject"]) for e in body["content"])
+    await _assert_folded(db, view, restored, snaps, view_inc3=[("A", "a-v1"), ("B", "b-v2"), ("D", "d-v3")])
+
+
+async def test_contacts_retention_folds_deleted_incrementals_and_keeps_deletions_hidden(db, monkeypatch):
+    api, restored = _readers(db, monkeypatch)
+    _, snaps = await _chain(db, models.ResourceType.USER_CONTACTS, "USER_CONTACT", "Contacts")
+
+    async def view(sid):
+        async with db.factory() as session:
+            body = await api.list_snapshot_contacts(str(sid), page=1, size=500, folder=None, search=None, db=session)
+        return sorted((c["externalId"], c["name"]) for c in body["content"])
+    await _assert_folded(db, view, restored, snaps, view_inc3=[("A", "a-v1"), ("B", "b-v2"), ("D", "d-v3")])
 
 
 async def test_copy_forward_rows_are_not_folded(db):
