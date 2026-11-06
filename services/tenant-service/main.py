@@ -100,29 +100,10 @@ async def run_tenant_discovery(db: AsyncSession, tenant: Tenant) -> int:
                 existing.email = r["email"]
             existing.extra_data = {**(existing.extra_data or {}), **(r.get("metadata") or {})}
 
-    # Singleton "Azure Active Directory" resource — matches AFI's
-    # office_directory model. One row per M365 tenant; holds all
-    # Entra-wide content (users / groups / roles / applications /
-    # audit / security / intune / admin units) as snapshot_items.
-    if tenant.type == TenantType.M365:
-        dir_ext_id = tenant.external_tenant_id or str(tenant.id)
-        dir_stmt = select(Resource).where(
-            Resource.tenant_id == tenant.id,
-            Resource.type == ResourceType.ENTRA_DIRECTORY,
-        )
-        dir_row = (await db.execute(dir_stmt)).scalar_one_or_none()
-        if dir_row is None:
-            db.add(Resource(
-                id=uuid4(),
-                tenant_id=tenant.id,
-                type=ResourceType.ENTRA_DIRECTORY,
-                external_id=dir_ext_id,
-                display_name="Azure Active Directory",
-                email=None,
-                extra_data={"source": "tenant_singleton"},
-                status=ResourceStatus.DISCOVERED,
-            ))
-            count += 1
+    # Singleton "Azure Active Directory" resource (shared with the discovery-worker path).
+    from shared.entra_directory import ensure_entra_directory
+    if await ensure_entra_directory(db, tenant):
+        count += 1
 
     tenant.status = TenantStatus.ACTIVE
     tenant.last_discovery_at = datetime.now(timezone.utc).replace(tzinfo=None)
