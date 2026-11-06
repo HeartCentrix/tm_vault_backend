@@ -7826,7 +7826,7 @@ class BackupWorker:
                     mail_select = (
                         "id,subject,from,toRecipients,ccRecipients,"
                         "sentDateTime,receivedDateTime,bodyPreview,body,"
-                        "hasAttachments,parentFolderId"
+                        "hasAttachments,parentFolderId,internetMessageId"
                     )
                     mail_fanout = int(
                         os.getenv("USER_MAIL_PARALLEL_FOLDERS", "10"),
@@ -14175,6 +14175,51 @@ class BackupWorker:
         msg_ids = [m.get("id") for m in messages_with_attachments if m.get("id")]
         att_lists_cache: Dict[str, List[Dict[str, Any]]] = {}
         batch_limit = min(20, mailbox_batch_concurrency(os.getenv("USER_MAIL_ATT_BATCH"), default=20))
+
+        # Cross-mailbox reuse: a copy of a message whose attachments this tenant already
+        # stored lists metadata only (no contentBytes) and points its rows at the stored
+        # blobs. Any mismatch leaves the message on the full listing below.
+        from shared import mail_attachment_reuse as _reuse
+        reuse_map: Dict[Tuple[str, str], Any] = {}
+        downloaded: List[Tuple[str, tuple, Dict[str, Any]]] = []
+        imid_of = {m.get("id"): m.get("internetMessageId") for m in messages_with_attachments}
+        if _reuse.reuse_enabled():
+            _stored = await _reuse.load_candidates(
+                tenant.id, [m.get("internetMessageId") for m in messages_with_attachments])
+            _cand = {m["id"]: _stored[m["internetMessageId"]] for m in messages_with_attachments
+                     if m.get("id") and _stored.get(m.get("internetMessageId") or "")}
+            _cand_ids, _probe = list(_cand), {}
+            for start in range(0, len(_cand_ids), batch_limit):
+                try:
+                    _meta = await graph_client.batch([
+                        BatchRequest(id=mid, method="GET",
+                                     url=f"/users/{user_id}/messages/{mid}/attachments?$select={_reuse.METADATA_SELECT}")
+                        for mid in _cand_ids[start:start + batch_limit]])
+                except (ProviderDeferred, ProviderBudgetExhausted):
+                    raise
+                except BatchReadError as be:
+                    _meta = be.responses
+                except Exception:
+                    continue
+                for mid, resp in _meta.items():
+                    body = getattr(resp, "body", None)
+                    if not (getattr(resp, "status", 0) == 200 and isinstance(body, dict)
+                            and "@odata.nextLink" not in body and isinstance(body.get("value"), list)
+                            and all(isinstance(a, dict) for a in body["value"])):
+                        continue
+                    plan = _reuse.match(body["value"], _cand.get(mid) or [])
+                    if not plan:
+                        continue
+                    oks = [await _reuse.usable(shard, container, tenant.id, imid_of[mid], hit, _probe)
+                           for hit in plan.values()]
+                    if not all(oks):
+                        continue
+                    att_lists_cache[mid] = [{**a, "contentId": plan[a["id"]].content_id} for a in body["value"]]
+                    reuse_map.update({(mid, aid): hit for aid, hit in plan.items()})
+            if reuse_map:
+                print(f"[{self.worker_id}] [ATT-REUSE] {len(att_lists_cache)}/{len(msg_ids)} msg(s), "
+                      f"{len(reuse_map)} attachment(s) reused from other mailbox copies")
+            msg_ids = [mid for mid in msg_ids if mid not in att_lists_cache]
         for start in range(0, len(msg_ids), batch_limit):
             batch_reqs = [
                 BatchRequest(
@@ -14341,8 +14386,11 @@ class BackupWorker:
                 declared_size = att.get("size") or 0
 
                 content_bytes: Optional[bytes] = None
+                hit = reuse_map.get((msg_id, att_id))
 
-                if att_kind.endswith("fileAttachment"):
+                if hit is not None:
+                    pass  # bytes already stored from another mailbox's copy
+                elif att_kind.endswith("fileAttachment"):
                     raw_b64 = att.get("contentBytes")
                     if raw_b64:
                         import base64 as _b64
@@ -14385,7 +14433,10 @@ class BackupWorker:
                 inline_b64: Optional[str] = None
                 bytes_added = 0
 
-                if content_bytes is not None:
+                if hit is not None:
+                    blob_path, content_hash = hit.blob_path, hit.content_hash
+                    size = bytes_added = hit.content_size
+                elif content_bytes is not None:
                     content_hash = hashlib.sha256(content_bytes).hexdigest()
                     size = len(content_bytes)
 
@@ -14421,6 +14472,12 @@ class BackupWorker:
                             content_hash = None
 
                 resolved = (blob_path is not None) or (inline_b64 is not None)
+                _k = _reuse.key(att)
+                if hit is None and blob_path and content_hash and _k and imid_of.get(msg_id):
+                    downloaded.append((msg_id, _k, {
+                        "imid": imid_of[msg_id], "name": _k[0], "graph_size": _k[1], "content_type": _k[2],
+                        "is_inline": _k[3], "content_id": att.get("contentId") or att.get("contentID"),
+                        "blob_path": blob_path, "content_hash": content_hash, "content_size": size}))
                 return (
                     SnapshotItem(
                         id=uuid.uuid4(),
@@ -14681,6 +14738,13 @@ class BackupWorker:
                 items, b = r
                 all_items.extend(items)
                 total_bytes += b
+        if _reuse.reuse_enabled() and downloaded:
+            # A key seen twice in one message cannot tell its contents apart: never record it.
+            _seen: Dict[Tuple[str, tuple], int] = {}
+            for _mid, _k, _ in downloaded:
+                _seen[(_mid, _k)] = _seen.get((_mid, _k), 0) + 1
+            await _reuse.remember(tenant.id, getattr(shard, "backend_id", None),
+                                  [row for _mid, _k, row in downloaded if _seen[(_mid, _k)] == 1])
         return all_items, total_bytes
 
     # ==================== Tier 2 USER_CHATS attachment capture ====================
@@ -24212,7 +24276,7 @@ class BackupWorker:
         mbx_select = (
             "id,subject,from,toRecipients,ccRecipients,"
             "sentDateTime,receivedDateTime,bodyPreview,body,"
-            "hasAttachments,parentFolderId"
+            "hasAttachments,parentFolderId,internetMessageId"
         )
         mbx_fanout = int(os.getenv("MAILBOX_PARALLEL_FOLDERS", "10"))
         mbx_timeout_s = int(os.getenv("MAILBOX_TIMEOUT_S", "43200"))

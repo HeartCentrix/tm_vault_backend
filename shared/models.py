@@ -796,6 +796,26 @@ class SnapshotPartition(Base):
     )
 
 
+class MailAttachmentContent(Base):
+    """One row per distinct stored mail file attachment (shared/mail_attachment_reuse.py).
+    Written when an attachment is first downloaded; later mailbox copies of the same message
+    probe this primary key instead of re-downloading. A row whose blob is gone is deleted
+    on the next lookup's HEAD miss."""
+    __tablename__ = "mail_attachment_contents"
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), primary_key=True)
+    internet_message_id = Column(String, primary_key=True)
+    name = Column(String, primary_key=True)
+    graph_size = Column(BigInteger, primary_key=True)
+    content_type = Column(String, primary_key=True)  # '' when Graph sends none
+    is_inline = Column(Boolean, primary_key=True)
+    content_id = Column(String)
+    blob_path = Column(String, nullable=False)
+    content_hash = Column(String, nullable=False)
+    content_size = Column(BigInteger, nullable=False)
+    backend_id = Column(UUID(as_uuid=True))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
 class MailFolderDelta(Base):
     """Per-folder delta token for mailbox-style resources.
 
