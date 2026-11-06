@@ -108,6 +108,9 @@ class Graph:
         self.batch_calls, self.list_calls = [], []
 
     async def batch(self, requests):
+        if all(r.url.endswith("?$select=internetMessageId") for r in requests):
+            # internetMessageId lookup for cross-mailbox reuse: none known, so these copies download.
+            return {r.id: BatchResponse(r.id, 200, {}, {"id": r.id}) for r in requests}
         self.batch_calls.append([r.id for r in requests])
         result = self.batches.pop(0)
         if isinstance(result, BaseException): raise result
