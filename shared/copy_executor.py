@@ -120,14 +120,15 @@ def _selection(kind, params):
                 OR NOT EXISTS (SELECT 1 FROM snapshot_partitions sp
                                 WHERE sp.snapshot_id=s.id AND sp.partition_type='MAIL_FOLDERS'
                                   AND (sp.payload::jsonb) ? 'carry_forward'))
-           AND EXISTS (SELECT 1 FROM snapshot_items x WHERE x.snapshot_id=s.id
-                        AND x.item_type IN ('EMAIL','EMAIL_ATTACHMENT'))
+           AND (s.overlay_base_id IS NOT NULL OR EXISTS (SELECT 1 FROM snapshot_items x WHERE x.snapshot_id=s.id
+                        AND x.item_type IN ('EMAIL','EMAIL_ATTACHMENT')))
         """
     prior += " ORDER BY s.created_at DESC,s.id DESC LIMIT 1)"
     if kind == "MAIL_CARRY":
+        # The prior's inventory: an overlay prior is its base + its own rows (docs/mail-overlay-snapshots.md).
         return (prior + """,
             emails AS MATERIALIZED (
-                SELECT src.* FROM snapshot_items src JOIN source_choice p ON src.snapshot_id=p.id
+                SELECT src.* FROM source_choice p CROSS JOIN LATERAL snapshot_items_effective(p.id) src
                  WHERE src.item_type='EMAIL'
                    AND COALESCE(src.metadata->>'source_mailbox','primary')='primary'
                    AND NOT (COALESCE(src.folder_path,'')=ANY(CAST(:excluded_paths AS text[])))
@@ -138,7 +139,7 @@ def _selection(kind, params):
                 SELECT src.snapshot_id AS source_snapshot_id,0 AS phase,to_jsonb(src) AS payload FROM emails src
                 UNION ALL
                 SELECT src.snapshot_id,1,to_jsonb(src)
-                  FROM snapshot_items src JOIN source_choice p ON src.snapshot_id=p.id
+                  FROM source_choice p CROSS JOIN LATERAL snapshot_items_effective(p.id) src
                  WHERE src.item_type='EMAIL_ATTACHMENT'
                    AND (NOT :whitelist OR cardinality(CAST(:keep_folder_ids AS text[])) > 0) AND (
                      EXISTS (SELECT 1 FROM emails e WHERE e.external_id=COALESCE(src.parent_external_id,split_part(src.external_id,'::',1)))

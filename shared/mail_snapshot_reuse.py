@@ -10,8 +10,9 @@ from __future__ import annotations
 from sqlalchemy import text
 
 # Prior = newest COMPLETED/PARTIAL snapshot of a DIFFERENT job that actually holds mail rows (a
-# 0-row run - fingerprint-skip, empty delta - must not restart the chain empty), is not a
-# reuse-chain pointer, and did not itself fail its carry-forward (its inventory is known-incomplete).
+# 0-row run - fingerprint-skip, empty delta - must not restart the chain empty; an overlay holds
+# its base's rows even when it owns none), is not a reuse-chain pointer, and did not itself fail
+# its carry-forward (its inventory is known-incomplete).
 # Shared by the carry-forward (its copy source) and the reuse (its pointer target), so both always
 # name the same snapshot. Binds :rid, :tsid, :jid.
 MAIL_PRIOR_SNAPSHOT_SQL = (
@@ -32,9 +33,10 @@ MAIL_PRIOR_SNAPSHOT_SQL = (
     "                         WHERE sp.snapshot_id = s2.id "
     "                           AND sp.partition_type = 'MAIL_FOLDERS' "
     "                           AND (sp.payload::jsonb) ? 'carry_forward')) "
-    "    AND EXISTS (SELECT 1 FROM snapshot_items x "
-    "                 WHERE x.snapshot_id = s2.id "
-    "                   AND x.item_type IN ('EMAIL', 'EMAIL_ATTACHMENT')) "
+    "    AND (s2.overlay_base_id IS NOT NULL "
+    "         OR EXISTS (SELECT 1 FROM snapshot_items x "
+    "                     WHERE x.snapshot_id = s2.id "
+    "                       AND x.item_type IN ('EMAIL', 'EMAIL_ATTACHMENT'))) "
     "  ORDER BY s2.created_at DESC "
     "  LIMIT 1)"
 )

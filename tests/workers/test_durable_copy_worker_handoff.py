@@ -67,6 +67,9 @@ async def test_required_copy_delegates_without_opening_inline_slot(
 
     monkeypatch.setattr(worker_module, "carry_forward_slot_session", inline_slot)
     monkeypatch.setattr(worker_module, "_externalize_prior_mail_attachments", AsyncMock())
+    # A mailbox whose overlay does not apply (compaction, no prior) takes the delegated full copy.
+    import shared.mail_overlay
+    monkeypatch.setattr(shared.mail_overlay, "try_mail_overlay", AsyncMock(return_value=None))
     result = await getattr(worker_module, name)(**params)
     assert result is workflow.defer_current_copy.return_value
     call = workflow.defer_current_copy.await_args

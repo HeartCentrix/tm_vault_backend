@@ -11,6 +11,8 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from shared.database import SNAPSHOT_ITEMS_EFFECTIVE_FUNCTION
+
 pytestmark = pytest.mark.integration
 
 
@@ -28,7 +30,8 @@ async def store():
         for ddl in (
             "CREATE TABLE resources (id uuid PRIMARY KEY, tenant_id uuid NOT NULL)",
             "CREATE TABLE snapshots (id uuid PRIMARY KEY, resource_id uuid NOT NULL, job_id uuid, "
-            "status text, created_at timestamp, extra_data json, reuse_of_snapshot_id uuid, reuse_chain_root_id uuid)",
+            "status text, created_at timestamp, extra_data json, reuse_of_snapshot_id uuid, reuse_chain_root_id uuid, "
+            "overlay_base_id uuid)",
             "CREATE TABLE snapshot_partitions (snapshot_id uuid, partition_type text, payload json)",
             "CREATE TABLE chat_threads (id uuid PRIMARY KEY, tenant_id uuid, chat_id text)",
             "CREATE TABLE chat_thread_messages (chat_thread_id uuid, message_external_id text)",
@@ -38,6 +41,9 @@ async def store():
             "blob_path text, encryption_key_id text, backup_version integer, metadata json, is_deleted boolean, "
             "indexed_at timestamp, backend_id uuid, chat_version_id uuid, created_at timestamp, "
             "UNIQUE(snapshot_id,external_id,item_type))",
+            "CREATE TABLE snapshot_overlay_removals (snapshot_id uuid, item_type text, external_id text, "
+            "PRIMARY KEY (snapshot_id, item_type, external_id))",
+            SNAPSHOT_ITEMS_EFFECTIVE_FUNCTION,
             "CREATE TABLE copy_workflows (id uuid PRIMARY KEY, tenant_id uuid, job_id uuid, resource_id uuid, "
             "target_snapshot_id uuid REFERENCES snapshots(id), state text DEFAULT 'DRAINING', capture_attempt bigint DEFAULT 0, "
             "parent_settle_pending boolean DEFAULT false)",
@@ -52,9 +58,9 @@ async def store():
     tenant, resource, source, target, job, workflow, backend, version = [uuid.uuid4() for _ in range(8)]
     async with factory() as s:
         await s.execute(text("INSERT INTO resources VALUES (:r,:t)"), {"r": resource, "t": tenant})
-        await s.execute(text("INSERT INTO snapshots VALUES (:s,:r,:j,'COMPLETED','2026-01-01','{}',NULL,NULL)"),
+        await s.execute(text("INSERT INTO snapshots VALUES (:s,:r,:j,'COMPLETED','2026-01-01','{}',NULL,NULL,NULL)"),
                         {"s": source, "r": resource, "j": uuid.uuid4()})
-        await s.execute(text("INSERT INTO snapshots VALUES (:s,:r,:j,'IN_PROGRESS','2026-01-02','{}',NULL,NULL)"),
+        await s.execute(text("INSERT INTO snapshots VALUES (:s,:r,:j,'IN_PROGRESS','2026-01-02','{}',NULL,NULL,NULL)"),
                         {"s": target, "r": resource, "j": job})
         await s.execute(text("INSERT INTO copy_workflows(id,tenant_id,job_id,resource_id,target_snapshot_id) VALUES (:w,:t,:j,:r,:s)"),
                         {"w": workflow, "t": tenant, "j": job, "r": resource, "s": target})
@@ -447,3 +453,41 @@ async def test_attachment_parent_check_reads_each_stored_payload_once(store):
         if result["done"]:
             break
     assert result["done"] and copied == 150
+
+
+async def _overlay_prior(store):
+    overlay = uuid.uuid4()
+    async with store.factory() as s:
+        await s.execute(text("INSERT INTO snapshots VALUES (:s,:r,:j,'COMPLETED','2026-01-01 12:00','{}',NULL,NULL,:b)"),
+                        {"s": overlay, "r": store.resource, "j": uuid.uuid4(), "b": store.source})
+        await s.execute(text("INSERT INTO snapshot_overlay_removals VALUES (:o,'EMAIL','gone')"), {"o": overlay})
+        await s.commit()
+    for ext in ("kept", "gone"):
+        await store.add(ext, kind="EMAIL")
+        await store.add(ext + "::att", kind="EMAIL_ATTACHMENT", parent=ext)
+    return overlay
+
+
+async def _copy(store):
+    task = await store.task("MAIL_CARRY")
+    await prepare(store, task)
+    while not (await batch(store, task, 20))["done"]:
+        pass
+    return task, [r["external_id"] for r in await store.rows()]
+
+
+async def test_mail_carry_from_an_overlay_prior_copies_base_plus_overlay_minus_removals(store):
+    """A compaction (any full copy) after an overlay copies the overlay's whole inventory."""
+    overlay = await _overlay_prior(store)
+    await store.add("new", kind="EMAIL", snapshot=overlay)
+    task, copied = await _copy(store)
+    assert task.params["prior_snapshot_id"] == str(overlay)
+    assert copied == ["kept", "new", "kept::att"]
+
+
+async def test_overlay_that_owns_no_rows_is_still_the_prior(store):
+    """Only deletions since the base: picking the base instead would resurrect them."""
+    overlay = await _overlay_prior(store)
+    task, copied = await _copy(store)
+    assert task.params["prior_snapshot_id"] == str(overlay)
+    assert copied == ["kept", "kept::att"]

@@ -1628,7 +1628,20 @@ async def _carry_forward_prior_mail_snapshot_items(
     keep_fids = sorted({str(f) for f in (keep_folder_ids or []) if f}) if keep_folder_ids is not None else None
     if keep_fids is not None and not keep_fids:
         return 0  # whitelist given but empty → nothing may be carried
-    # Before the copy is registered (its manifest freezes row payloads) or runs.
+    from shared.mail_overlay import mail_overlay_enabled, try_mail_overlay
+    if mail_overlay_enabled():
+        # Own only what changed since a full base; the full copy below runs when the overlay is not
+        # applicable (no prior, compaction, error) and logs why (docs/mail-overlay-snapshots.md).
+        # One short transaction bounded by the compaction threshold: no giant-lane slot, so a
+        # handler never waits behind full copies for it.
+        overlay = await try_mail_overlay(
+            async_session_factory, resource_id=resource_id, target_snapshot_id=target_snapshot_id, current_job_id=current_job_id,
+            excluded_paths=excl_paths, tombstoned_ids=excl_ids, keep_folder_ids=keep_fids,
+            exclude_pathless=exclude_pathless,
+        )
+        if overlay is not None:
+            return overlay["carried"]
+    # Full copy path: before the copy is registered (its manifest freezes row payloads) or runs.
     await _externalize_prior_mail_attachments(tenant_id, resource_id, target_snapshot_id, current_job_id)
     from shared.copy_workflow import defer_current_copy
     delegated = await defer_current_copy("MAIL_CARRY", {
@@ -1670,8 +1683,9 @@ async def _carry_forward_prior_mail_snapshot_items(
         "       COALESCE(src.backup_version, 1), src.metadata, "
         "       COALESCE(src.is_deleted, false), src.indexed_at, "
         "       src.backend_id, NOW() "
-        "  FROM snapshot_items src "
-        " WHERE src.snapshot_id = " + prior_snapshot_sql + " "
+        # The prior's inventory, which for an overlay prior is its base + its own rows.
+        "  FROM snapshot_items_effective(" + prior_snapshot_sql + ") src "
+        " WHERE true "
     )
     not_exists_sql = (
         "   AND NOT EXISTS ("
