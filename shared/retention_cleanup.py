@@ -314,8 +314,10 @@ def _holds_recoverable_data(s: Snapshot) -> bool:
     count = getattr(s, "item_count", None)
     if count is not None and count <= 0:
         # A reuse row legitimately owns zero snapshot_items — its inventory
-        # resolves through reuse_chain_root_id — so it IS a restore point.
-        return getattr(s, "reuse_chain_root_id", None) is not None
+        # resolves through reuse_chain_root_id — so it IS a restore point; so is
+        # an overlay, whose inventory is mostly its base's rows.
+        return (getattr(s, "reuse_chain_root_id", None) is not None
+                or getattr(s, "overlay_base_id", None) is not None)
     return True
 
 
@@ -854,7 +856,15 @@ async def _delete_snapshots(
                         WHERE si.snapshot_id = snapshots.id
                      )
                )
-         ORDER BY id
+           -- A pointer or overlay still being written depends on this row: its
+           -- heir cannot be chosen yet (docs/mail-overlay-snapshots.md).
+           AND NOT EXISTS (
+                 SELECT 1 FROM snapshots d
+                  WHERE (d.overlay_base_id = snapshots.id OR d.reuse_chain_root_id = snapshots.id)
+                    AND d.id <> snapshots.id
+                    AND d.status::text <> ALL(CAST(:terminal AS TEXT[]))
+               )
+         ORDER BY (overlay_base_id IS NULL), id
          FOR UPDATE
     """), {
         "ids": [str(x) for x in snap_ids],
@@ -876,9 +886,12 @@ async def _delete_snapshots(
     doomed = set(ids)
     # Per-id rehydration sweep BEFORE the bulk delete. Most ids will
     # have no descendants (the common case is full snapshots aging
-    # out), so the EXISTS probe short-circuits cheaply.
+    # out), so the EXISTS probe short-circuits cheaply. Overlays come
+    # first (ORDER BY above): a doomed overlay's pointer heir becomes an
+    # overlay of the same base, which that base's own pass must then see.
     for sid in ids:
-        await _rehydrate_reuse_heir(session, sid, doomed_ids=doomed)
+        heir = await _rehydrate_reuse_heir(session, sid, doomed_ids=doomed)
+        await _rehydrate_overlay_dependents(session, sid, pointer_heir=heir, doomed_ids=doomed)
     # Both deletes are scoped to the SAME re-qualified set: deleting the
     # items of a row we then decline to delete would leave a surviving
     # snapshot with no inventory — worse than either outcome.
@@ -959,7 +972,9 @@ async def _rehydrate_reuse_heir(
                tenant_id, external_id, parent_external_id,
                item_type, name, folder_path, content_hash, content_checksum,
                content_size, blob_path, encryption_key_id, backup_version,
-               metadata, is_deleted, indexed_at, backend_id, chat_version_id, NOW()
+               -- capture time kept: Recovery's sibling union is newest-wins on
+               -- si.created_at, and a NOW() copy would shadow later versions
+               metadata, is_deleted, indexed_at, backend_id, chat_version_id, created_at
           FROM snapshot_items
          WHERE snapshot_id = CAST(:did AS UUID)
         ON CONFLICT DO NOTHING
@@ -1047,6 +1062,133 @@ async def _rehydrate_reuse_heir(
         heir_id, doomed_id,
     )
     return heir_id
+
+
+# Columns that make a snapshot_items row the same captured item (id, snapshot_id, created_at aside).
+_PAYLOAD = ("item_type, external_id, parent_external_id, name, folder_path, content_hash, content_checksum, "
+            "content_size, blob_path, encryption_key_id, backup_version, metadata, is_deleted, indexed_at, "
+            "backend_id, chat_version_id, tenant_id")
+
+
+def _payload_row(alias):
+    return "ROW(" + ", ".join(f"{alias}.{c}::text" if c == "metadata" else f"{alias}.{c}"
+                              for c in _PAYLOAD.split(", ")) + ")"
+
+
+async def _inventory_fingerprint(session: AsyncSession, snapshot_id) -> tuple:
+    """(rows, digest) of a snapshot's inventory: equal before and after any heir surgery, or the
+    retention transaction aborts and nothing is deleted."""
+    row = (await session.execute(text(
+        f"SELECT count(*), md5(string_agg(md5({_payload_row('e')}::text), ',' ORDER BY e.item_type, e.external_id)) "
+        "FROM snapshot_items_effective(CAST(:s AS uuid)) e"), {"s": str(snapshot_id)})).one()
+    return int(row[0]), row[1]
+
+
+async def _assert_inventory_kept(session, snapshot_id, before, what):
+    after = await _inventory_fingerprint(session, snapshot_id)
+    if after != before:
+        raise RuntimeError(f"retention {what} changed snapshot {snapshot_id}'s inventory "
+                           f"({before[0]} -> {after[0]} rows); nothing deleted")
+
+
+async def _copy_base_rows(session, overlay_id, base_id, *, differing_from=None):
+    """Make the overlay own the base rows of its inventory (all of them, or only those whose payload
+    differs in / is missing from ``differing_from``), keeping their capture time."""
+    cols = _PAYLOAD
+    keep = "" if differing_from is None else (
+        "AND NOT EXISTS (SELECT 1 FROM snapshot_items h WHERE h.snapshot_id = CAST(:h AS uuid) "
+        f"AND h.item_type = e.item_type AND h.external_id = e.external_id AND {_payload_row('h')} "
+        f"IS NOT DISTINCT FROM {_payload_row('e')})")
+    await session.execute(text(
+        f"INSERT INTO snapshot_items (id, snapshot_id, {cols}, created_at) "
+        f"SELECT gen_random_uuid(), CAST(:o AS uuid), {', '.join('e.' + c for c in cols.split(', '))}, e.created_at "
+        f"FROM snapshot_items_effective(CAST(:o AS uuid)) e WHERE e.snapshot_id = CAST(:b AS uuid) {keep} "
+        "ON CONFLICT DO NOTHING"),
+        {"o": str(overlay_id), "b": str(base_id), "h": str(differing_from) if differing_from else None})
+
+
+async def _rebase_overlay(session, overlay_id, old_base, new_base):
+    """Point an overlay at another full snapshot without changing what it holds: own every base row
+    the new base lacks or holds differently, hide every new-base row the overlay did not show."""
+    before = await _inventory_fingerprint(session, overlay_id)
+    await _copy_base_rows(session, overlay_id, old_base, differing_from=new_base)
+    await session.execute(text(
+        "INSERT INTO snapshot_overlay_removals (snapshot_id, item_type, external_id) "
+        "SELECT CAST(:o AS uuid), h.item_type, h.external_id FROM snapshot_items h "
+        "WHERE h.snapshot_id = CAST(:h AS uuid) AND h.item_type IN ('EMAIL', 'EMAIL_ATTACHMENT') "
+        "AND NOT EXISTS (SELECT 1 FROM snapshot_items_effective(CAST(:o AS uuid)) e "
+        "                 WHERE e.item_type = h.item_type AND e.external_id = h.external_id) "
+        "ON CONFLICT DO NOTHING"), {"o": str(overlay_id), "h": str(new_base)})
+    await session.execute(text("UPDATE snapshots SET overlay_base_id = CAST(:h AS uuid) WHERE id = CAST(:o AS uuid)"),
+                          {"o": str(overlay_id), "h": str(new_base)})
+    await _assert_inventory_kept(session, overlay_id, before, "rebase")
+
+
+async def _restate_counts(session, snapshot_id):
+    await session.execute(text(
+        "UPDATE snapshots SET item_count = c.n, bytes_total = c.b FROM ("
+        "  SELECT count(*) AS n, COALESCE(sum(content_size), 0) AS b"
+        "    FROM snapshot_items_effective(CAST(:s AS uuid))) c WHERE id = CAST(:s AS uuid)"),
+        {"s": str(snapshot_id)})
+
+
+async def _rehydrate_overlay_dependents(
+    session: AsyncSession,
+    doomed_id: uuid.UUID,
+    *,
+    pointer_heir: Optional[uuid.UUID],
+    doomed_ids: Set[uuid.UUID],
+) -> None:
+    """Overlay half of the heir sequence (docs/mail-overlay-snapshots.md), after
+    _rehydrate_reuse_heir handled pointers:
+
+    * doomed overlay whose pointer heir took its own rows: the heir also takes its removals and
+      its base, becoming an overlay with the same inventory;
+    * doomed full snapshot with a pointer heir (identical rows): its overlays rebase onto the heir;
+    * doomed full snapshot with surviving overlays only: the earliest is materialised into a full
+      snapshot and the others rebase onto it.
+
+    Every step is verified against the inventory fingerprint taken before it."""
+    doomed = (await session.execute(text(
+        "SELECT overlay_base_id FROM snapshots WHERE id = CAST(:d AS uuid)"), {"d": str(doomed_id)})).first()
+    if doomed is None:
+        return
+    if doomed.overlay_base_id is not None:
+        if pointer_heir is not None:
+            before = await _inventory_fingerprint(session, doomed_id)
+            await session.execute(text(
+                "INSERT INTO snapshot_overlay_removals (snapshot_id, item_type, external_id) "
+                "SELECT CAST(:h AS uuid), item_type, external_id FROM snapshot_overlay_removals "
+                "WHERE snapshot_id = CAST(:d AS uuid) ON CONFLICT DO NOTHING"), {"h": str(pointer_heir), "d": str(doomed_id)})
+            await session.execute(text(
+                "UPDATE snapshots SET overlay_base_id = CAST(:b AS uuid) WHERE id = CAST(:h AS uuid)"),
+                {"h": str(pointer_heir), "b": str(doomed.overlay_base_id)})
+            await _assert_inventory_kept(session, pointer_heir, before, "overlay hand-over")
+            await _restate_counts(session, pointer_heir)
+        return
+    survivors = [r.id for r in (await session.execute(text(
+        "SELECT id FROM snapshots WHERE overlay_base_id = CAST(:d AS uuid) AND id <> ALL(CAST(:doomed AS uuid[])) "
+        "ORDER BY COALESCE(started_at, created_at), id FOR UPDATE"),
+        {"d": str(doomed_id), "doomed": [str(x) for x in doomed_ids]})).all()]
+    if not survivors:
+        return
+    heir = pointer_heir
+    if heir is None:
+        heir, survivors = survivors[0], survivors[1:]
+        before = await _inventory_fingerprint(session, heir)
+        await _copy_base_rows(session, heir, doomed_id)
+        await session.execute(text("DELETE FROM snapshot_overlay_removals WHERE snapshot_id = CAST(:h AS uuid)"),
+                              {"h": str(heir)})
+        await session.execute(text(
+            "UPDATE snapshots SET overlay_base_id = NULL, extra_data = (COALESCE(extra_data::jsonb, '{}'::jsonb) "
+            "|| jsonb_build_object('overlay_materialised_from', CAST(:d AS text)))::json WHERE id = CAST(:h AS uuid)"),
+            {"h": str(heir), "d": str(doomed_id)})
+        await _assert_inventory_kept(session, heir, before, "overlay materialisation")
+        await _restate_counts(session, heir)
+    for overlay in survivors:
+        await _rebase_overlay(session, overlay, doomed_id, heir)
+    logger.info("[retention] overlay heir snapshot=%s for doomed base=%s, %d overlay(s) rebased",
+                heir, doomed_id, len(survivors))
 
 
 # Resources loaded per keyset page in enforce_retention_for_tenant — the

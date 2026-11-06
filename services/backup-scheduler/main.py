@@ -1291,6 +1291,14 @@ async def startup():
                        -- corrupted live run.
                        AND {copy_source_pinned_sql('s.id')}
                        AND (s.lease_expires_at IS NULL OR s.lease_expires_at < NOW())
+                       -- Never tear down a snapshot another one reads: an overlay's
+                       -- base or a pointer's target (its blobs are only referenced
+                       -- through it). Retention hands those to an heir first.
+                       AND NOT EXISTS (
+                           SELECT 1 FROM snapshots d
+                            WHERE (d.overlay_base_id = s.id OR d.reuse_chain_root_id = s.id)
+                              AND d.id <> s.id
+                       )
                        -- Defense against partitioned-shard double-cleanup.
                        AND NOT EXISTS (
                            SELECT 1 FROM snapshot_partitions sp

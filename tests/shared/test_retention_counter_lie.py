@@ -340,6 +340,11 @@ def test_delete_time_guard_second_guesses_an_empty_looking_row(monkeypatch):
         return None
 
     monkeypatch.setattr(rc, "_rehydrate_reuse_heir", _fake_rehydrate)
+
+    async def _no_overlays(sess, sid, *, pointer_heir, doomed_ids):
+        return None
+
+    monkeypatch.setattr(rc, "_rehydrate_overlay_dependents", _no_overlays)
     asyncio.run(rc._delete_snapshots(session, {doomed}))
 
     guard = " ".join(session.guard_sql.split())

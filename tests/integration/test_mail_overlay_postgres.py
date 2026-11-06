@@ -664,3 +664,80 @@ async def test_restore_and_export_size_estimates_cover_the_overlays_inventory(tw
             sizes.append(await session.scalar(select(func.coalesce(func.sum(models.SnapshotItem.content_size), 0))
                                               .where(await items_scope_any(session, [str(box.snapshots[-1]), str(uuid4())]))))
     assert sizes[0] == sizes[1] > 0
+
+
+# ── Retention: retiring bases and middle snapshots keeps every survivor's inventory ─────────────
+
+async def _retire(box, doomed):
+    """Delete ``doomed`` through retention; return the survivors' inventories before and after."""
+    from shared.retention_cleanup import _delete_snapshots
+    survivors = [s for s in box.snapshots if s not in doomed]
+    before = [await box.inventory(s) for s in survivors]
+    async with box.db.factory.begin() as session:
+        deleted = await _delete_snapshots(session, set(doomed))
+    assert deleted == len(doomed)
+    box.snapshots = survivors
+    assert [await box.inventory(s) for s in survivors] == before
+    return survivors
+
+
+async def test_retiring_the_base_materialises_the_earliest_overlay_and_rebases_the_rest(twin):
+    t = await twin()
+    for ops in ({"add": [("r1", "Inbox", 1)]}, {"move": [("r1", "Archive")], "delete": ["m001"]},
+                {"change": ["m005"], "add": [("r2", "Projects", 2)]}):
+        await t.run(**ops)
+    base, o1, o2, o3 = t.overlay.snapshots
+    await _retire(t.overlay, [base])
+    assert tuple(await t.overlay.shape(o1))[:2] == (None, None)
+    assert (await t.overlay.shape(o2))[0] == (await t.overlay.shape(o3))[0] == o1
+
+
+async def test_retiring_base_and_a_middle_overlay_together(twin):
+    t = await twin()
+    for ops in ({"add": [("r1", "Inbox", 1)]}, {"delete": ["m001", "r1"]}, {"move": [("m004", "Projects")]}):
+        await t.run(**ops)
+    base, o1, o2, o3 = t.overlay.snapshots
+    await _retire(t.overlay, [base, o2])
+    assert (await t.overlay.shape(o3))[0] == o1
+
+
+async def test_retiring_a_base_with_pointer_heir_repoints_its_overlays(twin):
+    t = await twin()
+    await t.run()                                  # unchanged: pointer at the base
+    await t.run(add=[("r1", "Inbox", 1)])          # prior is the base (pointers are skipped)
+    await t.run(delete=["m003"])
+    base, pointer, o1, o2 = t.overlay.snapshots
+    assert (await t.overlay.shape(pointer))[1] == base and (await t.overlay.shape(o1))[0] == base
+    await _retire(t.overlay, [base])
+    assert (await t.overlay.shape(o1))[0] == (await t.overlay.shape(o2))[0] == pointer
+
+
+async def test_retiring_an_overlay_hands_its_inventory_to_its_pointer(twin):
+    t = await twin()
+    await t.run(add=[("r1", "Inbox", 1)])
+    await t.run()                                  # unchanged: pointer at the overlay
+    await t.run(delete=["m003"])
+    base, o1, pointer, o2 = t.overlay.snapshots
+    await _retire(t.overlay, [o1])
+    assert tuple(await t.overlay.shape(pointer))[:2] == (base, None)
+
+
+async def test_retiring_base_and_overlay_whose_pointer_survives(twin):
+    t = await twin()
+    await t.run(add=[("r1", "Inbox", 1)])
+    await t.run()
+    await t.run(delete=["m003"])
+    base, o1, pointer, o2 = t.overlay.snapshots
+    await _retire(t.overlay, [base, o1])
+    assert tuple(await t.overlay.shape(pointer))[:2] == (None, None)
+    assert (await t.overlay.shape(o2))[0] == pointer
+
+
+async def test_blobs_of_a_base_an_overlay_still_reads_are_protected(twin, db):
+    from shared.backup_cleanup import resolve_protected_reuse_roots
+    t = await twin()
+    await t.run(add=[("r1", "Inbox", 1)])
+    base = t.overlay.snapshots[0]
+    async with db.factory() as session:
+        assert await resolve_protected_reuse_roots(session, [base]) == {base}
+        assert await resolve_protected_reuse_roots(session, t.overlay.snapshots) == set()

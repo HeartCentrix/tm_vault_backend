@@ -606,6 +606,12 @@ async def resolve_protected_reuse_roots(
             "    FROM snapshots "
             "   WHERE reuse_of_snapshot_id = ANY(CAST(:doomed AS UUID[])) "
             "     AND id <> ALL(CAST(:doomed AS UUID[])) "
+            # an overlay reads its base's rows (docs/mail-overlay-snapshots.md)
+            "  UNION ALL "
+            "  SELECT overlay_base_id AS ancestor_id "
+            "    FROM snapshots "
+            "   WHERE overlay_base_id = ANY(CAST(:doomed AS UUID[])) "
+            "     AND id <> ALL(CAST(:doomed AS UUID[])) "
             ") anc WHERE anc.ancestor_id IS NOT NULL"
         ),
         {"doomed": ids},
