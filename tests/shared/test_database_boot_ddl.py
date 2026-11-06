@@ -176,3 +176,13 @@ def test_runtime_boot_rejects_missing_schema(monkeypatch):
     monkeypatch.setattr(db_mod, 'verify_runtime_schema', AsyncMock(return_value=False), raising=False)
     with pytest.raises(RuntimeError, match='schema.*incomplete'):
         asyncio.run(db_mod.init_db())
+
+
+def test_boot_ddl_creates_the_activity_rollup_lookup_indexes(monkeypatch):
+    """create_all/bootstrap databases need the same lookups migration 0020 builds concurrently:
+    without them the Activity rollup nest-loops snapshots/partitions per batch (TM catalogue #20)."""
+    statements = _boot_statements(monkeypatch)
+    for name, table in (("ix_snapshots_job_id", "snapshots (job_id)"),
+                        ("ix_snapshot_partitions_job_id", "snapshot_partitions (job_id)"),
+                        ("ix_jobs_spec_batch_id", "jobs ((COALESCE((spec)::jsonb ->> 'batch_id', '')))")):
+        assert any(f"CREATE INDEX IF NOT EXISTS {name} ON {table}" in s for s in statements), name

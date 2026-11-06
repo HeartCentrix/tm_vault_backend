@@ -66,6 +66,7 @@ EXPECTED_CHAIN = [
     ('0017', '0016'),
     ('0018', '0017'),
     ('0019', '0018'),            # PARTIAL job status
+    ('0020', '0019'),            # activity rollup lookup indexes
 ]
 
 # Substring that must appear in the module docstring of each pending revision,
@@ -84,6 +85,7 @@ PENDING_SUBJECTS = {
     "0017": "Durable provider continuation",
     "0018": "an archive may point at a PARTIAL prior",
     "0019": "PARTIAL job status",
+    "0020": "Activity rollup lookup indexes",
 }
 
 

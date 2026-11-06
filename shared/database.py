@@ -1743,6 +1743,13 @@ async def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS ix_snapshot_partitions_inprog_lease "
         "ON snapshot_partitions (lease_expires_at) "
         "WHERE status IN ('QUEUED','IN_PROGRESS');",
+        # Activity rollup / backup_batches lookups (TM catalogue #20). Existing
+        # databases get them CONCURRENTLY from alembic 0020; these cover
+        # create_all/bootstrap databases and are no-ops once 0020 has run.
+        "CREATE INDEX IF NOT EXISTS ix_snapshots_job_id ON snapshots (job_id);",
+        "CREATE INDEX IF NOT EXISTS ix_snapshot_partitions_job_id ON snapshot_partitions (job_id);",
+        "CREATE INDEX IF NOT EXISTS ix_jobs_spec_batch_id "
+        "ON jobs ((COALESCE((spec)::jsonb ->> 'batch_id', '')));",
         "CREATE INDEX IF NOT EXISTS ix_worker_heartbeats_last_seen "
         "ON worker_heartbeats (last_seen_at);",
         "CREATE INDEX IF NOT EXISTS ix_work_dead_letter_kind_created "
