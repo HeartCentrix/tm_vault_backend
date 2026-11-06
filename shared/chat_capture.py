@@ -19,6 +19,7 @@ from uuid import UUID
 from weakref import WeakKeyDictionary
 
 from sqlalchemy import and_, delete, exists, func, or_, select, text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import SQLAlchemyError
 
 from shared import chat_catalogue as catalogue
@@ -706,8 +707,22 @@ async def _known_hosted(factory, scope, messages):
     return found
 
 
+async def _known_unavailable(factory, scope) -> set:
+    """(graph id, parent id) of this chat's hosted contents already recorded unavailable (byte-less).
+    That is final: a re-read records them unavailable again without a request (Railway 2026-11-06:
+    every re-read of a 1:1 chat fetched a call recording's /views/video, which Microsoft never serves;
+    the recording itself is backed up from the organizer's OneDrive). A new hosted id is fetched."""
+    async def find(session):
+        return set((await session.execute(select(ChatItemVersion.graph_id, ChatItemVersion.parent_graph_id).where(
+            ChatItemVersion.tenant_id == scope.tenant_id, ChatItemVersion.chat_id == scope.chat_id,
+            ChatItemVersion.item_type == "CHAT_HOSTED_CONTENT", ChatItemVersion.object_id.is_(None),
+            func.cast(ChatItemVersion.payload, JSONB)[SOURCE_UNAVAILABLE_FIELD].astext == "true"))).all())
+    return await run_catalogue_transaction(factory, find)
+
+
 async def _observe_pages(*, scope, keeper, factory, source, ledger, observation, exclude_message, folder_path,
                          stats, home_tenant, pool, pending, flush, capture_binary):
+    gone = None   # read once, at the chat's first hosted content
     try:
         async for page in _prefetched(source.iter_message_pages(scope.chat_id)):
             keeper.check()
@@ -768,16 +783,21 @@ async def _observe_pages(*, scope, keeper, factory, source, ledger, observation,
             for identifier, attachments, hosted, marker in prepared:
                 for kind, values in (("CHAT_ATTACHMENT", attachments), ("CHAT_HOSTED_CONTENT", hosted)):
                     for child in values:
+                        if kind == "CHAT_HOSTED_CONTENT" and observation == 0 and gone is None:
+                            gone = await _known_unavailable(factory, scope)
                         if kind == "CHAT_ATTACHMENT" and metadata_only_attachment(child):
                             captured = CapturedChatItem(kind, child["id"], identifier, child, None)
                             if ledger.record(observation, captured) and observation == 0:
                                 pending.append(captured)
-                        elif observation and ledger.unavailable_in_first_pass(kind, child["id"], identifier):
+                        elif ((observation and ledger.unavailable_in_first_pass(kind, child["id"], identifier))
+                              or (kind == "CHAT_HOSTED_CONTENT" and (child["id"], identifier) in (gone or ()))):
                             # Pass 2 re-observes membership; bytes Microsoft could not serve in
-                            # pass 1 are not fetched (and retried) a second time.
+                            # pass 1 (or in an earlier capture, for hosted content) are not fetched again.
                             ledger.unavailable(observation, kind, child["id"], identifier)
-                            ledger.record(observation, CapturedChatItem(kind, child["id"], identifier,
-                                                                        {**child, SOURCE_UNAVAILABLE_FIELD: True}, None))
+                            captured = CapturedChatItem(kind, child["id"], identifier,
+                                                        {**child, SOURCE_UNAVAILABLE_FIELD: True}, None)
+                            if ledger.record(observation, captured) and observation == 0:
+                                pending.append(captured)
                         else:
                             await pool.submit(capture_binary(kind, child, identifier, marker))
                         await flush(200)
