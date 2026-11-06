@@ -96,3 +96,36 @@ def test_reason_is_a_single_line():
     )
     assert r is not None
     assert "\n" not in r
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-06: "OneDrive — Amit Mishra" finalized FAILED (8 of 8 shards failed
+# outright, one 2 GiB file each during a SeaweedFS volume-growth gap) and the
+# UI read "Failed: no reason recorded" — the reason was only synthesized for
+# PARTIAL. Ranjeet's 1-of-8 PARTIAL got one; Amit's all-failed run did not.
+# ---------------------------------------------------------------------------
+
+
+def test_first_shard_error_is_carried_into_the_reason():
+    reason = _bw.partition_loss_degraded_reason(lost_files=0, shards_lossy=0, shards_failed=8, shards_total=8,
+                enumeration_incomplete=False,
+                first_error="OneDrive required file content failed for 1 file(s)")
+    assert reason == ("8 of 8 shard(s) failed outright; first: "
+                      "OneDrive required file content failed for 1 file(s)")
+
+
+def test_first_shard_error_is_bounded():
+    reason = _bw.partition_loss_degraded_reason(lost_files=0, shards_lossy=0, shards_failed=1, shards_total=1,
+                enumeration_incomplete=False, first_error="x" * 5000)
+    assert len(reason) < 400
+
+
+def test_finalizer_synthesizes_a_reason_for_failed_runs_too():
+    import ast
+    tree = ast.parse(_MAIN_PATH.read_text())
+    fin = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef)
+               and n.name == "_finalize_partitioned_snapshot")
+    guards = [ast.unparse(n.test) for n in ast.walk(fin) if isinstance(n, ast.If)
+              and "partition_loss_degraded_reason" in ast.unparse(n)
+              and "_pf_degraded" in ast.unparse(n.test)]
+    assert guards and all("FAILED" in g for g in guards), guards

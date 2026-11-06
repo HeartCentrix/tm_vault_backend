@@ -4425,8 +4425,9 @@ def record_sp_rest_failure(
 def partition_loss_degraded_reason(
     *, lost_files: int, shards_lossy: int, shards_failed: int,
     shards_total: int, enumeration_incomplete: bool,
+    first_error: Optional[str] = None,
 ) -> Optional[str]:
-    """Operator-readable reason for a PARTITION-derived PARTIAL.
+    """Operator-readable reason for a PARTITION-derived PARTIAL or FAILED.
 
     The partitioned finalize path derives PARTIAL from partition counters
     (``failure_state.files_failed`` on shards that still report COMPLETED,
@@ -4464,6 +4465,8 @@ def partition_loss_degraded_reason(
         )
     if not bits:
         return None
+    if shards_failed > 0 and first_error:
+        bits.append(f"first: {first_error[:300]}")
     return "; ".join(bits)
 
 
@@ -18951,7 +18954,9 @@ class BackupWorker:
                           bool_or(COALESCE(
                               (failure_state::jsonb ->> 'enumeration_incomplete')::boolean, false
                           )) AS enum_incomplete,
-                          COUNT(*) FILTER (WHERE status IN ('QUEUED','IN_PROGRESS')) AS pending
+                          COUNT(*) FILTER (WHERE status IN ('QUEUED','IN_PROGRESS')) AS pending,
+                          (array_agg(failure_state::jsonb ->> 'message' ORDER BY partition_index)
+                             FILTER (WHERE status = 'FAILED'))[1] AS first_error
                           FROM snapshot_partitions
                          WHERE snapshot_id = :sid
                         """
@@ -18963,6 +18968,7 @@ class BackupWorker:
                 _d_failed = int(getattr(derived_row, "failed", 0) or 0)
                 _d_lossy = int(getattr(derived_row, "lossy", 0) or 0)
                 _d_pending = int(getattr(derived_row, "pending", 0) or 0)
+                _derived_status = None
                 if _d_n > 0 and _d_pending == 0:
                     if (snap.extra_data or {}).get("copy_required_failed"):
                         _derived_status = SnapshotStatus.PARTIAL if persisted_count else SnapshotStatus.FAILED
@@ -19004,7 +19010,9 @@ class BackupWorker:
                 # extra_data == {"partition_reconciled": true} and nothing
                 # else — the operator saw "Partial" with no cause anywhere on
                 # the row (observed on "IT Projects", both runs, 2026-08-13).
-                if not _pf_degraded and _derived_status == SnapshotStatus.PARTIAL:
+                # FAILED too: an all-shards-failed run read "Failed: no reason
+                # recorded" (OneDrive — Amit Mishra, 2026-11-06).
+                if not _pf_degraded and _derived_status in (SnapshotStatus.PARTIAL, SnapshotStatus.FAILED):
                     _pf_degraded = partition_loss_degraded_reason(
                         lost_files=int(getattr(derived_row, "lost_files", 0) or 0),
                         shards_lossy=_d_lossy,
@@ -19013,6 +19021,7 @@ class BackupWorker:
                         enumeration_incomplete=bool(
                             getattr(derived_row, "enum_incomplete", False)
                         ),
+                        first_error=getattr(derived_row, "first_error", None),
                     )
                     if _pf_degraded:
                         snap.extra_data = {
@@ -19206,6 +19215,10 @@ class BackupWorker:
             f"{persisted_count} items, "
             f"{persisted_bytes / (1024 * 1024):.1f} MB)"
         )
+        # Rescues that landed before this finalize leave FAILED shards behind;
+        # settle now or nothing ever will (no further rescue fires).
+        if new_status in ("FAILED", "PARTIAL"):
+            await self._settle_rescued_onedrive_snapshot(snapshot_id)
 
         # Emit partitioned-snapshot metrics. Same shape as complete_snapshot
         # so dashboards aggregate cleanly across partitioned and
@@ -22096,6 +22109,22 @@ class BackupWorker:
                 error=error, permanent=permanent, delay_seconds=delay)
             await session.commit()
 
+    async def _settle_rescued_onedrive_snapshot(self, snapshot_id) -> None:
+        """FAILED/PARTIAL → COMPLETED once the retry queue rescued every lost
+        file (shared/onedrive_rescue_settle.py). Best-effort: never fails a
+        rescue or a finalize."""
+        from shared.onedrive_rescue_settle import settle_rescued_onedrive_snapshot
+        try:
+            async with async_session_factory() as session:
+                settled = await settle_rescued_onedrive_snapshot(session, snapshot_id)
+                await session.commit()
+            if settled:
+                print(f"[{self.worker_id}] [ONEDRIVE_RETRY] snapshot {snapshot_id} "
+                      f"settled COMPLETED: every lost file rescued")
+        except Exception as exc:
+            print(f"[{self.worker_id}] [ONEDRIVE_RETRY] settle {snapshot_id} failed: "
+                  f"{type(exc).__name__}: {exc}")
+
     async def _retry_one_onedrive_file(self, *, retry_id, attempt: int,
                                        max_attempts: int, lease_seconds: float, retry_slot) -> None:
         from shared.onedrive_retry import owned_retry, renew_retry, RetryOwnershipLost
@@ -22162,6 +22191,7 @@ class BackupWorker:
             ok, error = await asyncio.wait_for(transfer, timeout=timeout) if timeout > 0 else await transfer
             if ok:
                 print(f"[{self.worker_id}] [ONEDRIVE_RETRY] {retry_id} RESCUED on attempt {attempt}")
+                await self._settle_rescued_onedrive_snapshot(row.snapshot_id)
             else:
                 await release(error)
         except asyncio.CancelledError:

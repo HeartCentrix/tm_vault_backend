@@ -3889,6 +3889,13 @@ async def _job_retry_tick() -> int:
                AND s.completed_at <= NOW() - make_interval(mins => :delay)
                -- a user cancel is final, not a failure to retry
                AND coalesce(s.extra_data->>'cancelled_at', '') = ''
+               -- per-file rescues still owed may settle it COMPLETED; a
+               -- re-run now re-copies the whole drive (127 GiB, 2026-11-06)
+               AND NOT EXISTS (
+                     SELECT 1 FROM onedrive_file_retries q
+                      WHERE q.snapshot_id = s.id
+                        AND q.status IN ('PENDING','IN_PROGRESS')
+                   )
                -- a failure the worker marked deterministic (e.g. the
                -- archive coverage gate) re-fails identically — retrying
                -- it is pure load. Absent flag = retryable.
