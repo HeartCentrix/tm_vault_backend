@@ -3063,7 +3063,11 @@ async def sharepoint_download(
             SnapshotItem.folder_path.startswith(folder_path),
         )
         if snap_id:
-            stmt = stmt.where(SnapshotItem.snapshot_id == _parse_uuid(snap_id, "snapshotId"))
+            from shared.snapshot_reuse import SnapshotNotFound, items_scope   # an overlay inherits list rows
+            try:
+                stmt = stmt.where(await items_scope(db, _parse_uuid(snap_id, "snapshotId")))
+            except SnapshotNotFound:
+                raise HTTPException(status_code=404, detail="Snapshot not found")
         else:
             # Restrict to snapshots of this resource so a bare folderPath
             # can't bleed across sites.

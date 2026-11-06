@@ -1213,7 +1213,8 @@ async def _rebase_overlay(session, overlay_id, old_base, new_base):
         "INSERT INTO snapshot_overlay_removals (snapshot_id, item_type, external_id) "
         "SELECT CAST(:o AS uuid), h.item_type, h.external_id FROM snapshot_items h "
         "WHERE h.snapshot_id = CAST(:h AS uuid) AND h.item_type IN ('EMAIL', 'EMAIL_ATTACHMENT', "
-        "'ARCHIVE_ITEM', 'ARCHIVE_ATTACHMENT', 'TEAMS_CHAT_MESSAGE', 'CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT') "
+        "'ARCHIVE_ITEM', 'ARCHIVE_ATTACHMENT', 'TEAMS_CHAT_MESSAGE', 'CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT', "
+        "'SHAREPOINT_LIST', 'SHAREPOINT_FILE', 'SHAREPOINT_FOLDER', 'SHAREPOINT_LIST_ITEM') "
         "AND NOT EXISTS (SELECT 1 FROM snapshot_items_effective(CAST(:o AS uuid)) e "
         "                 WHERE e.item_type = h.item_type AND e.external_id = h.external_id) "
         "ON CONFLICT DO NOTHING"), {"o": str(overlay_id), "h": str(new_base)})

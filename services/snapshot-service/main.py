@@ -4342,8 +4342,8 @@ _SP_SITE_ROW_IDS = """
         ORDER BY si.external_id, p.created_at DESC, si.id DESC)
     SELECT id FROM files WHERE is_deleted IS NOT TRUE
     UNION ALL
-    SELECT si.id FROM snapshot_items si
-    WHERE si.snapshot_id = :sid AND si.item_type <> 'FILE' AND si.is_deleted IS NOT TRUE"""
+    SELECT si.id FROM snapshot_items_effective(CAST(:sid AS uuid)) si   -- an overlay inherits unchanged list rows
+    WHERE si.item_type <> 'FILE' AND si.is_deleted IS NOT TRUE"""
 
 
 def _sharepoint_library_folder(item: SnapshotItem, libraries: list) -> Optional[str]:
@@ -4380,7 +4380,7 @@ async def _sharepoint_site_files(db, snapshot: Snapshot, *, page: int, size: int
     libraries = []
     if any((i.folder_path or "").startswith("/drives/") for i in items):
         for row in (await db.execute(select(SnapshotItem.name, SnapshotItem.extra_data, SnapshotItem.folder_path).where(
-                SnapshotItem.snapshot_id == snapshot.id, SnapshotItem.item_type == "SHAREPOINT_LIST"))).all():
+                await items_scope(db, snapshot.id), SnapshotItem.item_type == "SHAREPOINT_LIST"))).all():
             md = row.extra_data or {}
             if md.get("web_url"):
                 libraries.append((unquote(md["web_url"]).rstrip("/"), row.name,

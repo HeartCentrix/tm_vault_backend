@@ -25,7 +25,8 @@ CREATE OR REPLACE FUNCTION snapshot_items_effective(p_snapshot_id uuid)
                                   JOIN snapshots t ON t.id = COALESCE(s.reuse_chain_root_id, s.id)
                                  WHERE s.id = p_snapshot_id)
            AND b.item_type IN ('EMAIL', 'EMAIL_ATTACHMENT', 'ARCHIVE_ITEM', 'ARCHIVE_ATTACHMENT',
-                               'TEAMS_CHAT_MESSAGE', 'CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT')
+                               'TEAMS_CHAT_MESSAGE', 'CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT',
+                               'SHAREPOINT_LIST', 'SHAREPOINT_FILE', 'SHAREPOINT_FOLDER', 'SHAREPOINT_LIST_ITEM')
            AND NOT EXISTS (SELECT 1 FROM snapshot_items o
                             WHERE o.snapshot_id = (SELECT COALESCE(s.reuse_chain_root_id, s.id) FROM snapshots s
                                                     WHERE s.id = p_snapshot_id)

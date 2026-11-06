@@ -93,6 +93,9 @@ SNAPSHOT = UUID("00000000-0000-0000-0000-0000000000a1")
 class Session:
     """The snapshot's list row for Site Assets (its web_url is the library's root folder)."""
 
+    async def execute(self, stmt, params=None):   # shared.snapshot_reuse.items_scope: a full snapshot
+        return SimpleNamespace(first=lambda: SimpleNamespace(target_id=SNAPSHOT, overlay_base_id=None))
+
     async def scalar(self, stmt):
         sql = str(stmt.compile(compile_kwargs={"literal_binds": True}))
         assert "'list-sa'" in sql and SNAPSHOT.hex in sql and "'SHAREPOINT_LIST'" in sql, sql
