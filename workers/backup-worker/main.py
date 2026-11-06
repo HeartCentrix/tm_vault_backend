@@ -28311,9 +28311,14 @@ class BackupWorker:
         # strand messages the cursors would otherwise skip next run.
         await _raise_if_job_cancelled(getattr(snapshot, "job_id", None))
 
+        held_fids: Set[str] = set()
         fresh_count, fresh_bytes, persist_failed_fids = await self._persist_tier1_mail_items(
-            graph_client, resource, snapshot, tenant, items,
+            graph_client, resource, snapshot, tenant, items, held_out=held_fids,
         )
+        if held_fids:
+            ok_keys -= held_fids
+            print(f"[{self.worker_id}]   [TIER1-MAIL] {len(held_fids)} folder(s) keep their cursor: an "
+                  f"attachment list came back corrupt twice from Microsoft (not a failure)")
         if persist_failed_fids:
             # Rows for these folders did not all land: their cursors must
             # not advance (the next run re-fetches idempotently).
@@ -28641,6 +28646,7 @@ class BackupWorker:
         snapshot: Snapshot,
         tenant: Tenant,
         items: List[Dict[str, Any]],
+        held_out: Optional[Set[str]] = None,
     ) -> Tuple[int, int, Set[str]]:
         """Persist Tier-1 mailbox messages (blob + inline raw + source_mailbox
         rows) and the attachments of those flagged hasAttachments. Extracted
@@ -28742,11 +28748,15 @@ class BackupWorker:
         att_msgs = [m for m in items if m.get("hasAttachments")]
         if att_msgs:
             att_failed: Set[str] = set()
+            att_held: Set[str] = set()
             att_count, att_bytes = await self._backup_message_attachments(
                 graph_client, resource, snapshot, tenant, container, shard, att_msgs,
-                failed_out=att_failed,
+                failed_out=att_failed, held_out=att_held,
             )
             failed_msg_ids_all |= att_failed
+            if held_out is not None:
+                held_out |= {str(m.get("_source_folder_id")) for m in att_msgs
+                             if str(m.get("id")) in att_held and m.get("_source_folder_id")}
             item_count += att_count
             bytes_added += att_bytes
             print(f"[{self.worker_id}]   [ATTACHMENTS] Captured {att_count} email attachment(s), {att_bytes} bytes")
@@ -28767,6 +28777,7 @@ class BackupWorker:
         shard,
         messages_with_attachments: List[Dict[str, Any]],
         failed_out: Optional[Set[str]] = None,
+        held_out: Optional[Set[str]] = None,
     ) -> Tuple[int, int]:
         """For each message flagged hasAttachments, list and capture its
         attachments. fileAttachment binaries are downloaded as separate blobs;
@@ -28784,9 +28795,25 @@ class BackupWorker:
                 return [], 0
             async with sem:
                 try:
-                    attachments = await graph_client.list_message_attachments(
-                        resource.external_id, msg_id,
-                    )
+                    try:
+                        attachments = await graph_client.list_message_attachments(
+                            resource.external_id, msg_id,
+                        )
+                    except httpx.DecodingError:
+                        # Microsoft sometimes sends a corrupt gzip body: ask once more.
+                        attachments = await graph_client.list_message_attachments(
+                            resource.external_id, msg_id,
+                        )
+                except httpx.DecodingError as e:
+                    # Twice corrupt: not a failed backup. Say why; the folder's cursor holds so
+                    # the next run reads this message's attachments again.
+                    print(f"[{self.worker_id}]   [ATTACHMENT LIST] msg {msg_id}: Microsoft returned a corrupt "
+                          f"compressed response twice ({e}); attachments re-read next run")
+                    if held_out is not None:
+                        held_out.add(str(msg_id))
+                    elif failed_out is not None:
+                        failed_out.add(str(msg_id))
+                    return [], 0
                 except Exception as e:
                     print(f"[{self.worker_id}]   [ATTACHMENT LIST FAIL] msg {msg_id}: {type(e).__name__}: {e}")
                     if failed_out is not None:
