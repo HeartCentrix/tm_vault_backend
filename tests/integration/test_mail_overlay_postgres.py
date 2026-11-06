@@ -741,3 +741,34 @@ async def test_blobs_of_a_base_an_overlay_still_reads_are_protected(twin, db):
     async with db.factory() as session:
         assert await resolve_protected_reuse_roots(session, [base]) == {base}
         assert await resolve_protected_reuse_roots(session, t.overlay.snapshots) == set()
+
+
+async def test_partitioned_mailbox_union_carry_builds_an_overlay(db, carry, monkeypatch):
+    """TM's big mailboxes are partitioned: the winning finalizer unions every shard's tombstones
+    and excluded folders and carries once - that carry must become the overlay too."""
+    worker_module = _worker_module()
+    worker = worker_module.BackupWorker.__new__(worker_module.BackupWorker)
+    worker.worker_id = "overlay-test"
+    box = Mailbox(db, carry, monkeypatch, await db.resource(), overlay=True)
+    await box.run(add=[(f"m{n:03d}", ("Inbox", "Archive")[n % 2], n % 2) for n in range(40)])
+    base = box.snapshots[-1]
+    sid, job = await db.snapshot(box.rid)
+    await db.item(sid, "fresh-1", metadata={"raw": {"parentFolderId": "fid-inbox"}})
+    async with db.factory.begin() as session:
+        for index, (tombs, paths) in enumerate(((["m002"], []), ([], ["Archive"]))):
+            session.add(models.SnapshotPartition(
+                snapshot_id=sid, tenant_id=db.tenant, resource_id=box.rid, job_id=job, partition_type="MAIL_FOLDERS",
+                partition_index=index, status="COMPLETED", total_files=1,
+                payload={"folder_ids": [f"f{index}"], "carry_forward": {
+                    "excluded_paths": paths, "tombstoned_ids": tombs, "resumed_any": True,
+                    "drained_keys": [f"f{index}"]}}))
+    for msg in [m for m, v in box.messages.items() if v["folder"] == "Archive"]:   # re-bootstrapped folder
+        for row in box._rows(msg):
+            await db.item(sid, row.pop("external_id"), row.pop("item_type"), **row)
+    monkeypatch.setenv("MAIL_OVERLAY_ENABLED", "true")
+    monkeypatch.setenv("MAIL_OVERLAY_MAX_RATIO", "1")   # half the mailbox re-bootstrapped this run
+    await worker._carry_forward_partitioned_user_mail_inner(sid)
+    shape = await box.shape(sid)
+    assert shape[0] == base
+    names = {r[1] for r in await box.inventory(sid) if r[0] == "EMAIL"}
+    assert "fresh-1" in names and "m002" not in names and len(names) == 40
