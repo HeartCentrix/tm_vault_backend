@@ -9,10 +9,13 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import logging
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
 from sqlalchemy import func, select, text, update
+
+logger = logging.getLogger(__name__)
 from sqlalchemy.dialects.postgresql import insert
 
 from shared.models import ArchiveFolderWork as Folder, ArchiveItemWork as Item
@@ -569,15 +572,25 @@ class ArchiveCapture:
         if os.getenv('ARCHIVE_UNCHANGED_REUSE_ENABLED', 'true').strip().lower() in ('0', 'false', 'no', 'off'):
             return False
         census = await self.summary()
-        if census['scopes_pending'] or census['folders_failed'] or not census['items_enumerated']:
+        if census['scopes_pending'] or not census['items_enumerated']:
             return False
         from shared.snapshot_reuse import point_at
         async with self.factory.begin() as db:
             await self.lock(db)
             prior = await db.get(Snapshot, prior_id, with_for_update={'read': True})
-            if (not prior or prior.resource_id != self.fence.resource_id or prior.status.value != 'COMPLETED'
+            if (not prior or prior.resource_id != self.fence.resource_id
                     or (prior.extra_data or {}).get('cancelled_at') or (prior.extra_data or {}).get('copy_required_failed')):
                 return False
+            # A PARTIAL prior qualifies only when this run failed on exactly the same folders, same
+            # step, same error (TM: the same 4 archive folders return Microsoft HTTP 500 every run).
+            gaps = []
+            if census['folders_failed'] or prior.status.value != 'COMPLETED':
+                if prior.status.value != 'PARTIAL':
+                    return False
+                gaps = await self._failed_folders(db, self.fence.snapshot_id, self.generation)
+                prior_generation = ((prior.extra_data or {}).get('archive_capture') or {}).get('generation')
+                if not gaps or not prior_generation or gaps != await self._failed_folders(db, prior_id, prior_generation):
+                    return False
             counts = (await db.execute(text('''SELECT count(DISTINCT i.external_id) AS items,
                     count(*) FILTER (WHERE i.state<>'copy_pending') AS changed
                 FROM archive_item_work i JOIN archive_folder_work f ON f.snapshot_id=i.snapshot_id
@@ -588,8 +601,12 @@ class ArchiveCapture:
             if counts.changed or counts.items != prior_items:
                 return False
             if not await point_at(db, target_snapshot_id=self.fence.snapshot_id, prior_snapshot_id=prior_id,
-                                  marker='archive_reused_prior'):
+                                  marker='archive_reused_partial_prior' if gaps else 'archive_reused_prior'):
                 return False
+            if gaps:
+                logger.warning('[ARCHIVE] reused PARTIAL prior %s: unchanged items and the same %d failed folder(s) '
+                               'as last run (%s); the gap stays recorded on this backup', prior_id, len(gaps),
+                               ', '.join(f'{path or "/"} [{kind}]' for _, path, kind in gaps[:5]))
             await db.execute(text('''UPDATE archive_item_work i SET state='stored', receipt_item_id=s.id,
                 receipt=json_build_object('kind','reuse','change_key',i.change_key,'hash',s.content_hash,'size',s.content_size,
                     'blob_path',s.blob_path,'backend_id',s.backend_id::text,'encryption_key_id',s.encryption_key_id,
@@ -598,6 +615,16 @@ class ArchiveCapture:
                   AND s.snapshot_id=:prior AND s.item_type='ARCHIVE_ITEM' AND s.external_id=i.external_id'''),
                 self.params(prior=prior_id))
         return True
+
+    @staticmethod
+    async def _failed_folders(db, snapshot_id, generation):
+        """Sorted (phase, path, gap) of a capture's unreadable folder scopes, as summary() counts them."""
+        rows = await db.execute(text('''SELECT phase, COALESCE(display_path,''), COALESCE(gap_kind,'') FROM archive_folder_work
+            WHERE snapshot_id=:sid AND capture_generation=:gen AND phase NOT IN ('receipt','membership') AND state<>'excluded'
+              AND (state<>'complete' OR NOT terminal_page OR (evidence->'count_reconciliation' IS NOT NULL AND
+                   COALESCE(evidence->'count_reconciliation'->>'stable','false')<>'true'))'''),
+            {'sid': snapshot_id, 'gen': generation})
+        return sorted(tuple(r) for r in rows)
 
     async def fail_items(self, ids, kind):
         async with self.factory.begin() as db:

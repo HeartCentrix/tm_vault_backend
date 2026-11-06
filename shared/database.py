@@ -408,6 +408,59 @@ async def verify_runtime_schema() -> bool:
         return await _has_required_catalogue_constraints(conn)
 
 
+SNAPSHOT_REUSE_VALIDATE_FUNCTION = """CREATE OR REPLACE FUNCTION validate_snapshot_reuse_target()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            IF NEW.reuse_of_snapshot_id IS NULL
+               AND NEW.reuse_chain_root_id IS NULL THEN
+                RETURN NEW;
+            END IF;
+            IF NEW.reuse_of_snapshot_id IS NULL
+               OR  NEW.reuse_chain_root_id IS NULL THEN
+                RAISE EXCEPTION
+                    'snapshot % reuse columns must both be NULL or both NOT NULL',
+                    NEW.id;
+            END IF;
+            -- Parent must be a COMPLETED snapshot of the same resource
+            -- taken strictly earlier than this one.
+            PERFORM 1
+               FROM snapshots p
+              WHERE p.id = NEW.reuse_of_snapshot_id
+                AND p.resource_id = NEW.resource_id
+                AND (p.status = 'COMPLETED'::snapshotstatus
+                     -- An archive whose only gaps are the same Microsoft-side
+                     -- folders as its prior may reuse that PARTIAL prior; the
+                     -- marker is written in the same UPDATE (point_at).
+                     OR (p.status = 'PARTIAL'::snapshotstatus
+                         AND COALESCE(NEW.extra_data::jsonb, '{}'::jsonb) ? 'archive_reused_partial_prior'))
+                AND COALESCE(p.started_at, p.created_at)
+                  < COALESCE(NEW.started_at, NEW.created_at);
+            IF NOT FOUND THEN
+                RAISE EXCEPTION
+                    'reuse_of_snapshot_id % invalid for snapshot % '
+                    '(must be COMPLETED, same resource, earlier started_at)',
+                    NEW.reuse_of_snapshot_id, NEW.id;
+            END IF;
+            -- Chain root must point at a full snapshot of the same
+            -- resource (reuse_of_snapshot_id IS NULL on that row).
+            -- When the parent itself is a full snapshot the chain
+            -- root equals the parent; otherwise it inherits.
+            PERFORM 1
+               FROM snapshots r
+              WHERE r.id = NEW.reuse_chain_root_id
+                AND r.resource_id = NEW.resource_id
+                AND r.reuse_of_snapshot_id IS NULL;
+            IF NOT FOUND THEN
+                RAISE EXCEPTION
+                    'reuse_chain_root_id % invalid for snapshot % '
+                    '(must be a full snapshot of the same resource)',
+                    NEW.reuse_chain_root_id, NEW.id;
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;"""
+
+
 async def init_db() -> None:
     """Verify at runtime; explicit offline bootstrap retains the legacy schema setup."""
     mode = os.getenv("DB_SCHEMA_MODE", "verify").lower()
@@ -1701,52 +1754,7 @@ async def init_db() -> None:
         # bypass. The reuse_chain_root_id must also be either NULL
         # (when reuse_of_snapshot_id is NULL) or point at a full
         # snapshot of the same resource.
-        """CREATE OR REPLACE FUNCTION validate_snapshot_reuse_target()
-        RETURNS TRIGGER AS $$
-        BEGIN
-            IF NEW.reuse_of_snapshot_id IS NULL
-               AND NEW.reuse_chain_root_id IS NULL THEN
-                RETURN NEW;
-            END IF;
-            IF NEW.reuse_of_snapshot_id IS NULL
-               OR  NEW.reuse_chain_root_id IS NULL THEN
-                RAISE EXCEPTION
-                    'snapshot % reuse columns must both be NULL or both NOT NULL',
-                    NEW.id;
-            END IF;
-            -- Parent must be a COMPLETED snapshot of the same resource
-            -- taken strictly earlier than this one.
-            PERFORM 1
-               FROM snapshots p
-              WHERE p.id = NEW.reuse_of_snapshot_id
-                AND p.resource_id = NEW.resource_id
-                AND p.status = 'COMPLETED'::snapshotstatus
-                AND COALESCE(p.started_at, p.created_at)
-                  < COALESCE(NEW.started_at, NEW.created_at);
-            IF NOT FOUND THEN
-                RAISE EXCEPTION
-                    'reuse_of_snapshot_id % invalid for snapshot % '
-                    '(must be COMPLETED, same resource, earlier started_at)',
-                    NEW.reuse_of_snapshot_id, NEW.id;
-            END IF;
-            -- Chain root must point at a full snapshot of the same
-            -- resource (reuse_of_snapshot_id IS NULL on that row).
-            -- When the parent itself is a full snapshot the chain
-            -- root equals the parent; otherwise it inherits.
-            PERFORM 1
-               FROM snapshots r
-              WHERE r.id = NEW.reuse_chain_root_id
-                AND r.resource_id = NEW.resource_id
-                AND r.reuse_of_snapshot_id IS NULL;
-            IF NOT FOUND THEN
-                RAISE EXCEPTION
-                    'reuse_chain_root_id % invalid for snapshot % '
-                    '(must be a full snapshot of the same resource)',
-                    NEW.reuse_chain_root_id, NEW.id;
-            END IF;
-            RETURN NEW;
-        END;
-        $$ LANGUAGE plpgsql;""",
+        SNAPSHOT_REUSE_VALIDATE_FUNCTION,
         # Trigger is dropped+recreated so re-runs pick up function
         # changes without leaving a stale binding.
         "DROP TRIGGER IF EXISTS snapshots_reuse_validate ON snapshots;",
