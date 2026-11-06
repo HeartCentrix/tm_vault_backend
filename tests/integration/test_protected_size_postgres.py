@@ -1461,3 +1461,46 @@ async def test_future_split_owner_attachment_is_rejected_atomically(runtime_stor
             await db.scalar(text("SELECT discovery_epoch FROM protected_size_control"))
             == before
         )
+
+
+async def test_per_row_statements_in_one_transaction_share_journal_rows(ledger):
+    """ORM add_all reaches asyncpg as executemany: one statement (and trigger fire) per row.
+    One transaction's fires must coalesce into <=1000-item journal rows, totals unchanged."""
+    from datetime import datetime
+
+    from shared.protected_size import optimized_rollup
+
+    a, b = await ledger.snapshot(), await ledger.snapshot()
+    row = "INSERT INTO snapshot_items VALUES(:i,:s,:k,'mail',:z,false,:w)"
+    first = [{"i": uuid4(), "s": a, "k": f"k{n}", "z": n, "w": datetime(2026, 1, 1)} for n in range(1500)]
+    async with ledger.factory.begin() as db:
+        await db.execute(text(row), first)
+    events = "SELECT count(*), COALESCE(sum(cardinality(item_ids)),0) FROM protected_size_journal WHERE kind='items'"
+    assert tuple((await ledger.sql(events)).one()) == (2, 1500)
+    assert (await ledger.sql("SELECT count(*) FROM protected_size_targets t JOIN protected_size_journal j ON j.id=t.event_id WHERE j.kind='items'")).scalar() == 2
+    # Copy-forward, an update of a row inserted in the same transaction, a rolled-back
+    # savepoint and a delete, all in one transaction; then a second resource's items.
+    changed = uuid4()
+    async with ledger.factory.begin() as db:
+        await db.execute(
+            text("INSERT INTO snapshot_items SELECT gen_random_uuid(),:b,external_id,item_type,content_size,false,"
+                 "'2026-02-01' FROM snapshot_items WHERE snapshot_id=:a"), {"a": a, "b": b})
+        await db.execute(text(row), [{"i": changed, "s": b, "k": "new", "z": 5, "w": datetime(2026, 3, 1)}])
+        await db.execute(text("UPDATE snapshot_items SET content_size=7 WHERE id=:i"), {"i": changed})
+        nested = await db.begin_nested()
+        await db.execute(text(row), [{"i": uuid4(), "s": b, "k": "gone", "z": 1000, "w": datetime(2026, 3, 1)}])
+        await nested.rollback()
+        await db.execute(text(row), [{"i": uuid4(), "s": b, "k": "kept", "z": 3, "w": datetime(2026, 3, 1)}])
+        await db.execute(text("DELETE FROM snapshot_items WHERE snapshot_id=:b AND external_id='k1'"), {"b": b})
+    r2 = uuid4()
+    await ledger.sql("INSERT INTO resources VALUES(:r,:t,'USER_CHATS')", r=r2, t=ledger.tenant)
+    c = await ledger.snapshot(resource_id=r2)
+    async with ledger.factory.begin() as db:
+        await db.execute(text(row), [{"i": uuid4(), "s": c, "k": f"c{n}", "z": 2, "w": datetime(2026, 1, 1)} for n in range(10)])
+    assert (await ledger.sql("SELECT max(cardinality(item_ids)) FROM protected_size_journal")).scalar() <= 1000
+    assert (await ledger.sql(events)).scalar() <= 8
+    await ledger.drain(limit=200, page_size=1000)
+    expected = (await ledger.sql(optimized_rollup, rid=ledger.resource)).scalar()
+    assert expected == sum(range(1500)) + 7 + 3
+    assert (await ledger.summary(types=("USER_MAIL",)))["totalBytes"] == expected
+    assert (await ledger.summary(types=("USER_CHATS",)))["totalBytes"] == 20
