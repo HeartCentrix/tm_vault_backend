@@ -21274,9 +21274,8 @@ class BackupWorker:
         # held 788/788 blobs. The flush re-verifies each reused receipt against
         # Graph exactly like a fresh download, and retention keeps a blob while
         # any item still references it (select_deletable_blob_paths).
-        # ponytail: a source snapshot whose retention delete is already past
-        # the reference check could race this; PENDING_DELETION is excluded.
         reused: set = set()
+        reuse_source_items = {}
         wanted = [fid for fid, f in current_files.items()
                   if not checkpoint.is_done(fid) and int(f.get("size") or 0) > 0]
         if wanted:
@@ -21294,6 +21293,7 @@ class BackupWorker:
                         SnapshotItem.external_id, SnapshotItem.blob_path,
                         SnapshotItem.content_size, SnapshotItem.content_hash,
                         SnapshotItem.extra_data, SnapshotItem.snapshot_id,
+                        SnapshotItem.id, SnapshotItem.content_checksum,
                     ).where(
                         SnapshotItem.snapshot_id.in_(prior_snaps),
                         SnapshotItem.tenant_id == tenant.id,
@@ -21302,21 +21302,73 @@ class BackupWorker:
                         SnapshotItem.blob_path.is_not(None), SnapshotItem.blob_path != "",
                         SnapshotItem.is_deleted.is_(False),
                     ).order_by(SnapshotItem.created_at.desc()))).all()
-                    for external_id, blob_path, size, sha, metadata, source_snap in priors:
+                    for external_id, blob_path, size, sha, metadata, source_snap, source_item, checksum in priors:
                         source = (metadata or {}).get("onedrive_download_source")
                         if external_id in reused or not file_receipt_matches(
                                 source=source, current=current_files[external_id],
                                 drive_id=drive_id, blob_path=blob_path, content_size=size):
                             continue
                         reused.add(external_id)
+                        reuse_source_items[external_id] = source_item
                         download_sources[external_id] = source
-                        updates.append((external_id, blob_path, size, sha or "", {
+                        updates.append((external_id, blob_path, size, checksum or sha or "", {
                             "raw": current_files[external_id],
                             "sha256": (metadata or {}).get("sha256"),
                             "quickxor": (metadata or {}).get("quickxor"),
                             "reused_from_snapshot": str(source_snap),
                             "blobbed_at": datetime.utcnow().isoformat() + "Z",
                         }))
+                if reused:
+                    # Pin references before Graph I/O. Cleanup must first claim
+                    # the donor snapshot; SHARE locks serialize that claim with
+                    # this target-link commit. A claim that won becomes a miss.
+                    live = await _owned_snapshot(session)
+                    source_ids = sorted({uuid.UUID(row[4]["reused_from_snapshot"]) for row in updates})
+                    valid_sources = set((await session.scalars(select(Snapshot.id).where(
+                        Snapshot.id.in_(source_ids), Snapshot.resource_id == resource.id,
+                        Snapshot.backend_id == live.backend_id,
+                        Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL,
+                                             SnapshotStatus.FAILED]),
+                    ).order_by(Snapshot.id).with_for_update(read=True))).all())
+                    source_rows = (await session.scalars(select(SnapshotItem).where(
+                        SnapshotItem.id.in_(list(reuse_source_items.values())),
+                        SnapshotItem.snapshot_id.in_(valid_sources),
+                        SnapshotItem.is_deleted.is_(False),
+                    ).order_by(SnapshotItem.id).with_for_update(read=True))).all()
+                    sources = {item.id: item for item in source_rows}
+                    pinned = []
+                    for row in updates:
+                        ext_id, path, size, sha, _extra = row
+                        source = sources.get(reuse_source_items[ext_id])
+                        if (source is not None and source.blob_path == path
+                            and (source.content_checksum or source.content_hash or "") == sha
+                            and file_receipt_matches(
+                                source=(source.extra_data or {}).get("onedrive_download_source"),
+                                current=current_files[ext_id], drive_id=drive_id,
+                                blob_path=source.blob_path, content_size=source.content_size)):
+                            pinned.append(row)
+                        else:
+                            reused.discard(ext_id)
+                            download_sources.pop(ext_id, None)
+                    updates[:] = pinned
+                    for start in range(0, len(pinned), 500):
+                        params = {"sid": snapshot.id}
+                        values = []
+                        for i, (ext_id, path, size, sha, _extra) in enumerate(pinned[start:start + 500]):
+                            values.append(f"(:e{i}, :p{i}, CAST(:s{i} AS bigint), :h{i})")
+                            params.update({f"e{i}": ext_id, f"p{i}": path, f"s{i}": size, f"h{i}": sha})
+                        matched = (await session.execute(text(f"""
+                            UPDATE snapshot_items AS si
+                               SET blob_path = v.path, content_size = v.size,
+                                   content_hash = v.sha, content_checksum = v.sha
+                              FROM (VALUES {','.join(values)}) AS v(ext_id, path, size, sha)
+                             WHERE si.snapshot_id = :sid AND si.external_id = v.ext_id
+                               AND si.item_type = 'ONEDRIVE_FILE' AND si.is_deleted = false
+                            RETURNING si.external_id
+                        """), params)).scalars().all()
+                        if set(matched) != {row[0] for row in pinned[start:start + 500]}:
+                            raise RuntimeError("OneDrive required reuse target rows missing")
+                    await session.commit()
             if reused:
                 print(f"[{self.worker_id}] [USER_ONEDRIVE] {resource.display_name}: "
                       f"reusing {len(reused)} file(s) already stored by an earlier run")
