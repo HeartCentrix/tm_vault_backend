@@ -55,6 +55,14 @@ from shared.models import Resource, Snapshot, SnapshotItem  # noqa: E402
 from sqlalchemy.sql.elements import BooleanClauseList  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _full_snapshots(monkeypatch):
+    """These in-memory rows are full snapshots: chat_rows' overlay lookup (raw SQL) has nothing to model."""
+    async def plain(session, ids):
+        return SnapshotItem, SnapshotItem.snapshot_id.in_(list(ids))
+    monkeypatch.setattr(_ce, "chat_rows", plain)
+
+
 # ── in-memory rows ────────────────────────────────────────────────────────
 
 

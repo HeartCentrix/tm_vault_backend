@@ -9,6 +9,7 @@ before handing the list to the renderer.
 """
 from dataclasses import dataclass
 from types import SimpleNamespace
+from uuid import UUID
 from copy import deepcopy
 import logging
 import mimetypes
@@ -61,10 +62,13 @@ async def _catalogue_scope(sess, msgs, *, layout, effective, catalogue_ids):
     hydrated = list(by_version.values())
     children = []
     pairs = sorted(physical, key=lambda p: (str(p[0]), p[1]))
+    from shared.snapshot_reuse import chat_rows
+    SI, _ = await chat_rows(sess, catalogue_ids)   # an overlay's inherited children are its base's rows
     for start in range(0, len(pairs), 500):
-        batch = list((await sess.scalars(select(SnapshotItem).where(
-            SnapshotItem.item_type.in_(["CHAT_ATTACHMENT", "CHAT_HOSTED_CONTENT"]),
-            tuple_(SnapshotItem.snapshot_id, SnapshotItem.parent_external_id).in_(pairs[start:start + 500])))).all())
+        batch = list((await sess.scalars(select(SI).where(
+            SI.item_type.in_(["CHAT_ATTACHMENT", "CHAT_HOSTED_CONTENT"]),
+            tuple_(SI.snapshot_id, SI.parent_external_id).in_(pairs[start:start + 500]))
+            .execution_options(populate_existing=True))).all())
         children.extend(await materialize_chat_items(sess, batch))
     att_map, hosted_map, seen = {}, {}, set()
     for item in children:
@@ -115,8 +119,10 @@ async def resolve(sess, *, resource_id, snapshot_ids, thread_path: str | None,
     if not thread_path and not chat_id and not item_ids:
         raise ValueError("SCOPE_EMPTY")
     # A backup whose every chat was unchanged points at the full backup it reuses.
-    from shared.snapshot_reuse import resolve_snapshot_ids
+    from shared.snapshot_reuse import chat_rows, resolve_snapshot_ids
     snapshot_ids = [str(i) for i in await resolve_snapshot_ids(sess, snapshot_ids or [])]
+    # Overlay snapshots: inherited chats' rows are the base's, read labelled with the requested id.
+    SI, in_scope = await chat_rows(sess, snapshot_ids) if snapshot_ids else (SnapshotItem, None)
 
     Sn = aliased(Snapshot)
     CHAT_TYPES = ["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"]
@@ -132,28 +138,31 @@ async def resolve(sess, *, resource_id, snapshot_ids, thread_path: str | None,
     if chat_id:
         q = await chat_message_statement(sess, snapshot_ids=snapshot_ids, chat_id=chat_id,
             thread_path=thread_path, resource_ids=resource_ids)
-        msgs = list((await sess.execute(q.order_by(SnapshotItem.created_at.asc()))).scalars())
+        msgs = list((await sess.execute(q.order_by(q.selected_columns.created_at.asc()))).scalars())
         layout = "single_thread"
         effective = await captured_chat_path(sess, snapshot_ids[0], chat_id)
     elif thread_path:
-        q = (select(SnapshotItem)
-             .join(Sn, Sn.id == SnapshotItem.snapshot_id)
+        q = (select(SI)
+             .join(Sn, Sn.id == SI.snapshot_id)
              .where(Sn.resource_id.in_(resource_ids))
-             .where(SnapshotItem.snapshot_id.in_(snapshot_ids))
-             .where(SnapshotItem.item_type.in_(CHAT_TYPES))
-             .where(SnapshotItem.folder_path == thread_path)
-             .order_by(SnapshotItem.created_at.asc()))
+             .where(SI.snapshot_id.in_(snapshot_ids))
+             .where(SI.item_type.in_(CHAT_TYPES))
+             .where(SI.folder_path == thread_path)
+             .order_by(SI.created_at.asc())
+             .execution_options(populate_existing=True))
         msgs = list((await sess.execute(q)).scalars())
         layout = "single_thread"
         effective = thread_path
     else:
-        q = (select(SnapshotItem)
-             .join(Sn, Sn.id == SnapshotItem.snapshot_id)
+        q = (select(SI)
+             .join(Sn, Sn.id == SI.snapshot_id)
              .where(Sn.resource_id.in_(resource_ids))
-             .where(SnapshotItem.id.in_(item_ids))
-             .order_by(SnapshotItem.created_at.asc()))
-        if snapshot_ids:
-            q = q.where(SnapshotItem.snapshot_id.in_(snapshot_ids))
+             # The overlay alias's columns are untyped: bind ids as UUIDs there.
+             .where(SI.id.in_(item_ids if SI is SnapshotItem else [UUID(str(i)) for i in item_ids]))
+             .order_by(SI.created_at.asc())
+             .execution_options(populate_existing=True))
+        if in_scope is not None:
+            q = q.where(in_scope)
         msgs = list((await sess.execute(q)).scalars())
         paths = {m.folder_path for m in msgs}
         if not paths:

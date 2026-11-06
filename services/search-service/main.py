@@ -257,11 +257,10 @@ async def reindex_snapshots(
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="Invalid snapshot id")
 
-    stmt = (
-        select(SnapshotItem)
-        .where(SnapshotItem.snapshot_id.in_(snapshot_uuids))
-        .limit(limit)
-    )
+    # An overlay's inventory includes the rows it inherits from its base.
+    from shared.snapshot_reuse import chat_rows
+    rows, scope = await chat_rows(db, snapshot_uuids)
+    stmt = select(rows).where(scope).limit(limit)
 
     result = await db.execute(stmt)
     items = result.scalars().all()

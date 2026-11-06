@@ -1126,10 +1126,13 @@ async def _rebase_overlay(session, overlay_id, old_base, new_base):
 
 
 async def _restate_counts(session, snapshot_id):
+    # Chat catalogue snapshots count primary items only (chat_catalogue_entry.catalogue_snapshot_result).
     await session.execute(text(
-        "UPDATE snapshots SET item_count = c.n, bytes_total = c.b FROM ("
-        "  SELECT count(*) AS n, COALESCE(sum(content_size), 0) AS b"
-        "    FROM snapshot_items_effective(CAST(:s AS uuid))) c WHERE id = CAST(:s AS uuid)"),
+        "UPDATE snapshots s SET (item_count, bytes_total) = ("
+        "  SELECT count(*) FILTER (WHERE s.extra_data::jsonb ->> 'chat_inventory_format' IS DISTINCT FROM '1'"
+        "                          OR e.item_type NOT IN ('CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT')),"
+        "         COALESCE(sum(e.content_size), 0)"
+        "    FROM snapshot_items_effective(s.id) e) WHERE s.id = CAST(:s AS uuid)"),
         {"s": str(snapshot_id)})
 
 

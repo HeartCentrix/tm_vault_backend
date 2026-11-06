@@ -43,7 +43,7 @@ from shared.models import (
     Tenant,
 )
 from shared.security import get_current_user_from_token
-from shared.snapshot_reuse import resolve_snapshot_ids
+from shared.snapshot_reuse import chat_rows, resolve_snapshot_ids
 from shared.chat_presentation import (ChatSelectionError, chat_message_statement,
     captured_chat_path, message_chat_id, child_chat_id)
 
@@ -77,10 +77,12 @@ class ChatExportRequest(BaseModel):
 
 
 async def _catalogue_estimate(sess, *, resource_ids, snapshot_ids, thread_path, item_ids, catalogue_ids, chat_id=None):
-    stmt = select(SnapshotItem).join(Snapshot, Snapshot.id == SnapshotItem.snapshot_id).where(
-        Snapshot.resource_id.in_(resource_ids), SnapshotItem.item_type.in_(CHAT_MSG_TYPES))
-    if snapshot_ids:
-        stmt = stmt.where(SnapshotItem.snapshot_id.in_(snapshot_ids))
+    # Overlay snapshots: inherited chats' rows are the base's, read labelled with the requested id.
+    SI, in_scope = await chat_rows(sess, snapshot_ids) if snapshot_ids else (SnapshotItem, None)
+    stmt = select(SI).join(Snapshot, Snapshot.id == SI.snapshot_id).where(
+        Snapshot.resource_id.in_(resource_ids), SI.item_type.in_(CHAT_MSG_TYPES)).execution_options(populate_existing=True)
+    if in_scope is not None:
+        stmt = stmt.where(in_scope)
     if chat_id:
         try:
             stmt = await chat_message_statement(sess, snapshot_ids=snapshot_ids, chat_id=chat_id,
@@ -88,7 +90,7 @@ async def _catalogue_estimate(sess, *, resource_ids, snapshot_ids, thread_path, 
         except ChatSelectionError as exc:
             raise HTTPException(400, detail={"error": str(exc)}) from exc
     else:
-        stmt = stmt.where(SnapshotItem.folder_path == thread_path) if thread_path else stmt.where(SnapshotItem.id.in_(item_ids))
+        stmt = stmt.where(SI.folder_path == thread_path) if thread_path else stmt.where(SI.id.in_(item_ids))
     messages = list((await sess.scalars(stmt)).all())
     if not messages:
         raise HTTPException(400, detail={"error": "SCOPE_EMPTY"})
@@ -114,9 +116,9 @@ async def _catalogue_estimate(sess, *, resource_ids, snapshot_ids, thread_path, 
     pairs = list({(m.snapshot_id, m.external_id) for m in messages})
     children = {}
     for start in range(0, len(pairs), 500):
-        rows = (await sess.execute(select(SnapshotItem.chat_version_id, SnapshotItem.content_size).where(
-            SnapshotItem.item_type.in_(["CHAT_ATTACHMENT", "CHAT_HOSTED_CONTENT"]),
-            tuple_(SnapshotItem.snapshot_id, SnapshotItem.parent_external_id).in_(pairs[start:start + 500])))).all()
+        rows = (await sess.execute(select(SI.chat_version_id, SI.content_size).where(
+            SI.item_type.in_(["CHAT_ATTACHMENT", "CHAT_HOSTED_CONTENT"]),
+            tuple_(SI.snapshot_id, SI.parent_external_id).in_(pairs[start:start + 500])))).all()
         for version_id, size in rows:
             if version_id is None:
                 raise HTTPException(409, detail={"error": "CAPTURE_INTEGRITY_GAP"})
@@ -155,10 +157,11 @@ async def _resolve_counts(
     resource_uuids = [resource_uuid, *child_ids]
 
     Sn = aliased(Snapshot)
+    SI, in_scope = await chat_rows(sess, snapshot_uuids) if snapshot_uuids else (SnapshotItem, None)
     base = (
-        select(func.count(), func.coalesce(func.sum(SnapshotItem.content_size), 0))
-        .select_from(SnapshotItem)
-        .join(Sn, Sn.id == SnapshotItem.snapshot_id)
+        select(func.count(), func.coalesce(func.sum(SI.content_size), 0))
+        .select_from(SI)
+        .join(Sn, Sn.id == SI.snapshot_id)
         .where(Sn.resource_id.in_(resource_uuids))
     )
     identity_stmt = None
@@ -169,15 +172,15 @@ async def _resolve_counts(
             effective = await captured_chat_path(sess, snapshot_uuids[0], chat_id)
         except ChatSelectionError as exc:
             raise HTTPException(400, detail={"error": str(exc)}) from exc
-        q = base.where(SnapshotItem.id.in_(identity_stmt.with_only_columns(SnapshotItem.id)))
+        q = base.where(SI.id.in_(select(identity_stmt.subquery().c.id)))
         layout = "single_thread"
     elif thread_path:
         if not snapshot_uuids:
             raise HTTPException(400, detail={"error": "SCOPE_EMPTY"})
         q = (
-            base.where(SnapshotItem.snapshot_id.in_(snapshot_uuids))
-            .where(SnapshotItem.item_type.in_(CHAT_MSG_TYPES))
-            .where(SnapshotItem.folder_path == thread_path)
+            base.where(in_scope)
+            .where(SI.item_type.in_(CHAT_MSG_TYPES))
+            .where(SI.folder_path == thread_path)
         )
         layout = "single_thread"
         effective = thread_path
@@ -185,16 +188,16 @@ async def _resolve_counts(
         # Multi-item case. Reject when items straddle multiple thread folders —
         # cross-thread merge isn't implemented yet (single-thread for v1).
         paths_q = (
-            select(SnapshotItem.folder_path)
-            .join(Sn, Sn.id == SnapshotItem.snapshot_id)
+            select(SI.folder_path)
+            .join(Sn, Sn.id == SI.snapshot_id)
             .where(Sn.resource_id.in_(resource_uuids))
-            .where(SnapshotItem.id.in_(item_uuids))
+            .where(SI.id.in_(item_uuids))
             .distinct()
         )
         paths = [r[0] for r in (await sess.execute(paths_q))]
         if not paths:
             raise HTTPException(400, detail={"error": "SCOPE_EMPTY"})
-        q = base.where(SnapshotItem.id.in_(item_uuids))
+        q = base.where(SI.id.in_(item_uuids))
         effective = paths[0]
         layout = "per_message"
 
@@ -211,21 +214,17 @@ async def _resolve_counts(
     # CHAT_HOSTED_CONTENT row carries), NOT snapshot-scoped (shared-chat
     # attachments live in the first drainer's snapshot), then de-duplicated
     # per logical child so carry-forward copies count once.
-    ext_ids_q = (
-        select(SnapshotItem.external_id, SnapshotItem.tenant_id, message_chat_id().label("chat_id"))
-        .join(Sn, Sn.id == SnapshotItem.snapshot_id)
-        .where(Sn.resource_id.in_(resource_uuids))
-    )
+    criteria = [Sn.resource_id.in_(resource_uuids)]
     if identity_stmt is not None:
-        ext_ids_q = ext_ids_q.where(SnapshotItem.id.in_(identity_stmt.with_only_columns(SnapshotItem.id)))
+        criteria.append(SI.id.in_(select(identity_stmt.subquery().c.id)))
     elif thread_path:
-        ext_ids_q = (
-            ext_ids_q.where(SnapshotItem.snapshot_id.in_(snapshot_uuids))
-            .where(SnapshotItem.folder_path == thread_path)
-            .where(SnapshotItem.item_type.in_(CHAT_MSG_TYPES))
-        )
+        criteria += [in_scope, SI.folder_path == thread_path, SI.item_type.in_(CHAT_MSG_TYPES)]
     else:
-        ext_ids_q = ext_ids_q.where(SnapshotItem.id.in_(item_uuids))
+        criteria.append(SI.id.in_(item_uuids))
+    ext_ids_q = select(SnapshotItem.external_id, SnapshotItem.tenant_id, message_chat_id().label("chat_id"))
+    # An overlay alias only selects: its columns are untyped, so read the same physical rows' typed ones.
+    ext_ids_q = (ext_ids_q.join(Sn, Sn.id == SnapshotItem.snapshot_id).where(*criteria) if SI is SnapshotItem
+        else ext_ids_q.where(SnapshotItem.id.in_(select(SI.id).join(Sn, Sn.id == SI.snapshot_id).where(*criteria))))
     msg_rows = (await sess.execute(ext_ids_q)).all()
     ext_ids = [r[0] for r in msg_rows]
     msg_tenant_ids = {r[1] for r in msg_rows if r[1] is not None}

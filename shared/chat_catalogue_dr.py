@@ -29,9 +29,10 @@ from shared.chat_catalogue_identity import (
     canonical_version_fingerprint, qualified_chat_item_key,
     observation_semantic, validate_observation_hash_version,
 )
+from shared.snapshot_reuse import chat_rows
 from shared.models import (ChatBlobObject, ChatCaptureAttempt, ChatInventory,
     ChatInventoryItem, ChatItemVersion, Resource, ResourceType, SlaPolicy, Snapshot,
-    SnapshotChatInventory, SnapshotItem, SnapshotStatus, StorageBackend)
+    SnapshotChatInventory, SnapshotStatus, StorageBackend)
 
 FORMAT = "chat-catalogue-dr-v1"
 CHUNK_BYTES = 1024 * 1024
@@ -160,9 +161,11 @@ async def _source_manifest(session_factory, snapshot_id, tenant_id, writer, targ
         writer.record("snapshot", {"format": FORMAT, "tenant_id": str(tenant_id), "snapshot": snapshot_data,
             "target": {"kind": target.kind, "backend_id": target.backend_id, "container": container,
                        "prefix": prefix}, "encryption": encryption, "source_policy": policy})
+        # An overlay's links are its effective rows (inherited chats relabelled to it), as its copy twin's.
+        links, links_scope = await chat_rows(session, [snapshot_id])
         inventory_ids = select(SnapshotChatInventory.inventory_id).where(SnapshotChatInventory.snapshot_id == snapshot_id)
         version_ids = select(ChatInventoryItem.version_id).where(ChatInventoryItem.inventory_id.in_(inventory_ids)).union(
-            select(SnapshotItem.chat_version_id).where(SnapshotItem.snapshot_id == snapshot_id, SnapshotItem.chat_version_id.is_not(None)))
+            select(links.chat_version_id).where(links_scope, links.chat_version_id.is_not(None)))
         object_ids = select(ChatItemVersion.object_id).where(ChatItemVersion.id.in_(version_ids), ChatItemVersion.object_id.is_not(None))
         attempts = select(SnapshotChatInventory.capture_attempt_id).where(SnapshotChatInventory.snapshot_id == snapshot_id).union(
             select(ChatInventory.capture_attempt_id).where(ChatInventory.id.in_(inventory_ids)))
@@ -178,7 +181,7 @@ async def _source_manifest(session_factory, snapshot_id, tenant_id, writer, targ
             ("association", select(SnapshotChatInventory).where(SnapshotChatInventory.snapshot_id == snapshot_id).order_by(SnapshotChatInventory.chat_id)),
             ("inventory_item", select(ChatInventoryItem).where(ChatInventoryItem.inventory_id.in_(inventory_ids)).order_by(ChatInventoryItem.inventory_id, ChatInventoryItem.logical_key)),
             ("version", select(ChatItemVersion).where(ChatItemVersion.id.in_(version_ids)).order_by(ChatItemVersion.id)),
-            ("link", select(SnapshotItem).where(SnapshotItem.snapshot_id == snapshot_id).order_by(SnapshotItem.id)),
+            ("link", select(links).where(links_scope).order_by(links.id)),
             ("object", select(ChatBlobObject).where(ChatBlobObject.id.in_(object_ids)).order_by(ChatBlobObject.id)),
         )
         for kind, statement in statements:

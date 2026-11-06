@@ -171,16 +171,17 @@ async def chat_rows(session: AsyncSession, snapshot_ids):
         source = func_effective(sid)
         parts.append(select(*[(literal(sid, PGUUID(as_uuid=True)) if c.name == "snapshot_id" else source.c[c.name]).label(c.name)
                               for c in columns]))
-    rows = (union_all(*parts) if len(parts) > 1 else parts[0]).subquery("chat_rows")
+    rows = (union_all(*parts) if len(parts) > 1 else parts[0]).subquery()   # anonymous: two chat_rows entities may share a statement
     entity = aliased(SnapshotItem, rows, adapt_on_names=True)
     return entity, entity.snapshot_id.in_(ids)
 
 
 def func_effective(snapshot_id):
-    from sqlalchemy import func
+    from sqlalchemy import column, func
     from shared.models import SnapshotItem
+    # Typed columns: readers apply JSON operators (extra_data["chat_id"]) to the alias.
     return func.snapshot_items_effective(snapshot_id).table_valued(
-        *[c.name for c in SnapshotItem.__table__.columns]).alias()
+        *[column(c.name, c.type) for c in SnapshotItem.__table__.columns]).alias()
 
 
 __all__ = [
