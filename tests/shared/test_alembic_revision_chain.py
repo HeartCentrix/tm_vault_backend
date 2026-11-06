@@ -69,6 +69,7 @@ EXPECTED_CHAIN = [
     ('0020', '0019'),            # activity rollup lookup indexes
     ('0021', '0020'),            # overlay mail snapshots
     ('0022', '0021'),            # SKIPPED snapshot status
+    ('0023', '0022'),            # cross-mailbox mail attachment reuse index
 ]
 
 # Substring that must appear in the module docstring of each pending revision,
@@ -90,6 +91,7 @@ PENDING_SUBJECTS = {
     "0020": "Activity rollup lookup indexes",
     "0021": "Overlay mail snapshots",
     "0022": "SKIPPED snapshot status",
+    "0023": "mail attachment reuse index",
 }
 
 
