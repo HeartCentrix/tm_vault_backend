@@ -13,7 +13,7 @@ from uuid import UUID
 from sqlalchemy import Text, cast, func, or_, select, text
 from sqlalchemy.dialects.postgresql import JSONB
 
-from shared.chat_catalogue import ChatCatalogueConflict, ChatCatalogueIntegrityError, ChatCatalogueWorkLeaseMoved
+from shared.chat_catalogue import ChatCatalogueConflict, ChatCatalogueIntegrityError, ChatCatalogueWorkLeaseMoved, compact_chat_overlay
 from shared.chat_catalogue_identity import CaptureResult, ChatCaptureScope, authentication_context_fingerprint
 from shared.db_retry import run_catalogue_transaction
 from shared.models import (ChatCaptureAttempt, ChatInventory, ChatInventoryItem, ChatItemVersion, Job, JobStatus,
@@ -762,6 +762,9 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
         snapshot = await lock_chat_catalogue_snapshot(session, snapshot_id=snapshot_id,
             snapshot_lease_token=snapshot_lease_token, partition_id=partition_id,
             partition_lease_token=partition_lease_token, job_lease_token=job_lease_token)
+        if snapshot.status == SnapshotStatus.IN_PROGRESS:
+            # Changed chats were staged whole after the overlay was built: keep only what changed.
+            await compact_chat_overlay(session, snapshot_id)
         result = await catalogue_snapshot_result(session, snapshot_id)
         if snapshot.status != SnapshotStatus.IN_PROGRESS:
             return result

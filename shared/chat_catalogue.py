@@ -786,22 +786,15 @@ async def _overlay_unchanged(session, params, expected) -> bool:
         return False   # rows the overlay function would not inherit
     nested = await session.begin_nested()
     await session.execute(text("UPDATE snapshots SET overlay_base_id = :base WHERE id = :snapshot"), p)
-    # Whole chats only: a chat whose every entry the base holds (same key, version, folder) is inherited,
-    # any other is copied entire, so a chat's messages and children always share one snapshot.
-    held = set(await session.scalars(text(
-        "SELECT c.inventory_id FROM unnest(CAST(:inventories AS uuid[]), CAST(:folders AS text[])) "
-        "AS c(inventory_id, folder) WHERE NOT EXISTS (SELECT 1 FROM chat_inventory_items ii "
-        "WHERE ii.inventory_id = c.inventory_id AND NOT EXISTS (SELECT 1 FROM snapshot_items b WHERE "
-        + _INHERITED + "))"), p))
-    pairs = list(zip(p["inventories"], p["folders"]))
-    keep = dict(p, inventories=[str(i) for i, _ in pairs if UUID(str(i)) in held],
-                folders=[f for i, f in pairs if UUID(str(i)) in held])
-    move = dict(p, inventories=[str(i) for i, _ in pairs if UUID(str(i)) not in held],
-                folders=[f for i, f in pairs if UUID(str(i)) not in held])
-    inherited = await session.scalar(text("SELECT count(*) " + _LINKED), keep)
+    # Per entry, not per chat: an entry the base holds (same key, version, folder) is inherited, any
+    # other is copied. Whole-chat copying re-wrote every message of a chat changed once since the base
+    # on every later run (Railway 2026-11-06: 4,084 identical rows + 4,084 removals on a no-change run).
+    inherited = await session.scalar(text(
+        "SELECT count(*) " + _LINKED + "WHERE EXISTS (SELECT 1 FROM snapshot_items b WHERE " + _INHERITED + ")"), p)
     copied = (await session.execute(text(
         _COPY_LINKED + "JOIN snapshot_items_effective(CAST(:source AS uuid)) si ON si.external_id = ii.logical_key "
-        "AND si.chat_version_id = ii.version_id"), move)).rowcount if move["inventories"] else 0
+        "AND si.chat_version_id = ii.version_id "
+        "WHERE NOT EXISTS (SELECT 1 FROM snapshot_items b WHERE " + _INHERITED + ")"), p)).rowcount
     if inherited + copied != expected:
         await nested.rollback()
         raise ChatCatalogueIntegrityError("unchanged chats' earlier rows differ from their inventories")
@@ -810,7 +803,7 @@ async def _overlay_unchanged(session, params, expected) -> bool:
         "SELECT :snapshot, b.item_type, b.external_id FROM snapshot_items b "
         "WHERE b.snapshot_id = :base AND NOT EXISTS (SELECT 1 FROM snapshot_items own "
         "  WHERE own.snapshot_id = :snapshot AND own.item_type = b.item_type AND own.external_id = b.external_id) "
-        "AND NOT EXISTS (SELECT 1 " + _LINKED + "WHERE " + _INHERITED + ") ON CONFLICT DO NOTHING"), keep)).rowcount
+        "AND NOT EXISTS (SELECT 1 " + _LINKED + "WHERE " + _INHERITED + ") ON CONFLICT DO NOTHING"), p)).rowcount
     own, base_rows = (await session.execute(text(
         "SELECT (SELECT count(*) FROM snapshot_items WHERE snapshot_id = :snapshot), "
         "(SELECT count(*) FROM snapshot_items WHERE snapshot_id = :base)"), p)).one()
@@ -828,6 +821,28 @@ async def _overlay_unchanged(session, params, expected) -> bool:
     logger.info("chat_overlay_built snapshot=%s base=%s inherited=%s copied=%s removed=%s base_rows=%s",
                 p["snapshot"], p["base"], inherited, copied, removed, base_rows)
     return True
+
+
+async def compact_chat_overlay(session, snapshot_id) -> int:
+    """Chats captured after the overlay was built (changed this run) were removed from the base whole and
+    staged whole. Drop each staged row the base holds identically, and its removal, so it is inherited:
+    the overlay keeps only what changed. snapshot_items_effective() is the same before and after.
+    Idempotent. ponytail: the staging write is still O(changed chat) once, on the day it changes;
+    skipping it needs the overlay decision before staging."""
+    base = await session.scalar(text("SELECT overlay_base_id FROM snapshots WHERE id = :s"), {"s": snapshot_id})
+    if base is None:
+        return 0
+    return (await session.execute(text(
+        "WITH dup AS (DELETE FROM snapshot_items own USING snapshot_items b "
+        "  WHERE own.snapshot_id = :s AND own.item_type = ANY(CAST(:types AS text[])) "
+        "    AND b.snapshot_id = :base AND b.item_type = own.item_type AND b.external_id = own.external_id "
+        "    AND b.chat_version_id IS NOT DISTINCT FROM own.chat_version_id AND b.folder_path IS NOT DISTINCT FROM own.folder_path "
+        "    AND b.blob_path IS NOT DISTINCT FROM own.blob_path AND b.parent_external_id IS NOT DISTINCT FROM own.parent_external_id "
+        "    AND b.is_deleted IS NOT DISTINCT FROM own.is_deleted AND b.backend_id IS NOT DISTINCT FROM own.backend_id "
+        "  RETURNING own.item_type, own.external_id) "
+        "DELETE FROM snapshot_overlay_removals r USING dup "
+        "WHERE r.snapshot_id = :s AND r.item_type = dup.item_type AND r.external_id = dup.external_id"),
+        {"s": str(snapshot_id), "base": str(base), "types": _CHAT_ROW_TYPES})).rowcount
 
 
 async def publish_unchanged_inventories(session, *, scopes, links, folders, source_snapshot_id) -> set:

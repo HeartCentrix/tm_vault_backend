@@ -31,6 +31,19 @@ async def own_rows(store, snapshot_id):
             {"s": snapshot_id})).all())
 
 
+async def keys_of(store, snapshot_id, chat):
+    async with store.factory() as session:
+        return set(await session.scalars(text(
+            "SELECT external_id FROM snapshot_items WHERE snapshot_id = :s AND metadata->>'chat_id' = :c"),
+            {"s": snapshot_id, "c": chat}))
+
+
+async def removals(store, snapshot_id):
+    async with store.factory() as session:
+        return set(await session.scalars(text(
+            "SELECT external_id FROM snapshot_overlay_removals WHERE snapshot_id = :s"), {"s": snapshot_id}))
+
+
 async def effective(store, snapshot_id):
     async with store.factory() as session:
         return sorted((await session.execute(text(
@@ -85,7 +98,11 @@ async def test_incremental_with_one_changed_chat_owns_only_that_chats_rows(store
         snapshot = await session.get(models.Snapshot, second.snapshot_id)
     assert snapshot.overlay_base_id == first.snapshot_id
     own = await own_rows(store, second.snapshot_id)
-    assert {chat for chat, *_ in own} == {"chat-beta"} and len(own) == 3
+    # Only beta's edited message is owned; its two unchanged messages are inherited from the base.
+    assert [chat for chat, *_ in own] == ["chat-beta"]
+    # Removed: the chat that left, and the edited message's earlier version; nothing else of beta.
+    assert await removals(store, second.snapshot_id) == (await keys_of(store, first.snapshot_id, "chat-delta")
+                                                          | {key for _, key, _ in own})
     assert await effective(store, second.snapshot_id) == await expected_rows(store, second.snapshot_id)
     async with store.factory() as session:
         counted = await api().catalogue_snapshot_result(session, second.snapshot_id)
@@ -93,7 +110,8 @@ async def test_incremental_with_one_changed_chat_owns_only_that_chats_rows(store
     await settle(store, second.snapshot_id)
 
     # Next day gamma changes: still one level over the first full base; beta (changed since the base)
-    # is carried whole, so a chat's messages and children always live in one snapshot.
+    # carries only its edited message, not the whole chat again (Railway 2026-11-06: four chats with
+    # 1-7 new messages re-copied 4,084 identical rows + 4,084 removals on a no-change run).
     source.messages["chat-gamma"].append({"id": "chat-gamma-new", "body": {"content": "new"}, "attachments": []})
     changed_only(source, "chat-gamma")
     feed.append({"chat-gamma"})
@@ -102,7 +120,9 @@ async def test_incremental_with_one_changed_chat_owns_only_that_chats_rows(store
     async with store.factory() as session:
         assert (await session.get(models.Snapshot, third.snapshot_id)).overlay_base_id == first.snapshot_id
     own = await own_rows(store, third.snapshot_id)
-    assert {chat for chat, *_ in own} == {"chat-beta", "chat-gamma"} and len(own) == 3 + 4
+    assert [chat for chat, *_ in own] == ["chat-beta", "chat-gamma"]
+    # beta, linked this run, copies only its edited message (no removal needed: the copy holds the key).
+    assert await removals(store, third.snapshot_id) == await keys_of(store, first.snapshot_id, "chat-delta")
     assert await effective(store, third.snapshot_id) == await expected_rows(store, third.snapshot_id)
     # The earlier overlay is untouched.
     assert await effective(store, second.snapshot_id) == await expected_rows(store, second.snapshot_id)
