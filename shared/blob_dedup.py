@@ -197,6 +197,7 @@ async def find_unchanged_file_blob(
                        Snapshot.backend_id == select(current.backend_id)
                            .where(current.id == exclude_snapshot_id).scalar_subquery(),
                        SnapshotItem.external_id == external_id, SnapshotItem.blob_path.isnot(None),
+                       SnapshotItem.is_deleted.isnot(True),
                        SnapshotItem.content_size == size, SnapshotItem.content_checksum.isnot(None),
                        or_(SnapshotItem.extra_data["quickxor"].as_string() == quickxor,
                            SnapshotItem.extra_data[("structured", "file_hash", "quickXorHash")]

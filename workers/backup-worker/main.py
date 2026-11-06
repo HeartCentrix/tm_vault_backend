@@ -22877,7 +22877,13 @@ class BackupWorker:
                     _sess, resource_id=resource.id, external_id=file_id, quickxor=qxh,
                     size=file_size_hint, exclude_snapshot_id=snapshot.id,
                 )
-            if unchanged:
+            # The stored copy must still be there (retention, manual cleanup); a failed probe downloads.
+            # Presence only: an encrypted backend's stored size is not the file size.
+            try:
+                _donor = await shard.get_blob_properties(container, unchanged[0]) if unchanged else None
+            except Exception:
+                _donor = None
+            if _donor:
                 await self._create_file_snapshot_item(
                     snapshot, tenant, file_id, file_name, file_size_hint, unchanged[0],
                     {"sha256": unchanged[1], "quickxor": qxh}, file_item, drive_id,

@@ -44,8 +44,8 @@ def _run(monkeypatch, hit):
             return False
 
     class _Shard:
-        async def get_blob_properties(self, *a):
-            return None
+        async def get_blob_properties(self, container, path):
+            return {"size": 5000} if path == "prev/f1" else None
 
     async def create(*a, **k):
         created.append(a)
