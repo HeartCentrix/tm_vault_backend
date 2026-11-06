@@ -100,6 +100,13 @@ async def test_fully_rescued_snapshot_becomes_a_complete_restore_point(factory):
     assert "onedrive_delta_link_pending_snapshot" not in res.extra_data
     assert res.last_backup_status == "COMPLETED"
     assert job.status == models.JobStatus.COMPLETED
+    # The reconciler's STEP D re-derives a terminal snapshot from its shards every ~60 s; a shard
+    # left FAILED flipped the settled snapshot back to FAILED/PARTIAL on Railway (2026-11-06).
+    async with factory() as s:
+        shards = (await s.execute(text("SELECT status, failure_state FROM snapshot_partitions WHERE snapshot_id = :s"),
+                                  {"s": ids["snap"]})).all()
+    assert {st for st, _ in shards} == {"COMPLETED"}
+    assert any((fs or {}).get("rescued_after_finalize") for _, fs in shards)
     async with factory.begin() as s:  # idempotent
         assert await settle_rescued_onedrive_snapshot(s, ids["snap"]) is False
 

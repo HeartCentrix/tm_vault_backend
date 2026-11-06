@@ -56,6 +56,17 @@ _SNAPSHOT = text("""
      WHERE id = :sid
 """)
 
+# The reconciler's STEP D re-derives every terminal snapshot from its shards (~60 s); a shard left FAILED
+# flipped a settled snapshot straight back (Railway 2026-11-06). Eligibility already proved these shards
+# failed only on file content that is now rescued; keep their old failure_state for the record.
+_SHARDS = text("""
+    UPDATE snapshot_partitions
+       SET status = 'COMPLETED',
+           failure_state = jsonb_build_object('rescued_after_finalize', now()::text,
+                                              'previous', failure_state::jsonb)::json
+     WHERE snapshot_id = :sid AND status = 'FAILED'
+""")
+
 # promote_pending_delta_link semantics: only the owning snapshot's pending link moves.
 _CURSOR = text("""
     UPDATE resources
@@ -140,6 +151,7 @@ async def settle_rescued_onedrive_snapshot(session, snapshot_id) -> bool:
         return False
     params = {"sid": snapshot_id, "sid_text": str(snapshot_id), "rid": row.resource_id, "jid": row.job_id}
     await session.execute(_SNAPSHOT, params)
+    await session.execute(_SHARDS, params)
     await session.execute(_CURSOR, params)
     await session.execute(_STAMP, params)
     await session.execute(_JOB, params)
