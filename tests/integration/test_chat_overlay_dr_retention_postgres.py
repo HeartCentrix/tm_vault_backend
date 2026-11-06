@@ -138,3 +138,27 @@ async def test_retiring_a_chat_overlay_hands_it_to_its_pointer_with_inventories(
     item_count, bytes_total, base_id, fmt = await counts(store, pointer)
     assert base_id == base and fmt == 1
     assert (item_count, bytes_total) == await twin_counts(store, twin) and item_count == 7
+
+
+async def test_retiring_a_full_chat_snapshot_restates_its_pointer_heir_by_the_catalogue_rule(
+        store, source_adapter, monkeypatch):
+    """Non-overlay pointer heir: item_count counts primary chat items only, not attachments."""
+    from shared.snapshot_reuse import point_at
+    _base, _overlay, twin = await overlay_and_twin(store, source_adapter, monkeypatch)
+    want = await twin_counts(store, twin)
+    pointer, job = uuid4(), uuid4()
+    async with store.factory.begin() as session:
+        source = await session.get(models.Snapshot, twin)
+        source.item_count, source.bytes_total = want
+        session.add(models.Job(id=job, type=models.JobType.BACKUP, tenant_id=store.tenant,
+                               resource_id=source.resource_id, status=models.JobStatus.COMPLETED))
+        await session.flush()
+        session.add(models.Snapshot(id=pointer, resource_id=source.resource_id, job_id=job, backend_id=source.backend_id,
+                                    status=models.SnapshotStatus.COMPLETED, type=source.type,
+                                    extra_data={"chat_inventory_format": 1}))
+        await session.flush()
+        assert await point_at(session, target_snapshot_id=pointer, prior_snapshot_id=twin, marker="chat_reuse_of")
+    await retire(store, [twin])
+    item_count, bytes_total, base_id, _fmt = await counts(store, pointer)
+    assert base_id is None
+    assert (item_count, bytes_total) == want and item_count == 7

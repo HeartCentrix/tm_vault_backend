@@ -127,6 +127,10 @@ class _ChainDB:
         # by the real PostgreSQL catalogue retention roundtrip.
         if sql.startswith("INSERT INTO snapshot_chat_inventories") or sql.startswith("UPDATE snapshots AS heir"):
             return _Result([])
+        # _restate_counts: on legacy (non-catalogue) inventories it restates the same
+        # COUNT(*) / SUM the promote step already wrote.
+        if sql.startswith("UPDATE snapshots s SET (item_count, bytes_total)"):
+            return _Result([])
         if "reuse_rehydrated_from" in sql:            # step 4 — promote
             return self._promote(sql, p)
         if sql.startswith("UPDATE snapshots"):        # step 3 — repoint

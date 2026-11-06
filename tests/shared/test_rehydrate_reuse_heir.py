@@ -70,14 +70,15 @@ async def test_rehydrates_in_copy_then_promote_then_repoint_order():
     result = await _rehydrate_reuse_heir(sess, doomed, doomed_ids={doomed})
 
     assert result == heir_id
-    assert len(sess.executed) == 6
+    assert len(sess.executed) == 7
     assert "FOR UPDATE" in sess.executed[0]                                   # select heir
     assert "INSERT INTO snapshot_items" in sess.executed[1]                   # copy items
     assert "INSERT INTO snapshot_chat_inventories" in sess.executed[2]
     assert "chat_inventory_format" in sess.executed[3]
     # Promotion (nulls reuse cols + carries cursor) MUST precede repoint.
     assert "delta_token = COALESCE(h.delta_token, d.delta_token)" in sess.executed[4]
-    assert "reuse_of_snapshot_id = CASE" in sess.executed[5]                  # repoint siblings
+    assert "snapshot_items_effective(s.id)" in sess.executed[5]               # catalogue-rule restate
+    assert "reuse_of_snapshot_id = CASE" in sess.executed[6]                  # repoint siblings
 
 
 @pytest.mark.asyncio

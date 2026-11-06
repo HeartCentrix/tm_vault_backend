@@ -1040,6 +1040,8 @@ async def _rehydrate_reuse_heir(
           FROM snapshots AS d
          WHERE h.id = CAST(:heir AS UUID) AND d.id = CAST(:did AS UUID)
     """), {"did": str(doomed_id), "heir": str(heir_id)})
+    # The COUNT(*) above counts every row; a chat catalogue heir counts primary items only.
+    await _restate_counts(session, heir_id)
 
     # 4. Now repoint every OTHER still-live descendant at the (now-full) heir.
     # A descendant that pointed reuse_of_snapshot_id straight at the doomed row
