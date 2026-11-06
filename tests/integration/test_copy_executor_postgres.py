@@ -416,7 +416,8 @@ def test_batch_byte_cap_is_configurable(monkeypatch):
         assert importlib.reload(module).BATCH_MAX_BYTES == 48 * 1024 * 1024
     finally:
         monkeypatch.delenv("COPY_BATCH_MAX_BYTES")
-        importlib.reload(module)
+        # Default: 32 MB (~12 s per batch at Railway's ~3 s per 8 MB, inside the 60 s budget).
+        assert importlib.reload(module).BATCH_MAX_BYTES == 32 * 1024 * 1024
 
 
 async def test_attachment_parent_check_reads_each_stored_payload_once(store):

@@ -331,7 +331,7 @@ async def prepare_manifest(session, task) -> None:
 
 # Stored payload bytes per copy batch (always at least one row). Each batch statement must finish
 # inside COPY_WORK_STATEMENT_TIMEOUT_MS (default 60 s).
-BATCH_MAX_BYTES = int(os.getenv("COPY_BATCH_MAX_BYTES", str(8 * 1024 * 1024)))
+BATCH_MAX_BYTES = int(os.getenv("COPY_BATCH_MAX_BYTES", str(32 * 1024 * 1024)))
 
 
 async def copy_manifest_batch(session, task, *, limit: int) -> dict:
