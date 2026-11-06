@@ -117,6 +117,34 @@ async def test_edit_new_and_deleted_message_read_only_from_the_feed(store, sourc
     assert await inventory(store, second.snapshot_id) == await full_reference(store, source_adapter)
 
 
+async def test_change_newer_than_the_feed_is_read_from_the_gap_not_the_whole_chat(store, source_adapter, big_chat, caplog):
+    """The one-request check shows a change newer than the feed's newest record (the feed missed an
+    edit, Railway 2026-11-05; or the user kept chatting during the run, Railway 2026-11-06: a ~4,000
+    message 1:1 was re-read page by page for 3+ minutes). Only messages modified after the feed's
+    newest record are listed, newest first, and the capture stays changed-only."""
+    source, feed, latest = big_chat
+    first = await legacy_scope(store)
+    assert (await source_adapter.run(first))["outcome"] == "complete"
+    await settle(store, first.snapshot_id)
+
+    now = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(minutes=1)
+    edited = msg(5, body="edited", modified=now)
+    missed = msg(9, body="edited too", modified=now + timedelta(hours=1))
+    source.messages["chat-alpha"][5], source.messages["chat-alpha"][9] = edited, missed
+    feed.queue.append([edited])
+    latest["at"] = now + timedelta(hours=1)
+    reads = len(source.message_calls)
+
+    caplog.set_level("INFO")
+    second = await store.new_scope()
+    assert (await source_adapter.run(second))["outcome"] == "complete"
+    assert source.message_calls[reads:] == []                  # no page of the whole chat
+    assert source.topup_calls == ("chat-alpha",)
+    assert "chat_changed_only_capture chat=chat-alpha changed=2 deleted=0 reused=" in caplog.text
+    await settle(store, second.snapshot_id)
+    assert await inventory(store, second.snapshot_id) == await full_reference(store, source_adapter)
+
+
 @pytest.mark.parametrize("case", ["probe_newer", "system_event", "removed", "resumed", "kill_switch", "reconcile"])
 async def test_any_doubt_reads_the_whole_chat(store, source_adapter, big_chat, caplog, monkeypatch, case):
     source, feed, latest = big_chat
@@ -128,10 +156,11 @@ async def test_any_doubt_reads_the_whole_chat(store, source_adapter, big_chat, c
     edited = msg(5, body="edited", modified=now)
     source.messages["chat-alpha"][5] = edited
     records, latest["at"] = [edited], now
-    if case == "probe_newer":      # the feed missed a later edit (Railway 2026-11-05)
+    if case == "probe_newer":      # the feed missed a later edit and the gap is too big to list
         missed = msg(9, body="edited too", modified=now + timedelta(hours=1))
         source.messages["chat-alpha"][9] = missed
         latest["at"] = now + timedelta(hours=1)
+        monkeypatch.setenv("CHAT_CHANGED_ONLY_GAP_PAGES", "0")
     elif case == "system_event":
         records.append({**msg(600, modified=now), "messageType": "systemEventMessage"})
     elif case == "removed":

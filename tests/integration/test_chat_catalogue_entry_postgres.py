@@ -174,6 +174,14 @@ def source_adapter(store, monkeypatch):
             self.hosted_calls.append((chat_id, message_id))
             if False:
                 yield {}
+        topup_calls = ()
+        async def messages_modified_after(self, chat_id, after, *, max_pages):
+            # Graph: /chats/{id}/messages ordered lastModifiedDateTime desc, stopping at ``after``.
+            from shared.chat_catalogue_entry import _graph_time
+            self.topup_calls = (*self.topup_calls, chat_id)
+            rows = sorted(self.messages.get(chat_id, []), key=lambda m: m.get("lastModifiedDateTime") or "", reverse=True)
+            newer = [deepcopy(m) for m in rows if (_graph_time(m.get("lastModifiedDateTime")) or after) > after]
+            return newer if len(newer) <= 50 * max_pages else None
         latest_change = None
         async def latest_message_change(self, chat_id):
             # Default: always changed, so these tests exercise the full capture.

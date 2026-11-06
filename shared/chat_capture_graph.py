@@ -357,6 +357,28 @@ class StrictChatGraphSource:
                 raise ChatGraphError("delta round ended without a cursor")
         raise ChatGraphError("delta round did not finish")
 
+    async def messages_modified_after(self, chat_id: str, after, *, max_pages: int):
+        """Messages modified after ``after``, newest first (the order latest_message_change reads), or
+        None when more than ``max_pages`` pages of 50 would be needed: the caller then reads the
+        whole chat. Only the head of this ordering is used; a full enumeration uses createdDateTime."""
+        from shared.chat_catalogue_entry import _graph_time
+        path = f"/chats/{_component(chat_id)}/messages"
+        found, pages = [], 0
+        async for page in self._pages(path, params={"$top": "50", "$orderby": "lastModifiedDateTime desc"}):
+            if pages >= max_pages:
+                return None
+            pages += 1
+            for row in page:
+                if not isinstance(row, dict) or row.get("chatId", chat_id) != chat_id:
+                    raise ChatGraphError("Graph message page changed collection scope")
+                modified = _graph_time(row.get("lastModifiedDateTime"))
+                if modified is None:
+                    raise ChatGraphError("Graph message has no modification time")
+                if modified <= after:
+                    return found
+                found.append(row)
+        return found
+
     async def latest_message_change(self, chat_id: str):
         """Modification time of the chat's most recently modified message (None when empty):
         one request, used by the incremental unchanged-chat check."""

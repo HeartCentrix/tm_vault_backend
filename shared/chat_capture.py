@@ -1215,6 +1215,24 @@ async def capture_changed_only(*, scope, source, records, since_snapshot_id, ses
         latest = await source.latest_message_change(scope.chat_id)
     except ChatGraphError as exc:
         return fallback(f"check_failed_{getattr(exc, 'status_code', None)}")
+    fed = max(modified for modified, _ in newest.values())
+    if latest is not None and latest > fed:
+        # A change newer than the feed's newest record (the feed missed an edit, or the user kept
+        # chatting during the run): list just that gap, newest first, instead of the whole chat
+        # (Railway 2026-11-06: a ~4,000-message 1:1 was re-read page by page for 3+ minutes).
+        pages = int(os.getenv("CHAT_CHANGED_ONLY_GAP_PAGES", "4"))
+        gap = None
+        if pages > 0 and hasattr(source, "messages_modified_after"):
+            try:
+                gap = await source.messages_modified_after(scope.chat_id, fed, max_pages=pages)
+            except ChatGraphError as exc:
+                return fallback(f"gap_failed_{getattr(exc, 'status_code', None)}")
+        if gap is None:
+            return fallback("check_newer_than_feed")
+        newest, reason = _feed_messages(scope.chat_id, [*records, *gap])
+        if newest is None:
+            return fallback(reason)
+        logger.info("chat_changed_only_gap chat=%s gap_messages=%s", scope.chat_id, len(gap))
     if latest is None or latest > max(modified for modified, _ in newest.values()):
         return fallback("check_newer_than_feed")
 
