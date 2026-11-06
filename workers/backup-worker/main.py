@@ -24871,8 +24871,12 @@ class BackupWorker:
                 print(f"[{self.worker_id}]   [PROFILE] Done — {profile.get('displayName', 'N/A')}")
                 return [("USER_PROFILE", profile)]
 
+            # A protected Tier-2 USER_CONTACTS / USER_CALENDAR child backs this content up
+            # incrementally, and Recovery reads that child — re-reading it all here every
+            # run only duplicated it (O(mailbox) per user per day).
             async def fetch_contacts():
-                if not backup_contacts:
+                if not backup_contacts or await self._owned_elsewhere(
+                        tenant, "USER_CONTACTS", f"{obj_id}:contacts", snapshot, "user_contacts"):
                     return []
                 print(f"[{self.worker_id}]   [CONTACTS] Fetching...")
                 try:
@@ -24887,7 +24891,8 @@ class BackupWorker:
                     raise
 
             async def fetch_calendar():
-                if not backup_calendars:
+                if not backup_calendars or await self._owned_elsewhere(
+                        tenant, "USER_CALENDAR", f"{obj_id}:calendar", snapshot, "user_calendar"):
                     return [], None
                 print(f"[{self.worker_id}]   [CALENDAR] Fetching...")
                 try:
