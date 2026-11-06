@@ -521,8 +521,10 @@ async def fail_exhausted_work(session, claim):
         partition.failure_state = {**(partition.failure_state or {}), 'reason': 'provider_budget_exhausted'}
         partition.completed_at = now.replace(tzinfo=None)
     elif snapshot.status.value == 'IN_PROGRESS':
-        count, size = (await session.execute(select(func.count(), func.coalesce(func.sum(SnapshotItem.content_size), 0))
-            .where(SnapshotItem.snapshot_id == snapshot.id))).one()
+        # Through snapshot_items_effective: an overlay's inherited rows count too.
+        effective = func.snapshot_items_effective(snapshot.id).table_valued("content_size")
+        count, size = (await session.execute(select(func.count(), func.coalesce(func.sum(effective.c.content_size), 0))
+            .select_from(effective))).one()
         snapshot.item_count, snapshot.bytes_total = count, size
         snapshot.status = SnapshotStatus.PARTIAL if count else SnapshotStatus.FAILED
         snapshot.completed_at = now.replace(tzinfo=None)

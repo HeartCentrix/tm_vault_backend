@@ -18,3 +18,11 @@ def test_migration_and_bootstrap_apply_the_shared_ddl():
     assert "for ddl in MAIL_OVERLAY_DDL:" in migration
     bootstrap = (ROOT / "shared" / "database.py").read_text()
     assert "MAIL_OVERLAY_DDL[0]" in bootstrap and "*MAIL_OVERLAY_DDL," in bootstrap
+
+
+def test_chat_overlay_script_and_migration_carry_the_shared_function():
+    from shared.database import SNAPSHOT_ITEMS_EFFECTIVE_FUNCTION
+    script = (ROOT / "scripts" / "2026_11_07_chat_overlay_snapshots.sql").read_text()
+    assert SNAPSHOT_ITEMS_EFFECTIVE_FUNCTION + ";\n" in script and "'CHAT_HOSTED_CONTENT'" in script
+    assert "op.execute(SNAPSHOT_ITEMS_EFFECTIVE_FUNCTION)" in (
+        ROOT / "alembic" / "versions" / "0025_chat_overlay_snapshots.py").read_text()

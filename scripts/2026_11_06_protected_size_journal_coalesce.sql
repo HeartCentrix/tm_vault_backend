@@ -1,4 +1,4 @@
--- Generated from shared.protected_size_schema.capture_function("public") (alembic 0023). Run in one transaction.
+-- Generated from shared.protected_size_schema.capture_function("public") (alembic 0024). Run in one transaction.
 BEGIN;
 SET LOCAL search_path TO public;
 CREATE OR REPLACE FUNCTION protected_size_capture() RETURNS trigger LANGUAGE plpgsql SET search_path="public" AS $fn$

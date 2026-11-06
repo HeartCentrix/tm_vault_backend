@@ -18816,7 +18816,7 @@ class BackupWorker:
                             WHEN c.terminal < e.n THEN s.status
                             WHEN c.completed = 0
                              AND (s.extra_data->>'chat_inventory_format' = '1' OR s.extra_data->>'copy_required_failed' = 'true')
-                             AND EXISTS (SELECT 1 FROM snapshot_items si WHERE si.snapshot_id = s.id)
+                             AND EXISTS (SELECT 1 FROM snapshot_items_effective(s.id) si)
                               THEN 'PARTIAL'::snapshotstatus
                             WHEN c.completed = 0 THEN 'FAILED'::snapshotstatus
                             WHEN c.failed > 0 OR c.lossy > 0
@@ -18824,7 +18824,7 @@ class BackupWorker:
                               OR (s.extra_data->>'chat_inventory_format' = '1'
                                   AND NULLIF(s.extra_data->>'degraded_reason', '') IS NOT NULL)
                               THEN CASE WHEN s.extra_data->>'copy_required_failed' = 'true'
-                                  AND NOT EXISTS (SELECT 1 FROM snapshot_items si WHERE si.snapshot_id = s.id)
+                                  AND NOT EXISTS (SELECT 1 FROM snapshot_items_effective(s.id) si)
                                 THEN 'FAILED'::snapshotstatus ELSE 'PARTIAL'::snapshotstatus END
                             ELSE 'COMPLETED'::snapshotstatus
                         END),

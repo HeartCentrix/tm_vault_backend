@@ -100,12 +100,18 @@ async def chat_message_statement(session, *, snapshot_ids, chat_id=None,
             Snapshot.id.in_(snapshots), Snapshot.resource_id.in_(_ids(resource_ids))))).all())
         if matching != set(snapshots):
             raise ChatSelectionError('SNAPSHOT_RESOURCE_MISMATCH')
-    identity = message_chat_id()
-    stmt = select(SnapshotItem).where(SnapshotItem.snapshot_id.in_(snapshots),
-        SnapshotItem.item_type.in_(MESSAGE_TYPES))
+    # Overlay snapshots inherit unchanged chats' rows from their base; read the effective rows,
+    # relabelled with the requested snapshot. Callers narrow via stmt.selected_columns (e.g.
+    # .id, .created_at), never SnapshotItem columns; populate_existing keeps the labels on loaded rows.
+    from shared.snapshot_reuse import chat_rows
+    item, scope = await chat_rows(session, snapshots)
+    identity = message_chat_id(item)
+    stmt = select(item).where(scope, item.item_type.in_(MESSAGE_TYPES))
+    if item is not SnapshotItem:
+        stmt = stmt.execution_options(populate_existing=True)
     if chat_id:
-        present = set((await session.scalars(select(SnapshotItem.snapshot_id).where(
-            SnapshotItem.snapshot_id.in_(snapshots), SnapshotItem.item_type.in_(MESSAGE_TYPES),
+        present = set((await session.scalars(select(item.snapshot_id).where(
+            scope, item.item_type.in_(MESSAGE_TYPES),
             identity == chat_id).distinct())).all())
         present.update((await session.scalars(select(SnapshotChatInventory.snapshot_id).join(Snapshot,
             Snapshot.id == SnapshotChatInventory.snapshot_id).where(
@@ -114,9 +120,9 @@ async def chat_message_statement(session, *, snapshot_ids, chat_id=None,
         if present != set(snapshots):
             raise ChatSelectionError("CHAT_NOT_IN_SNAPSHOT")
         if thread_path is not None:
-            aliases = set((await session.scalars(select(SnapshotItem.snapshot_id).where(
-                SnapshotItem.snapshot_id.in_(snapshots), SnapshotItem.item_type.in_(MESSAGE_TYPES),
-                identity == chat_id, SnapshotItem.folder_path == thread_path).distinct())).all())
+            aliases = set((await session.scalars(select(item.snapshot_id).where(
+                scope, item.item_type.in_(MESSAGE_TYPES),
+                identity == chat_id, item.folder_path == thread_path).distinct())).all())
             captured_aliases = set((await session.scalars(select(SnapshotChatPresentation.snapshot_id)
                 .join(Snapshot, Snapshot.id == SnapshotChatPresentation.snapshot_id)
                 .join(ChatPresentationPlan, ChatPresentationPlan.snapshot_id == Snapshot.id)
@@ -134,9 +140,8 @@ async def chat_message_statement(session, *, snapshot_ids, chat_id=None,
             if aliases | captured_aliases != set(snapshots):
                 raise ChatSelectionError("CHAT_ALIAS_MISMATCH")
         return stmt.where(identity == chat_id)
-    stmt = stmt.where(SnapshotItem.id.in_(items)) if items else stmt.where(SnapshotItem.folder_path == thread_path)
-    chats = list((await session.scalars(select(identity).where(
-        SnapshotItem.id.in_(stmt.with_only_columns(SnapshotItem.id))).distinct().limit(2))).all())
+    stmt = stmt.where(item.id.in_(items)) if items else stmt.where(item.folder_path == thread_path)
+    chats = list((await session.scalars(stmt.with_only_columns(identity).distinct().limit(2))).all())
     if None in chats:
         raise ChatSelectionError("CHAT_IDENTITY_UNAVAILABLE")
     if len(chats) > 1:

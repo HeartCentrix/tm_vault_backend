@@ -19,7 +19,7 @@ from sqlalchemy.orm import aliased
 from shared.database import get_db, init_db, close_db, AsyncSession, async_session_factory
 from shared.models import Snapshot, SnapshotItem, Resource, SnapshotType, SnapshotStatus, ResourceType, ResourceStatus, Job, ChatItemVersion, SnapshotChatInventory, ChatCaptureAttempt, ChatThread, ChatThreadMessage, SnapshotChatPresentation
 from shared.chat_catalogue import materialize_chat_items, ChatCatalogueIntegrityError
-from shared.snapshot_reuse import SnapshotNotFound, items_snapshot_id, items_scope, item_in_snapshot
+from shared.snapshot_reuse import SnapshotNotFound, chat_rows, items_snapshot_id, items_scope, item_in_snapshot
 from shared.audit import internal_audit_headers
 from shared.config import settings
 # Producer-only; on-demand archive enrichment nudge. Defensive so this read API
@@ -385,13 +385,15 @@ async def _catalogue_snapshot(db, snapshot_id, *, resolve_chat_sibling=False):
 
 
 async def _assert_catalogue_links(db, snapshot):
-    bad = await db.scalar(select(SnapshotItem.id).outerjoin(ChatItemVersion,
-        ChatItemVersion.id == SnapshotItem.chat_version_id).where(SnapshotItem.snapshot_id == snapshot.id,
-        or_(ChatItemVersion.id.is_(None), ChatItemVersion.tenant_id != SnapshotItem.tenant_id,
-            ChatItemVersion.logical_key != SnapshotItem.external_id,
-            ChatItemVersion.item_type != SnapshotItem.item_type,
-            SnapshotItem.extra_data["chat_id"].as_string().is_(None),
-            ChatItemVersion.chat_id != SnapshotItem.extra_data["chat_id"].as_string())).limit(1))
+    # A chat overlay's restore point includes the base rows of its inherited chats.
+    SI, scope = await chat_rows(db, [snapshot.id])
+    bad = await db.scalar(select(SI.id).outerjoin(ChatItemVersion,
+        ChatItemVersion.id == SI.chat_version_id).where(scope,
+        or_(ChatItemVersion.id.is_(None), ChatItemVersion.tenant_id != SI.tenant_id,
+            ChatItemVersion.logical_key != SI.external_id,
+            ChatItemVersion.item_type != SI.item_type,
+            SI.extra_data["chat_id"].as_string().is_(None),
+            ChatItemVersion.chat_id != SI.extra_data["chat_id"].as_string())).limit(1))
     if bad is not None:
         raise ChatCatalogueIntegrityError("new-format snapshot link has no owned captured version")
 
@@ -400,12 +402,13 @@ async def _catalogue_page(db, snapshot, *, page, size, item_type=None, chat_id=N
                           folder=None, query=None, messages_only=False):
     # A nullable broken link must not vanish inside the version JOIN/filter.
     await _assert_catalogue_links(db, snapshot)
-    stmt = select(SnapshotItem).join(ChatItemVersion,
-        ChatItemVersion.id == SnapshotItem.chat_version_id).where(SnapshotItem.snapshot_id == snapshot.id)
+    SI, scope = await chat_rows(db, [snapshot.id])
+    stmt = select(SI).join(ChatItemVersion,
+        ChatItemVersion.id == SI.chat_version_id).where(scope)
     if messages_only:
-        stmt = stmt.where(SnapshotItem.item_type.in_(["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"]))
+        stmt = stmt.where(SI.item_type.in_(["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"]))
     if item_type:
-        stmt = stmt.where(SnapshotItem.item_type == item_type)
+        stmt = stmt.where(SI.item_type == item_type)
     if chat_id or (folder is not None and messages_only):
         from shared.chat_presentation import chat_message_statement, ChatSelectionError
         try:
@@ -415,16 +418,16 @@ async def _catalogue_page(db, snapshot, *, page, size, item_type=None, chat_id=N
         if chat_id:
             stmt = stmt.where(ChatItemVersion.chat_id == chat_id)
     if folder is not None and not chat_id:
-        stmt = stmt.where(SnapshotItem.folder_path == folder)
+        stmt = stmt.where(SI.folder_path == folder)
     if query:
-        stmt = stmt.where(or_(SnapshotItem.name.ilike(f"%{query}%"),
+        stmt = stmt.where(or_(SI.name.ilike(f"%{query}%"),
             ChatItemVersion.graph_id.ilike(f"%{query}%"),
             ChatItemVersion.payload["body"]["content"].as_string().ilike(f"%{query}%")))
     total = await db.scalar(select(func.count()).select_from(stmt.order_by(None).subquery())) or 0
     # Source-created timestamps are immutable; the item UUID breaks ties.
     stmt = stmt.order_by(cast(ChatItemVersion.payload["createdDateTime"].as_string(), DateTime(timezone=True)).desc().nullslast(),
-        SnapshotItem.created_at.desc(), SnapshotItem.id.desc()).offset((page - 1) * size).limit(size)
-    links = list((await db.scalars(stmt)).all())
+        SI.created_at.desc(), SI.id.desc()).offset((page - 1) * size).limit(size)
+    links = list((await db.scalars(stmt.execution_options(populate_existing=True))).all())
     return await materialize_chat_items(db, links), total
 
 
@@ -437,15 +440,16 @@ async def _catalogue_item_response(db, snapshot, *, page, size, item_type=None, 
 
 async def _catalogue_groups(db, snapshot, *, offset=0, limit=None):
     await _assert_catalogue_links(db, snapshot)
+    SI, _ = await chat_rows(db, [snapshot.id])
     messages = ["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"]
     statement = (select(SnapshotChatInventory.chat_id,
-        ChatCaptureAttempt.folder_path, func.count(SnapshotItem.id).label("count"),
+        ChatCaptureAttempt.folder_path, func.count(SI.id).label("count"),
         func.max(cast(ChatItemVersion.payload["createdDateTime"].as_string(), DateTime(timezone=True))).label("last_message_at"))
         .join(ChatCaptureAttempt, ChatCaptureAttempt.id == SnapshotChatInventory.capture_attempt_id)
-        .outerjoin(SnapshotItem, and_(SnapshotItem.snapshot_id == SnapshotChatInventory.snapshot_id,
-            SnapshotItem.extra_data["chat_id"].as_string() == SnapshotChatInventory.chat_id,
-            SnapshotItem.item_type.in_(messages)))
-        .outerjoin(ChatItemVersion, ChatItemVersion.id == SnapshotItem.chat_version_id)
+        .outerjoin(SI, and_(SI.snapshot_id == SnapshotChatInventory.snapshot_id,
+            SI.extra_data["chat_id"].as_string() == SnapshotChatInventory.chat_id,
+            SI.item_type.in_(messages)))
+        .outerjoin(ChatItemVersion, ChatItemVersion.id == SI.chat_version_id)
         .where(SnapshotChatInventory.snapshot_id == snapshot.id)
         .group_by(SnapshotChatInventory.chat_id, ChatCaptureAttempt.folder_path)
         .order_by(func.max(cast(ChatItemVersion.payload["createdDateTime"].as_string(), DateTime(timezone=True))).desc().nullslast(),
@@ -460,13 +464,13 @@ async def _catalogue_groups(db, snapshot, *, offset=0, limit=None):
 
 async def _catalogue_folders(db, snapshot, *, page, size, item_type=None):
     await _assert_catalogue_links(db, snapshot)
-    stmt = select(SnapshotItem.folder_path.label("path"), func.count().label("count")).where(
-        SnapshotItem.snapshot_id == snapshot.id)
-    stmt = stmt.where(SnapshotItem.item_type == item_type) if item_type else stmt.where(
-        SnapshotItem.item_type.in_(["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"]))
-    stmt = stmt.group_by(SnapshotItem.folder_path)
+    SI, scope = await chat_rows(db, [snapshot.id])
+    stmt = select(SI.folder_path.label("path"), func.count().label("count")).where(scope)
+    stmt = stmt.where(SI.item_type == item_type) if item_type else stmt.where(
+        SI.item_type.in_(["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"]))
+    stmt = stmt.group_by(SI.folder_path)
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-    rows = (await db.execute(stmt.order_by(SnapshotItem.folder_path).offset((page - 1) * size).limit(size))).all()
+    rows = (await db.execute(stmt.order_by(SI.folder_path).offset((page - 1) * size).limit(size))).all()
     return {"content": [{"path": r.path or "", "count": int(r.count)} for r in rows],
         "total": total, "page": page, "size": size, "hasMore": page * size < total}
 
@@ -550,11 +554,10 @@ async def _catalogue_message_response(db, snapshot, *, page, size, chat_id=None,
         chat_id=chat_id, folder=folder, query=search, messages_only=True)
     # Page-sized child load; links are joined by qualified physical message key.
     ids = [i.id for i in items]
-    parent = aliased(SnapshotItem)
-    children = list((await db.scalars(select(SnapshotItem).join(parent,
-        and_(parent.snapshot_id == SnapshotItem.snapshot_id,
-            parent.external_id == SnapshotItem.parent_external_id)).where(parent.id.in_(ids),
-        SnapshotItem.item_type == "CHAT_HOSTED_CONTENT"))).all()) if ids else []
+    SI, scope = await chat_rows(db, [snapshot.id])
+    parents = select(SI.external_id).where(scope, SI.id.in_(ids)).correlate(None)
+    children = list((await db.scalars(select(SI).where(scope, SI.parent_external_id.in_(parents),
+        SI.item_type == "CHAT_HOSTED_CONTENT").execution_options(populate_existing=True))).all()) if ids else []
     child_items = await materialize_chat_items(db, children)
     hosted = {}
     for child in child_items:
@@ -4750,10 +4753,11 @@ async def get_item_attachments(
     if catalogue is not None:
         if parent.chat_version_id is None:
             raise ChatCatalogueIntegrityError("new-format message has no captured version")
-        children = list((await db.scalars(select(SnapshotItem).where(
-            SnapshotItem.snapshot_id == _sid,
-            SnapshotItem.parent_external_id == parent.external_id,
-            SnapshotItem.item_type == "CHAT_ATTACHMENT").order_by(SnapshotItem.name, SnapshotItem.id))).all())
+        SI, scope = await chat_rows(db, [_sid])
+        children = list((await db.scalars(select(SI).where(scope,
+            SI.parent_external_id == parent.external_id,
+            SI.item_type == "CHAT_ATTACHMENT").order_by(SI.name, SI.id)
+            .execution_options(populate_existing=True))).all())
         items = await materialize_chat_items(db, children)
         return [{"id": str(item.id), "name": item.name, "size": item.content_size or 0,
             "kind": (item.extra_data or {}).get("attachment_kind"),

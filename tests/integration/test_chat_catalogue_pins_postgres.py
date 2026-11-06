@@ -165,3 +165,17 @@ async def test_pin_acquisition_serializes_against_snapshot_deletion(store):
                 await deleting
             except asyncio.CancelledError:
                 pass
+
+
+async def test_overlay_snapshot_pins_an_object_its_base_row_holds(store):
+    """A chat overlay inherits unchanged chats' rows from its base: downloading one of their files
+    through the overlay pins the object those base rows reference."""
+    scope, object_id, _ = await captured(store)
+    overlay = await store.new_scope()
+    async with store.factory.begin() as session:
+        await session.execute(update(Snapshot).where(Snapshot.id == scope.snapshot_id).values(status="COMPLETED"))
+        await session.execute(update(Snapshot).where(Snapshot.id == overlay.snapshot_id).values(
+            status="COMPLETED", overlay_base_id=scope.snapshot_id))
+    async with api().catalogue_read_pin(store.factory, snapshot_ids=[overlay.snapshot_id], object_ids=[object_id]):
+        async with store.factory() as session:
+            assert (await session.scalars(select(ChatCataloguePin))).one().object_id == object_id

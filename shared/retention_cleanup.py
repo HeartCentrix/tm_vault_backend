@@ -1115,7 +1115,8 @@ async def _rebase_overlay(session, overlay_id, old_base, new_base):
     await session.execute(text(
         "INSERT INTO snapshot_overlay_removals (snapshot_id, item_type, external_id) "
         "SELECT CAST(:o AS uuid), h.item_type, h.external_id FROM snapshot_items h "
-        "WHERE h.snapshot_id = CAST(:h AS uuid) AND h.item_type IN ('EMAIL', 'EMAIL_ATTACHMENT', 'ARCHIVE_ITEM', 'ARCHIVE_ATTACHMENT') "
+        "WHERE h.snapshot_id = CAST(:h AS uuid) AND h.item_type IN ('EMAIL', 'EMAIL_ATTACHMENT', "
+        "'ARCHIVE_ITEM', 'ARCHIVE_ATTACHMENT', 'TEAMS_CHAT_MESSAGE', 'CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT') "
         "AND NOT EXISTS (SELECT 1 FROM snapshot_items_effective(CAST(:o AS uuid)) e "
         "                 WHERE e.item_type = h.item_type AND e.external_id = h.external_id) "
         "ON CONFLICT DO NOTHING"), {"o": str(overlay_id), "h": str(new_base)})
@@ -1125,10 +1126,13 @@ async def _rebase_overlay(session, overlay_id, old_base, new_base):
 
 
 async def _restate_counts(session, snapshot_id):
+    # Chat catalogue snapshots count primary items only (chat_catalogue_entry.catalogue_snapshot_result).
     await session.execute(text(
-        "UPDATE snapshots SET item_count = c.n, bytes_total = c.b FROM ("
-        "  SELECT count(*) AS n, COALESCE(sum(content_size), 0) AS b"
-        "    FROM snapshot_items_effective(CAST(:s AS uuid))) c WHERE id = CAST(:s AS uuid)"),
+        "UPDATE snapshots s SET (item_count, bytes_total) = ("
+        "  SELECT count(*) FILTER (WHERE s.extra_data::jsonb ->> 'chat_inventory_format' IS DISTINCT FROM '1'"
+        "                          OR e.item_type NOT IN ('CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT')),"
+        "         COALESCE(sum(e.content_size), 0)"
+        "    FROM snapshot_items_effective(s.id) e) WHERE s.id = CAST(:s AS uuid)"),
         {"s": str(snapshot_id)})
 
 

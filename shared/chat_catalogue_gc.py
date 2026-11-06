@@ -9,7 +9,7 @@ import logging
 import time
 from uuid import UUID, uuid4
 
-from sqlalchemy import delete, exists, func, or_, select, text
+from sqlalchemy import delete, exists, func, or_, select, text, union_all
 
 from shared.chat_catalogue import ChatCatalogueIntegrityError
 from shared.models import (ChatBlobObject, ChatCataloguePin, ChatCaptureAttempt, ChatInventory,
@@ -37,9 +37,12 @@ async def acquire_catalogue_read_pins(session, *, snapshot_ids, owner_kind, owne
     if not snapshot_ids or {s.id for s in snapshots} != snapshot_ids:
         raise ChatCatalogueIntegrityError("read pin snapshot scope no longer exists")
     new_ids = {s.id for s in snapshots if (s.extra_data or {}).get("chat_inventory_format") == 1}
-    referenced = set((await session.scalars(select(ChatItemVersion.object_id).join(
-        SnapshotItem, SnapshotItem.chat_version_id == ChatItemVersion.id).where(
-        SnapshotItem.snapshot_id.in_(new_ids), ChatItemVersion.object_id.is_not(None)))).all())
+    # A chat overlay's unchanged chats are its base's rows (snapshot_items_effective).
+    effective = [select(func.snapshot_items_effective(sid).table_valued("chat_version_id").c.chat_version_id)
+                 for sid in sorted(new_ids, key=str)]
+    referenced = set((await session.scalars(select(ChatItemVersion.object_id).where(
+        ChatItemVersion.id.in_(union_all(*effective) if len(effective) > 1 else effective[0]),
+        ChatItemVersion.object_id.is_not(None)))).all()) if effective else set()
     inventories = []
     covered = set()
     if object_ids is not None:

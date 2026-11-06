@@ -73,6 +73,22 @@ _SIBLING_EXCLUDED_STATES = (
 )
 
 
+def _selection_clause(entity, item_ids, folder_paths):
+    """OR of picked ids, folder prefixes and exact folders on ``entity`` (SnapshotItem or a
+    chat_rows alias); None when nothing narrows the snapshot."""
+    from sqlalchemy import or_
+    from shared.folder_resolver import LIKE_ESCAPE, _prefix_and_exact_for
+    if not (folder_paths or item_ids):
+        return None
+    clauses = [entity.id.in_([uuid.UUID(iid) for iid in item_ids])] if item_ids else []
+    prefixes, exacts = _prefix_and_exact_for(folder_paths or [])
+    # ESCAPE must be declared: the prefix carries escaped LIKE metacharacters from the ticked folder name.
+    clauses += [entity.folder_path.like(prefix, escape=LIKE_ESCAPE) for prefix in prefixes]
+    if exacts:
+        clauses.append(entity.folder_path.in_(exacts))
+    return or_(*clauses) if clauses else None
+
+
 class CatalogueExportCancelled(RuntimeError):
     """The operator or another owner already terminalized this export."""
 
@@ -1102,34 +1118,21 @@ class RestoreWorker:
         )
 
         # Apply folder/item filters on top of the sibling-unioned base.
-        if folder_paths or item_ids:
-            from shared.folder_resolver import LIKE_ESCAPE, _prefix_and_exact_for
-            from sqlalchemy import or_
-
-            clauses = []
-            if item_ids:
-                clauses.append(
-                    SnapshotItem.id.in_([uuid.UUID(iid) for iid in item_ids])
-                )
-            prefixes, exacts = _prefix_and_exact_for(folder_paths)
-            for prefix in prefixes:
-                # ESCAPE must be declared: the prefix carries escaped
-                # LIKE metacharacters from the ticked folder name.
-                clauses.append(SnapshotItem.folder_path.like(prefix, escape=LIKE_ESCAPE))
-            if exacts:
-                clauses.append(SnapshotItem.folder_path.in_(exacts))
-
-            if clauses:
-                base_stmt = base_stmt.where(or_(*clauses))
+        selection = _selection_clause(SnapshotItem, item_ids, folder_paths)
+        if selection is not None:
+            base_stmt = base_stmt.where(selection)
 
         rows = list((await session.execute(base_stmt)).scalars().all()) if sibling_ids else []
         # Newest-wins first, then drop items whose newest row is a deletion (a file deleted by then).
         rows = [r for r in rows if not _is_file_tombstone(r)]
         if catalogue_ids:
-            exact = select(SnapshotItem).where(SnapshotItem.snapshot_id.in_(catalogue_ids))
-            if folder_paths or item_ids:
-                if clauses:
-                    exact = exact.where(or_(*clauses))
+            # A chat overlay's unchanged chats are its base's rows (snapshot_items_effective).
+            from shared.snapshot_reuse import chat_rows
+            SI, scope = await chat_rows(session, catalogue_ids)
+            exact = select(SI).where(scope).execution_options(populate_existing=True)
+            selection = _selection_clause(SI, item_ids, folder_paths)
+            if selection is not None:
+                exact = exact.where(selection)
             rows.extend((await session.execute(exact)).scalars().all())
 
         # Excluded-id filtering happens client-side after newest-wins —
@@ -1161,7 +1164,22 @@ class RestoreWorker:
         catalogue_ids = {sid for sid, snap in snapshots.items() if (snap.extra_data or {}).get("chat_inventory_format") == 1}
         if not catalogue_ids:
             return rows
-        if snapshot_ids and not catalogue_ids <= {uuid.UUID(str(sid)) for sid in snapshot_ids}:
+        requested = {uuid.UUID(str(sid)) for sid in snapshot_ids or []}
+        if requested and not catalogue_ids <= requested:
+            # Rows picked by id from a chat overlay's inherited chats carry the base's id: read
+            # them back as the requested snapshot's own (no-op unless a requested id is an overlay).
+            from shared.snapshot_reuse import chat_rows
+            SI, scope = await chat_rows(session, requested)
+            if SI is not SnapshotItem:
+                stray = [item.id for item in rows if item.snapshot_id in catalogue_ids - requested]
+                own = {item.id: item for item in (await session.execute(select(SI).where(scope, SI.id.in_(stray))
+                    .execution_options(populate_existing=True))).scalars().all()}
+                rows = [own.get(item.id, item) for item in rows]
+                snapshots.update({s.id: s for s in (await session.execute(select(Snapshot).where(
+                    Snapshot.id.in_({item.snapshot_id for item in rows} - set(snapshots))))).scalars().all()})
+                catalogue_ids = {item.snapshot_id for item in rows} & {sid for sid, snap in snapshots.items()
+                    if (snap.extra_data or {}).get("chat_inventory_format") == 1}
+        if snapshot_ids and not catalogue_ids <= requested:
             raise ChatCatalogueIntegrityError("selected catalogue item is outside the requested snapshot scope")
         for sid in catalogue_ids:
             self._require_catalogue_restore_point(snapshots[sid])
@@ -1169,10 +1187,14 @@ class RestoreWorker:
             item.item_type in {"TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"}}
         all_rows = {item.id: item for item in rows}
         pairs = sorted(parents, key=lambda pair: (str(pair[0]), pair[1])) if include_children else []
+        if pairs:
+            from shared.snapshot_reuse import chat_rows
+            SI, scope = await chat_rows(session, {sid for sid, _ in pairs})
         for start in range(0, len(pairs), 500):
-            children = (await session.execute(select(SnapshotItem).where(
-                tuple_(SnapshotItem.snapshot_id, SnapshotItem.parent_external_id).in_(pairs[start:start + 500]),
-                SnapshotItem.item_type.in_(["CHAT_ATTACHMENT", "CHAT_HOSTED_CONTENT"])))).scalars().all()
+            children = (await session.execute(select(SI).where(scope,
+                tuple_(SI.snapshot_id, SI.parent_external_id).in_(pairs[start:start + 500]),
+                SI.item_type.in_(["CHAT_ATTACHMENT", "CHAT_HOSTED_CONTENT"])).execution_options(
+                populate_existing=True))).scalars().all()
             all_rows.update((item.id, item) for item in children)
         excluded = {uuid.UUID(str(value)) for value in (excluded_item_ids or [])}
         physical = [item for item in all_rows.values() if item.snapshot_id in catalogue_ids and item.id not in excluded]
@@ -1199,7 +1221,7 @@ class RestoreWorker:
         wrap the dedup query in a ``SELECT COUNT(*) FROM (…)`` so the DB
         does the counting in one round-trip.
         """
-        from sqlalchemy import func, or_ as _or
+        from sqlalchemy import func
 
         folder_paths = folder_paths or []
         excluded_item_ids = excluded_item_ids or []
@@ -1221,8 +1243,13 @@ class RestoreWorker:
         )).scalars().all()
 
         sibling_ids: set = set()
+        catalogue_ids = set()
         if picked_rows:
             for picked in picked_rows:
+                if (picked.extra_data or {}).get("chat_inventory_format") == 1:
+                    # Exact, like fetch_snapshot_items: the snapshot's effective rows (overlay-aware).
+                    catalogue_ids.add(picked.reuse_chain_root_id or picked.id)
+                    continue
                 rows = (await session.execute(
                     select(Snapshot.id).where(
                         Snapshot.resource_id == picked.resource_id,
@@ -1231,8 +1258,19 @@ class RestoreWorker:
                     )
                 )).all()
                 sibling_ids.update(r[0] for r in rows)
-        if not sibling_ids:
+        if not sibling_ids and not catalogue_ids:
             sibling_ids = set(picked_uuids)
+        total = 0
+        if catalogue_ids:
+            from shared.snapshot_reuse import chat_rows
+            SI, scope = await chat_rows(session, catalogue_ids)
+            exact = select(func.count()).select_from(SI).where(scope)
+            selection = _selection_clause(SI, item_ids, folder_paths)
+            if selection is not None:
+                exact = exact.where(selection)
+            total = int((await session.execute(exact)).scalar_one() or 0)
+        if not sibling_ids:
+            return total
 
         # Inner: DISTINCT external_id newest-wins; outer: COUNT(*) of the live ones.
         inner = (
@@ -1242,28 +1280,17 @@ class RestoreWorker:
             .order_by(SnapshotItem.external_id, Snapshot.created_at.desc())
             .distinct(SnapshotItem.external_id)
         )
-
-        if folder_paths or item_ids:
-            from shared.folder_resolver import LIKE_ESCAPE, _prefix_and_exact_for
-            clauses = []
-            if item_ids:
-                clauses.append(SnapshotItem.id.in_([uuid.UUID(iid) for iid in item_ids]))
-            prefixes, exacts = _prefix_and_exact_for(folder_paths)
-            for prefix in prefixes:
-                # Same escaped-pattern contract as fetch_snapshot_items —
-                # the count must match the rows the restore will write.
-                clauses.append(SnapshotItem.folder_path.like(prefix, escape=LIKE_ESCAPE))
-            if exacts:
-                clauses.append(SnapshotItem.folder_path.in_(exacts))
-            if clauses:
-                inner = inner.where(_or(*clauses))
+        # Same escaped-pattern contract as fetch_snapshot_items — the count must match the rows the restore will write.
+        selection = _selection_clause(SnapshotItem, item_ids, folder_paths)
+        if selection is not None:
+            inner = inner.where(selection)
 
         latest = inner.subquery()
         cnt = (await session.execute(
             select(func.count()).select_from(latest).where(
                 ~(latest.c.is_deleted.is_(True) & latest.c.item_type.in_(_FILE_TOMBSTONE_TYPES)))
         )).scalar_one()
-        return int(cnt or 0)
+        return total + int(cnt or 0)
 
     async def stream_snapshot_items_by_group(
         self,

@@ -71,6 +71,7 @@ EXPECTED_CHAIN = [
     ('0022', '0021'),            # SKIPPED snapshot status
     ('0023', '0022'),            # archive overlay snapshots
     ('0024', '0023'),            # protected-size journal coalescing
+    ('0025', '0024'),            # chat overlay snapshots
 ]
 
 # Substring that must appear in the module docstring of each pending revision,
@@ -94,6 +95,7 @@ PENDING_SUBJECTS = {
     "0022": "SKIPPED snapshot status",
     "0023": "Archive overlay snapshots",
     "0024": "Protected-size capture",
+    "0025": "Chat overlay snapshots",
 }
 
 

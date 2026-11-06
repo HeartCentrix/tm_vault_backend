@@ -51,6 +51,14 @@ import asyncio  # noqa: E402
 
 from shared.models import Resource, Snapshot, SnapshotItem  # noqa: E402
 from sqlalchemy.sql.elements import BooleanClauseList  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _full_snapshots(monkeypatch):
+    """These in-memory rows are full snapshots: chat_rows' overlay lookup (raw SQL) has nothing to model."""
+    async def plain(session, ids):
+        return SnapshotItem, SnapshotItem.snapshot_id.in_(list(ids))
+    monkeypatch.setattr(__import__("shared.snapshot_reuse").snapshot_reuse, "chat_rows", plain)
 from sqlalchemy.sql.elements import TextClause  # noqa: E402
 
 

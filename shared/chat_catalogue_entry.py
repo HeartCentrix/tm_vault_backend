@@ -169,14 +169,14 @@ async def catalogue_snapshot_result(session, snapshot_id, *, force_recount=False
             "partitioned": bool(extra.get("partitioned")), "status": snapshot.status.value, "resumed_terminal": True,
             "outcome": snapshot.status.value.lower(), "failure_reason": extra.get("failure_reason") or extra.get("error"),
             "failed": snapshot.status == SnapshotStatus.FAILED}
-    primary = SnapshotItem.item_type.notin_(["CHAT_ATTACHMENT", "CHAT_HOSTED_CONTENT"])
-    # A backup whose every chat was unchanged points at the full backup it reuses (no rows of its own).
-    count, logical_bytes = (await session.execute(select(func.count().filter(primary),
-        func.coalesce(func.sum(SnapshotItem.content_size), 0)).where(
-            SnapshotItem.snapshot_id == (snapshot.reuse_chain_root_id or snapshot_id)))).one()
-    # A prior backup that points at an earlier one holds no rows: compare with the rows it stands for.
-    prior = None if snapshot.reuse_chain_root_id else await session.scalar(select(
-        func.coalesce(Snapshot.reuse_chain_root_id, Snapshot.id)).where(Snapshot.resource_id == snapshot.resource_id,
+    # Through snapshot_items_effective: a backup whose every chat was unchanged points at the full backup
+    # it reuses (no rows of its own); an overlay inherits its unchanged chats' rows from its base.
+    totals = ("SELECT count(*) FILTER (WHERE e.item_type NOT IN ('CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT')), "
+              "COALESCE(sum(e.content_size), 0) FROM snapshot_items_effective(CAST(:s AS uuid)) e ")
+    count, logical_bytes = (await session.execute(text(totals), {"s": str(snapshot_id)})).one()
+    # The prior backup's rows, whatever form it takes, are what this run compares with.
+    prior = None if snapshot.reuse_chain_root_id else await session.scalar(select(Snapshot.id).where(
+        Snapshot.resource_id == snapshot.resource_id,
         Snapshot.id != snapshot_id, Snapshot.job_id != snapshot.job_id,
         Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL]),
         Snapshot.created_at <= snapshot.created_at).order_by(Snapshot.created_at.desc(), Snapshot.id.desc()).limit(1))
@@ -185,11 +185,9 @@ async def catalogue_snapshot_result(session, snapshot_id, *, force_recount=False
     elif prior is None:
         new_count, new_bytes = count, logical_bytes
     else:
-        prior_versions = select(SnapshotItem.chat_version_id).where(SnapshotItem.snapshot_id == prior,
-            SnapshotItem.chat_version_id.is_not(None))
-        new_count, new_bytes = (await session.execute(select(func.count().filter(primary),
-            func.coalesce(func.sum(SnapshotItem.content_size), 0)).where(SnapshotItem.snapshot_id == snapshot_id,
-                SnapshotItem.chat_version_id.notin_(prior_versions)))).one()
+        new_count, new_bytes = (await session.execute(text(totals + "WHERE "
+            "e.chat_version_id NOT IN (SELECT p.chat_version_id FROM snapshot_items_effective(CAST(:p AS uuid)) p "
+            "WHERE p.chat_version_id IS NOT NULL)"), {"s": str(snapshot_id), "p": str(prior)})).one()
     uploaded = await session.scalar(select(func.coalesce(func.sum(SnapshotChatInventory.uploaded_bytes), 0))
         .where(SnapshotChatInventory.snapshot_id == snapshot_id)) or 0
     return {"chat_inventory_format": 1, "item_count": int(count), "bytes_total": int(logical_bytes),
@@ -453,7 +451,8 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
     full_backup: a requested full backup re-reads every chat (no unchanged-chat reuse)."""
     from shared.provider_runtime import (unit_scope, checkpoint_unit, check_provider_turn,
         ProviderTurnDeferred, current_execution, other_provider_work_waiting, yield_provider_turn)
-    from shared.chat_capture import capture_chat_inventory, derive_shared_chat, reuse_unchanged_chat, SHARED_CAPTURE_BUSY
+    from shared.chat_capture import (capture_changed_only, capture_chat_inventory, derive_shared_chat,
+                                     reuse_unchanged_chat, SHARED_CAPTURE_BUSY)
     from shared.provider_admission import ProviderDeferred
     from shared.provider_runtime import defer_provider
     from shared.chat_capture_graph import pinned_chat_source, effective_capture_scope_hash
@@ -605,6 +604,12 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                         defer_provider(ProviderDeferred(None, 15 if busy else 60, stage="shared_chat_wait"))
                 async with unit_scope('chat:' + hashlib.sha256(cid.encode()).hexdigest(), 'chat'):
                     result = previous
+                    if result is None and cid in changed_chats and not full_backup:
+                        # The feed's records of this chat replace only the messages they name.
+                        result = await capture_changed_only(scope=scope, source=source,
+                            records=feed_records.get(cid), since_snapshot_id=since_snapshot,
+                            session_factory=session_factory, storage=storage, folder_path=chat_folder(chats[cid], principal),
+                            exclude_message=filters[cid][0], scope_filter_hash=filters[cid][1])
                     if result is None:
                         result = await capture_chat_inventory(scope=scope, graph_client=source, storage=storage,
                             session_factory=session_factory, folder_path=chat_folder(chats[cid], principal),
@@ -621,10 +626,14 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                         chats.get(cid), getattr(source, "home_tenant_id", None), result)
                     await checkpoint_unit(receipt_id=str(result.inventory_id), state='COMPLETED' if done else 'FAILED')
                     return result
+            changed_chats, feed_records, since_snapshot = set(), {}, None
             if partition_id is None and allowed is None:
                 delta = await _chat_delta_round(session_factory, source, resource_id=resource_id,
                     snapshot_id=snapshot_id, principal=principal, since=started)
                 changed, since_snapshot = delta if delta is not None else (None, None)
+                # A fresh round carries each changed chat's records; a resumed turn only their ids.
+                changed_chats = set(changed or ())
+                feed_records = changed if isinstance(changed, dict) else {}
                 if changed is not None and not full_backup:
                     # A resumed turn does not walk chats this snapshot already linked, and a chat hosted in
                     # another tenant at the cursor's snapshot that the feed shows unchanged is listed again
@@ -638,7 +647,7 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                     known_external = set((((since.extra_data or {}).get("chat_catalogue_scopes") or {}).get("resource") or {})
                                          .get("external_tenant_chats") or []) if since is not None else set()
                     home = getattr(source, "home_tenant_id", None)
-                    still_external = {cid for cid in (known_external & set(keys)) - changed if _listed_elsewhere(chats[cid], home)}
+                    still_external = {cid for cid in (known_external & set(keys)) - changed_chats if _listed_elsewhere(chats[cid], home)}
                     done_before = (linked_before & set(keys)) | still_external
                     completed += len(done_before)
                     external.extend(sorted(still_external))
