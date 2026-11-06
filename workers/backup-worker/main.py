@@ -1749,6 +1749,62 @@ async def _carry_forward_prior_mail_snapshot_items(
         return copied
 
 
+async def _carry_unchanged_secondary_mail(
+    *, resource_id: str, target_snapshot_id: str, current_job_id: Optional[Any], items: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Tier-1 archive / recoverable tiers are re-listed in full every run (no delta on those roots).
+    A message whose source tier, changeKey, folder id and path equal its row in the mail prior
+    snapshot is copied forward from that row (and its attachments) instead of re-uploaded and
+    re-fetched. Returns (items still to persist fresh, rows copied). Anything unexpected → nothing
+    copied, everything persists fresh as before. Messages gone from the listing are never copied."""
+    secondary = [m for m in items if m.get("_source_mailbox", "primary") != "primary"
+                 and m.get("id") and m.get("changeKey")]
+    if not secondary or not resource_id or not target_snapshot_id:
+        return items, 0
+    from shared.mail_snapshot_reuse import MAIL_PRIOR_SNAPSHOT_SQL
+    params: Dict[str, Any] = {"rid": str(resource_id), "tsid": str(target_snapshot_id),
+                              "jid": str(current_job_id) if current_job_id else None,
+                              "ids": sorted({str(m["id"]) for m in secondary})}
+    prior_src = "snapshot_items_effective(" + MAIL_PRIOR_SNAPSHOT_SQL + ") src"
+    try:
+        async with async_session_factory() as session:
+            prior = {r.external_id: (r.sm, r.ck, r.fid, r.fp) for r in (await session.execute(text(
+                "SELECT src.external_id, src.metadata->>'source_mailbox' sm, src.metadata->'raw'->>'changeKey' ck, "
+                "src.metadata->'raw'->>'parentFolderId' fid, src.folder_path fp FROM " + prior_src +
+                " WHERE src.item_type = 'EMAIL' AND COALESCE(src.metadata->>'source_mailbox', 'primary') <> 'primary' "
+                "AND src.external_id = ANY(CAST(:ids AS TEXT[]))"), params)).all()}
+            same = sorted({str(m["id"]) for m in secondary if prior.get(str(m["id"])) == (
+                m["_source_mailbox"], m["changeKey"], m.get("parentFolderId"),
+                m.get("_full_folder_path") or m.get("parentFolderName"))})
+            if not same:
+                return items, 0
+            params["ids"] = same
+            columns = ("id, snapshot_id, tenant_id, item_type, external_id, parent_external_id, name, folder_path, "
+                       "content_hash, content_checksum, content_size, blob_path, encryption_key_id, backup_version, "
+                       "metadata, is_deleted, indexed_at, backend_id, created_at")
+            select_sql = (
+                "SELECT gen_random_uuid(), CAST(:tsid AS UUID), src.tenant_id, src.item_type, src.external_id, "
+                "src.parent_external_id, src.name, src.folder_path, src.content_hash, src.content_checksum, "
+                "src.content_size, src.blob_path, src.encryption_key_id, COALESCE(src.backup_version, 1), src.metadata, "
+                "COALESCE(src.is_deleted, false), src.indexed_at, src.backend_id, NOW() FROM " + prior_src)
+            parent = "COALESCE(src.parent_external_id, split_part(src.external_id, '::', 1))"
+            copied = 0
+            for where in ("src.item_type = 'EMAIL' AND COALESCE(src.metadata->>'source_mailbox', 'primary') <> 'primary' "
+                          "AND src.external_id = ANY(CAST(:ids AS TEXT[]))",
+                          "src.item_type = 'EMAIL_ATTACHMENT' AND " + parent + " = ANY(CAST(:ids AS TEXT[]))"):
+                r = await session.execute(text(
+                    "INSERT INTO snapshot_items (" + columns + ") " + select_sql + " WHERE " + where +
+                    " ON CONFLICT (snapshot_id, external_id, item_type) DO NOTHING"), params)
+                copied += r.rowcount or 0
+            await session.commit()
+    except Exception as exc:
+        print(f"[TIER1-MAIL] secondary-tier reuse skipped for {resource_id}: {type(exc).__name__}: {exc}")
+        return items, 0
+    keep = set(same)
+    return [m for m in items if not (m.get("_source_mailbox", "primary") != "primary"
+                                     and str(m.get("id")) in keep)], copied
+
+
 class VersionListCoordinator:
     """Async coordinator that bunches per-file /versions requests into
     Graph $batch calls.
@@ -27286,6 +27342,16 @@ class BackupWorker:
         container = azure_storage_manager.get_container_name(str(tenant.id), "planner")
         db_items: List[SnapshotItem] = []
         files_failed = 0
+        # Unchanged items reuse the prior full snapshot's blob; a wholly unchanged run points at it.
+        from shared.item_reuse import PriorItems
+        prior_items = await PriorItems.load(async_session_factory, resource.id, snapshot.id)
+
+        async def _put(item_type: str, ext_id: str, path: str, data: bytes, digest: str):
+            reused = prior_items.blob(item_type, ext_id, digest)
+            if reused:
+                return reused
+            r = await upload_blob_with_retry(container, path, data, shard)
+            return path if r.get("success") else None
 
         plans = await graph_client.get_planner_plans_for_group(obj_id)
         plan_list = plans.get("value", [])
@@ -27308,8 +27374,8 @@ class BackupWorker:
                 tp = azure_storage_manager.build_blob_path(
                     str(tenant.id), str(resource.id), str(snapshot.id), f"task_{task_id}"
                 )
-                tr = await upload_blob_with_retry(container, tp, tb, shard)
-                if tr.get("success"):
+                tp = await _put("PLANNER_TASK", task_id, tp, tb, th)
+                if tp:
                     _items.append(SnapshotItem(
                         snapshot_id=snapshot.id, tenant_id=tenant.id,
                         external_id=task_id, item_type="PLANNER_TASK",
@@ -27333,8 +27399,8 @@ class BackupWorker:
                     dp = azure_storage_manager.build_blob_path(
                         str(tenant.id), str(resource.id), str(snapshot.id), f"task_{task_id}_details"
                     )
-                    dr = await upload_blob_with_retry(container, dp, db, shard)
-                    if dr.get("success"):
+                    dp = await _put("PLANNER_TASK_DETAILS", f"{task_id}:details", dp, db, dh)
+                    if dp:
                         _items.append(SnapshotItem(
                             snapshot_id=snapshot.id, tenant_id=tenant.id,
                             external_id=f"{task_id}:details", item_type="PLANNER_TASK_DETAILS",
@@ -27357,8 +27423,8 @@ class BackupWorker:
                 blob_path = azure_storage_manager.build_blob_path(
                     str(tenant.id), str(resource.id), str(snapshot.id), f"plan_{plan_id}"
                 )
-                r = await upload_blob_with_retry(container, blob_path, content_bytes, shard)
-                if r.get("success"):
+                blob_path = await _put("PLANNER_PLAN", plan_id, blob_path, content_bytes, content_hash)
+                if blob_path:
                     _items.append(SnapshotItem(
                         snapshot_id=snapshot.id, tenant_id=tenant.id,
                         external_id=plan_id, item_type="PLANNER_PLAN",
@@ -27407,6 +27473,11 @@ class BackupWorker:
             if len(plan_list) >= 2:
                 print(f"[PERF][PLANNER] processed {len(plan_list)} plans in {time.time()-_t0_planner:.2f}s")
 
+        if not files_failed:
+            pointed = await prior_items.point_if_unchanged(async_session_factory, snapshot.id, db_items, "planner_reused_prior")
+            if pointed:
+                print(f"[{self.worker_id}] [PLANNER COMPLETE] {resource.display_name} — unchanged, reusing prior snapshot")
+                return pointed
         if db_items:
             async with async_session_factory() as session:
                 session.add_all(db_items)
@@ -27435,6 +27506,16 @@ class BackupWorker:
         container = azure_storage_manager.get_container_name(str(tenant.id), "todo")
         db_items: List[SnapshotItem] = []
         files_failed = 0
+        # Unchanged items reuse the prior full snapshot's blob; a wholly unchanged run points at it.
+        from shared.item_reuse import PriorItems
+        prior_items = await PriorItems.load(async_session_factory, resource.id, snapshot.id)
+
+        async def _put(item_type: str, ext_id: str, path: str, data: bytes, digest: str):
+            reused = prior_items.blob(item_type, ext_id, digest)
+            if reused:
+                return reused
+            r = await upload_blob_with_retry(container, path, data, shard)
+            return path if r.get("success") else None
 
         async def backup_task_extras(list_id: str, task_id: str, task_title: str):
             """Fetch checklistItems and linkedResources for a task; return (items, bytes)."""
@@ -27460,8 +27541,8 @@ class BackupWorker:
                 path = azure_storage_manager.build_blob_path(
                     str(tenant.id), str(resource.id), str(snapshot.id), f"task_{task_id}_{kind}"
                 )
-                r = await upload_blob_with_retry(container, path, data, shard)
-                if r.get("success"):
+                path = await _put(item_type, f"{task_id}:{kind}", path, data, h)
+                if path:
                     extras.append(SnapshotItem(
                         snapshot_id=snapshot.id, tenant_id=tenant.id,
                         external_id=f"{task_id}:{kind}", item_type=item_type,
@@ -27484,8 +27565,8 @@ class BackupWorker:
             lp = azure_storage_manager.build_blob_path(
                 str(tenant.id), str(resource.id), str(snapshot.id), f"list_{list_id}"
             )
-            lr = await upload_blob_with_retry(container, lp, lb, shard)
-            if lr.get("success"):
+            lp = await _put("TODO_LIST", list_id, lp, lb, lh)
+            if lp:
                 local_items.append(SnapshotItem(
                     snapshot_id=snapshot.id, tenant_id=tenant.id,
                     external_id=list_id, item_type="TODO_LIST",
@@ -27509,8 +27590,8 @@ class BackupWorker:
                 tp = azure_storage_manager.build_blob_path(
                     str(tenant.id), str(resource.id), str(snapshot.id), f"task_{task_id}"
                 )
-                tr = await upload_blob_with_retry(container, tp, tb, shard)
-                if tr.get("success"):
+                tp = await _put("TODO_TASK", task_id, tp, tb, th)
+                if tp:
                     local_items.append(SnapshotItem(
                         snapshot_id=snapshot.id, tenant_id=tenant.id,
                         external_id=task_id, item_type="TODO_TASK",
@@ -27539,6 +27620,11 @@ class BackupWorker:
             else:
                 print(f"[{self.worker_id}]   [TODO] List task error: {r}")
 
+        if not files_failed:
+            pointed = await prior_items.point_if_unchanged(async_session_factory, snapshot.id, db_items, "todo_reused_prior")
+            if pointed:
+                print(f"[{self.worker_id}] [TODO COMPLETE] {resource.display_name} — unchanged, reusing prior snapshot")
+                return pointed
         if db_items:
             async with async_session_factory() as session:
                 session.add_all(db_items)
@@ -29062,7 +29148,11 @@ class BackupWorker:
         delta path can hold those folders' cursors back (legacy callers
         ignore it; a full walk re-fetches everything next run anyway).
         """
-        item_count = 0
+        # Unchanged archive / recoverable messages: copy the prior rows, no upload / attachment fetch.
+        items, item_count = await _carry_unchanged_secondary_mail(
+            resource_id=str(resource.id), target_snapshot_id=str(snapshot.id),
+            current_job_id=getattr(snapshot, "job_id", None), items=items,
+        )
         bytes_added = 0
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
         # Write to the "email" workload container so the restore-side PST

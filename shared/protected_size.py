@@ -303,7 +303,7 @@ async def _source_page(factory, work, page_size, ms, replica):
                         await db.execute(
                             text(f"""SELECT i.id item_id,i.snapshot_id,
               COALESCE(i.external_id,i.id::text) identity,i.created_at,COALESCE(i.content_size,0) size
-              FROM unnest(CAST(:snapshots AS uuid[]),CAST(:ids AS uuid[])) k(snapshot_id,item_id)
+              FROM (SELECT DISTINCT * FROM unnest(CAST(:snapshots AS uuid[]),CAST(:ids AS uuid[]))) k(snapshot_id,item_id)
               JOIN snapshot_items i ON i.snapshot_id=k.snapshot_id AND i.id=k.item_id
               JOIN snapshots s ON s.id=i.snapshot_id WHERE s.resource_id=:r AND s.status IN {ELIGIBLE}
               AND NOT COALESCE(i.is_deleted,false)"""),
