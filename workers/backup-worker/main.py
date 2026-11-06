@@ -9177,10 +9177,10 @@ class BackupWorker:
 
                     # Record deletions so the newest restore point hides them. The cursor only
                     # advances when this snapshot COMPLETES, so a failed run re-reports them.
-                    # Off until Recovery's OneDrive reads drop is_deleted rows AFTER the
-                    # newest-wins dedup (they filter before it, and /onedrive/ids not at all).
+                    # On by default: Recovery's OneDrive reads drop is_deleted rows AFTER the
+                    # newest-wins dedup (db41c62). ONEDRIVE_RECORD_DELETIONS=false turns it off.
                     _record_deletions = snapshot is not None and os.getenv(
-                        "ONEDRIVE_RECORD_DELETIONS", "false").strip().lower() in ("1", "true", "yes", "on")
+                        "ONEDRIVE_RECORD_DELETIONS", "true").strip().lower() in ("1", "true", "yes", "on")
                     if deleted_items and _record_deletions:
                         for _i in range(0, len(deleted_items), 1000):
                             await self._insert_snapshot_item_rows([

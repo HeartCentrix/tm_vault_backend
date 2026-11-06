@@ -3,9 +3,9 @@ every later restore point (Recovery merges restore points newest-wins). The delt
 each Graph deletion as an is_deleted ONEDRIVE_FILE row in the run's snapshot, like SharePoint's
 library tombstones; older restore points keep their live row.
 
-Gated by ONEDRIVE_RECORD_DELETIONS (default off) until the Recovery OneDrive reads drop
-is_deleted rows AFTER the newest-wins dedup: today /onedrive and /folders filter them before it
-(so the older live row would still win) and /onedrive/ids does not filter them at all."""
+Gated by ONEDRIVE_RECORD_DELETIONS, default on: the Recovery OneDrive reads (/onedrive, /folders,
+/onedrive/ids) drop is_deleted rows AFTER the newest-wins dedup (db41c62). Set it false to stop
+recording tombstones."""
 from __future__ import annotations
 
 import pathlib
@@ -42,7 +42,7 @@ def test_unnamed_deletion_falls_back_to_its_id():
 
 
 def test_walk_records_deletions_only_when_enabled():
-    assert 'os.getenv( "ONEDRIVE_RECORD_DELETIONS", "false")' in _FLAT
+    assert 'os.getenv( "ONEDRIVE_RECORD_DELETIONS", "true")' in _FLAT
     assert "deleted_items.append(f)" in _FLAT
     assert "await self._insert_snapshot_item_rows([ _onedrive_tombstone_row(snapshot, resource.tenant_id, d)" in _FLAT
 
