@@ -73,6 +73,7 @@ EXPECTED_CHAIN = [
     ('0024', '0023'),            # protected-size journal coalescing
     ('0025', '0024'),            # chat overlay snapshots
     ('0026', '0025'),            # cross-mailbox mail attachment contents
+    ('0027', '0026'),            # protected-size identity ledger (anchored winners)
 ]
 
 # Substring that must appear in the module docstring of each pending revision,
@@ -98,6 +99,7 @@ PENDING_SUBJECTS = {
     "0024": "Protected-size capture",
     "0025": "Chat overlay snapshots",
     "0026": "mail attachment contents",
+    "0027": "Protected-size identity ledger",
 }
 
 

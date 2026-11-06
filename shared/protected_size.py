@@ -135,6 +135,10 @@ async def _claim(factory, owner, ms):
         )
         if not control:
             return {"status": "busy"}
+        # Per-item refs (pre-0027) are converted to anchors by the online script, which drops
+        # the table when done; until then the winners carry no anchors to maintain.
+        if await db.scalar(text("SELECT to_regclass('protected_size_refs') IS NOT NULL")):
+            return {"status": "converting", "referencesTouched": 0}
         if control["owner"] and await db.scalar(
             text("SELECT :until > clock_timestamp()"), {"until": control["lease_until"]}
         ):
@@ -328,7 +332,7 @@ async def _source_page(factory, work, page_size, ms, replica):
                 refs = list(
                     (
                         await db.execute(
-                            text("""SELECT item_id FROM protected_size_refs WHERE resource_id=:r AND snapshot_id=:s
+                            text("""SELECT DISTINCT item_id FROM protected_size_winners WHERE resource_id=:r AND snapshot_id=:s
                   AND (CAST(:cursor AS uuid) IS NULL OR item_id>CAST(:cursor AS uuid)) ORDER BY item_id LIMIT :n"""),
                             {
                                 "r": work["resource_id"],
@@ -380,96 +384,124 @@ def _identity_hash(identity):
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
-async def _references(db, rid, ids, rows, snapshot_id=None, item_keys=None):
+# Newest eligible, non-deleted source item of each identity in :keys (identities of :r).
+# Probes ride (snapshot_id, external_id...) per eligible snapshot; a NULL external_id identity
+# is the item's own id and rides the id index.
+# ponytail: one probe per eligible snapshot per recomputed identity; only real changes and
+# anchor removals (amortised N/retention-days per day) pay it. A (resource, external_id) source
+# index would make it O(1) if resources ever keep thousands of snapshots.
+_RECOMPUTE = f"""INSERT INTO protected_size_winners(resource_id,identity_id,size,snapshot_id,item_id,created_at)
+  SELECT :r,x.id,w.size,w.snapshot_id,w.item_id,w.created_at FROM protected_size_identities x
+  CROSS JOIN LATERAL (SELECT * FROM (
+    SELECT i.snapshot_id,i.id item_id,i.created_at,COALESCE(i.content_size,0) size
+      FROM snapshots s JOIN snapshot_items i ON i.snapshot_id=s.id
+      WHERE s.resource_id=:r AND s.status IN {ELIGIBLE} AND i.external_id=x.identity AND NOT COALESCE(i.is_deleted,false)
+    UNION ALL
+    SELECT i.snapshot_id,i.id,i.created_at,COALESCE(i.content_size,0)
+      FROM snapshot_items i JOIN snapshots s ON s.id=i.snapshot_id
+      WHERE i.id=CASE WHEN x.identity ~* '^[0-9a-f]{{8}}-([0-9a-f]{{4}}-){{3}}[0-9a-f]{{12}}$' THEN CAST(x.identity AS uuid) END
+      AND i.external_id IS NULL AND s.resource_id=:r AND s.status IN {ELIGIBLE} AND NOT COALESCE(i.is_deleted,false)
+  ) c ORDER BY created_at DESC,item_id DESC LIMIT 1) w
+  WHERE x.resource_id=:r AND x.id=ANY(CAST(:keys AS bigint[]))"""
+
+
+async def _identity_ids(db, rid, rows):
     """Narrow hash probes resolve exact identities, including hash collisions."""
     keys = {r["identity"] for r in rows}
     hashes = {key: _identity_hash(key) for key in keys}
-    identities = {}
-    if hashes:
-        known = (
+    if not hashes:
+        return {}
+    known = (
+        await db.execute(
+            text("""SELECT id,identity FROM protected_size_identities
+      WHERE resource_id=:r AND identity_hash=ANY(CAST(:hashes AS text[]))"""),
+            {"r": rid, "hashes": list(set(hashes.values()))},
+        )
+    ).mappings()
+    identities = {r["identity"]: r["id"] for r in known if r["identity"] in keys}
+    missing = [
+        {"identity": key, "identity_hash": hashes[key]}
+        for key in keys
+        if key not in identities
+    ]
+    if missing:
+        inserted = (
             await db.execute(
-                text("""SELECT id,identity FROM protected_size_identities
-          WHERE resource_id=:r AND identity_hash=ANY(CAST(:hashes AS text[]))"""),
-                {"r": rid, "hashes": list(set(hashes.values()))},
+                text("""INSERT INTO protected_size_identities(resource_id,identity_hash,identity)
+          SELECT :r,x.identity_hash,x.identity FROM jsonb_to_recordset(CAST(:rows AS jsonb))
+          x(identity_hash text,identity text) RETURNING id,identity"""),
+                {"r": rid, "rows": json.dumps(missing)},
             )
         ).mappings()
-        identities = {r["identity"]: r["id"] for r in known if r["identity"] in keys}
-        missing = [
-            {"identity": key, "identity_hash": hashes[key]}
-            for key in keys
-            if key not in identities
-        ]
-        if missing:
-            inserted = (
-                await db.execute(
-                    text("""INSERT INTO protected_size_identities(resource_id,identity_hash,identity)
-              SELECT :r,x.identity_hash,x.identity FROM jsonb_to_recordset(CAST(:rows AS jsonb))
-              x(identity_hash text,identity text) RETURNING id,identity"""),
-                    {"r": rid, "rows": json.dumps(missing)},
-                )
-            ).mappings()
-            identities.update({r["identity"]: r["id"] for r in inserted})
-    pairs = item_keys if item_keys is not None else [(snapshot_id, iid) for iid in ids]
-    scope = {
-        "r": rid,
-        "keys": json.dumps(
-            [{"snapshot_id": str(sid), "item_id": str(iid)} for sid, iid in pairs]
-        ),
-    }
-    old = list(
-        (
+        identities.update({r["identity"]: r["id"] for r in inserted})
+    return identities
+
+
+async def _references(db, rid, keys, rows):
+    """Apply one page: ``keys`` are the (snapshot_id, item_id) pairs it covers, ``rows`` those
+    still eligible and not deleted. Returns the identities recomputed.
+
+    Ledger invariant per identity (one winner row): every eligible item at or after the anchor
+    key (created_at, NULL newest, then item_id) has the winner's size, and the anchor item is
+    one of them, so winner.size is the newest item's size. A row older than the anchor, or newer
+    with the same size (copy-forward), changes nothing and writes nothing. Only a removed or
+    altered anchor, a newer different size, or an unknown identity recomputes that identity
+    from the source; the newest item becomes the anchor."""
+    identities = await _identity_ids(db, rid, rows)
+    recompute = set()
+    if keys:
+        anchors = (
             await db.execute(
-                text("""SELECT DISTINCT f.identity_id FROM
-      jsonb_to_recordset(CAST(:keys AS jsonb)) k(snapshot_id uuid,item_id uuid)
-      JOIN protected_size_refs f ON f.resource_id=:r AND f.snapshot_id=k.snapshot_id AND f.item_id=k.item_id"""),
-                scope,
+                text("""SELECT w.identity_id,w.snapshot_id,w.item_id FROM jsonb_to_recordset(CAST(:keys AS jsonb))
+          k(snapshot_id uuid,item_id uuid) JOIN protected_size_winners w
+          ON w.resource_id=:r AND w.snapshot_id=k.snapshot_id AND w.item_id=k.item_id"""),
+                {
+                    "r": rid,
+                    "keys": json.dumps(
+                        [{"snapshot_id": str(s), "item_id": str(i)} for s, i in keys]
+                    ),
+                },
             )
-        ).scalars()
-    )
-    affected = list(set(old) | set(identities.values()))
-    if not affected:
-        return 0
-    args = {"r": rid, "keys": affected}
-    before = await db.scalar(
-        text(
-            "SELECT COALESCE(sum(size),0) FROM protected_size_winners WHERE resource_id=:r AND identity_id=ANY(CAST(:keys AS bigint[]))"
-        ),
-        args,
-    )
-    await db.execute(
-        text("""DELETE FROM protected_size_refs f USING
-      jsonb_to_recordset(CAST(:keys AS jsonb)) k(snapshot_id uuid,item_id uuid)
-      WHERE f.resource_id=:r AND f.snapshot_id=k.snapshot_id AND f.item_id=k.item_id"""),
-        scope,
-    )
+        ).all()
+        present = {
+            (identities[r["identity"]], str(r["snapshot_id"]), str(r["item_id"]))
+            for r in rows
+        }
+        recompute |= {
+            a.identity_id
+            for a in anchors
+            if (a.identity_id, str(a.snapshot_id), str(a.item_id)) not in present
+        }
     if rows:
         payload = [dict(r, identity_id=identities[r["identity"]]) for r in rows]
-        await db.execute(
-            text("""INSERT INTO protected_size_refs(resource_id,snapshot_id,item_id,identity_id,created_at,size)
-          SELECT :r,x.snapshot_id,x.item_id,x.identity_id,x.created_at,x.size FROM jsonb_to_recordset(CAST(:rows AS jsonb))
-          AS x(snapshot_id uuid,item_id uuid,identity_id bigint,created_at timestamp,size bigint)
-          ON CONFLICT(resource_id,snapshot_id,item_id) DO UPDATE SET identity_id=EXCLUDED.identity_id,created_at=EXCLUDED.created_at,size=EXCLUDED.size"""),
-            {"r": rid, "rows": json.dumps(payload, default=str)},
+        recompute |= set(
+            (
+                await db.execute(
+                    text("""SELECT DISTINCT x.identity_id FROM jsonb_to_recordset(CAST(:rows AS jsonb))
+          x(identity_id bigint,snapshot_id uuid,item_id uuid,created_at timestamp,size bigint)
+          LEFT JOIN protected_size_winners w ON w.resource_id=:r AND w.identity_id=x.identity_id
+          WHERE w.item_id IS NULL
+            OR (w.snapshot_id=x.snapshot_id AND w.item_id=x.item_id
+              AND (w.created_at IS DISTINCT FROM x.created_at OR w.size<>x.size))
+            OR (x.size<>w.size AND (x.created_at IS NULL,COALESCE(x.created_at,'-infinity'),x.item_id)
+              >= (w.created_at IS NULL,COALESCE(w.created_at,'-infinity'),w.item_id))"""),
+                    {"r": rid, "rows": json.dumps(payload, default=str)},
+                )
+            ).scalars()
         )
+    if not recompute:
+        return 0
+    args = {"r": rid, "keys": sorted(recompute)}
+    total = "SELECT COALESCE(sum(size),0) FROM protected_size_winners WHERE resource_id=:r AND identity_id=ANY(CAST(:keys AS bigint[]))"
+    before = await db.scalar(text(total), args)
     await db.execute(
         text(
             "DELETE FROM protected_size_winners WHERE resource_id=:r AND identity_id=ANY(CAST(:keys AS bigint[]))"
         ),
         args,
     )
-    await db.execute(
-        text("""INSERT INTO protected_size_winners(resource_id,identity_id,size)
-      SELECT :r,key.identity_id,w.size FROM unnest(CAST(:keys AS bigint[])) key(identity_id)
-      CROSS JOIN LATERAL (SELECT size FROM protected_size_refs WHERE resource_id=:r AND identity_id=key.identity_id
-      ORDER BY created_at DESC,item_id DESC LIMIT 1) w"""),
-        args,
-    )
-    after = await db.scalar(
-        text(
-            "SELECT COALESCE(sum(size),0) FROM protected_size_winners WHERE resource_id=:r AND identity_id=ANY(CAST(:keys AS bigint[]))"
-        ),
-        args,
-    )
+    await db.execute(text(_RECOMPUTE), args)
+    after = await db.scalar(text(total), args)
     await db.execute(
         text(
             "UPDATE resource_protected_bytes SET working_bytes=working_bytes+:delta WHERE resource_id=:r"
@@ -478,11 +510,10 @@ async def _references(db, rid, ids, rows, snapshot_id=None, item_keys=None):
     )
     await db.execute(
         text("""DELETE FROM protected_size_identities i WHERE resource_id=:r AND id=ANY(CAST(:keys AS bigint[]))
-      AND NOT EXISTS(SELECT 1 FROM protected_size_refs f WHERE f.resource_id=:r AND f.identity_id=i.id)
       AND NOT EXISTS(SELECT 1 FROM protected_size_winners w WHERE w.resource_id=:r AND w.identity_id=i.id)"""),
         args,
     )
-    return len(ids)
+    return len(recompute)
 
 
 async def _apply(factory, work, page, page_size, ms):
@@ -581,9 +612,7 @@ async def _apply(factory, work, page, page_size, ms):
                         {"r": rid, "s": sid},
                     )
             else:
-                touched = await _references(
-                    db, rid, ids, page["rows"], item_keys=page["keys"]
-                )
+                touched = await _references(db, rid, page["keys"], page["rows"])
             total = len(
                 event["snapshot_ids"]
                 if event["kind"] == "snapshots"
@@ -610,24 +639,10 @@ async def _apply(factory, work, page, page_size, ms):
 
         elif work["kind"] == "job":
             job = work["job"]
-            if page["remove"]:
-                rows = page["rows"]
-                touched = await _references(
-                    db,
-                    rid,
-                    [r["item_id"] for r in rows],
-                    page["current"],
-                    job["snapshot_id"],
-                )
-            else:
-                rows = page["rows"]
-                touched = await _references(
-                    db,
-                    rid,
-                    [r["item_id"] for r in rows],
-                    [r for r in rows if not r["deleted"]],
-                    job["snapshot_id"],
-                )
+            rows = page["rows"]
+            keys = [(job["snapshot_id"], r["item_id"]) for r in rows]
+            current = page["current"] if page["remove"] else [r for r in rows if not r["deleted"]]
+            touched = await _references(db, rid, keys, current)
             if len(rows) < page_size and not page["remove"]:
                 await db.execute(
                     text(
@@ -718,7 +733,6 @@ async def _cleanup(db, page_size):
     )
     if rid:
         for table in (
-            "protected_size_refs",
             "protected_size_winners",
             "protected_size_jobs",
             "protected_size_snapshots",
@@ -733,7 +747,6 @@ async def _cleanup(db, page_size):
             removed += result.rowcount
         remains = await db.scalar(
             text("""SELECT
-          EXISTS(SELECT 1 FROM protected_size_refs WHERE resource_id=:r) OR
           EXISTS(SELECT 1 FROM protected_size_winners WHERE resource_id=:r) OR
           EXISTS(SELECT 1 FROM protected_size_jobs WHERE resource_id=:r) OR
           EXISTS(SELECT 1 FROM protected_size_snapshots WHERE resource_id=:r) OR

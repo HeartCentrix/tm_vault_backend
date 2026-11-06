@@ -409,7 +409,6 @@ async def test_bounded_cleanup_runs_after_resource_deleted_and_journal_retention
     await ledger.sql("DELETE FROM resources WHERE id=:r", r=ledger.resource)
     assert (await ledger.summary())["totalBytes"] == 0
     turns = await ledger.drain(page_size=1)
-    assert (await ledger.sql("SELECT count(*) FROM protected_size_refs")).scalar() == 0
     assert (
         await ledger.sql("SELECT count(*) FROM protected_size_winners")
     ).scalar() == 0
@@ -824,13 +823,13 @@ async def test_real_serialization_conflict_retries_whole_page_without_delta_dupl
             nonlocal injected
             result = await super().execute(statement, *args, **kwargs)
             if not injected and str(statement).startswith(
-                "SELECT DISTINCT f.identity_id"
+                "SELECT DISTINCT x.identity_id"
             ):
                 injected = True
                 # This real concurrent update changes the tuple version after
                 # the serializable page has read it, before its DELETE.
                 await ledger.sql(
-                    "UPDATE protected_size_refs SET size=size WHERE resource_id=:r",
+                    "UPDATE protected_size_winners SET size=size WHERE resource_id=:r",
                     r=ledger.resource,
                 )
             return result
@@ -1504,3 +1503,218 @@ async def test_per_row_statements_in_one_transaction_share_journal_rows(ledger):
     assert expected == sum(range(1500)) + 7 + 3
     assert (await ledger.summary(types=("USER_MAIL",)))["totalBytes"] == expected
     assert (await ledger.summary(types=("USER_CHATS",)))["totalBytes"] == 20
+
+
+COPY_FORWARD = ("INSERT INTO snapshot_items SELECT gen_random_uuid(),:new,external_id,item_type,content_size,"
+                "is_deleted,now() FROM snapshot_items WHERE snapshot_id=:old")
+
+
+async def _parity(ledger, page_size=3):
+    from shared.protected_size import optimized_rollup
+
+    turns = await ledger.drain(limit=500, page_size=page_size)
+    expected = (await ledger.sql(optimized_rollup, rid=ledger.resource)).scalar()
+    assert (await ledger.summary())["totalBytes"] == expected
+    return turns, expected
+
+
+async def test_identity_ledger_matches_optimized_rollup_across_lifecycle(ledger):
+    """Insert, copy-forward, change, revert, out-of-order, delete, retention, pointer and
+    overlay snapshots, eligibility flips: the ledger total equals optimized_rollup each step."""
+    s1 = await ledger.snapshot()
+    for key, size in (("a", 10), ("b", 20), ("c", 30)):
+        await ledger.item(s1, key, size)
+    await ledger.item(s1, "d", 40, deleted=True)
+    await ledger.sql("INSERT INTO snapshot_items VALUES(gen_random_uuid(),:s,'n','mail',6,false,NULL)", s=s1)
+    assert (await _parity(ledger))[1] == 66
+
+    async def copy(old, *, finish=True):
+        new = await ledger.snapshot("IN_PROGRESS")
+        await ledger.sql(COPY_FORWARD, new=new, old=old)
+        if finish:
+            await ledger.sql("UPDATE snapshots SET status='COMPLETED' WHERE id=:s", s=new)
+        return new
+
+    s2 = await copy(s1)
+    assert (await _parity(ledger))[1] == 66
+    # Change b, add e, drop c from the newest snapshot (c stays retained in s1/s2).
+    s3 = await copy(s2, finish=False)
+    await ledger.sql("UPDATE snapshot_items SET content_size=25 WHERE snapshot_id=:s AND external_id='b'", s=s3)
+    await ledger.sql("DELETE FROM snapshot_items WHERE snapshot_id=:s AND external_id='c'", s=s3)
+    await ledger.item(s3, "e", 5, when="2026-12-01")
+    await ledger.sql("UPDATE snapshots SET status='COMPLETED' WHERE id=:s", s=s3)
+    assert (await _parity(ledger))[1] == 76
+    # Revert b to its original size in a later copy.
+    s4 = await copy(s3, finish=False)
+    await ledger.sql("UPDATE snapshot_items SET content_size=20 WHERE snapshot_id=:s AND external_id='b'", s=s4)
+    await ledger.sql("UPDATE snapshots SET status='COMPLETED' WHERE id=:s", s=s4)
+    assert (await _parity(ledger))[1] == 71
+    # Out of order: an older version changes nothing, a far-future one wins, then goes away.
+    await ledger.item(s1, "a", 99, when="2025-01-01")
+    await _parity(ledger)
+    future = await ledger.item(s1, "a", 7, when="2030-01-01")
+    assert (await _parity(ledger))[1] == 68
+    await ledger.sql("DELETE FROM snapshot_items WHERE id=:i", i=future)
+    assert (await _parity(ledger))[1] == 71
+    # A copied (non-anchor) row changes size in place, then is soft-deleted.
+    await ledger.sql("UPDATE snapshot_items SET content_size=1 WHERE snapshot_id=:s AND external_id='a'", s=s2)
+    await _parity(ledger)
+    await ledger.sql("UPDATE snapshot_items SET is_deleted=true WHERE snapshot_id=:s AND external_id='a'", s=s4)
+    await _parity(ledger)
+    # Retention: items then snapshot row; then a snapshot row only.
+    await ledger.sql("DELETE FROM snapshot_items WHERE snapshot_id=:s", s=s1)
+    await ledger.sql("DELETE FROM snapshots WHERE id=:s", s=s1)
+    await _parity(ledger)
+    await ledger.sql("DELETE FROM snapshots WHERE id=:s", s=s2)
+    await _parity(ledger)
+    # Pointer snapshot (no rows of its own) and an overlay holding only its own changes.
+    pointer = await ledger.snapshot()
+    await _parity(ledger)
+    overlay = await ledger.snapshot()
+    await ledger.item(overlay, "b", 2, when="2031-01-01")
+    await ledger.item(overlay, "f", 9, when="2031-01-01")
+    await _parity(ledger)
+    await ledger.sql("UPDATE snapshots SET status='FAILED' WHERE id=:s", s=s4)
+    await _parity(ledger)
+    await ledger.sql("UPDATE snapshots SET status='COMPLETED' WHERE id=:s", s=s4)
+    await _parity(ledger)
+    await ledger.sql("DELETE FROM snapshots WHERE id IN (:a,:b)", a=overlay, b=pointer)
+    await _parity(ledger)
+    await ledger.sql("DELETE FROM snapshots")
+    assert (await _parity(ledger))[1] == 0
+    # The anchor itself moves back in time; a later-arriving version in between must win.
+    s7 = await ledger.snapshot()
+    anchor = await ledger.item(s7, "x", 5, when="2026-02-01")
+    await _parity(ledger)
+    await ledger.sql("UPDATE snapshot_items SET created_at='2025-01-01' WHERE id=:i", i=anchor)
+    await _parity(ledger)
+    await ledger.item(s7, "x", 9, when="2025-06-01")
+    assert (await _parity(ledger))[1] == 9
+
+
+async def test_copy_forward_of_unchanged_items_writes_no_ledger_rows(ledger):
+    """A daily incremental that copies N unchanged rows forward costs O(changes) ledger
+    writes: zero winner/identity rows touched, and one per real change."""
+    n = 300
+    s1 = await ledger.snapshot()
+    await ledger.sql(
+        "INSERT INTO snapshot_items SELECT gen_random_uuid(),:s,'k'||g,'mail',g,false,now() FROM generate_series(1,:n) g",
+        s=s1, n=n)
+    await _parity(ledger, page_size=1000)
+    state = "SELECT resource_id,identity_id,xmin::text,ctid::text FROM protected_size_winners ORDER BY 1,2"
+    identities = "SELECT id,xmin::text FROM protected_size_identities ORDER BY 1"
+    before, ids_before = (await ledger.sql(state)).all(), (await ledger.sql(identities)).all()
+    assert len(before) == n
+    s2 = await ledger.snapshot("IN_PROGRESS")
+    await ledger.sql(COPY_FORWARD, new=s2, old=s1)
+    await ledger.sql("UPDATE snapshots SET status='COMPLETED' WHERE id=:s", s=s2)
+    turns, total = await _parity(ledger, page_size=1000)
+    assert total == n * (n + 1) // 2
+    assert sum(t.get("referencesTouched", 0) for t in turns) == 0
+    assert (await ledger.sql(state)).all() == before
+    assert (await ledger.sql(identities)).all() == ids_before
+    assert (await ledger.sql("SELECT to_regclass('protected_size_refs')")).scalar() is None
+    # One real change in the next copy: one winner row rewritten.
+    s3 = await ledger.snapshot("IN_PROGRESS")
+    await ledger.sql(COPY_FORWARD, new=s3, old=s2)
+    await ledger.sql("UPDATE snapshot_items SET content_size=0 WHERE snapshot_id=:s AND external_id='k7'", s=s3)
+    await ledger.sql("UPDATE snapshots SET status='COMPLETED' WHERE id=:s", s=s3)
+    turns, total = await _parity(ledger, page_size=1000)
+    assert total == n * (n + 1) // 2 - 7
+    assert sum(t.get("referencesTouched", 0) for t in turns) == 1
+    after = (await ledger.sql(state)).all()
+    assert len(after) == n and len(set(after) - set(before)) == 1
+
+
+async def test_identity_ledger_random_history_matches_optimized_rollup(ledger):
+    """Seeded random copy-forward/change/delete/retention/eligibility history, NULL and tied
+    timestamps included: exact parity with optimized_rollup after every step."""
+    import random
+
+    rng = random.Random(14)
+    keys = ["k0", "k1", "k2", "k3", None]
+    times = [None, "2026-01-01", "2026-01-01", "2026-02-01", "2027-01-01"]
+    snapshots = [await ledger.snapshot()]
+    for _ in range(60):
+        op = rng.choice(["copy", "copy", "item", "size", "time", "delete", "drop", "status", "softdel"])
+        live = [r[0] for r in (await ledger.sql("SELECT id FROM snapshots")).all()]
+        items = [r[0] for r in (await ledger.sql("SELECT id FROM snapshot_items")).all()]
+        if op == "copy" and live:
+            new = await ledger.snapshot(rng.choice(["IN_PROGRESS", "COMPLETED"]))
+            await ledger.sql(COPY_FORWARD, new=new, old=rng.choice(live))
+            await ledger.sql("UPDATE snapshots SET status='COMPLETED' WHERE id=:s", s=new)
+            snapshots.append(new)
+        elif op == "item" and live:
+            when = rng.choice(times)
+            await ledger.sql(
+                "INSERT INTO snapshot_items VALUES(gen_random_uuid(),:s,:k,'mail',:z,false,CAST(CAST(:w AS text) AS timestamp))",
+                s=rng.choice(live), k=rng.choice(keys), z=rng.randint(0, 9), w=when)
+        elif op == "size" and items:
+            await ledger.sql("UPDATE snapshot_items SET content_size=:z WHERE id=:i", z=rng.randint(0, 9), i=rng.choice(items))
+        elif op == "time" and items:
+            await ledger.sql("UPDATE snapshot_items SET created_at=CAST(CAST(:w AS text) AS timestamp) WHERE id=:i",
+                             w=rng.choice(times), i=rng.choice(items))
+        elif op == "delete" and items:
+            await ledger.sql("DELETE FROM snapshot_items WHERE id=:i", i=rng.choice(items))
+        elif op == "softdel" and items:
+            await ledger.sql("UPDATE snapshot_items SET is_deleted=NOT COALESCE(is_deleted,false) WHERE id=:i", i=rng.choice(items))
+        elif op == "drop" and len(live) > 1:
+            await ledger.sql("DELETE FROM snapshots WHERE id=:s", s=rng.choice(live))
+        elif op == "status" and live:
+            await ledger.sql("UPDATE snapshots SET status=:st WHERE id=:s",
+                             st=rng.choice(["COMPLETED", "FAILED", "PARTIAL", "PENDING_DELETION"]), s=rng.choice(live))
+        await _parity(ledger, page_size=rng.choice([1, 2, 1000]))
+
+
+@pytest.mark.parametrize("mode", ["script", "inline"])
+async def test_pre_0027_refs_convert_online_to_anchors_and_keep_totals(ledger, mode):
+    """A ledger left in the pre-0027 shape (per-item refs, unanchored winners) converts via the
+    Railway script or migration 0027's inline path; the refresher idles meanwhile; totals stay
+    exact and later copy-forwards write nothing."""
+    import pathlib
+    import re
+
+    from shared.protected_size import ELIGIBLE, refresh_once
+    from shared.protected_size_schema import ANCHOR_BACKFILL
+
+    s1 = await ledger.snapshot()
+    for key, size in (("a", 10), ("b", 20), ("c", 30)):
+        await ledger.item(s1, key, size)
+    s2 = await ledger.snapshot("IN_PROGRESS")
+    await ledger.sql(COPY_FORWARD, new=s2, old=s1)
+    await ledger.sql("UPDATE snapshot_items SET content_size=21 WHERE snapshot_id=:s AND external_id='b'", s=s2)
+    await ledger.sql("UPDATE snapshots SET status='COMPLETED' WHERE id=:s", s=s2)
+    assert (await _parity(ledger))[1] == 61
+    await ledger.sql("""CREATE TABLE protected_size_refs(resource_id uuid NOT NULL,snapshot_id uuid NOT NULL,item_id uuid NOT NULL,
+        identity_id bigint NOT NULL,created_at timestamp,size bigint NOT NULL,PRIMARY KEY(resource_id,snapshot_id,item_id))""")
+    await ledger.sql("CREATE INDEX protected_size_ref_winner ON protected_size_refs(resource_id,identity_id,created_at DESC NULLS FIRST,item_id DESC)")
+    await ledger.sql(f"""INSERT INTO protected_size_refs SELECT s.resource_id,i.snapshot_id,i.id,x.id,i.created_at,COALESCE(i.content_size,0)
+        FROM snapshot_items i JOIN snapshots s ON s.id=i.snapshot_id JOIN protected_size_identities x
+        ON x.resource_id=s.resource_id AND x.identity=COALESCE(i.external_id,i.id::text)
+        WHERE s.status IN {ELIGIBLE} AND NOT COALESCE(i.is_deleted,false)""")
+    await ledger.sql("UPDATE protected_size_winners SET snapshot_id=NULL,item_id=NULL,created_at=NULL")
+    assert (await refresh_once(ledger.factory))["status"] == "converting"
+    if mode == "script":
+        path = pathlib.Path(__file__).parents[2] / "scripts/2026_11_06_protected_size_identity_ledger.sql"
+        engine = ledger.factory.kw["bind"]
+        async with engine.connect() as conn:
+            raw = (await conn.get_raw_connection()).driver_connection
+            await raw.execute(f'SET search_path TO "{ledger.schema}"')
+            for statement in re.split(r";\n(?=[A-Z])", path.read_text()):
+                await raw.execute(statement)
+            await raw.execute("RESET search_path")
+    else:
+        await ledger.sql(ANCHOR_BACKFILL)
+        await ledger.sql("DROP TABLE protected_size_refs")
+    assert (await ledger.sql("SELECT count(*) FROM protected_size_winners WHERE item_id IS NULL")).scalar() == 0
+    assert (await ledger.sql("SELECT to_regclass('protected_size_refs')")).scalar() is None
+    assert (await _parity(ledger))[1] == 61
+    s3 = await ledger.snapshot("IN_PROGRESS")
+    await ledger.sql(COPY_FORWARD, new=s3, old=s2)
+    await ledger.sql("UPDATE snapshots SET status='COMPLETED' WHERE id=:s", s=s3)
+    turns, total = await _parity(ledger)
+    assert total == 61 and sum(t.get("referencesTouched", 0) for t in turns) == 0
+    await ledger.sql("DELETE FROM snapshots WHERE id IN (:a,:b)", a=s1, b=s2)
+    assert (await _parity(ledger))[1] == 61
+    await ledger.sql("UPDATE snapshot_items SET content_size=1 WHERE snapshot_id=:s AND external_id='c'", s=s3)
+    assert (await _parity(ledger))[1] == 32
