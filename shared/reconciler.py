@@ -87,6 +87,14 @@ _UNCLAIMED_RQ = (
     "THEN ({c}->>'unclaimed_republish_count')::int END, 0)"
 )
 _UNCLAIMED_RQ_SP = _UNCLAIMED_RQ.format(c="sp.failure_state")
+# TM issue #10: a shard whose workers died RECONCILER_MAX_REQUEUE times
+# (typically pod kills during a deploy roll) gets this many automatic
+# replays before it is FAILED + dead-lettered. A replay parks the row
+# QUEUED with a fresh requeue budget; the requeue step above republishes it
+# once RECONCILER_PART_STALE_MIN has passed (the replay delay), under the
+# same live-owner, lease and durable provider/copy-work guards.
+RECONCILER_DLQ_REPLAY_MAX = int(os.getenv("RECONCILER_DLQ_REPLAY_MAX", "1"))
+_DLQ_REPLAYS = _UNCLAIMED_RQ.replace("unclaimed_republish_count", "dlq_replay_count").format(c="failure_state")
 # Shared "no worker has ever touched this row" predicate. Kept in one
 # place so the republish branch and the expiry branch can never drift
 # into overlapping with the claimed-then-abandoned paths.
@@ -432,7 +440,50 @@ async def sweep_orphans(session) -> SweepStats:
     stats.partitions_unclaimed_requeued = len(unclaimed_rows)
     stats.partitions_requeued += len(unclaimed_rows)
 
-    # Partitions that exceeded the requeue cap → mark FAILED + DLQ.
+    # Partitions that exceeded the requeue cap with replay budget left →
+    # replay (see RECONCILER_DLQ_REPLAY_MAX); without it → FAILED + DLQ.
+    _poison_sql = f"""
+                 WHERE status IN ('QUEUED','IN_PROGRESS')
+                   AND {pending_copy_sql(partition_expr='snapshot_partitions.id')}
+                   AND requeue_count >= :max_rq
+                   AND (lease_expires_at IS NULL OR lease_expires_at < NOW())
+                   AND (
+                        status = 'IN_PROGRESS'
+                     OR worker_id IS NOT NULL
+                     OR started_at IS NOT NULL
+                     OR lease_owner_id IS NOT NULL
+                     OR retry_count > 0
+                   )"""
+    replay_rows = (
+        await session.execute(
+            text(
+                f"""
+                UPDATE snapshot_partitions
+                   SET status = 'QUEUED',
+                       lease_owner_id = NULL,
+                       lease_expires_at = NULL,
+                       lease_token = lease_token + 1,
+                       requeue_count = 0,
+                       enqueued_at = NOW(),
+                       failure_state = COALESCE(failure_state, '{{}}'::json)::jsonb
+                           || jsonb_build_object('dlq_replay_count', {_DLQ_REPLAYS} + 1,
+                                                 'dlq_replayed_at', NOW())
+                {_poison_sql}
+                   AND {_DLQ_REPLAYS} < :max_replays
+                RETURNING id, snapshot_id, partition_type, partition_index,
+                          {_DLQ_REPLAYS} AS replays
+                """
+            ),
+            {"max_rq": RECONCILER_MAX_REQUEUE, "max_replays": RECONCILER_DLQ_REPLAY_MAX},
+        )
+    ).all()
+    for r in replay_rows:
+        print(
+            f"[RECONCILER][DLQ_REPLAY] partition={r.id} replay={r.replays}/{RECONCILER_DLQ_REPLAY_MAX} "
+            f"snapshot_id={r.snapshot_id} partition_type={r.partition_type} "
+            f"partition_index={r.partition_index} republish_after_min={RECONCILER_PART_STALE_MIN}"
+        )
+
     poison_rows = (
         await session.execute(
             text(
@@ -442,22 +493,13 @@ async def sweep_orphans(session) -> SweepStats:
                        lease_owner_id = NULL,
                        lease_expires_at = NULL,
                        lease_token = lease_token + 1
-                 WHERE status IN ('QUEUED','IN_PROGRESS')
-                   AND {pending_copy_sql(partition_expr='snapshot_partitions.id')}
-                   AND requeue_count >= :max_rq
-                   AND (lease_expires_at IS NULL OR lease_expires_at < NOW())
+                {_poison_sql}
                    -- Only a shard some worker actually claimed can be a
-                   -- poison pill. A never-claimed QUEUED row is healthy
-                   -- work still waiting in RabbitMQ; failing + DLQ-ing
-                   -- it loses a backup that never started. Same
-                   -- claim-evidence predicate as the CTE above.
-                   AND (
-                        status = 'IN_PROGRESS'
-                     OR worker_id IS NOT NULL
-                     OR started_at IS NOT NULL
-                     OR lease_owner_id IS NOT NULL
-                     OR retry_count > 0
-                   )
+                   -- poison pill (claim evidence in _poison_sql). A
+                   -- never-claimed QUEUED row is healthy work still
+                   -- waiting in RabbitMQ; failing + DLQ-ing it loses a
+                   -- backup that never started.
+                   AND {_DLQ_REPLAYS} >= :max_replays
                 -- Same column set as the requeue CTEs above: a dead-letter
                 -- row is only replayable if it stores exactly what a
                 -- republish would have published (_partition_envelope).
@@ -466,7 +508,7 @@ async def sweep_orphans(session) -> SweepStats:
                           drive_id, file_ids, payload
                 """
             ),
-            {"max_rq": RECONCILER_MAX_REQUEUE},
+            {"max_rq": RECONCILER_MAX_REQUEUE, "max_replays": RECONCILER_DLQ_REPLAY_MAX},
         )
     ).all()
     for r in poison_rows:
