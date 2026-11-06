@@ -25727,6 +25727,9 @@ class BackupWorker:
                 await sess.commit()
             total_items += len(channel_info_rows)
 
+        _saved_channel_tokens = (resource.extra_data or {}).get("channel_delta_tokens", {}) or {}
+        _new_channel_tokens: Dict[str, str] = {}  # saved once after the gather (parallel saves race)
+
         # Parallelize channel drain across one worker. Mirrors the
         # TEAMS_CHANNEL handler's asyncio.gather pattern in
         # _backup_teams_resource — channels are independent so there's
@@ -25738,7 +25741,11 @@ class BackupWorker:
             ch_id = ch.get("id")
             ch_name = ch.get("displayName", ch_id)
             try:
-                msgs = await graph_client.get_channel_messages(team_id, ch_id)
+                # Resume from the saved per-channel token (same key as the TEAMS_CHANNEL
+                # handler); a stale token falls back to a full read in get_channel_messages.
+                msgs = await graph_client.get_channel_messages(
+                    team_id, ch_id, delta_token=_saved_channel_tokens.get(ch_id),
+                )
             except Exception as exc:
                 logger.warning(
                     "[%s] Channel messages fetch failed for %s/%s: %s",
@@ -25858,6 +25865,8 @@ class BackupWorker:
                     sess.add_all(db_items)
                     await sess.commit()
                 local_items = len(db_items)
+            if msgs.get("@odata.deltaLink"):
+                _new_channel_tokens[ch_id] = msgs["@odata.deltaLink"]
             return local_items, local_bytes
 
         ch_results = await asyncio.gather(
@@ -25868,6 +25877,13 @@ class BackupWorker:
             if isinstance(r, tuple):
                 total_items += r[0]
                 total_bytes += r[1]
+        if _new_channel_tokens:
+            async with async_session_factory() as sess:
+                r = await sess.get(Resource, resource.id)
+                if r:
+                    r.extra_data = r.extra_data or {}
+                    r.extra_data.setdefault("channel_delta_tokens", {}).update(_new_channel_tokens)
+                    await sess.commit()
 
         print(f"[{self.worker_id}]   [CHANNELS] {resource.display_name}: persisted {total_items} messages, {total_bytes} bytes")
         return total_items, total_bytes
