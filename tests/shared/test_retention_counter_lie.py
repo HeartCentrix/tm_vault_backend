@@ -335,6 +335,7 @@ def test_delete_time_guard_second_guesses_an_empty_looking_row(monkeypatch):
     so a lying counter can no longer reach a DELETE."""
     doomed = uuid.uuid4()
     session = _RecordingDeleteSession([doomed])
+    monkeypatch.setattr(rc, "_sparse_fold_target", _no_sparse_rows)  # sparse fold: tests/integration
 
     async def _fake_rehydrate(sess, sid, *, doomed_ids):
         return None
@@ -356,3 +357,7 @@ def test_delete_time_guard_second_guesses_an_empty_looking_row(monkeypatch):
         "delete-time guard does not verify the claim against snapshot_items "
         "— retention can again delete real items on a counter's word"
     )
+
+
+async def _no_sparse_rows(session, sid, doomed):
+    return None

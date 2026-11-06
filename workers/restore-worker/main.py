@@ -3472,8 +3472,9 @@ class RestoreWorker:
         # inline their bytes into the MIME. Match on parent_item_id.
         att_items: List[SnapshotItem] = []
         if session is not None:
+            from shared.snapshot_reuse import items_scope
             att_stmt = select(SnapshotItem).where(
-                SnapshotItem.snapshot_id == item.snapshot_id,
+                await items_scope(session, item.snapshot_id),   # an overlay's message keeps its base attachments
                 SnapshotItem.item_type == "EMAIL_ATTACHMENT",
             )
             rows = (await session.execute(att_stmt)).scalars().all()

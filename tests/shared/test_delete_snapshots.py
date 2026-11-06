@@ -61,6 +61,7 @@ async def test_rehydrates_every_id_before_deleting(monkeypatch):
         return None
 
     monkeypatch.setattr(rc, "_rehydrate_overlay_dependents", _no_overlays)
+    monkeypatch.setattr(rc, "_sparse_fold_target", _no_sparse_rows)  # sparse fold: tests/integration
     sess = _FakeSession()
 
     n = await rc._delete_snapshots(sess, doomed)
@@ -79,3 +80,7 @@ async def test_rehydrates_every_id_before_deleting(monkeypatch):
     assert "snapshots" in sess.events[first_exec + 1][1]
     # returns the Snapshot delete's rowcount
     assert n == 2
+
+
+async def _no_sparse_rows(session, sid, doomed):
+    return None
