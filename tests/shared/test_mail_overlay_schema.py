@@ -26,3 +26,13 @@ def test_chat_overlay_script_and_migration_carry_the_shared_function():
     assert SNAPSHOT_ITEMS_EFFECTIVE_FUNCTION + ";\n" in script and "'CHAT_HOSTED_CONTENT'" in script
     assert "op.execute(SNAPSHOT_ITEMS_EFFECTIVE_FUNCTION)" in (
         ROOT / "alembic" / "versions" / "0025_chat_overlay_snapshots.py").read_text()
+
+
+def test_sharepoint_overlay_script_and_migration_carry_the_shared_function():
+    from shared.database import SNAPSHOT_ITEMS_EFFECTIVE_FUNCTION
+    from shared.sp_overlay import SP_OVERLAY_TYPES
+    script = (ROOT / "scripts" / "2026_11_08_sharepoint_overlay_snapshots.sql").read_text()
+    assert SNAPSHOT_ITEMS_EFFECTIVE_FUNCTION + ";\n" in script and script.rstrip().endswith("COMMIT;")
+    assert all(f"'{t}'" in SNAPSHOT_ITEMS_EFFECTIVE_FUNCTION for t in SP_OVERLAY_TYPES)
+    assert "op.execute(SNAPSHOT_ITEMS_EFFECTIVE_FUNCTION)" in (
+        ROOT / "alembic" / "versions" / "0028_sharepoint_overlay_snapshots.py").read_text()

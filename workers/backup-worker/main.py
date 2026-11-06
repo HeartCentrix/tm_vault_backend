@@ -2259,6 +2259,7 @@ from sqlalchemy.orm import selectinload
 
 from shared.audit import internal_audit_headers
 from shared.database import async_session_factory
+from shared.sp_overlay import BASE_OF_PRIOR as _SP_BASE_OF_PRIOR, sp_overlay_plan, try_sp_overlay  # noqa: E402
 from shared.lease import register as lease_register, unregister as lease_unregister
 from shared.models import (
     Resource, Tenant, Job, Snapshot, SnapshotItem, SnapshotPartition,
@@ -22870,8 +22871,8 @@ class BackupWorker:
             if prev is None:
                 return None, {}
             rows = (await sess.execute(_text("""
-                SELECT external_id, metadata FROM snapshot_items WHERE snapshot_id = :prev
-                  AND item_type = 'SHAREPOINT_LIST' AND metadata->>'site_id' = :site
+                SELECT external_id, metadata FROM snapshot_items_effective(:prev)
+                WHERE item_type = 'SHAREPOINT_LIST' AND metadata->>'site_id' = :site
                   AND (:completed OR metadata->>'rest_complete' = 'true')"""),
                 {"prev": prev[0], "site": site_id, "completed": prev[1] == "COMPLETED"})).all()
         return prev[0], {r[0]: (json.loads(r[1]) if isinstance(r[1], str) else r[1]) or {} for r in rows}
@@ -22889,24 +22890,47 @@ class BackupWorker:
             await sess.commit()
 
     async def _copy_forward_sp_list_rows(self, snapshot_id, prior_snapshot_id, site_id: str, list_id: str,
-                                         skip_external_ids=()) -> int:
+                                         skip_external_ids=(), overlay: Optional[dict] = None) -> int:
         """Copy an unchanged list's rows from the prior restore point in one statement (blobs are
-        retained, so their paths stay valid), except rows this run read again. Returns the rows copied."""
+        retained, so their paths stay valid), except rows this run read again. Returns the rows copied.
+        With an ``overlay`` plan (shared.sp_overlay) only the prior overlay's own rows are copied; the
+        rest stay in the base for _finish_sp_overlay, and the return counts them as carried."""
         from sqlalchemy import text as _text
         columns = [c.name for c in SnapshotItem.__table__.columns]
         values = ["gen_random_uuid()" if c == "id" else "CAST(:sid AS uuid)" if c == "snapshot_id"
                   else "now() AT TIME ZONE 'utc'" if c == "created_at" else "src." + c for c in columns]
+        p = {"sid": str(snapshot_id), "prior": str(prior_snapshot_id), "site": site_id, "list": list_id,
+             "skip": list(skip_external_ids), "base": None}
+        rows_of_list = """FROM snapshot_items_effective(CAST(:prior AS uuid)) src
+                WHERE src.metadata->>'source' = 'sp_rest' AND src.metadata->>'site_id' = :site
+                  AND src.metadata->>'list_id' = :list AND NOT (src.external_id = ANY(:skip))"""
         async with async_session_factory() as sess:
+            if overlay is not None:
+                base = await sess.scalar(_text(f"SELECT {_SP_BASE_OF_PRIOR}"), p)
+                if base is not None and overlay.setdefault("prior", p["prior"]) == p["prior"] \
+                        and overlay.setdefault("base", str(base)) == str(base):
+                    p["base"] = str(base)
             copied = (await sess.execute(_text(
-                "INSERT INTO snapshot_items (" + ",".join(columns) + ") SELECT " + ",".join(values) + """
-                FROM snapshot_items src WHERE src.snapshot_id = CAST(:prior AS uuid)
-                  AND src.metadata->>'source' = 'sp_rest' AND src.metadata->>'site_id' = :site
-                  AND src.metadata->>'list_id' = :list AND NOT (src.external_id = ANY(:skip))
-                ON CONFLICT (snapshot_id, external_id, item_type) DO NOTHING"""),
-                {"sid": str(snapshot_id), "prior": str(prior_snapshot_id), "site": site_id, "list": list_id,
-                 "skip": list(skip_external_ids)})).rowcount
+                "INSERT INTO snapshot_items (" + ",".join(columns) + ") SELECT " + ",".join(values) + " "
+                + rows_of_list + (" AND src.snapshot_id <> CAST(:base AS uuid)" if p["base"] else "")
+                + " ON CONFLICT (snapshot_id, external_id, item_type) DO NOTHING"), p)).rowcount
+            if p["base"]:
+                copied = await sess.scalar(_text("SELECT count(*) " + rows_of_list), p)
+                overlay["inherited"].add(f"{site_id} {list_id}")
+                overlay["skip"].update(p["skip"])
             await sess.commit()
         return int(copied or 0)
+
+    async def _finish_sp_overlay(self, snapshot_id, overlay: Optional[dict]) -> None:
+        """Make the snapshot an overlay of the carried lists' base, or copy those lists in full."""
+        if not overlay or not overlay.get("prior"):
+            return
+        if await try_sp_overlay(async_session_factory, snapshot_id, overlay) is not None:
+            return
+        for key in sorted(overlay["inherited"]):
+            site_id, list_id = key.rsplit(" ", 1)
+            await self._copy_forward_sp_list_rows(snapshot_id, overlay["prior"], site_id, list_id,
+                                                  skip_external_ids=sorted(overlay["skip"]))
 
     async def _previous_sp_rest_rows(self, snapshot: Snapshot, site_id: str) -> Dict[str, Dict[str, Any]]:
         """The latest earlier restore point's list rows for this site (every run re-reads every list)."""
@@ -22922,7 +22946,7 @@ class BackupWorker:
             rows = (await sess.execute(_text("""
                 SELECT external_id, blob_path, content_hash, content_size,
                        metadata->>'row_version' AS row_version, metadata->>'ghosted' AS ghosted, metadata->'file' AS file
-                FROM snapshot_items WHERE snapshot_id = :prev AND metadata->>'source' = 'sp_rest'
+                FROM snapshot_items_effective(:prev) WHERE metadata->>'source' = 'sp_rest'
                   AND metadata->>'site_id' = :site AND metadata->>'row_version' IS NOT NULL"""),
                 {"prev": prev, "site": site_id})).mappings().all()
         return {r["external_id"]: {**r, "ghosted": r["ghosted"] == "true",
@@ -29860,6 +29884,8 @@ class BackupWorker:
         # (site id, list id) whose REST read or a row failed this run: not marked complete, so a PARTIAL
         # snapshot's next run re-reads only these lists (_previous_sp_lists).
         sp_lists_incomplete: Set[Tuple[str, str]] = set()
+        # Carried lists stay in the base snapshot instead of being copied (shared.sp_overlay).
+        sp_overlay = sp_overlay_plan() if _sp_owns_inventory else None
 
         stats = {
             "drive_ok": 0, "drive_bytes": 0, "drive_fail": 0, "drive_excluded": 0,
@@ -30212,7 +30238,8 @@ class BackupWorker:
                     continue
                 if _reuse_walked:
                     try:
-                        _copied = await self._copy_forward_sp_list_rows(snapshot.id, prior_lists_id, site_id, lst_id)
+                        _copied = await self._copy_forward_sp_list_rows(snapshot.id, prior_lists_id, site_id, lst_id,
+                                                                  overlay=sp_overlay)
                         if _copied or not (_sig or {}).get("count"):
                             stats["lists_reused"] = stats.get("lists_reused", 0) + 1
                             stats["list_rows_reused"] = stats.get("list_rows_reused", 0) + _copied
@@ -30247,7 +30274,8 @@ class BackupWorker:
                             _changed_ids.append(f"{lst_id}:{row.get('Id') or row.get('ID')}")
                             await rest_queue.put(_rest_work(row))
                         _copied = await self._copy_forward_sp_list_rows(
-                            snapshot.id, prior_lists_id, site_id, lst_id, skip_external_ids=_changed_ids)
+                            snapshot.id, prior_lists_id, site_id, lst_id, skip_external_ids=_changed_ids,
+                            overlay=sp_overlay)
                         if _copied or _changed_ids or not (_sig or {}).get("count"):
                             stats["lists_reused"] = stats.get("lists_reused", 0) + 1
                             stats["list_rows_reused"] = stats.get("list_rows_reused", 0) + _copied
@@ -30406,6 +30434,8 @@ class BackupWorker:
             except Exception as exc:
                 # Unmarked lists are re-read after a PARTIAL run: slower, never wrong.
                 logger.warning("SharePoint list completeness marks for %s failed: %s", snapshot.id, exc)
+            # After the marks: an own list row identical to its base row is dropped there.
+            await self._finish_sp_overlay(snapshot.id, sp_overlay)
 
         total_items = stats["drive_ok"] + stats["list_folders"] + stats["rest_rows"]
         total_bytes = stats["drive_bytes"] + stats["rest_bytes"]

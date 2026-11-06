@@ -470,7 +470,7 @@ SNAPSHOT_REUSE_VALIDATE_FUNCTION = """CREATE OR REPLACE FUNCTION validate_snapsh
 
 # Overlay snapshots (docs/mail-overlay-snapshots.md; mail and in-place archive). The ONE definition of a snapshot's
 # inventory: a pointer resolves to its chain root; the root's own rows; plus, for an overlay, the
-# mail / archive / Teams-chat rows of its full base that it neither owns (by item_type, external_id) nor
+# mail / archive / Teams-chat / SharePoint-list rows of its full base that it neither owns (by item_type, external_id) nor
 # removed, and, for mail / archive attachments, whose parent email / archive item is visible (a chat overlay
 # removes every row of a chat it does not inherit, children included: shared.chat_catalogue._overlay_unchanged).
 # A full snapshot's second branch is empty. LANGUAGE
@@ -486,7 +486,8 @@ SNAPSHOT_ITEMS_EFFECTIVE_FUNCTION = """CREATE OR REPLACE FUNCTION snapshot_items
                                   JOIN snapshots t ON t.id = COALESCE(s.reuse_chain_root_id, s.id)
                                  WHERE s.id = p_snapshot_id)
            AND b.item_type IN ('EMAIL', 'EMAIL_ATTACHMENT', 'ARCHIVE_ITEM', 'ARCHIVE_ATTACHMENT',
-                               'TEAMS_CHAT_MESSAGE', 'CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT')
+                               'TEAMS_CHAT_MESSAGE', 'CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT',
+                               'SHAREPOINT_LIST', 'SHAREPOINT_FILE', 'SHAREPOINT_FOLDER', 'SHAREPOINT_LIST_ITEM')
            AND NOT EXISTS (SELECT 1 FROM snapshot_items o
                             WHERE o.snapshot_id = (SELECT COALESCE(s.reuse_chain_root_id, s.id) FROM snapshots s
                                                     WHERE s.id = p_snapshot_id)

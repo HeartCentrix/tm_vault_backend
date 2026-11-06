@@ -3791,8 +3791,9 @@ class RestoreWorker:
         key = (item.snapshot_id, list_id)
         if key not in cache:
             from urllib.parse import unquote, urlparse
+            from shared.snapshot_reuse import items_scope
             md = await session.scalar(select(SnapshotItem.extra_data).where(
-                SnapshotItem.snapshot_id == item.snapshot_id, SnapshotItem.external_id == list_id,
+                await items_scope(session, item.snapshot_id), SnapshotItem.external_id == list_id,   # an overlay inherits it
                 SnapshotItem.item_type == "SHAREPOINT_LIST").limit(1))
             url = (md or {}).get("web_url")
             cache[key] = unquote(urlparse(url).path).rstrip("/") if url else None
