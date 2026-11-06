@@ -565,9 +565,14 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
     # productive for at least this long before fair checkpoints apply.
     turn_started, min_turn_s = time.monotonic(), float(os.getenv("CHAT_TURN_MIN_SECONDS", "60"))
     errors, completed, planned, selected, external = [], 0, 0, set(), []
+    laps, lap_at, processed = {}, [turn_started], 0
+    def lap(name):
+        now = time.monotonic()
+        laps[name], lap_at[0] = laps.get(name, 0) + now - lap_at[0], now
     try:
         async with pinned_chat_source(graph_client, principal_id=principal) as source:
             chats = await _chat_list(source)
+            lap("list")
             selected = set(chats) if allowed is None else set(chats) & allowed
             planned = len(chats) if allowed is None else len(allowed)
             if allowed is not None and allowed - set(chats):
@@ -698,6 +703,7 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                     completed += len(done_before)
                     external.extend(sorted(still_external))
                     keys = [cid for cid in keys if cid not in done_before]
+                lap("delta")
                 unchanged = [cid for cid in keys if changed is not None and cid not in changed and cid not in published]
                 if unchanged and since_snapshot and not full_backup:
                     from shared.chat_capture import link_unchanged_chats
@@ -716,6 +722,7 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                                 lambda session: refresh_catalogue_progress(session, chat_scope(next(iter(linked)))))
                         except Exception as exc:
                             logging.getLogger(__name__).warning("chat live progress refresh failed (%s)", type(exc).__name__)
+            lap("link")
             remaining, postponed = iter(keys), []
             yield_requested, processed = False, 0
             # A turn handed back for fairness still waits for captures already running. Free
@@ -790,6 +797,7 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                     for task in workers:
                         task.cancel()
                     await asyncio.gather(*workers, return_exceptions=True)
+            lap("capture")
             if yield_requested and processed < len(keys):
                 yield_provider_turn()
             # No chat read this turn: nothing to re-check, and a full re-list costs pages at 1 request/s per user.
@@ -797,6 +805,7 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                 final_chats = set(await _chat_list(source))
                 if (allowed is None and final_chats != set(chats)) or (allowed is not None and allowed - final_chats):
                     errors.append("chat visibility changed during resource capture")
+                lap("final_list")
     except asyncio.CancelledError:
         raise
     except ChatCatalogueWorkLeaseMoved:
@@ -847,4 +856,9 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
         return {**result, "outcome": outcome, "failure_reason": reason, "failed": outcome == "failed",
             "_snapshot_lease_token": snapshot_lease_token, "_job_lease_token": job_lease_token,
             "_partition_lease_token": partition_lease_token}
-    return await run_catalogue_transaction(session_factory, finish)
+    lap_at[0] = time.monotonic()
+    result = await run_catalogue_transaction(session_factory, finish)
+    lap("finish")
+    logging.getLogger(__name__).info("chat_turn_phases snapshot=%s chats=%s captured=%s %s", snapshot_id, planned, processed,
+        " ".join(f"{k}_s={laps.get(k, 0):.2f}" for k in ("list", "delta", "link", "capture", "final_list", "finish")))
+    return result

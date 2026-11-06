@@ -687,6 +687,20 @@ async def test_turn_that_captured_nothing_lists_chats_once(store, source_adapter
     assert source.list_calls == lists + 1
 
 
+async def test_turn_logs_where_its_time_went(store, source_adapter, caplog):
+    """Railway logs could not attribute a 30-60 s unchanged turn to a phase (pace waits name no backup)."""
+    import logging
+    feed, rounds, checks = [], [], []
+    delta_source(source_adapter.source, feed, rounds, checks, latest_at=datetime(2020, 1, 1, tzinfo=timezone.utc))
+    scope = await legacy_scope(store)
+    with caplog.at_level(logging.INFO, logger="shared.chat_catalogue_entry"):
+        await source_adapter.run(scope)
+    line = [r.getMessage() for r in caplog.records if r.getMessage().startswith("chat_turn_phases")]
+    assert len(line) == 1 and f"snapshot={scope.snapshot_id}" in line[0]
+    for field in ("chats=1", "list_s=", "delta_s=", "link_s=", "capture_s=", "final_list_s=", "finish_s="):
+        assert field in line[0]
+
+
 async def test_delta_feed_silence_never_links_a_chat_whose_message_was_edited(store, source_adapter):
     """Railway 2026-11-05: a 13-hour-old message in a group chat was edited at 14:38; at 14:42 every
     member's delta feed reported no change and all five linked the old version. Each chat the feed
