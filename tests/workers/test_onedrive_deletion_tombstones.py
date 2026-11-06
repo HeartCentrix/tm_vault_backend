@@ -42,6 +42,12 @@ def test_unnamed_deletion_falls_back_to_its_id():
 
 
 def test_walk_records_deletions_only_when_enabled():
-    assert 'os.getenv("ONEDRIVE_RECORD_DELETIONS", "false")' in _FLAT
+    assert 'os.getenv( "ONEDRIVE_RECORD_DELETIONS", "false")' in _FLAT
     assert "deleted_items.append(f)" in _FLAT
     assert "await self._insert_snapshot_item_rows([ _onedrive_tombstone_row(snapshot, resource.tenant_id, d)" in _FLAT
+
+
+def test_full_walk_tombstones_unseen_files_only_when_enabled_and_complete():
+    i = _FLAT.index("await self._tombstone_unseen_onedrive_files(")
+    gate = _FLAT[i - 400:i]
+    assert "not saved_delta" in gate and "pages_seen <= 10000" in gate and "_record_deletions" in gate

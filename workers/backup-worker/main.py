@@ -9123,13 +9123,19 @@ class BackupWorker:
                     # advances when this snapshot COMPLETES, so a failed run re-reports them.
                     # Off until Recovery's OneDrive reads drop is_deleted rows AFTER the
                     # newest-wins dedup (they filter before it, and /onedrive/ids not at all).
-                    if (deleted_items and snapshot is not None
-                            and os.getenv("ONEDRIVE_RECORD_DELETIONS", "false").strip().lower() in ("1", "true", "yes", "on")):
+                    _record_deletions = snapshot is not None and os.getenv(
+                        "ONEDRIVE_RECORD_DELETIONS", "false").strip().lower() in ("1", "true", "yes", "on")
+                    if deleted_items and _record_deletions:
                         for _i in range(0, len(deleted_items), 1000):
                             await self._insert_snapshot_item_rows([
                                 _onedrive_tombstone_row(snapshot, resource.tenant_id, d)
                                 for d in deleted_items[_i:_i + 1000]
                             ])
+                    # A full walk (first run, 410 re-bootstrap, force-full) carries no deletions:
+                    # tombstone what the last restore point shows but this complete walk did not return.
+                    if _record_deletions and not saved_delta and pages_seen <= 10000:
+                        await self._tombstone_unseen_onedrive_files(
+                            snapshot, resource.tenant_id, {r[2] for r in out})
 
                     if saved_delta:
                         print(
@@ -22816,6 +22822,29 @@ class BackupWorker:
         rows = []
         for ext_id, name, folder, _deleted, drive in unseen:
             row = _library_tombstone_row(snapshot, tenant.id, {"id": ext_id, "name": name, "_drive_id": drive})
+            row["folder_path"] = folder
+            rows.append(row)
+        for i in range(0, len(rows), 1000):
+            await self._insert_snapshot_item_rows(rows[i:i + 1000])
+        return len(rows)
+
+    async def _tombstone_unseen_onedrive_files(self, snapshot: Snapshot, tenant_id, seen_ids: Set[str]) -> int:
+        """A full OneDrive walk reports no deletions: a file the newest earlier restore point still shows
+        but the walk did not return was deleted (cf. _tombstone_unseen_library_files)."""
+        from sqlalchemy import text as _text
+        async with async_session_factory() as sess:
+            prior = (await sess.execute(_text("""
+                SELECT DISTINCT ON (si.external_id) si.external_id, si.name, si.folder_path, si.is_deleted
+                FROM snapshot_items si JOIN snapshots s ON s.id = si.snapshot_id
+                WHERE s.resource_id = :rid AND s.id <> :sid AND s.created_at <= :at
+                  AND s.status IN ('COMPLETED', 'PARTIAL') AND si.item_type = 'ONEDRIVE_FILE'
+                ORDER BY si.external_id, s.created_at DESC, si.id DESC"""),
+                {"rid": snapshot.resource_id, "sid": snapshot.id, "at": snapshot.created_at})).all()
+        rows = []
+        for ext_id, name, folder, deleted in prior:
+            if deleted or ext_id in seen_ids:
+                continue
+            row = _onedrive_tombstone_row(snapshot, tenant_id, {"id": ext_id, "name": name})
             row["folder_path"] = folder
             rows.append(row)
         for i in range(0, len(rows), 1000):

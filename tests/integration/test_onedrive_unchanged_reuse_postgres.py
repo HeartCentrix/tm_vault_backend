@@ -253,3 +253,31 @@ async def test_null_backend_donor_is_not_reused_when_backends_are_ambiguous(stor
                     endpoint="https://storage.invalid", config={}, secret_ref="synthetic-reference"))
     assert await _found(store, current) is None
 
+
+async def test_onedrive_full_walk_tombstones_files_it_no_longer_sees(store, bw, monkeypatch):
+    """A full OneDrive walk (first run, 410 re-bootstrap, force-full) reports no deletions; a file the
+    last restore point still shows but the walk did not return was deleted."""
+    from types import SimpleNamespace
+    from sqlalchemy import select
+    first = await store.new_scope()
+    await add_file(store, first, external_id="kept")
+    await add_file(store, first, external_id="gone", blob="onedrive/gone")
+    await add_file(store, first, external_id="old-tomb", blob="onedrive/x")
+    async with store.factory.begin() as session:
+        await session.execute(update(models.SnapshotItem).where(models.SnapshotItem.external_id == "old-tomb")
+                              .values(is_deleted=True))
+        await session.execute(update(models.Snapshot).where(models.Snapshot.id == first.snapshot_id)
+                              .values(status=models.SnapshotStatus.COMPLETED))
+    current = await store.new_scope()
+    monkeypatch.setattr(bw, "async_session_factory", store.factory)
+    async with store.factory() as session:
+        snapshot = await session.get(models.Snapshot, current.snapshot_id)
+    worker = SimpleNamespace(worker_id="t")
+    worker._insert_snapshot_item_rows = lambda rows: bw.BackupWorker._insert_snapshot_item_rows(worker, rows)
+    n = await bw.BackupWorker._tombstone_unseen_onedrive_files(worker, snapshot, store.tenant, {"kept"})
+    async with store.factory() as session:
+        rows = (await session.scalars(select(models.SnapshotItem).where(
+            models.SnapshotItem.snapshot_id == current.snapshot_id))).all()
+    assert n == 1
+    assert [(r.external_id, r.is_deleted, r.item_type, r.blob_path, r.backend_id) for r in rows] == \
+        [("gone", True, "ONEDRIVE_FILE", None, store.backend)]
