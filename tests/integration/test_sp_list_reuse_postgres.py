@@ -63,3 +63,39 @@ async def test_reused_list_rows_are_copied_forward_in_one_statement(store, monke
         rows = (await db.execute(select(models.SnapshotItem.external_id, models.SnapshotItem.content_size)
                 .where(models.SnapshotItem.snapshot_id == current.snapshot_id).order_by(models.SnapshotItem.external_id))).all()
     assert rows == [("list-a:0", 5), ("list-a:1", 5), ("list-a:2", 5)]
+
+
+def test_a_list_whose_only_change_is_its_modified_date_reads_rows_changed_since_then():
+    # Railway 2026-11-06: SharePoint moved Site Assets' LastItemModifiedDate on 6 sites in one second
+    # (count and deleted date unchanged) and each site re-read the whole library.
+    changed_since = _worker().sp_list_changed_since
+    walked = (NOW - timedelta(days=2)).isoformat()
+    prior = {"rest_signature": SIG, "rest_walked_at": walked}
+    touched = {**SIG, "modified": "2026-11-06T08:04:35Z"}
+    assert changed_since(touched, prior, NOW) == (walked, "2026-11-01T09:59:00Z")   # 1 min margin
+    assert changed_since(SIG, prior, NOW) is None                                   # unchanged: plain carry
+    assert changed_since({**touched, "count": 4}, prior, NOW) is None               # added: full read
+    assert changed_since({**touched, "deleted": "2026-11-05T00:00:00Z"}, prior, NOW) is None
+    assert changed_since({**touched, "title": "Renamed"}, prior, NOW) is None
+    assert changed_since(touched, {**prior, "rest_walked_at": (NOW - timedelta(days=8)).isoformat()}, NOW) is None
+    assert changed_since(touched, {**prior, "rest_signature": {**SIG, "modified": None}}, NOW) is None
+    assert changed_since(touched, None, NOW) is None and changed_since(None, prior, NOW) is None
+
+
+async def test_rows_read_again_are_left_out_of_the_carry_forward(store, monkeypatch):
+    worker_module = _worker()
+    monkeypatch.setattr(worker_module, "async_session_factory", store.factory)
+    worker = worker_module.BackupWorker.__new__(worker_module.BackupWorker)
+    prior, current = await store.new_scope(), await store.new_scope()
+    async with store.factory.begin() as db:
+        for i in range(3):
+            db.add(models.SnapshotItem(snapshot_id=prior.snapshot_id, tenant_id=store.tenant, backend_id=store.backend,
+                external_id=f"list-a:{i}", item_type="SHAREPOINT_FILE", name=f"row {i}", folder_path="site/Assets",
+                content_size=5, extra_data={"source": "sp_rest", "list_id": "list-a", "site_id": "site-1"}))
+    copied = await worker._copy_forward_sp_list_rows(current.snapshot_id, prior.snapshot_id, "site-1", "list-a",
+                                                     skip_external_ids=["list-a:1"])
+    assert copied == 2
+    async with store.factory() as db:
+        rows = (await db.execute(select(models.SnapshotItem.external_id)
+                .where(models.SnapshotItem.snapshot_id == current.snapshot_id).order_by(models.SnapshotItem.external_id))).scalars().all()
+    assert rows == ["list-a:0", "list-a:2"]

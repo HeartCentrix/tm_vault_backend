@@ -274,3 +274,16 @@ async def test_list_that_rejects_the_file_expand_is_read_without_it(client_facto
     async with client_factory(route) as (client, state):
         rows = [x async for x in client.iter_sharepoint_list_items_via_rest(HOST, WEB, "list")]
     assert seen == ["FieldValuesAsText,File", "FieldValuesAsText"] and rows == [{"Id": 1}]
+
+
+async def test_list_items_can_be_read_from_a_modified_date(client_factory):
+    seen = []
+    def route(req, n):
+        seen.append(req.url.params.get("$filter"))
+        return httpx.Response(200, json={"value": [{"Id": 1}]})
+    async with client_factory(route) as (client, _):
+        rows = [x async for x in client.iter_sharepoint_list_items_via_rest(
+            HOST, WEB, "list", modified_since="2026-11-06T08:03:35Z")]
+        assert rows == [{"Id": 1}]
+        _ = [x async for x in client.iter_sharepoint_list_items_via_rest(HOST, WEB, "list")]
+    assert seen == ["Modified ge datetime'2026-11-06T08:03:35Z'", None]
