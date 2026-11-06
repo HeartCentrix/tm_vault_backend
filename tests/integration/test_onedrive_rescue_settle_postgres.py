@@ -5,6 +5,7 @@ file in each of Amit's 8 shards → snapshot FAILED ("no reason recorded"); the 
 Recovery (it lists COMPLETED/PARTIAL only), delta cursor never promoted, and AUTO_RETRY
 re-copied all 127 GiB."""
 import ast
+import asyncio
 import os
 import pathlib
 from uuid import uuid4
@@ -17,6 +18,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from shared.database import Base
 import shared.models as models
 from shared.onedrive_rescue_settle import settle_rescued_onedrive_snapshot
+import shared.onedrive_rescue_settle as rescue_settle
 
 pytestmark = pytest.mark.integration
 REPO = pathlib.Path(__file__).resolve().parents[2]
@@ -116,6 +118,82 @@ async def test_anything_short_of_full_rescue_is_left_alone(factory, kw):
     assert snap.status == models.SnapshotStatus.FAILED
     assert res.extra_data["onedrive_delta_link"] == "https://graph/delta?token=old"
     assert job.status == models.JobStatus.PARTIAL
+
+
+async def test_duplicate_snapshot_does_not_cover_an_undispatched_resource(factory):
+    ids = await scenario(factory)
+    missing = uuid4()
+    async with factory.begin() as s:
+        s.add(models.Resource(id=missing, tenant_id=ids['tenant'], type=models.ResourceType.USER_ONEDRIVE,
+            external_id='missing-drive', display_name='Missing OneDrive'))
+        job = await s.get(models.Job, ids['job'])
+        job.batch_resource_ids = [ids['resource'], missing]
+        s.add(models.Snapshot(resource_id=ids['resource'], job_id=ids['job'], backend_id=ids['backend'],
+            status=models.SnapshotStatus.COMPLETED, extra_data={}))
+    async with factory.begin() as s:
+        assert await settle_rescued_onedrive_snapshot(s, ids['snap'])
+    snap, _, job = await state(factory, ids)
+    assert snap.status == models.SnapshotStatus.COMPLETED
+    assert job.status == models.JobStatus.PARTIAL
+
+
+async def test_cancelled_parent_cannot_promote_snapshot_or_pending_cursor(factory):
+    ids = await scenario(factory)
+    async with factory.begin() as s:
+        (await s.get(models.Job, ids['job'])).status = models.JobStatus.CANCELLED
+    async with factory.begin() as s:
+        assert not await settle_rescued_onedrive_snapshot(s, ids['snap'])
+    snap, resource, job = await state(factory, ids)
+    assert snap.status == models.SnapshotStatus.FAILED
+    assert resource.extra_data['onedrive_delta_link'] == 'https://graph/delta?token=old'
+    assert job.status == models.JobStatus.CANCELLED
+
+
+async def test_last_concurrent_rescues_converge_the_parent_job(factory, monkeypatch):
+    first, second = await scenario(factory), await scenario(factory)
+    async with factory.begin() as s:
+        (await s.get(models.Resource, second['resource'])).tenant_id = first['tenant']
+        (await s.get(models.Snapshot, second['snap'])).job_id = first['job']
+        (await s.get(models.Job, first['job'])).batch_resource_ids = [first['resource'], second['resource']]
+        await s.execute(text('UPDATE snapshot_partitions SET job_id=:j WHERE snapshot_id=:sid'),
+                        {'j': first['job'], 'sid': second['snap']})
+    first_rollup_written, second_rollup_started, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    from sqlalchemy.ext.asyncio import AsyncSession
+    original = AsyncSession.execute
+
+    async def execute(session, statement, params=None, **kw):
+        is_rollup = statement is rescue_settle._JOB
+        if is_rollup and params['sid'] == second['snap']:
+            second_rollup_started.set()
+        result = await original(session, statement, params, **kw)
+        if is_rollup and params['sid'] == first['snap']:
+            first_rollup_written.set()
+            await release.wait()
+        return result
+
+    monkeypatch.setattr(AsyncSession, 'execute', execute)
+
+    async def settle(ids):
+        async with factory.begin() as s:
+            return await settle_rescued_onedrive_snapshot(s, ids['snap'])
+
+    a = asyncio.create_task(settle(first))
+    b = None
+    try:
+        await asyncio.wait_for(first_rollup_written.wait(), timeout=3)
+        b = asyncio.create_task(settle(second))
+        try:
+            await asyncio.wait_for(second_rollup_started.wait(), timeout=.2)
+            await asyncio.sleep(.05)  # Let the old unlocked rollup reach its DB lock wait.
+        except asyncio.TimeoutError:
+            pass  # Correct serialization holds the second call before this statement.
+    finally:
+        release.set()
+        assert await asyncio.wait_for(a, timeout=3)
+        if b is not None:
+            assert await asyncio.wait_for(b, timeout=3)
+    _, _, job = await state(factory, first)
+    assert job.status == models.JobStatus.COMPLETED
 
 
 def _calls(func_name, callee):

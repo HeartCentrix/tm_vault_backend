@@ -11,6 +11,12 @@ for file content alone, and every non-empty ONEDRIVE_FILE row carrying a blob.
 """
 from sqlalchemy import text
 
+_PARENT = text("""
+    SELECT j.id FROM jobs j JOIN snapshots s ON s.job_id = j.id
+     WHERE s.id = :sid AND j.status::text NOT IN ('CANCELLED', 'CANCELLING')
+     FOR UPDATE OF j
+""")
+
 _ELIGIBLE = text("""
     SELECT s.id, s.job_id, s.resource_id
       FROM snapshots s
@@ -35,7 +41,7 @@ _ELIGIBLE = text("""
              SELECT 1 FROM snapshot_items i
               WHERE i.snapshot_id = s.id
                 AND i.item_type = 'ONEDRIVE_FILE'
-                AND i.blob_path IS NULL
+                AND coalesce(i.blob_path, '') = ''
                 AND NOT coalesce(i.is_deleted, false)
                 -- a 0-byte OneDrive file has nothing to store (Graph size 0, quickXor all zeros)
                 AND coalesce((i.metadata::jsonb -> 'raw' ->> 'size')::bigint, i.content_size, 1) > 0)
@@ -72,21 +78,32 @@ _JOB = text("""
                count(*) FILTER (WHERE status::text IN ('COMPLETED', 'SKIPPED')) AS completed,
                count(*) FILTER (WHERE status::text = 'PARTIAL') AS partial,
                count(*) FILTER (WHERE status::text NOT IN ('COMPLETED', 'SKIPPED', 'PARTIAL', 'FAILED')) AS pending
-          FROM snapshots WHERE job_id = :jid)
+          FROM snapshots WHERE job_id = :jid),
+    missing AS (
+        SELECT count(*) AS n FROM jobs j, unnest(j.batch_resource_ids) AS rid
+         WHERE j.id = :jid AND NOT EXISTS (
+             SELECT 1 FROM snapshots s WHERE s.resource_id = rid
+               AND (s.job_id = j.id OR s.created_at >= j.created_at)))
     UPDATE jobs j
        SET status = (CASE WHEN c.completed = 0 AND c.partial = 0 THEN 'FAILED'
-                          WHEN c.completed = c.n THEN 'COMPLETED'
+                          WHEN c.completed = c.n AND missing.n = 0 THEN 'COMPLETED'
                           ELSE 'PARTIAL' END)::jobstatus
-      FROM c
+      FROM c, missing
      WHERE j.id = :jid
        AND j.status::text IN ('PARTIAL', 'FAILED')
        AND c.pending = 0
-       AND c.n >= greatest(coalesce(cardinality(j.batch_resource_ids), 0), 1)
+       AND c.n > 0
+       AND NOT EXISTS (SELECT 1 FROM snapshot_partitions p WHERE p.job_id = j.id
+                       AND p.status NOT IN ('COMPLETED', 'FAILED'))
 """)
 
 
 async def settle_rescued_onedrive_snapshot(session, snapshot_id) -> bool:
     """FAILED/PARTIAL → COMPLETED once every lost file is rescued. Caller commits."""
+    # Lock parent first: concurrent last rescues must count committed siblings,
+    # and cancellation must fence snapshot/cursor promotion in the same order.
+    if (await session.execute(_PARENT, {"sid": snapshot_id})).first() is None:
+        return False
     row = (await session.execute(_ELIGIBLE, {"sid": snapshot_id})).first()
     if row is None:
         return False
