@@ -147,6 +147,42 @@ def _coerce_uuid(value: UUIDLike) -> uuid.UUID:
     return uuid.UUID(str(value))
 
 
+async def chat_rows(session: AsyncSession, snapshot_ids):
+    """``(entity, scope)`` for reading the snapshot_items rows of ``snapshot_ids`` (already resolved to
+    the snapshots that hold rows). Full snapshots: ``(SnapshotItem, snapshot_id IN ids)``, today's plan.
+    When any is an overlay: an aliased SnapshotItem over snapshot_items_effective(), every row labelled
+    with the snapshot it was asked for (a chat overlay's inherited chats are its base's rows, which
+    readers matching rows to snapshot_chat_inventories or to the requested scope must see as its own).
+    Read only: rows of the alias are never flushed (populate_existing keeps labels per query)."""
+    from sqlalchemy import literal, select, union_all
+    from sqlalchemy.dialects.postgresql import UUID as PGUUID
+    from sqlalchemy.orm import aliased
+    from shared.models import SnapshotItem
+    ids = [_coerce_uuid(s) for s in snapshot_ids]
+    overlays = set((await session.execute(text(
+        "SELECT s.id FROM snapshots s JOIN snapshots t ON t.id = COALESCE(s.reuse_chain_root_id, s.id) "
+        "WHERE s.id = ANY(CAST(:ids AS uuid[])) AND t.overlay_base_id IS NOT NULL"),
+        {"ids": [str(i) for i in ids]})).scalars().all()) if ids else set()
+    if not overlays:
+        return SnapshotItem, SnapshotItem.snapshot_id.in_(ids)
+    columns = [c for c in SnapshotItem.__table__.columns]
+    parts = []
+    for sid in ids:
+        source = func_effective(sid)
+        parts.append(select(*[(literal(sid, PGUUID(as_uuid=True)) if c.name == "snapshot_id" else source.c[c.name]).label(c.name)
+                              for c in columns]))
+    rows = (union_all(*parts) if len(parts) > 1 else parts[0]).subquery("chat_rows")
+    entity = aliased(SnapshotItem, rows, adapt_on_names=True)
+    return entity, entity.snapshot_id.in_(ids)
+
+
+def func_effective(snapshot_id):
+    from sqlalchemy import func
+    from shared.models import SnapshotItem
+    return func.snapshot_items_effective(snapshot_id).table_valued(
+        *[c.name for c in SnapshotItem.__table__.columns]).alias()
+
+
 __all__ = [
     "SnapshotReuseInfo",
     "SnapshotNotFound",
@@ -155,6 +191,7 @@ __all__ = [
     "items_scope",
     "items_scope_any",
     "item_in_snapshot",
+    "chat_rows",
 ]
 
 
