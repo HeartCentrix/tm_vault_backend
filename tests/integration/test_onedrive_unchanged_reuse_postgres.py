@@ -124,6 +124,8 @@ async def test_copy_on_another_storage_backend_is_not_reused(store):
         await session.flush()
         await session.execute(update(models.Snapshot).where(models.Snapshot.id == first.snapshot_id)
                               .values(status=models.SnapshotStatus.COMPLETED, backend_id=other))
+        await session.execute(update(models.SnapshotItem).where(models.SnapshotItem.snapshot_id == first.snapshot_id)
+                              .values(backend_id=other))
     current = await store.new_scope()
     async with store.factory() as session:
         assert await find_unchanged_file_blob(session, resource_id=current.resource_id, external_id="file-1",
@@ -192,3 +194,62 @@ async def test_sharepoint_rerun_does_not_reuse_a_deleted_row(store, bw, monkeypa
 
 
 from test_copy_worker_handoff_postgres import bw as bw  # noqa: E402,F811
+
+
+async def test_sharepoint_file_row_records_its_snapshot_backend(store, bw, monkeypatch):
+    """SP FILE rows were written with backend_id NULL; restore resolves the store by item.backend_id."""
+    from types import SimpleNamespace
+    from sqlalchemy import select
+    current = await store.new_scope()
+    monkeypatch.setattr(bw, "async_session_factory", store.factory)
+    async with store.factory() as session:
+        snapshot = await session.get(models.Snapshot, current.snapshot_id)
+    await bw.BackupWorker._create_file_snapshot_item(
+        SimpleNamespace(worker_id="t"), snapshot, SimpleNamespace(id=store.tenant), "sp-9", "f.docx", 10,
+        "files/sp-9", {"sha256": "c" * 64}, {"id": "sp-9", "name": "f.docx"}, "drive-1")
+    async with store.factory() as session:
+        row = await session.scalar(select(models.SnapshotItem).where(
+            models.SnapshotItem.snapshot_id == current.snapshot_id))
+    assert row.backend_id == store.backend
+
+
+async def _legacy_null_backend_donor(store, *, snapshot_null):
+    """Prod rows predating backend stamping: snapshot_items.backend_id (and old snapshots') NULL."""
+    from sqlalchemy import text as _t
+    first = await store.new_scope()
+    async with store.factory.begin() as session:
+        await session.execute(_t("ALTER TABLE snapshot_items ALTER COLUMN backend_id DROP NOT NULL"))
+        await session.execute(_t("ALTER TABLE snapshots ALTER COLUMN backend_id DROP NOT NULL"))
+        session.add(models.SnapshotItem(snapshot_id=first.snapshot_id, tenant_id=store.tenant, external_id="sp-1",
+            item_type="FILE", name="f.docx", content_size=5000, content_checksum="b" * 64, blob_path="files/sp-1",
+            backend_id=None, extra_data={"structured": {"file_hash": {"quickXorHash": "QX1="}}}))
+        await session.execute(update(models.Snapshot).where(models.Snapshot.id == first.snapshot_id)
+                              .values(status=models.SnapshotStatus.COMPLETED,
+                                      **({"backend_id": None} if snapshot_null else {})))
+    return await store.new_scope()
+
+
+async def _found(store, current):
+    from shared.blob_dedup import find_unchanged_file_blob
+    async with store.factory() as session:
+        return await find_unchanged_file_blob(session, resource_id=current.resource_id, external_id="sp-1",
+            quickxor="QX1=", size=5000, exclude_snapshot_id=current.snapshot_id)
+
+
+async def test_null_item_backend_donor_uses_its_snapshot_backend(store):
+    current = await _legacy_null_backend_donor(store, snapshot_null=False)
+    assert await _found(store, current) == ("files/sp-1", "b" * 64)
+
+
+async def test_null_backend_donor_is_reused_when_only_one_backend_exists(store):
+    current = await _legacy_null_backend_donor(store, snapshot_null=True)
+    assert await _found(store, current) == ("files/sp-1", "b" * 64)
+
+
+async def test_null_backend_donor_is_not_reused_when_backends_are_ambiguous(store):
+    current = await _legacy_null_backend_donor(store, snapshot_null=True)
+    async with store.factory.begin() as session:
+        session.add(models.StorageBackend(id=uuid4(), kind="azure", name=uuid4().hex,
+                    endpoint="https://storage.invalid", config={}, secret_ref="synthetic-reference"))
+    assert await _found(store, current) is None
+

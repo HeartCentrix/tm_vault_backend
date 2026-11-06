@@ -23150,6 +23150,7 @@ class BackupWorker:
         row = {
             "snapshot_id": snapshot.id,
             "tenant_id": tenant.id,
+            "backend_id": snapshot.backend_id,  # restore resolves the store by item.backend_id
             "external_id": file_id,
             "item_type": "FILE",
             "name": file_name,

@@ -185,17 +185,25 @@ async def find_unchanged_file_blob(
     backend cannot be read back through this one."""
     if not quickxor or not external_id or size is None:
         return None
-    from sqlalchemy import or_
+    from sqlalchemy import and_, func, or_
     from sqlalchemy.orm import aliased
-    from shared.models import Snapshot, SnapshotStatus
+    from shared.models import Snapshot, SnapshotStatus, StorageBackend
     try:
         current = aliased(Snapshot)
+        current_backend = select(current.backend_id).where(current.id == exclude_snapshot_id).scalar_subquery()
+        # The donor's bytes live on its item's backend, else its snapshot's. Legacy rows with
+        # neither are on the active backend only provably when exactly one backend exists.
+        donor_backend = func.coalesce(SnapshotItem.backend_id, Snapshot.backend_id)
+        single_backend = and_(
+            select(func.count()).select_from(StorageBackend).scalar_subquery() == 1,
+            current_backend == select(StorageBackend.id).scalar_subquery(),
+        )
         stmt = (select(SnapshotItem.blob_path, SnapshotItem.content_checksum)
                 .join(Snapshot, Snapshot.id == SnapshotItem.snapshot_id)
                 .where(Snapshot.resource_id == resource_id, Snapshot.id != exclude_snapshot_id,
                        Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL]),
-                       Snapshot.backend_id == select(current.backend_id)
-                           .where(current.id == exclude_snapshot_id).scalar_subquery(),
+                       or_(donor_backend == current_backend,
+                           and_(donor_backend.is_(None), single_backend)),
                        SnapshotItem.external_id == external_id, SnapshotItem.blob_path.isnot(None),
                        SnapshotItem.is_deleted.isnot(True),
                        SnapshotItem.content_size == size, SnapshotItem.content_checksum.isnot(None),
