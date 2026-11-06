@@ -70,16 +70,6 @@ def client(monkeypatch):
     monkeypatch.setattr(_gp.settings, "INTERNAL_API_KEY", KEY)
     monkeypatch.setattr(_gp, "throttle_manager", _gp.AdaptiveThrottleManager())
     monkeypatch.setattr(_gp, "redis_client", None)
-    # Each TestClient owns a new event loop. Keep this unit fixture off the
-    # process singleton's Redis connections retained by earlier integration tests.
-    from shared import graph_rate_limiter as admission
-    limiter = admission.GraphRateLimiter()
-
-    async def local_admission():
-        pass
-
-    monkeypatch.setattr(limiter, "maybe_init_redis", local_admission)
-    monkeypatch.setattr(admission, "graph_rate_limiter", limiter)
 
     async def _fake_token(tenant_id):
         return "fake-graph-token"
