@@ -27141,6 +27141,16 @@ class BackupWorker:
         container = azure_storage_manager.get_container_name(str(tenant.id), "planner")
         db_items: List[SnapshotItem] = []
         files_failed = 0
+        # Unchanged items reuse the prior full snapshot's blob; a wholly unchanged run points at it.
+        from shared.item_reuse import PriorItems
+        prior_items = await PriorItems.load(async_session_factory, resource.id, snapshot.id)
+
+        async def _put(item_type: str, ext_id: str, path: str, data: bytes, digest: str):
+            reused = prior_items.blob(item_type, ext_id, digest)
+            if reused:
+                return reused
+            r = await upload_blob_with_retry(container, path, data, shard)
+            return path if r.get("success") else None
 
         plans = await graph_client.get_planner_plans_for_group(obj_id)
         plan_list = plans.get("value", [])
@@ -27163,8 +27173,8 @@ class BackupWorker:
                 tp = azure_storage_manager.build_blob_path(
                     str(tenant.id), str(resource.id), str(snapshot.id), f"task_{task_id}"
                 )
-                tr = await upload_blob_with_retry(container, tp, tb, shard)
-                if tr.get("success"):
+                tp = await _put("PLANNER_TASK", task_id, tp, tb, th)
+                if tp:
                     _items.append(SnapshotItem(
                         snapshot_id=snapshot.id, tenant_id=tenant.id,
                         external_id=task_id, item_type="PLANNER_TASK",
@@ -27188,8 +27198,8 @@ class BackupWorker:
                     dp = azure_storage_manager.build_blob_path(
                         str(tenant.id), str(resource.id), str(snapshot.id), f"task_{task_id}_details"
                     )
-                    dr = await upload_blob_with_retry(container, dp, db, shard)
-                    if dr.get("success"):
+                    dp = await _put("PLANNER_TASK_DETAILS", f"{task_id}:details", dp, db, dh)
+                    if dp:
                         _items.append(SnapshotItem(
                             snapshot_id=snapshot.id, tenant_id=tenant.id,
                             external_id=f"{task_id}:details", item_type="PLANNER_TASK_DETAILS",
@@ -27212,8 +27222,8 @@ class BackupWorker:
                 blob_path = azure_storage_manager.build_blob_path(
                     str(tenant.id), str(resource.id), str(snapshot.id), f"plan_{plan_id}"
                 )
-                r = await upload_blob_with_retry(container, blob_path, content_bytes, shard)
-                if r.get("success"):
+                blob_path = await _put("PLANNER_PLAN", plan_id, blob_path, content_bytes, content_hash)
+                if blob_path:
                     _items.append(SnapshotItem(
                         snapshot_id=snapshot.id, tenant_id=tenant.id,
                         external_id=plan_id, item_type="PLANNER_PLAN",
@@ -27262,6 +27272,11 @@ class BackupWorker:
             if len(plan_list) >= 2:
                 print(f"[PERF][PLANNER] processed {len(plan_list)} plans in {time.time()-_t0_planner:.2f}s")
 
+        if not files_failed:
+            pointed = await prior_items.point_if_unchanged(async_session_factory, snapshot.id, db_items, "planner_reused_prior")
+            if pointed:
+                print(f"[{self.worker_id}] [PLANNER COMPLETE] {resource.display_name} — unchanged, reusing prior snapshot")
+                return pointed
         if db_items:
             async with async_session_factory() as session:
                 session.add_all(db_items)
@@ -27290,6 +27305,16 @@ class BackupWorker:
         container = azure_storage_manager.get_container_name(str(tenant.id), "todo")
         db_items: List[SnapshotItem] = []
         files_failed = 0
+        # Unchanged items reuse the prior full snapshot's blob; a wholly unchanged run points at it.
+        from shared.item_reuse import PriorItems
+        prior_items = await PriorItems.load(async_session_factory, resource.id, snapshot.id)
+
+        async def _put(item_type: str, ext_id: str, path: str, data: bytes, digest: str):
+            reused = prior_items.blob(item_type, ext_id, digest)
+            if reused:
+                return reused
+            r = await upload_blob_with_retry(container, path, data, shard)
+            return path if r.get("success") else None
 
         async def backup_task_extras(list_id: str, task_id: str, task_title: str):
             """Fetch checklistItems and linkedResources for a task; return (items, bytes)."""
@@ -27315,8 +27340,8 @@ class BackupWorker:
                 path = azure_storage_manager.build_blob_path(
                     str(tenant.id), str(resource.id), str(snapshot.id), f"task_{task_id}_{kind}"
                 )
-                r = await upload_blob_with_retry(container, path, data, shard)
-                if r.get("success"):
+                path = await _put(item_type, f"{task_id}:{kind}", path, data, h)
+                if path:
                     extras.append(SnapshotItem(
                         snapshot_id=snapshot.id, tenant_id=tenant.id,
                         external_id=f"{task_id}:{kind}", item_type=item_type,
@@ -27339,8 +27364,8 @@ class BackupWorker:
             lp = azure_storage_manager.build_blob_path(
                 str(tenant.id), str(resource.id), str(snapshot.id), f"list_{list_id}"
             )
-            lr = await upload_blob_with_retry(container, lp, lb, shard)
-            if lr.get("success"):
+            lp = await _put("TODO_LIST", list_id, lp, lb, lh)
+            if lp:
                 local_items.append(SnapshotItem(
                     snapshot_id=snapshot.id, tenant_id=tenant.id,
                     external_id=list_id, item_type="TODO_LIST",
@@ -27364,8 +27389,8 @@ class BackupWorker:
                 tp = azure_storage_manager.build_blob_path(
                     str(tenant.id), str(resource.id), str(snapshot.id), f"task_{task_id}"
                 )
-                tr = await upload_blob_with_retry(container, tp, tb, shard)
-                if tr.get("success"):
+                tp = await _put("TODO_TASK", task_id, tp, tb, th)
+                if tp:
                     local_items.append(SnapshotItem(
                         snapshot_id=snapshot.id, tenant_id=tenant.id,
                         external_id=task_id, item_type="TODO_TASK",
@@ -27394,6 +27419,11 @@ class BackupWorker:
             else:
                 print(f"[{self.worker_id}]   [TODO] List task error: {r}")
 
+        if not files_failed:
+            pointed = await prior_items.point_if_unchanged(async_session_factory, snapshot.id, db_items, "todo_reused_prior")
+            if pointed:
+                print(f"[{self.worker_id}] [TODO COMPLETE] {resource.display_name} — unchanged, reusing prior snapshot")
+                return pointed
         if db_items:
             async with async_session_factory() as session:
                 session.add_all(db_items)
