@@ -292,3 +292,14 @@ def test_in_progress_batch_drilldown_keeps_pending_child_workloads():
     out = prune_unrun_terminal_children(resources, "IN_PROGRESS")
 
     assert [child["type"] for child in out[0]["children"]] == ["USER_MAIL", "USER_CHATS"]
+
+
+def test_scope_label_names_the_resource_types_it_holds():
+    # Railway 2026-11-06: 6 Teams channels + 16 Microsoft 365 groups were labelled "22 users".
+    out = shape_activity_row(_row(total_scope_count=22,
+                                  scope_types=["M365_GROUP"] * 16 + ["TEAMS_CHANNEL"] * 6))
+    assert out["object"] == "16 Microsoft 365 groups, 6 Teams channels"
+    sites = shape_activity_row(_row(total_scope_count=1, scope_types=["SHAREPOINT_SITE"]))
+    assert sites["object"] == "1 SharePoint site"
+    users = shape_activity_row(_row(total_scope_count=10, scope_types=["ENTRA_USER"] * 10))
+    assert users["object"] == "10 users"

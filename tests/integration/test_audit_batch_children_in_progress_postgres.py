@@ -60,3 +60,25 @@ async def test_in_progress_child_shows_items_and_bytes_so_far(store, monkeypatch
     assert chats["status"] == "IN_PROGRESS"
     assert chats["itemCount"] == 1231
     assert chats["bytesAdded"] == 78419186
+
+
+async def test_parentless_resources_of_any_type_are_listed_in_the_drilldown(store, monkeypatch):
+    # Railway 2026-11-06: a batch of 6 TEAMS_CHANNEL + 16 M365_GROUP expanded to nothing — only five
+    # types were top-level and everything else waited for a parent user it never had.
+    scope = await store.new_scope()
+    batch_id = str(uuid4())
+    channel_id, group_id, job_id = uuid4(), uuid4(), uuid4()
+    async with store.factory.begin() as session:
+        tenant_id = await session.scalar(text("SELECT tenant_id FROM resources WHERE id=:id"), {"id": scope.resource_id})
+        session.add(models.Resource(id=channel_id, tenant_id=tenant_id, type=models.ResourceType.TEAMS_CHANNEL,
+                                    external_id="team-1", display_name="Axsaro"))
+        session.add(models.Resource(id=group_id, tenant_id=tenant_id, type=models.ResourceType.M365_GROUP,
+                                    external_id="group-1", display_name="QFION"))
+        await session.flush()
+        session.add(models.Job(id=job_id, type=models.JobType.BACKUP, tenant_id=tenant_id, resource_id=channel_id,
+                               status=models.JobStatus.RUNNING, spec={"batch_id": batch_id},
+                               batch_resource_ids=[channel_id, group_id]))
+    monkeypatch.setattr(_as, "async_session_factory", store.factory)
+    body = await _as.get_batch_children(batch_id)
+    assert sorted((r["type"], r["displayName"]) for r in body["resources"]) == [
+        ("M365_GROUP", "QFION"), ("TEAMS_CHANNEL", "Axsaro")]

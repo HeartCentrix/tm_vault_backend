@@ -1330,7 +1330,10 @@ async def _list_activities_batch_v2(
             elif len(ids) == 0:
                 object_label = "No scope"
             else:
-                object_label = f"{len(ids)} users"
+                types = (await session.execute(text(
+                    "SELECT array_agg(type::text) FROM resources WHERE id = ANY(cast(:ids AS uuid[]))"),
+                    {"ids": [str(i) for i in ids]})).scalar()
+                object_label = _ab_mod.scope_label(len(ids), types)
 
             out.append({
                 "id": r.batch_id,
@@ -1776,6 +1779,8 @@ async def list_activities(
                   b.scope_user_ids,
                   b.bytes_expected,
                   COALESCE(array_length(b.scope_user_ids, 1), 0) AS total_scope_count,
+                  (SELECT array_agg(r.type::text) FROM resources r
+                    WHERE r.id = ANY(b.scope_user_ids))             AS scope_types,
                   (SELECT COALESCE(SUM(s.bytes_added), 0)
                      FROM snapshots s
                      JOIN jobs j ON j.id = s.job_id
@@ -2363,6 +2368,7 @@ async def get_batch_children(batch_id: str):
 
         tier1: List[Dict[str, Any]] = []
         children_by_parent: Dict[Any, List[Dict[str, Any]]] = {}
+        batch_rids = {row[0] for row in rs}
         for rid, parent, rtype, name, license_missing, license_hint in rs:
             entry: Dict[str, Any] = {
                 "resourceId":  str(rid),
@@ -2385,7 +2391,9 @@ async def get_batch_children(batch_id: str):
                 entry["status"] = "SKIPPED_NO_LICENSE"
                 entry["skippedNoLicense"] = True
                 entry["licenseHint"] = license_hint
-            if rtype in TIER1_TYPES:
+            # Parentless resources of any type (Teams channels, Microsoft 365 / Entra groups, ...)
+            # and children whose parent is not in this batch are rows of their own.
+            if rtype in TIER1_TYPES or parent is None or parent not in batch_rids:
                 entry["children"] = []
                 tier1.append(entry)
             else:

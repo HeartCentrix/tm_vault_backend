@@ -41,6 +41,33 @@ def _fmt_bytes(n: int) -> str:
     return f"{f:.2f} PiB"
 
 
+_SCOPE_NOUNS = {
+    "ENTRA_USER": ("user", "users"),
+    "SHAREPOINT_SITE": ("SharePoint site", "SharePoint sites"),
+    "TEAMS_CHANNEL": ("Teams channel", "Teams channels"),
+    "M365_GROUP": ("Microsoft 365 group", "Microsoft 365 groups"),
+    "ENTRA_GROUP": ("Entra group", "Entra groups"),
+    "SHARED_MAILBOX": ("shared mailbox", "shared mailboxes"),
+    "ROOM_MAILBOX": ("room mailbox", "room mailboxes"),
+    "MAILBOX": ("mailbox", "mailboxes"),
+}
+
+
+def scope_label(count: int, types=None) -> str:
+    """'10 users', '1 SharePoint site', '16 Microsoft 365 groups, 6 Teams channels'. Without types
+    (older rows) the clicked scope is users, as before."""
+    if not types:
+        return f"{count} user" if count == 1 else f"{count} users"
+    counts: Dict[str, int] = {}
+    for t in types:
+        counts[t] = counts.get(t, 0) + 1
+    parts = []
+    for t, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        one, many = _SCOPE_NOUNS.get(t, ("resource", "resources"))
+        parts.append(f"{n} {one if n == 1 else many}")
+    return ", ".join(parts[:3]) + (f" +{len(parts) - 3} more" if len(parts) > 3 else "")
+
+
 def shape_activity_row(row) -> Dict[str, Any]:
     """Build one Activity-feed dict from a backup_batches row.
 
@@ -55,9 +82,7 @@ def shape_activity_row(row) -> Dict[str, Any]:
       - total_scope_count (int)
     """
     scope_count = int(row.total_scope_count or 0)
-    user_label = (
-        f"{scope_count} user" if scope_count == 1 else f"{scope_count} users"
-    )
+    user_label = scope_label(scope_count, getattr(row, "scope_types", None))
 
     bytes_done = int(row.bytes_done or 0)
     bytes_expected = int(row.bytes_expected) if row.bytes_expected else None
