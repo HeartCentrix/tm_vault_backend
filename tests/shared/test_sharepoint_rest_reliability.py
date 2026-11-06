@@ -252,3 +252,25 @@ async def test_sharepoint_token_uses_the_certificate_app_not_the_pooled_graph_ap
     assert await client._get_sharepoint_token("contoso.sharepoint.com") == "t"
     claims = jwt.decode(posted[0]["client_assertion"], options={"verify_signature": False})
     assert posted[0]["client_id"] == claims["iss"] == claims["sub"] == "sharepoint-cert-app"
+
+
+async def test_list_rows_carry_their_file_identity(client_factory):
+    seen = []
+    def route(req, n):
+        seen.append(req.url.params.get("$expand"))
+        return httpx.Response(200, json={"value": [{"Id": 1, "File": {"Length": "3", "ETag": '"{G},1"'}}]})
+    async with client_factory(route) as (client, state):
+        rows = [x async for x in client.iter_sharepoint_list_items_via_rest(HOST, WEB, "list")]
+    assert seen == ["FieldValuesAsText,File"] and rows[0]["File"]["Length"] == "3"
+
+
+async def test_list_that_rejects_the_file_expand_is_read_without_it(client_factory):
+    seen = []
+    def route(req, n):
+        seen.append(req.url.params.get("$expand"))
+        if "File" in req.url.params.get("$expand", ""):
+            return httpx.Response(400, json={"error": {"code": "-1", "message": "bad expand"}})
+        return httpx.Response(200, json={"value": [{"Id": 1}]})
+    async with client_factory(route) as (client, state):
+        rows = [x async for x in client.iter_sharepoint_list_items_via_rest(HOST, WEB, "list")]
+    assert seen == ["FieldValuesAsText,File", "FieldValuesAsText"] and rows == [{"Id": 1}]

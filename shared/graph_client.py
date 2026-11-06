@@ -3800,17 +3800,29 @@ class GraphClient:
             # Catalog lists: drop $select so every declared column comes
             # back, and $expand FieldValuesAsText so lookup/url columns
             # render as strings (not OData shells).
+            # File: each row carries its file's (Length, ETag, version), so the worker skips one
+            # per-file metadata request (1 of 3 per file; live 181/181 identical, ~105 ms each).
             params: Optional[Dict[str, str]] = {
                 "$top": str(page_size),
-                "$expand": "FieldValuesAsText",
+                "$expand": "FieldValuesAsText,File",
             }
         else:
             params = {
                 "$top": str(page_size),
                 "$select": "Id,FileRef,FileLeafRef,FileSystemObjectType",
             }
-        async for row in self._iter_sharepoint_rest_rows(hostname, url, params=params, stage="list_page"):
-            yield row
+        yielded = False
+        try:
+            async for row in self._iter_sharepoint_rest_rows(hostname, url, params=params, stage="list_page"):
+                yielded = True
+                yield row
+        except ProviderReadError as exc:
+            # A list type that rejects $expand=File (none of 333 live lists did) is read as before.
+            if yielded or not all_fields or exc.status_code != 400:
+                raise
+            params = {"$top": str(page_size), "$expand": "FieldValuesAsText"}
+            async for row in self._iter_sharepoint_rest_rows(hostname, url, params=params, stage="list_page"):
+                yield row
 
     async def _iter_sharepoint_rest_rows(self, hostname, url, *, params, stage):
         next_url, seen = url, set()

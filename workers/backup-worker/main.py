@@ -30008,10 +30008,15 @@ class BackupWorker:
             file_info, ghosted = previous.get("file"), bool(previous.get("ghosted"))
         elif srv_rel and not is_folder:
             try:
-                file_info = await graph_client.get_sharepoint_file_metadata_via_rest(
-                    sp_hostname, sp_site_web_url, srv_rel,
-                )
-                file_identity = sharepoint_file_identity(file_info)
+                try:
+                    # The list page's $expand=File carries the identity: no metadata request.
+                    file_info = row.get("File") if isinstance(row.get("File"), dict) else None
+                    file_identity = sharepoint_file_identity(file_info)
+                except ProviderReadError:
+                    file_info = await graph_client.get_sharepoint_file_metadata_via_rest(
+                        sp_hostname, sp_site_web_url, srv_rel,
+                    )
+                    file_identity = sharepoint_file_identity(file_info)
                 size = file_identity[0]
                 if size == 0:
                     stats["rest_rows_size_zero"] += 1
@@ -30052,6 +30057,7 @@ class BackupWorker:
                         )
                         if sharepoint_file_identity(current_info) != file_identity:
                             raise ProviderReadError("file_version_changed")
+                        file_info = current_info  # store the full metadata, as before
                         upload_result = await upload_blob_with_retry_from_file(
                             container_name=container,
                             blob_path=blob_path_candidate,
