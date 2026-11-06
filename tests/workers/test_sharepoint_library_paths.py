@@ -116,3 +116,23 @@ def test_only_a_stored_or_ghosted_copy_of_the_same_version_is_reused():
     assert not _bw._reusable_sp_copy({**stored, "blob_path": None}, version)      # failed before: try again
     assert not _bw._reusable_sp_copy({**stored, "row_version": "old"}, version)
     assert not _bw._reusable_sp_copy(None, version) and not _bw._reusable_sp_copy(stored, None)
+
+
+# Railway 2026-11-06: SharePoint re-stamped Site Assets' __siteIcon__ on 6 sites in one second (item
+# version and Modified moved, bytes did not) and each was downloaded again. SP.File.ContentTag is
+# "{UniqueId},<item version>,<content version>": only the third part moves with the bytes (TM's QFION
+# __siteIcon__.jpg: item version 264, content version 2).
+FILE = {"ContentTag": "{13E977B4-3A9F-4412-A520-4D7520AD2372},23,3", "Length": "10436",
+        "UniqueId": "13e977b4-3a9f-4412-a520-4d7520ad2372"}
+
+
+def test_a_restamped_file_with_the_same_content_reuses_the_stored_copy():
+    stored = {"row_version": "old", "blob_path": "b/1", "ghosted": False, "file": FILE}
+    restamped = {**FILE, "ContentTag": "{13E977B4-3A9F-4412-A520-4D7520AD2372},24,3"}
+    assert _bw._reusable_sp_copy(stored, "new", restamped)
+    assert not _bw._reusable_sp_copy(stored, "new", {**FILE, "ContentTag": "{13E977B4-3A9F-4412-A520-4D7520AD2372},24,4"})
+    assert not _bw._reusable_sp_copy(stored, "new", {**restamped, "Length": "10437"})
+    assert not _bw._reusable_sp_copy(stored, "new", {"Length": "10436"})               # no content tag: download
+    assert not _bw._reusable_sp_copy({**stored, "file": {"Length": "10436"}}, "new", restamped)
+    assert not _bw._reusable_sp_copy({**stored, "blob_path": None}, "new", restamped)   # failed before: try again
+    assert not _bw._reusable_sp_copy(stored, "new", None)

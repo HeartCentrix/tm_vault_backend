@@ -903,6 +903,15 @@ def test_sharepoint_list_producer_carries_an_unchanged_list_forward():
     flat = re.sub(r"\s+", " ", _SRC[start:start + 16000])
     assert "await self._previous_sp_lists(snapshot, site_id)" in flat
     assert "sp_list_reusable(_sig, prior_lists.get(lst_id)" in flat
-    assert '"rest_signature": _sig, "rest_walked_at": _reuse_walked or _walked_now' in flat
+    assert '"rest_signature": _sig, "rest_walked_at": _reuse_walked or (_delta or (None,))[0] or _walked_now' in flat
     copy = flat.index("await self._copy_forward_sp_list_rows(snapshot.id, prior_lists_id, site_id, lst_id)")
     assert copy < flat.index("iter_sharepoint_list_items_via_rest(", copy)
+
+
+def test_sharepoint_list_producer_reads_only_rows_changed_since_a_modified_only_touch():
+    start = _SRC.index("previous_rows = await self._previous_sp_rest_rows(snapshot, site_id)")
+    flat = re.sub(r"\s+", " ", _SRC[start:start + 20000])
+    assert "sp_list_changed_since(_sig, prior_lists.get(lst_id)" in flat
+    read = flat.index("modified_since=_since")
+    copy = flat.index("skip_external_ids=_changed_ids", read)
+    assert copy < flat.index("iter_sharepoint_list_items_via_rest( sp_hostname, sp_site_web_url, lst_id, )", copy)

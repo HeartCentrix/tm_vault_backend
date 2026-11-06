@@ -3595,6 +3595,26 @@ def sp_list_reusable(signature, prior, now, max_age_hours=None):
     return walked if now - walked_at < timedelta(hours=hours) else None
 
 
+def sp_list_changed_since(signature, prior, now, max_age_hours=None):
+    """(prior full read time, lower bound) when only a list's LastItemModifiedDate moved: same item count,
+    last delete and title, so no row was added or removed and only rows modified since the prior's date
+    need reading; the rest are carried. The bound is one minute early so a row stamped beside the list
+    date is not missed. Same kill switch and full-read age as sp_list_reusable. Else None."""
+    old = (prior or {}).get("rest_signature") or {}
+    if (not signature or not old.get("modified") or signature == old
+            or any(signature.get(k) != old.get(k) for k in ("deleted", "count", "title"))):
+        return None
+    walked = sp_list_reusable(signature, {**prior, "rest_signature": signature}, now, max_age_hours)
+    try:
+        since = datetime.fromisoformat(str(old["modified"]).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    since = (since.astimezone(timezone.utc) - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return (walked, since) if walked else None
+
+
 def mail_carry_forward_enabled(env: Optional[Dict[str, str]] = None) -> bool:
     """Kill switch for the mail carry-forward (both USER_MAIL and Tier-1).
     Default ON; ``MAIL_CARRY_FORWARD_ENABLED`` = 0/false/no/off disables it
@@ -4665,11 +4685,29 @@ def _sp_row_version(row: Dict[str, Any]) -> Optional[str]:
                                      row.get("OData__UIVersionString") or fvat.get("OData__x005f_UIVersionString") or ""))
 
 
-def _reusable_sp_copy(previous: Optional[Dict[str, Any]], version: Optional[str]) -> bool:
+def _sp_content_key(file_info: Any) -> Optional[tuple]:
+    """SP.File.ContentTag is "{UniqueId},<item version>,<content version>": only the content version moves
+    with the bytes. A metadata-only touch moves the item version and Modified (TM's QFION __siteIcon__.jpg:
+    item version 264, content version 2)."""
+    if not isinstance(file_info, dict) or file_info.get("Length") in (None, ""):
+        return None
+    parts = str(file_info.get("ContentTag") or "").split(",")
+    if len(parts) != 3 or not parts[0] or not parts[2]:
+        return None
+    return parts[0].lower(), parts[2], str(file_info["Length"])
+
+
+def _reusable_sp_copy(previous: Optional[Dict[str, Any]], version: Optional[str], file_info: Any = None) -> bool:
     """Reuse the previous restore point's copy of the same version: stored bytes, or a ghosted file that has
-    no content stream (retried 28,660 times in TM's 30 days). A copy that failed before is tried again."""
-    return bool(previous and version and previous.get("row_version") == version
-                and (previous.get("blob_path") or previous.get("ghosted")))
+    no content stream (retried 28,660 times in TM's 30 days). A copy that failed before is tried again.
+    Stored bytes are also reused when only the item version moved and the content did not (SharePoint
+    re-stamped Site Assets' __siteIcon__ on 6 sites in one second, Railway 2026-11-06)."""
+    if not previous:
+        return False
+    if version and previous.get("row_version") == version and (previous.get("blob_path") or previous.get("ghosted")):
+        return True
+    key = _sp_content_key(file_info)
+    return bool(key and previous.get("blob_path") and _sp_content_key(previous.get("file")) == key)
 
 
 class BackupWorker:
@@ -22660,9 +22698,10 @@ class BackupWorker:
                 {"prev": prev[0], "site": site_id})).all()
         return prev[0], {r[0]: (json.loads(r[1]) if isinstance(r[1], str) else r[1]) or {} for r in rows}
 
-    async def _copy_forward_sp_list_rows(self, snapshot_id, prior_snapshot_id, site_id: str, list_id: str) -> int:
+    async def _copy_forward_sp_list_rows(self, snapshot_id, prior_snapshot_id, site_id: str, list_id: str,
+                                         skip_external_ids=()) -> int:
         """Copy an unchanged list's rows from the prior restore point in one statement (blobs are
-        retained, so their paths stay valid). Returns the rows copied."""
+        retained, so their paths stay valid), except rows this run read again. Returns the rows copied."""
         from sqlalchemy import text as _text
         columns = [c.name for c in SnapshotItem.__table__.columns]
         values = ["gen_random_uuid()" if c == "id" else "CAST(:sid AS uuid)" if c == "snapshot_id"
@@ -22672,9 +22711,10 @@ class BackupWorker:
                 "INSERT INTO snapshot_items (" + ",".join(columns) + ") SELECT " + ",".join(values) + """
                 FROM snapshot_items src WHERE src.snapshot_id = CAST(:prior AS uuid)
                   AND src.metadata->>'source' = 'sp_rest' AND src.metadata->>'site_id' = :site
-                  AND src.metadata->>'list_id' = :list
+                  AND src.metadata->>'list_id' = :list AND NOT (src.external_id = ANY(:skip))
                 ON CONFLICT (snapshot_id, external_id, item_type) DO NOTHING"""),
-                {"sid": str(snapshot_id), "prior": str(prior_snapshot_id), "site": site_id, "list": list_id})).rowcount
+                {"sid": str(snapshot_id), "prior": str(prior_snapshot_id), "site": site_id, "list": list_id,
+                 "skip": list(skip_external_ids)})).rowcount
             await sess.commit()
         return int(copied or 0)
 
@@ -29848,6 +29888,9 @@ class BackupWorker:
                 _walked_now = datetime.now(timezone.utc).isoformat()
                 _reuse_walked = (sp_list_reusable(_sig, prior_lists.get(lst_id), datetime.now(timezone.utc))
                                  if prior_lists_id else None)
+                # Only the list's modified date moved: read rows changed since, carry the rest.
+                _delta = (sp_list_changed_since(_sig, prior_lists.get(lst_id), datetime.now(timezone.utc))
+                          if prior_lists_id and not _reuse_walked else None)
                 list_row = {
                     "id": uuid.uuid4(),
                     "snapshot_id": snapshot.id,
@@ -29875,7 +29918,8 @@ class BackupWorker:
                         "is_library": is_library,
                         "web_url": lst.get("webUrl"),
                         "last_modified": lst.get("lastModifiedDateTime"),
-                        "rest_signature": _sig, "rest_walked_at": _reuse_walked or _walked_now,
+                        "rest_signature": _sig,
+                        "rest_walked_at": _reuse_walked or (_delta or (None,))[0] or _walked_now,
                     },
                 }
                 try:
@@ -29921,6 +29965,41 @@ class BackupWorker:
                         logger.warning("SharePoint list carry-forward failed for %s/%s, reading it: %s",
                                        site_label, display, exc)
 
+                def _rest_work(row):
+                    return {
+                        "row": row,
+                        "previous": previous_rows.get(f"{lst_id}:{row.get('Id') or row.get('ID')}"),
+                        "lst_id": lst_id,
+                        "list_display": display,
+                        "site_id": site_id,
+                        "site_label": site_label,
+                        "sp_hostname": sp_hostname,
+                        "sp_site_web_url": sp_site_web_url,
+                        "is_catalog": is_catalog,
+                        "template": template,
+                    }
+
+                if _delta:
+                    # Railway 2026-11-06: SharePoint moved Site Assets' modified date on 6 sites in one
+                    # second with no content change; each re-read the whole library. Any failure
+                    # (e.g. the list view threshold on an unindexed Modified) reads the whole list.
+                    _since, _changed_ids = _delta[1], []
+                    try:
+                        async for row in graph_client.iter_sharepoint_list_items_via_rest(
+                            sp_hostname, sp_site_web_url, lst_id, modified_since=_since,
+                        ):
+                            _changed_ids.append(f"{lst_id}:{row.get('Id') or row.get('ID')}")
+                            await rest_queue.put(_rest_work(row))
+                        _copied = await self._copy_forward_sp_list_rows(
+                            snapshot.id, prior_lists_id, site_id, lst_id, skip_external_ids=_changed_ids)
+                        if _copied or _changed_ids or not (_sig or {}).get("count"):
+                            stats["lists_reused"] = stats.get("lists_reused", 0) + 1
+                            stats["list_rows_reused"] = stats.get("list_rows_reused", 0) + _copied
+                            continue
+                    except Exception as exc:
+                        logger.warning("SharePoint changed-rows read failed for %s/%s, reading it all: %s",
+                                       site_label, display, exc)
+
                 try:
                     # all_fields defaults to True now — every list returns
                     # FieldValuesAsText so the frontend can render each list's
@@ -29929,18 +30008,7 @@ class BackupWorker:
                     async for row in graph_client.iter_sharepoint_list_items_via_rest(
                         sp_hostname, sp_site_web_url, lst_id,
                     ):
-                        await rest_queue.put({
-                            "row": row,
-                            "previous": previous_rows.get(f"{lst_id}:{row.get('Id') or row.get('ID')}"),
-                            "lst_id": lst_id,
-                            "list_display": display,
-                            "site_id": site_id,
-                            "site_label": site_label,
-                            "sp_hostname": sp_hostname,
-                            "sp_site_web_url": sp_site_web_url,
-                            "is_catalog": is_catalog,
-                            "template": template,
-                        })
+                        await rest_queue.put(_rest_work(row))
                 except Exception as exc:
                     stats["rest_enum_fail"] = stats.get("rest_enum_fail", 0) + 1
                     logger.warning("SP REST stream failed for list %s/%s: %s", site_label, display, exc)
@@ -30333,13 +30401,16 @@ class BackupWorker:
         row_version = _sp_row_version(row)
         ghosted = False
         previous = work.get("previous")
-        reused = bool(srv_rel and not is_folder and _reusable_sp_copy(previous, row_version))
+        listed = row.get("File") if isinstance(row.get("File"), dict) else None
+        reused = bool(srv_rel and not is_folder and _reusable_sp_copy(previous, row_version, listed))
         if reused:
-            # Same item version as the previous restore point: point at its copy, no SharePoint request.
+            # Same item version (or same content) as the previous restore point: point at its copy, no
+            # SharePoint request. A re-stamped file records its new version.
             stats["rest_reused"] = stats.get("rest_reused", 0) + 1
             blob_path, content_hash = previous.get("blob_path"), previous.get("content_hash")
             downloaded_bytes = size = int(previous.get("content_size") or 0)
-            file_info, ghosted = previous.get("file"), bool(previous.get("ghosted"))
+            file_info = previous.get("file") if previous.get("row_version") == row_version else listed
+            ghosted = bool(previous.get("ghosted"))
         elif srv_rel and not is_folder:
             try:
                 try:

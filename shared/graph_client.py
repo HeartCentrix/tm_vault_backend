@@ -3767,8 +3767,11 @@ class GraphClient:
         list_id: str,
         page_size: int = 1000,
         all_fields: bool = True,
+        modified_since: Optional[str] = None,
     ):
         """Streaming page-by-page iterator over SP REST list items.
+
+        ``modified_since`` (ISO UTC, e.g. 2026-11-06T08:04:35Z) reads only rows modified at or after it.
 
         Why: libraries on a heavy tenant can hold millions of rows; the old
         buffered wrapper kept every row in memory before returning. This
@@ -3811,6 +3814,8 @@ class GraphClient:
                 "$top": str(page_size),
                 "$select": "Id,FileRef,FileLeafRef,FileSystemObjectType",
             }
+        since = {"$filter": f"Modified ge datetime'{modified_since}'"} if modified_since else {}
+        params.update(since)
         yielded = False
         try:
             async for row in self._iter_sharepoint_rest_rows(hostname, url, params=params, stage="list_page"):
@@ -3820,7 +3825,7 @@ class GraphClient:
             # A list type that rejects $expand=File (none of 333 live lists did) is read as before.
             if yielded or not all_fields or exc.status_code != 400:
                 raise
-            params = {"$top": str(page_size), "$expand": "FieldValuesAsText"}
+            params = {"$top": str(page_size), "$expand": "FieldValuesAsText", **since}
             async for row in self._iter_sharepoint_rest_rows(hostname, url, params=params, stage="list_page"):
                 yield row
 

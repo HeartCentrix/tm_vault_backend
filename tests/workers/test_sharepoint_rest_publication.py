@@ -24,7 +24,7 @@ def run_row():
     path = Path(__file__).parents[2] / "workers/backup-worker/main.py"
     tree = ast.parse(path.read_text())
     fn = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == "_backup_sp_rest_row")
-    helpers = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("_sp_row_version", "_reusable_sp_copy")]
+    helpers = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("_sp_row_version", "_sp_content_key", "_reusable_sp_copy")]
     state = {"uploads": [], "rows": [], "db_fail": False, "metadata_calls": 0}
     stats = {k: 0 for k in ("rest_rows", "rest_fail", "rest_files_ok", "rest_bytes")}
 
@@ -54,7 +54,7 @@ def run_row():
     # Execute the production method unchanged; replace only its external seams.
     exec(compile(ast.Module(body=[*helpers, fn], type_ignores=[]), str(path), "exec"), ns)
 
-    async def run(*, metadata=None, chunks=(b"abc",), metadata_error=None, after=None, listed=None):
+    async def run(*, metadata=None, chunks=(b"abc",), metadata_error=None, after=None, listed=None, previous=None):
         if metadata is None:
             metadata = {"Length": "3", "ETag": '"v1"', "UniqueId": "file", "UIVersionLabel": "1.0"}
         async def get_meta(*args):
@@ -74,7 +74,7 @@ def run_row():
             shard=None, container="container", stats=stats, work={
                 "row": {"Id": 1, "FileRef": "/sites/a/x", "FileLeafRef": "x", "FileSystemObjectType": 0,
                         **({"File": listed} if listed is not None else {})},
-                "lst_id": "list", "list_display": "List", "site_id": "site", "site_label": "Site",
+                "previous": previous, "lst_id": "list", "list_display": "List", "site_id": "site", "site_label": "Site",
                 "sp_hostname": "tenant.sharepoint.com", "sp_site_web_url": "https://tenant.sharepoint.com/sites/a"})
         return state, stats
     return run, state, stats
@@ -144,3 +144,27 @@ async def test_row_without_a_usable_listed_identity_reads_metadata_first(run_row
     run, state, stats = run_row
     await run(listed={"ETag": '"v1"'})  # no Length
     assert state["metadata_calls"] == 2 and stats["rest_files_ok"] == 1
+
+
+async def test_restamped_file_with_unchanged_content_reuses_the_stored_copy(run_row):
+    # Railway 2026-11-06: SharePoint re-stamped __siteIcon__ (item version moved, ContentTag's
+    # content version did not) and the row worker downloaded it again. Reuse the stored blob.
+    run, state, stats = run_row
+    listed = {"Length": "3", "ETag": '"{F},24"', "ContentTag": "{F},24,3", "UniqueId": "f", "UIVersionLabel": "18.0"}
+    previous = {"row_version": "f|23", "blob_path": "prior/blob", "content_hash": "h", "content_size": 3,
+                "ghosted": False, "file": {**listed, "ETag": '"{F},23"', "ContentTag": "{F},23,3"}}
+    await run(listed=listed, previous=previous)
+    assert not state["uploads"] and state["metadata_calls"] == 0
+    row = state["rows"][0]
+    assert (row["blob_path"], row["content_hash"], row["content_size"]) == ("prior/blob", "h", 3)
+    assert row["metadata"]["file"] == listed          # the new version is what this restore point records
+    assert stats["rest_reused"] == 1 and stats["rest_fail"] == 0
+
+
+async def test_file_whose_content_version_moved_is_downloaded(run_row):
+    run, state, stats = run_row
+    listed = {"Length": "3", "ETag": '"v1"', "ContentTag": "{F},24,4", "UniqueId": "file", "UIVersionLabel": "1.0"}
+    previous = {"row_version": "f|23", "blob_path": "prior/blob", "content_hash": "h", "content_size": 3,
+                "ghosted": False, "file": {**listed, "ContentTag": "{F},23,3"}}
+    await run(listed=listed, previous=previous)
+    assert len(state["uploads"]) == 1 and state["rows"][0]["blob_path"] == "blob"
