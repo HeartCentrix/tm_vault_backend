@@ -229,3 +229,20 @@ async def test_chat_rows_label_inherited_rows_with_the_logical_snapshot(store, s
         want = sorted((overlay, r.external_id, r.chat_version_id) for r in (await session.scalars(
             select(plain).where(plain_scope))).all())
     assert got == want and len(got) == 8   # alpha 1 + card, beta 3, gamma 3
+
+
+async def test_chat_rows_scoped_to_one_chat_read_only_that_chats_effective_rows(store, source_adapter, monkeypatch):
+    """chat_id pushes the chat's version ids into each branch of the effective set, so a one-chat
+    browse page of an overlay reads that chat's rows instead of the whole effective chat set."""
+    from shared.snapshot_reuse import chat_rows
+    _base, overlay, twin = await overlay_and_twin(store, source_adapter, monkeypatch)
+    async with store.factory() as session:
+        for chat in ("chat-alpha", "chat-beta", "chat-gamma", "chat-missing"):
+            rows, scope = await chat_rows(session, [overlay], chat_id=chat)
+            got = sorted((r.snapshot_id, r.external_id, r.chat_version_id) for r in (await session.scalars(
+                select(rows).where(scope))).all())
+            plain, plain_scope = await chat_rows(session, [twin])
+            want = sorted((overlay, r.external_id, r.chat_version_id) for r in (await session.scalars(
+                select(plain).where(plain_scope))).all() if (r.extra_data or {}).get("chat_id") == chat)
+            assert got == want, chat
+            assert len(got) == {"chat-alpha": 2, "chat-beta": 3, "chat-gamma": 3, "chat-missing": 0}[chat]

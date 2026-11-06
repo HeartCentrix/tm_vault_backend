@@ -384,9 +384,10 @@ async def _catalogue_snapshot(db, snapshot_id, *, resolve_chat_sibling=False):
     return selected
 
 
-async def _assert_catalogue_links(db, snapshot):
-    # A chat overlay's restore point includes the base rows of its inherited chats.
-    SI, scope = await chat_rows(db, [snapshot.id])
+async def _assert_catalogue_links(db, snapshot, chat_id=None):
+    # A chat overlay's restore point includes the base rows of its inherited chats. With chat_id an
+    # overlay checks that chat's linked rows only (the unscoped chat list checks every row).
+    SI, scope = await chat_rows(db, [snapshot.id], chat_id=chat_id)
     bad = await db.scalar(select(SI.id).outerjoin(ChatItemVersion,
         ChatItemVersion.id == SI.chat_version_id).where(scope,
         or_(ChatItemVersion.id.is_(None), ChatItemVersion.tenant_id != SI.tenant_id,
@@ -401,8 +402,8 @@ async def _assert_catalogue_links(db, snapshot):
 async def _catalogue_page(db, snapshot, *, page, size, item_type=None, chat_id=None,
                           folder=None, query=None, messages_only=False):
     # A nullable broken link must not vanish inside the version JOIN/filter.
-    await _assert_catalogue_links(db, snapshot)
-    SI, scope = await chat_rows(db, [snapshot.id])
+    await _assert_catalogue_links(db, snapshot, chat_id=chat_id)
+    SI, scope = await chat_rows(db, [snapshot.id], chat_id=chat_id)
     stmt = select(SI).join(ChatItemVersion,
         ChatItemVersion.id == SI.chat_version_id).where(scope)
     if messages_only:
@@ -554,7 +555,7 @@ async def _catalogue_message_response(db, snapshot, *, page, size, chat_id=None,
         chat_id=chat_id, folder=folder, query=search, messages_only=True)
     # Page-sized child load; links are joined by qualified physical message key.
     ids = [i.id for i in items]
-    SI, scope = await chat_rows(db, [snapshot.id])
+    SI, scope = await chat_rows(db, [snapshot.id], chat_id=chat_id)
     parents = select(SI.external_id).where(scope, SI.id.in_(ids)).correlate(None)
     children = list((await db.scalars(select(SI).where(scope, SI.parent_external_id.in_(parents),
         SI.item_type == "CHAT_HOSTED_CONTENT").execution_options(populate_existing=True))).all()) if ids else []

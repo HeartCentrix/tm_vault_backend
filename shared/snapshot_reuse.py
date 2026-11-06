@@ -147,15 +147,19 @@ def _coerce_uuid(value: UUIDLike) -> uuid.UUID:
     return uuid.UUID(str(value))
 
 
-async def chat_rows(session: AsyncSession, snapshot_ids):
+async def chat_rows(session: AsyncSession, snapshot_ids, chat_id=None):
     """``(entity, scope)`` for reading the snapshot_items rows of ``snapshot_ids`` (already resolved to
     the snapshots that hold rows). Full snapshots: ``(SnapshotItem, snapshot_id IN ids)``, today's plan.
     When any is an overlay: an aliased SnapshotItem over snapshot_items_effective(), every row labelled
     with the snapshot it was asked for (a chat overlay's inherited chats are its base's rows, which
     readers matching rows to snapshot_chat_inventories or to the requested scope must see as its own).
-    Read only: rows of the alias are never flushed (populate_existing keeps labels per query)."""
-    from sqlalchemy import literal, select, union_all
-    from sqlalchemy.dialects.postgresql import UUID as PGUUID
+    Read only: rows of the alias are never flushed (populate_existing keeps labels per query).
+    ``chat_id`` (overlays only) limits every branch of the effective set to that chat's version ids, so a
+    one-chat page probes ix_snapshot_items_chat_version_id (the index the plain path's version join
+    uses) instead of scanning and anti-joining the whole effective chat set. Callers still filter the
+    chat themselves; full snapshots ignore it."""
+    from sqlalchemy import any_, bindparam, literal, select, union_all
+    from sqlalchemy.dialects.postgresql import ARRAY, UUID as PGUUID
     from sqlalchemy.orm import aliased
     from shared.models import SnapshotItem
     ids = [_coerce_uuid(s) for s in snapshot_ids]
@@ -165,12 +169,24 @@ async def chat_rows(session: AsyncSession, snapshot_ids):
         {"ids": [str(i) for i in ids]})).scalars().all()) if ids else set()
     if not overlays:
         return SnapshotItem, SnapshotItem.snapshot_id.in_(ids)
+    versions = None
+    if chat_id is not None:
+        # A literal array (not a subquery) so the planner pushes it into each UNION ALL branch.
+        versions = list((await session.execute(text(
+            "SELECT v.id FROM chat_item_versions v WHERE v.chat_id = :c AND v.tenant_id IN ("
+            "SELECT r.tenant_id FROM snapshots s JOIN resources r ON r.id = s.resource_id "
+            "WHERE s.id = ANY(CAST(:ids AS uuid[])))"),
+            {"c": chat_id, "ids": [str(i) for i in ids]})).scalars().all())
     columns = [c for c in SnapshotItem.__table__.columns]
     parts = []
     for sid in ids:
         source = func_effective(sid)
-        parts.append(select(*[(literal(sid, PGUUID(as_uuid=True)) if c.name == "snapshot_id" else source.c[c.name]).label(c.name)
-                              for c in columns]))
+        part = select(*[(literal(sid, PGUUID(as_uuid=True)) if c.name == "snapshot_id" else source.c[c.name]).label(c.name)
+                        for c in columns])
+        if versions is not None:
+            part = part.where(source.c.chat_version_id == any_(
+                bindparam(None, versions, type_=ARRAY(PGUUID(as_uuid=True)))))
+        parts.append(part)
     rows = (union_all(*parts) if len(parts) > 1 else parts[0]).subquery()   # anonymous: two chat_rows entities may share a statement
     entity = aliased(SnapshotItem, rows, adapt_on_names=True)
     return entity, entity.snapshot_id.in_(ids)
