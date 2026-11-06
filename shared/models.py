@@ -1909,6 +1909,16 @@ class CopyWorkItem(Base):
     phase = Column(Integer, nullable=False, default=0)
 
 
+def _env_capacity(name, default):
+    """Positive int from env (capacity defaults of the first-use control rows)."""
+    import os
+    try:
+        value = int(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
 class CopyWorkControl(Base):
     """One short transactional claim mutex and coordinated protocol settings."""
     __tablename__ = 'copy_work_control'
@@ -1918,7 +1928,8 @@ class CopyWorkControl(Base):
     micro_capacity = Column(Integer, nullable=False, default=3)
     giant_capacity = Column(Integer, nullable=False, default=3)
     total_capacity = Column(Integer, nullable=False, default=6)
-    tenant_capacity = Column(Integer, nullable=False, default=2)
+    # The row is created on first use. TM is one tenant: 2 serialised its whole cluster's copies.
+    tenant_capacity = Column(Integer, nullable=False, default=lambda: _env_capacity('COPY_TENANT_CAPACITY', 6))
     virtual_clock = Column(Float, nullable=False, default=0)
     __table_args__ = (CheckConstraint('micro_capacity > 0 AND giant_capacity > 0 AND total_capacity > 0 AND tenant_capacity > 0', name='ck_copy_control_capacity'),)
 
@@ -2009,8 +2020,10 @@ class ProviderWorkControl(Base):
     id = Column(String(16), primary_key=True, default='global')
     enabled = Column(Boolean, nullable=False, default=False)
     epoch = Column(BigInteger, nullable=False, default=1)
-    total_capacity = Column(Integer, nullable=False, default=8)
-    tenant_capacity = Column(Integer, nullable=False, default=4)
+    # Created on first use; TM sets no overrides. 8/4 capped TM's single tenant at 4 concurrent
+    # backups across 20 worker replicas. 40/40 is what Railway (also 10+10 replicas) runs.
+    total_capacity = Column(Integer, nullable=False, default=lambda: _env_capacity('PROVIDER_TOTAL_CAPACITY', 40))
+    tenant_capacity = Column(Integer, nullable=False, default=lambda: _env_capacity('PROVIDER_TENANT_CAPACITY', 40))
     control_reserve = Column(Integer, nullable=False, default=2)
     virtual_clock = Column(Float, nullable=False, default=0)
     __table_args__ = (CheckConstraint('total_capacity > 0 AND tenant_capacity > 0 AND control_reserve > 0', name='ck_provider_capacity'),)
