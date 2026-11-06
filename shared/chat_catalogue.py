@@ -20,6 +20,8 @@ from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import logging
+import os
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -40,6 +42,9 @@ from shared.models import (
     ChatItemVersion, Job, JobStatus, Resource, ResourceType, Snapshot, SnapshotChatInventory,
     SnapshotItem, SnapshotPartition, SnapshotStatus,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class ChatCatalogueConflict(RuntimeError):
@@ -401,10 +406,11 @@ async def copy_versions(session, *, lease: CaptureLease, inventory_id, source_sn
             si.backup_version, si.metadata, si.is_deleted, COALESCE((v.content->>'backend_id')::uuid, :backend),
             si.chat_version_id, now() AT TIME ZONE 'utc'
         FROM chat_inventory_items ii JOIN chat_item_versions v ON v.id = ii.version_id
-        JOIN snapshot_items si ON si.external_id = ii.logical_key AND si.chat_version_id = ii.version_id
-        WHERE ii.inventory_id = :staged AND ii.logical_key = ANY(:keys) AND si.snapshot_id = :source"""),
+        JOIN snapshot_items_effective(CAST(:source AS uuid)) si
+          ON si.external_id = ii.logical_key AND si.chat_version_id = ii.version_id
+        WHERE ii.inventory_id = :staged AND ii.logical_key = ANY(:keys)"""),
         {"snapshot": scope.snapshot_id, "folder": attempt.folder_path, "backend": scope.backend_id,
-         "staged": inventory.id, "keys": keys, "source": source_snapshot_id})).rowcount
+         "staged": inventory.id, "keys": keys, "source": str(source_snapshot_id)})).rowcount
     if entries != len(keys) or links != len(keys):
         await nested.rollback()
         return False
@@ -693,11 +699,11 @@ async def publish_unchanged_inventory(session, *, lease: CaptureLease, inventory
         SELECT gen_random_uuid(), :snapshot, si.tenant_id, si.external_id, si.parent_external_id, si.item_type, si.name,
             :folder, si.content_hash, si.content_checksum, si.content_size, si.blob_path, si.encryption_key_id,
             si.backup_version, si.metadata, si.is_deleted, si.backend_id, si.chat_version_id, now() AT TIME ZONE 'utc'
-        FROM snapshot_items si JOIN chat_inventory_items ii
+        FROM snapshot_items_effective(CAST(:source AS uuid)) si JOIN chat_inventory_items ii
           ON ii.logical_key = si.external_id AND ii.version_id = si.chat_version_id
-        WHERE ii.inventory_id = :inventory AND si.snapshot_id = :source"""),
+        WHERE ii.inventory_id = :inventory"""),
         {"snapshot": scope.snapshot_id, "folder": attempt.folder_path, "inventory": inventory.id,
-         "source": source_snapshot_id})).rowcount
+         "source": str(source_snapshot_id)})).rowcount
     if copied != inventory.item_count:
         await nested.rollback()
         return None
@@ -716,6 +722,114 @@ async def publish_unchanged_inventory(session, *, lease: CaptureLease, inventory
     attempt.state = "PUBLISHED"
     await session.flush()
     return _result(attempt, association, inventory, 0)
+
+
+def chat_overlay_enabled(env=None) -> bool:
+    """``CHAT_OVERLAY_ENABLED`` = 1/true/yes/on builds chat overlays; off (the default) copies every
+    unchanged chat's rows forward as before. Off until the catalogue readers that still filter
+    ``snapshot_items.snapshot_id`` directly (snapshot-service _catalogue_*, chat_presentation,
+    chat export, restore-worker, chat DR) read through snapshot_items_effective()."""
+    flag = str((os.environ if env is None else env).get("CHAT_OVERLAY_ENABLED", "") or "").strip().lower()
+    return flag in ("1", "true", "yes", "on")
+
+
+def _env_float(name, default):
+    try:
+        return float(os.environ.get(name) or default)
+    except ValueError:
+        return default
+
+
+_CHAT_ROW_TYPES = ["TEAMS_CHAT_MESSAGE", "CHAT_ATTACHMENT", "CHAT_HOSTED_CONTENT"]
+# The linked chats (``c``: inventory, this snapshot's folder) and their inventory entries (``ii``).
+_LINKED = ("FROM unnest(CAST(:inventories AS uuid[]), CAST(:folders AS text[])) AS c(inventory_id, folder) "
+           "JOIN chat_inventory_items ii ON ii.inventory_id = c.inventory_id ")
+_COPY_LINKED = ("""INSERT INTO snapshot_items (id, snapshot_id, tenant_id, external_id, parent_external_id, item_type,
+        name, folder_path, content_hash, content_checksum, content_size, blob_path, encryption_key_id, backup_version,
+        metadata, is_deleted, backend_id, chat_version_id, created_at)
+    SELECT gen_random_uuid(), :snapshot, si.tenant_id, si.external_id, si.parent_external_id, si.item_type, si.name,
+        c.folder, si.content_hash, si.content_checksum, si.content_size, si.blob_path, si.encryption_key_id,
+        si.backup_version, si.metadata, si.is_deleted, si.backend_id, si.chat_version_id, now() AT TIME ZONE 'utc' """
+    + _LINKED)
+# A base row an entry of a linked chat inherits: same key, version and folder.
+_INHERITED = ("b.snapshot_id = :base AND b.external_id = ii.logical_key AND b.chat_version_id = ii.version_id "
+              "AND b.folder_path = c.folder")
+
+
+async def _overlay_unchanged(session, params, expected) -> bool:
+    """Make the in-progress snapshot an overlay of the full base behind ``params['source']`` (itself, or
+    the base of the overlay it is) instead of copying the linked chats' rows: a chat the base holds
+    entirely (every entry with the same version and folder) is inherited; any other (changed since the
+    base, renamed folder) is copied whole; every other base chat row (changed chats, chats out of scope) is recorded as a
+    removal, so snapshot_items_effective() equals the full copy. Same compaction rules as mail
+    (shared.mail_overlay): base COMPLETED/PARTIAL, one level, at most CHAT_OVERLAY_MAX_AGE_DAYS old,
+    own + removed rows at most CHAT_OVERLAY_MAX_RATIO x the base's chat rows. False, with nothing
+    written, when the caller must copy (an already-overlaid snapshot of a resumed turn copies too)."""
+    p = dict(params, types=_CHAT_ROW_TYPES, snapshot=str(params["snapshot"]), source=str(params["source"]))
+    target = (await session.execute(text(
+        "SELECT created_at FROM snapshots WHERE id = :snapshot AND status = 'IN_PROGRESS' "
+        "AND reuse_of_snapshot_id IS NULL AND overlay_base_id IS NULL AND extra_data->>'cancelled_at' IS NULL "
+        "FOR NO KEY UPDATE"), p)).first()
+    source = (await session.execute(text("SELECT id, overlay_base_id, resource_id FROM snapshots WHERE id = :source"),
+                                    p)).first()
+    if target is None or source is None:
+        return False
+    p["base"] = str(source.overlay_base_id or source.id)
+    # KEY SHARE: retention's DELETE of the base waits for this transaction, then sees the dependent.
+    base = (await session.execute(text(
+        "SELECT created_at FROM snapshots WHERE id = :base AND status IN ('COMPLETED', 'PARTIAL') "
+        "AND reuse_of_snapshot_id IS NULL AND overlay_base_id IS NULL AND extra_data->>'cancelled_at' IS NULL "
+        "FOR KEY SHARE"), p)).first()
+    max_age = _env_float("CHAT_OVERLAY_MAX_AGE_DAYS", 7.0)
+    if base is None or (target.created_at - base.created_at).total_seconds() > max_age * 86400:
+        return False
+    if await session.scalar(text("SELECT EXISTS (SELECT 1 FROM snapshot_items WHERE snapshot_id = :base "
+                                 "AND item_type <> ALL(CAST(:types AS text[])))"), p):
+        return False   # rows the overlay function would not inherit
+    nested = await session.begin_nested()
+    await session.execute(text("UPDATE snapshots SET overlay_base_id = :base WHERE id = :snapshot"), p)
+    # Whole chats only: a chat whose every entry the base holds (same key, version, folder) is inherited,
+    # any other is copied entire, so a chat's messages and children always share one snapshot.
+    held = set(await session.scalars(text(
+        "SELECT c.inventory_id FROM unnest(CAST(:inventories AS uuid[]), CAST(:folders AS text[])) "
+        "AS c(inventory_id, folder) WHERE NOT EXISTS (SELECT 1 FROM chat_inventory_items ii "
+        "WHERE ii.inventory_id = c.inventory_id AND NOT EXISTS (SELECT 1 FROM snapshot_items b WHERE "
+        + _INHERITED + "))"), p))
+    pairs = list(zip(p["inventories"], p["folders"]))
+    keep = dict(p, inventories=[str(i) for i, _ in pairs if UUID(str(i)) in held],
+                folders=[f for i, f in pairs if UUID(str(i)) in held])
+    move = dict(p, inventories=[str(i) for i, _ in pairs if UUID(str(i)) not in held],
+                folders=[f for i, f in pairs if UUID(str(i)) not in held])
+    inherited = await session.scalar(text("SELECT count(*) " + _LINKED), keep)
+    copied = (await session.execute(text(
+        _COPY_LINKED + "JOIN snapshot_items_effective(CAST(:source AS uuid)) si ON si.external_id = ii.logical_key "
+        "AND si.chat_version_id = ii.version_id"), move)).rowcount if move["inventories"] else 0
+    if inherited + copied != expected:
+        await nested.rollback()
+        raise ChatCatalogueIntegrityError("unchanged chats' earlier rows differ from their inventories")
+    removed = (await session.execute(text(
+        "INSERT INTO snapshot_overlay_removals (snapshot_id, item_type, external_id) "
+        "SELECT :snapshot, b.item_type, b.external_id FROM snapshot_items b "
+        "WHERE b.snapshot_id = :base AND NOT EXISTS (SELECT 1 FROM snapshot_items own "
+        "  WHERE own.snapshot_id = :snapshot AND own.item_type = b.item_type AND own.external_id = b.external_id) "
+        "AND NOT EXISTS (SELECT 1 " + _LINKED + "WHERE " + _INHERITED + ") ON CONFLICT DO NOTHING"), keep)).rowcount
+    own, base_rows = (await session.execute(text(
+        "SELECT (SELECT count(*) FROM snapshot_items WHERE snapshot_id = :snapshot), "
+        "(SELECT count(*) FROM snapshot_items WHERE snapshot_id = :base)"), p)).one()
+    ratio = _env_float("CHAT_OVERLAY_MAX_RATIO", 0.25)
+    if own + removed > ratio * base_rows:
+        await nested.rollback()
+        logger.info("chat_overlay_compaction snapshot=%s base=%s own=%s removed=%s base_rows=%s",
+                    p["snapshot"], p["base"], own, removed, base_rows)
+        return False
+    await session.execute(text(
+        "UPDATE snapshots SET extra_data = (COALESCE(extra_data::jsonb, '{}'::jsonb) || jsonb_build_object("
+        "'chat_overlay_base', CAST(:base AS text), 'chat_overlay_prior', CAST(:source AS text)))::json "
+        "WHERE id = :snapshot"), p)
+    await nested.commit()
+    logger.info("chat_overlay_built snapshot=%s base=%s inherited=%s copied=%s removed=%s base_rows=%s",
+                p["snapshot"], p["base"], inherited, copied, removed, base_rows)
+    return True
 
 
 async def publish_unchanged_inventories(session, *, scopes, links, folders, source_snapshot_id) -> set:
@@ -771,20 +885,13 @@ async def publish_unchanged_inventories(session, *, scopes, links, folders, sour
     for start in range(0, len(attempts), 500):  # ~22 binds a row; Postgres allows 32,767 per statement
         await session.execute(insert(ChatCaptureAttempt.__table__).values(attempts[start:start + 500]))
         await session.execute(insert(SnapshotChatInventory.__table__).values(associations[start:start + 500]))
-    copied = (await session.execute(text("""
-        INSERT INTO snapshot_items (id, snapshot_id, tenant_id, external_id, parent_external_id, item_type, name,
-            folder_path, content_hash, content_checksum, content_size, blob_path, encryption_key_id, backup_version,
-            metadata, is_deleted, backend_id, chat_version_id, created_at)
-        SELECT gen_random_uuid(), :snapshot, si.tenant_id, si.external_id, si.parent_external_id, si.item_type, si.name,
-            c.folder, si.content_hash, si.content_checksum, si.content_size, si.blob_path, si.encryption_key_id,
-            si.backup_version, si.metadata, si.is_deleted, si.backend_id, si.chat_version_id, now() AT TIME ZONE 'utc'
-        FROM unnest(CAST(:inventories AS uuid[]), CAST(:folders AS text[])) AS c(inventory_id, folder)
-        JOIN chat_inventory_items ii ON ii.inventory_id = c.inventory_id
-        JOIN snapshot_items si ON si.snapshot_id = :source AND si.external_id = ii.logical_key
-             AND si.chat_version_id = ii.version_id"""),
-        {"snapshot": first.snapshot_id, "source": source_snapshot_id,
-         "inventories": [inventory_id for _, inventory_id, _ in chosen],
-         "folders": [folder for _, _, folder in chosen]})).rowcount
+    params = {"snapshot": first.snapshot_id, "source": str(source_snapshot_id),
+              "inventories": [inventory_id for _, inventory_id, _ in chosen],
+              "folders": [folder for _, _, folder in chosen]}
+    if chat_overlay_enabled() and await _overlay_unchanged(session, params, expected):
+        return {cid for cid, _, _ in chosen}
+    copied = (await session.execute(text(_COPY_LINKED + "JOIN snapshot_items_effective(CAST(:source AS uuid)) si "
+        "ON si.external_id = ii.logical_key AND si.chat_version_id = ii.version_id"), params)).rowcount
     if copied != expected:
         raise ChatCatalogueIntegrityError("unchanged chats' earlier rows differ from their inventories")
     return {cid for cid, _, _ in chosen}

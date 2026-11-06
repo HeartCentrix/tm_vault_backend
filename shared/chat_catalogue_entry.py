@@ -169,14 +169,14 @@ async def catalogue_snapshot_result(session, snapshot_id, *, force_recount=False
             "partitioned": bool(extra.get("partitioned")), "status": snapshot.status.value, "resumed_terminal": True,
             "outcome": snapshot.status.value.lower(), "failure_reason": extra.get("failure_reason") or extra.get("error"),
             "failed": snapshot.status == SnapshotStatus.FAILED}
-    primary = SnapshotItem.item_type.notin_(["CHAT_ATTACHMENT", "CHAT_HOSTED_CONTENT"])
-    # A backup whose every chat was unchanged points at the full backup it reuses (no rows of its own).
-    count, logical_bytes = (await session.execute(select(func.count().filter(primary),
-        func.coalesce(func.sum(SnapshotItem.content_size), 0)).where(
-            SnapshotItem.snapshot_id == (snapshot.reuse_chain_root_id or snapshot_id)))).one()
-    # A prior backup that points at an earlier one holds no rows: compare with the rows it stands for.
-    prior = None if snapshot.reuse_chain_root_id else await session.scalar(select(
-        func.coalesce(Snapshot.reuse_chain_root_id, Snapshot.id)).where(Snapshot.resource_id == snapshot.resource_id,
+    # Through snapshot_items_effective: a backup whose every chat was unchanged points at the full backup
+    # it reuses (no rows of its own); an overlay inherits its unchanged chats' rows from its base.
+    totals = ("SELECT count(*) FILTER (WHERE e.item_type NOT IN ('CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT')), "
+              "COALESCE(sum(e.content_size), 0) FROM snapshot_items_effective(CAST(:s AS uuid)) e ")
+    count, logical_bytes = (await session.execute(text(totals), {"s": str(snapshot_id)})).one()
+    # The prior backup's rows, whatever form it takes, are what this run compares with.
+    prior = None if snapshot.reuse_chain_root_id else await session.scalar(select(Snapshot.id).where(
+        Snapshot.resource_id == snapshot.resource_id,
         Snapshot.id != snapshot_id, Snapshot.job_id != snapshot.job_id,
         Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL]),
         Snapshot.created_at <= snapshot.created_at).order_by(Snapshot.created_at.desc(), Snapshot.id.desc()).limit(1))
@@ -185,11 +185,9 @@ async def catalogue_snapshot_result(session, snapshot_id, *, force_recount=False
     elif prior is None:
         new_count, new_bytes = count, logical_bytes
     else:
-        prior_versions = select(SnapshotItem.chat_version_id).where(SnapshotItem.snapshot_id == prior,
-            SnapshotItem.chat_version_id.is_not(None))
-        new_count, new_bytes = (await session.execute(select(func.count().filter(primary),
-            func.coalesce(func.sum(SnapshotItem.content_size), 0)).where(SnapshotItem.snapshot_id == snapshot_id,
-                SnapshotItem.chat_version_id.notin_(prior_versions)))).one()
+        new_count, new_bytes = (await session.execute(text(totals + "WHERE "
+            "e.chat_version_id NOT IN (SELECT p.chat_version_id FROM snapshot_items_effective(CAST(:p AS uuid)) p "
+            "WHERE p.chat_version_id IS NOT NULL)"), {"s": str(snapshot_id), "p": str(prior)})).one()
     uploaded = await session.scalar(select(func.coalesce(func.sum(SnapshotChatInventory.uploaded_bytes), 0))
         .where(SnapshotChatInventory.snapshot_id == snapshot_id)) or 0
     return {"chat_inventory_format": 1, "item_count": int(count), "bytes_total": int(logical_bytes),
