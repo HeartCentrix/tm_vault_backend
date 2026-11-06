@@ -30590,7 +30590,13 @@ class BackupWorker:
                 "WHERE NOT EXISTS ("
                 "    SELECT 1 FROM snapshot_items_effective(CAST(:pri AS uuid)) pri "
                 "    WHERE pri.external_id = cur.external_id "
-                "      AND pri.item_type = cur.item_type)"
+                "      AND pri.item_type = cur.item_type "
+                # A drive file keeps its id across edits: a new content hash
+                # is a new stored version (2026-11-06: edited .docx showed 0).
+                # Only file types — other hashes may cover volatile JSON.
+                "      AND NOT (cur.item_type IN ('ONEDRIVE_FILE','FILE') "
+                "               AND NULLIF(cur.content_hash, '') IS DISTINCT FROM pri.content_hash "
+                "               AND NULLIF(cur.content_hash, '') IS NOT NULL))"
             ),
             {"cur": str(snapshot_id), "pri": str(prior_id)},
         )).first()
