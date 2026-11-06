@@ -22862,6 +22862,30 @@ class BackupWorker:
                     "method": "skipped_already_present",
                     "item_id": file_id, "file_name": file_name}
 
+        # Unchanged since the resource's last backup (same drive item, Graph quickXorHash and
+        # size): point at that stored copy instead of downloading it again — the HEAD above only
+        # sees this snapshot's own path. Retention keeps a blob while any row references it.
+        qxh = ((file_item.get("file") or {}).get("hashes") or {}).get("quickXorHash")
+        if qxh and file_size_hint:
+            from shared.blob_dedup import find_unchanged_file_blob
+            async with async_session_factory() as _sess:
+                unchanged = await find_unchanged_file_blob(
+                    _sess, resource_id=resource.id, external_id=file_id, quickxor=qxh,
+                    size=file_size_hint, exclude_snapshot_id=snapshot.id,
+                )
+            if unchanged:
+                await self._create_file_snapshot_item(
+                    snapshot, tenant, file_id, file_name, file_size_hint, unchanged[0],
+                    {"sha256": unchanged[1], "quickxor": qxh}, file_item, drive_id,
+                    graph_client=graph_client,
+                )
+                await self._capture_file_version_history(
+                    graph_client, tenant, snapshot, drive_id, file_id, file_name,
+                    file_item, container, shard, source_etag,
+                )
+                return {"success": True, "size": 0, "method": "reused_unchanged",
+                        "blob_path": unchanged[0], "item_id": file_id, "file_name": file_name}
+
         return await self._stream_file_snapshot(
             tenant, snapshot, file_item, graph_client, drive_id, file_id, file_name,
             container, blob_path, shard, source_etag,

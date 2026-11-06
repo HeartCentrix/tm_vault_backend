@@ -178,18 +178,29 @@ async def find_unchanged_file_blob(
     The quickXorHash is stored in the item's metadata; content_checksum holds the SHA-256, so a
     quickXorHash lookup against content_checksum (find_existing_blob) never matches and a
     requested full backup re-downloaded and re-stored every file (Railway 2026-11-04, 142 GiB).
-    Uses the (snapshot_id, external_id, item_type) index per candidate snapshot."""
+    Uses the (snapshot_id, external_id, item_type) index per candidate snapshot.
+
+    SharePoint library rows record Graph's hashes under structured.file_hash, so both shapes
+    match. The copy must be on this snapshot's storage backend: a blob path on another
+    backend cannot be read back through this one."""
     if not quickxor or not external_id or size is None:
         return None
+    from sqlalchemy import or_
+    from sqlalchemy.orm import aliased
     from shared.models import Snapshot, SnapshotStatus
     try:
+        current = aliased(Snapshot)
         stmt = (select(SnapshotItem.blob_path, SnapshotItem.content_checksum)
                 .join(Snapshot, Snapshot.id == SnapshotItem.snapshot_id)
                 .where(Snapshot.resource_id == resource_id, Snapshot.id != exclude_snapshot_id,
                        Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL]),
+                       Snapshot.backend_id == select(current.backend_id)
+                           .where(current.id == exclude_snapshot_id).scalar_subquery(),
                        SnapshotItem.external_id == external_id, SnapshotItem.blob_path.isnot(None),
                        SnapshotItem.content_size == size, SnapshotItem.content_checksum.isnot(None),
-                       SnapshotItem.extra_data["quickxor"].as_string() == quickxor)
+                       or_(SnapshotItem.extra_data["quickxor"].as_string() == quickxor,
+                           SnapshotItem.extra_data[("structured", "file_hash", "quickXorHash")]
+                           .as_string() == quickxor))
                 .order_by(Snapshot.created_at.desc()).limit(1))
         row = (await session.execute(stmt)).first()
         return (row[0], row[1]) if row else None

@@ -93,3 +93,38 @@ async def test_full_backup_does_not_download_an_unchanged_file_again(store, bw, 
     changed.worker._stream_graph_to_backend = stream
     assert (await changed.run())[0] == 1
     assert streamed == ["file-1"]
+
+
+async def test_sharepoint_library_row_is_matched_by_its_recorded_graph_hash(store):
+    """SharePoint FILE rows keep Graph's hashes under structured.file_hash, not a top-level quickxor."""
+    from shared.blob_dedup import find_unchanged_file_blob
+    first = await store.new_scope()
+    async with store.factory.begin() as session:
+        session.add(models.SnapshotItem(snapshot_id=first.snapshot_id, tenant_id=store.tenant, external_id="sp-1",
+            item_type="FILE", name="f.docx", content_size=5000, content_checksum="b" * 64, blob_path="files/sp-1",
+            backend_id=store.backend, extra_data={"structured": {"file_hash": {"quickXorHash": "QX1="}}}))
+        await session.execute(update(models.Snapshot).where(models.Snapshot.id == first.snapshot_id)
+                              .values(status=models.SnapshotStatus.COMPLETED))
+    current = await store.new_scope()
+    async with store.factory() as session:
+        assert await find_unchanged_file_blob(session, resource_id=current.resource_id, external_id="sp-1",
+            quickxor="QX1=", size=5000, exclude_snapshot_id=current.snapshot_id) == ("files/sp-1", "b" * 64)
+        assert await find_unchanged_file_blob(session, resource_id=current.resource_id, external_id="sp-1",
+            quickxor="QX2=", size=5000, exclude_snapshot_id=current.snapshot_id) is None
+
+
+async def test_copy_on_another_storage_backend_is_not_reused(store):
+    from shared.blob_dedup import find_unchanged_file_blob
+    first = await store.new_scope()
+    await add_file(store, first)
+    other = uuid4()
+    async with store.factory.begin() as session:
+        session.add(models.StorageBackend(id=other, kind="azure", name=uuid4().hex,
+                    endpoint="https://storage.invalid", config={}, secret_ref="synthetic-reference"))
+        await session.flush()
+        await session.execute(update(models.Snapshot).where(models.Snapshot.id == first.snapshot_id)
+                              .values(status=models.SnapshotStatus.COMPLETED, backend_id=other))
+    current = await store.new_scope()
+    async with store.factory() as session:
+        assert await find_unchanged_file_blob(session, resource_id=current.resource_id, external_id="file-1",
+            quickxor="QX1=", size=5000, exclude_snapshot_id=current.snapshot_id) is None
