@@ -673,6 +673,20 @@ async def test_incremental_links_every_chat_the_delta_feed_shows_unchanged_at_on
     assert len((await chat_state(store, third.snapshot_id))[0]) == 2
 
 
+async def test_turn_that_captured_nothing_lists_chats_once(store, source_adapter):
+    """Railway 2026-11-06: an unchanged user's turn listed every chat (pages of 50 with members, Microsoft
+    allows 1 request/s per user) twice. With no chat read in the turn there is no capture window to
+    re-check; a chat that appears later is not in the source backup and is captured next run."""
+    source = source_adapter.source
+    feed, rounds, checks = [], [], []
+    delta_source(source, feed, rounds, checks, latest_at=datetime(2020, 1, 1, tzinfo=timezone.utc))
+    await source_adapter.run(await legacy_scope(store))
+    lists = source.list_calls
+    feed.append(set())
+    assert (await source_adapter.run(await store.new_scope()))["outcome"] == "complete"
+    assert source.list_calls == lists + 1
+
+
 async def test_delta_feed_silence_never_links_a_chat_whose_message_was_edited(store, source_adapter):
     """Railway 2026-11-05: a 13-hour-old message in a group chat was edited at 14:38; at 14:42 every
     member's delta feed reported no change and all five linked the old version. Each chat the feed

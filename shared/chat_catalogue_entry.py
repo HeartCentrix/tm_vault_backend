@@ -792,9 +792,11 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                     await asyncio.gather(*workers, return_exceptions=True)
             if yield_requested and processed < len(keys):
                 yield_provider_turn()
-            final_chats = set(await _chat_list(source))
-            if (allowed is None and final_chats != set(chats)) or (allowed is not None and allowed - final_chats):
-                errors.append("chat visibility changed during resource capture")
+            # No chat read this turn: nothing to re-check, and a full re-list costs pages at 1 request/s per user.
+            if processed or allowed is not None:
+                final_chats = set(await _chat_list(source))
+                if (allowed is None and final_chats != set(chats)) or (allowed is not None and allowed - final_chats):
+                    errors.append("chat visibility changed during resource capture")
     except asyncio.CancelledError:
         raise
     except ChatCatalogueWorkLeaseMoved:
