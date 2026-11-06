@@ -164,19 +164,22 @@ async def _seed_feed(seed):
 # are ignored; C is keyed by its job id; D waits on Tier-2 discovery.
 _ZERO = dict(any_cancelled=False, any_preemptive=False, single_resource_name=None, single_resource_type=None,
              entra_user_name=None, snap_done=0, snap_failed=0, snap_partial=0, snap_pending=0, snap_skipped=0,
-             parts_pending=0, missing_t2=0, skipped_no_license=0, discovery_pending=False)
+             parts_pending=0, missing_t2=0, skipped_no_license=0, discovery_pending=False,
+             capture_is_onedrive=False, capture_progress_known=False,
+             capture_expected_bytes=0, capture_expected_files=0, capture_bytes=0, capture_files=0)
 LOCKED_ROWS = {
     "A": _ZERO | dict(jobs=["A:1", "A:2"], all_jobs_terminal=True, any_job_completed=True, any_job_failed=False,
                       any_tier2_jobs=False, batch_recent=True, bytes_added=Decimal(28), items_added=12,
                       entra_user_count=2, total_resource_count=4, expected_count=9, missing_t2=1,
                       skipped_no_license=1, parts_pending=1, snap_total=4, snap_done=1, snap_skipped=1,
                       snap_partial=1, snap_failed=1, tier1_total=2, tier1_terminal=2, tier2_total=9,
-                      tier2_terminal=2),
+                      tier2_terminal=2, capture_is_onedrive=True),
     "B": _ZERO | dict(jobs=["B:1", "B:2"], all_jobs_terminal=False, any_job_completed=False, any_job_failed=True,
                       any_tier2_jobs=True, batch_recent=False, bytes_added=Decimal(14), items_added=6,
                       entra_user_count=1, entra_user_name="ENTRA_USER 3", total_resource_count=2,
                       expected_count=2, parts_pending=1, snap_total=2, snap_failed=1, snap_pending=1,
-                      tier1_total=1, tier1_terminal=1, tier2_total=5, tier2_terminal=0),
+                      tier1_total=1, tier1_terminal=1, tier2_total=5, tier2_terminal=0,
+                      capture_is_onedrive=True),
     "C": _ZERO | dict(jobs=["C:1"], all_jobs_terminal=True, any_job_completed=True, any_job_failed=False,
                       any_tier2_jobs=False, any_preemptive=True, batch_recent=True, bytes_added=Decimal(7),
                       items_added=3, entra_user_count=0, total_resource_count=0, expected_count=0,
