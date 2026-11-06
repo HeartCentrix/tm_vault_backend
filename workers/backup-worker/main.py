@@ -21257,9 +21257,12 @@ class BackupWorker:
                   if not checkpoint.is_done(fid) and int(f.get("size") or 0) > 0]
         if wanted:
             async with async_session_factory() as session:
+                from sqlalchemy.orm import aliased
+                current = aliased(Snapshot)
                 prior_snaps = select(Snapshot.id).where(
                     Snapshot.resource_id == resource.id, Snapshot.id != snapshot.id,
-                    Snapshot.backend_id == snapshot.backend_id,
+                    Snapshot.backend_id == select(current.backend_id)
+                        .where(current.id == snapshot.id).scalar_subquery(),
                     Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL,
                                          SnapshotStatus.FAILED]))
                 for id_chunk in iter_hydration_chunks(wanted):

@@ -106,6 +106,8 @@ class FakeSession:
     async def execute(self, stmt, params=None):
         # The blob_path bulk UPDATE binds one :eN param per external_id.
         if getattr(stmt, "is_select", False):
+            if "FROM snapshots" in str(stmt):  # prior-run blob reuse: no earlier runs here
+                return FakeResult(rows=[])
             return FakeResult(rows=self.db.receipts.values())
         matched = []
         for key, val in (params or {}).items():
