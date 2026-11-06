@@ -2339,8 +2339,12 @@ async def get_batch_children(batch_id: str):
                    -- An IN_PROGRESS row has no settled delta yet (the chat path
                    -- publishes item_count/bytes_total while running and settles
                    -- new_item_count/bytes_added at the end), so show progress so
-                   -- far instead of 0 / "—" (2026-11-04).
-                   CASE WHEN s.status::text = 'IN_PROGRESS' THEN COALESCE(s.item_count, 0)
+                   -- far instead of 0 / "—" (2026-11-04). The chat catalogue
+                   -- publishes its running new/changed count, so a chat row
+                   -- grows toward the final delta instead of showing the total
+                   -- it inherits and then dropping to the delta (2026-11-06).
+                   CASE WHEN s.status::text = 'IN_PROGRESS'
+                        THEN COALESCE((s.extra_data::jsonb->>'chat_live_new_items')::bigint, s.item_count, 0)
                         ELSE COALESCE(s.new_item_count, s.item_count) END AS item_count,
                    COALESCE(s.item_count, 0)                     AS item_count_total,
                    -- bytesAdded must reconcile with the Activity row total,
