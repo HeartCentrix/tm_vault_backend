@@ -13,13 +13,15 @@
 -- Does not touch alembic_version.
 SET lock_timeout = '5s';
 ALTER TABLE protected_size_winners ADD COLUMN IF NOT EXISTS snapshot_id uuid,ADD COLUMN IF NOT EXISTS item_id uuid,ADD COLUMN IF NOT EXISTS created_at timestamp;
+-- An interrupted build leaves an INVALID index that IF NOT EXISTS would skip: drop it (plain SQL, so
+-- the script also runs through a driver; brief lock on the small winners table, under the 5s timeout).
+DO $fn$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_index WHERE indexrelid = to_regclass('protected_size_winner_anchor') AND NOT indisvalid)
+  THEN DROP INDEX protected_size_winner_anchor; END IF; END $fn$;
 -- CONCURRENTLY waits for every transaction older than itself (railway: lock timeout after 5s on a
 -- busy DB). That wait blocks no writer, so let it wait.
 SET lock_timeout = 0;
 SET statement_timeout = 0;
-SELECT 'DROP INDEX CONCURRENTLY protected_size_winner_anchor'
- WHERE EXISTS (SELECT 1 FROM pg_index WHERE indexrelid = to_regclass('protected_size_winner_anchor') AND NOT indisvalid)
-\gexec
 CREATE INDEX CONCURRENTLY IF NOT EXISTS protected_size_winner_anchor ON protected_size_winners(resource_id,snapshot_id,item_id);
 DO $fn$
   DECLARE cur_r uuid := '00000000-0000-0000-0000-000000000000'; cur_i bigint := -9223372036854775808;
