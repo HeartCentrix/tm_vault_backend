@@ -1563,6 +1563,25 @@ async def _carry_forward_prior_chat_snapshot_items(
     return await run_owned_db_operation(copy_once)
 
 
+async def _externalize_prior_mail_attachments(tenant_id, resource_id, target_snapshot_id, current_job_id) -> None:
+    """Move the carry prior's inline attachment bytes to blob storage in place, so the copy moves
+    pointer rows instead of re-copying them (shared/mail_inline_attachments.py). Best effort: a row
+    left inline is still carried, as before, and the next carry retries it."""
+    try:
+        from shared.mail_inline_attachments import externalize_prior_mail_attachments
+        moved = await externalize_prior_mail_attachments(
+            async_session_factory, tenant_id=tenant_id, resource_id=resource_id,
+            target_snapshot_id=target_snapshot_id, current_job_id=current_job_id,
+            shard=azure_storage_manager.get_shard_for_resource(str(resource_id), str(tenant_id)),
+            container=azure_storage_manager.get_container_name(str(tenant_id), "email"))
+        if moved:
+            print(f"[MAIL-CARRY] resource {resource_id}: moved {moved} inline attachment(s) "
+                  f"of the prior snapshot to blob storage")
+    except Exception as exc:
+        print(f"[MAIL-CARRY] resource {resource_id}: inline attachments left in place: "
+              f"{type(exc).__name__}: {exc}")
+
+
 async def _carry_forward_prior_mail_snapshot_items(
     *,
     tenant_id: str,
@@ -1608,6 +1627,8 @@ async def _carry_forward_prior_mail_snapshot_items(
     keep_fids = sorted({str(f) for f in (keep_folder_ids or []) if f}) if keep_folder_ids is not None else None
     if keep_fids is not None and not keep_fids:
         return 0  # whitelist given but empty → nothing may be carried
+    # Before the copy is registered (its manifest freezes row payloads) or runs.
+    await _externalize_prior_mail_attachments(tenant_id, resource_id, target_snapshot_id, current_job_id)
     from shared.copy_workflow import defer_current_copy
     delegated = await defer_current_copy("MAIL_CARRY", {
         "tenant_id": str(tenant_id), "resource_id": str(resource_id),
