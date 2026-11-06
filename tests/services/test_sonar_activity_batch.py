@@ -103,7 +103,12 @@ async def test_batch_feed_keeps_source_filters_and_fixed_scan_scope(audit, monke
         async def __aexit__(self, *args):
             pass
 
+        def begin_nested(self):  # the rollup runs in a savepoint
+            return self
+
         async def execute(self, stmt):
+            if "statement_timeout" in str(stmt):
+                return None
             if stmt is batch_stmt:
                 queries.append("batch")
                 return SimpleNamespace(all=lambda: [

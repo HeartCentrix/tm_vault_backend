@@ -25,11 +25,13 @@ from typing import Any, NamedTuple, Optional, List, Dict, Set, Tuple
 from fastapi import FastAPI, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, func, asc, desc, and_, or_, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 import asyncio
 import httpx
 
 from shared.database import async_session_factory, Base
+from shared.db_retry import first_db_sqlstate
 from shared.models import AuditEvent, Resource, Tenant, Organization, Job, JobStatus, SlaPolicy, ResourceType
 from shared.config import settings
 from shared.batch_rollup import SNAPSHOT_REASON_SQL, job_issues_sql
@@ -881,6 +883,11 @@ _DUP_STARTED_WINDOW_S = 120
 # raise it if a tenant ever legitimately exceeds it, and watch `total_capped`.
 ACTIVITY_SCAN_CAP = int(os.environ.get("ACTIVITY_SCAN_CAP", "5000"))
 
+# Statement timeout for the batch Activity feed's queries, under api-gateway's 60 s read timeout.
+# Without it a slow rollup kept running after the gateway had answered 504, and TM's ~15 s polls
+# stacked up behind it (catalogue #20). The rollup takes 0.5-0.8 s on TM's 30 days and ~9 s at 10x.
+ACTIVITY_ROLLUP_TIMEOUT_MS = int(os.environ.get("ACTIVITY_ROLLUP_TIMEOUT_MS", "20000"))
+
 M365_RESOURCE_TYPES = {
     ResourceType.MAILBOX,
     ResourceType.SHARED_MAILBOX,
@@ -1218,13 +1225,26 @@ async def _list_activities_batch(
     # the number is a floor rather than a count.
     fetch_limit = ACTIVITY_SCAN_CAP
     items: List[Dict[str, Any]] = []
+    backup_timed_out = False
 
     async with async_session_factory() as db:
+        await db.execute(text(f"SET LOCAL statement_timeout = {int(ACTIVITY_ROLLUP_TIMEOUT_MS)}"))
         if include_backup:
-            items.extend(await _batch_backup_activity_rows(
-                db, tenant_id=tenantId, start_date=start_date,
-                end_date=end_date, limit=fetch_limit, status=status,
-            ))
+            # A timed-out rollup costs only the backup rows: the savepoint keeps the
+            # transaction usable for the warning and discovery sources.
+            try:
+                async with db.begin_nested():
+                    rows = await _batch_backup_activity_rows(
+                        db, tenant_id=tenantId, start_date=start_date,
+                        end_date=end_date, limit=fetch_limit, status=status,
+                    )
+                items.extend(rows)
+            except DBAPIError as exc:
+                if first_db_sqlstate(exc) != "57014":  # query_canceled (statement timeout)
+                    raise
+                backup_timed_out = True
+                logging.getLogger(__name__).warning(
+                    "activity backup rollup hit its %d ms statement timeout", ACTIVITY_ROLLUP_TIMEOUT_MS)
         if include_warnings:
             stmt = _activity_event_query(
                 WARNING_ACTIVITY_ACTIONS, tenant_id=tenantId,
@@ -1256,6 +1276,7 @@ async def _list_activities_batch(
         "page":  page,
         "size":  size,
         "has_more": (page * size) < total,
+        "backup_rollup_timed_out": backup_timed_out,
     }
 
 
@@ -1505,6 +1526,7 @@ async def list_activities(
             "page": page,
             "size": size,
             "has_more": (page * size) < total,
+            "backup_rollup_timed_out": bool(legacy.get("backup_rollup_timed_out")),
         })
     # Fall through to the legacy per-Job rollup below.
     async with async_session_factory() as db:
@@ -2058,6 +2080,9 @@ async def export_activity_csv(
             operation=operation, status=status,
             page=1, size=5000,
         )
+        if data["backup_rollup_timed_out"]:
+            # An export without its backup rows would read as a complete record.
+            raise HTTPException(status_code=503, detail="Activity backup rows timed out; retry the export.")
         output = io.StringIO()
         writer = SafeCsvWriter(csv.writer(output))
         writer.writerow([
