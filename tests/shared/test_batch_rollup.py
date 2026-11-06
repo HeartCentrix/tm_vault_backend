@@ -521,7 +521,7 @@ def test_deferred_resources_are_excluded_from_missing_t2():
         "deferred_t2 must read spec.deferred_resource_ids"
     )
     fanout = sql[sql.index("fanout AS"):sql.index("entra_count")]
-    assert "df.child_resource_id IS NULL" in fanout, (
+    assert "EXCEPT SELECT batch_id, child_resource_id FROM deferred_t2" in fanout, (
         "missing_t2 must not count children the scheduler deferred"
     )
 

@@ -356,28 +356,30 @@ def _withheld_children_cte(cte_name: str, spec_key: str, comment: str) -> str:
       * UUID shape filter before the cast — a non-UUID string would
         raise on ::uuid.
 
-    Absent key ⇒ zero rows ⇒ the LEFT JOIN in ``fanout`` leaves the child
-    counted as missing, i.e. EXACTLY today's behaviour for every batch
-    dispatched before the writer shipped. Never "expect nothing".
+    Absent key ⇒ zero rows ⇒ ``fanout`` still counts the child as
+    missing, i.e. EXACTLY today's behaviour for every batch dispatched
+    before the writer shipped. Never "expect nothing".
+
+    The scheduler stamps the SAME list on every job of a batch, so the
+    lists are collapsed to one per (batch, list) BEFORE unnesting. TM's
+    30 days: 2,289 jobs x ~86 ids = 197,868 elements, 5.4 s when every
+    element also re-read the job's spec (catalogue #20).
     """
+    ids = f"COALESCE((j.spec->'{spec_key}')::jsonb, '[]'::jsonb)"
     return f"""
     {cte_name} AS (
 {comment}
         SELECT DISTINCT
-            COALESCE(j.spec->>'batch_id', j.id::text) AS batch_id,
-            (d.value #>> '{{}}')::uuid                AS child_resource_id
-        FROM filtered_jobs j
-        CROSS JOIN LATERAL jsonb_array_elements(
-            CASE
-                WHEN jsonb_typeof(
-                        COALESCE((j.spec->'{spec_key}')::jsonb,
-                                 '[]'::jsonb)
-                     ) = 'array'
-                THEN COALESCE((j.spec->'{spec_key}')::jsonb,
-                              '[]'::jsonb)
-                ELSE '[]'::jsonb
-            END
-        ) AS d(value)
+            w.batch_id,
+            (d.value #>> '{{}}')::uuid AS child_resource_id
+        FROM (
+            SELECT DISTINCT
+                j.batch_key AS batch_id,
+                CASE WHEN jsonb_typeof({ids}) = 'array' THEN {ids}
+                     ELSE '[]'::jsonb END AS ids
+            FROM filtered_jobs j
+        ) w
+        CROSS JOIN LATERAL jsonb_array_elements(w.ids) AS d(value)
         WHERE (d.value #>> '{{}}') ~*
               '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$'
     )"""
@@ -505,7 +507,10 @@ def build_batch_rollup_query(
     ))
     sql = f"""
     WITH filtered_jobs AS (
-        SELECT *
+        -- batch_key is computed HERE, once per job. Every CTE that unnests
+        -- an array per job used to recompute it per element, re-detoasting
+        -- and re-parsing the whole json spec each time (catalogue #20).
+        SELECT j.*, COALESCE(j.spec->>'batch_id', j.id::text) AS batch_key
         FROM jobs j
         WHERE (CAST(:tid AS UUID) IS NULL OR j.tenant_id = CAST(:tid AS UUID))
           AND (CAST(:start_date AS TIMESTAMP) IS NULL OR j.created_at >= CAST(:start_date AS TIMESTAMP))
@@ -515,7 +520,7 @@ def build_batch_rollup_query(
     ),
     batches_all AS (
         SELECT
-            COALESCE(j.spec->>'batch_id', j.id::text)              AS batch_id,
+            j.batch_key                                            AS batch_id,
             j.tenant_id                                            AS tenant_id,
             MIN(j.created_at)                                      AS started_at,
             MAX(j.completed_at)                                    AS jobs_max_completed_at,
@@ -568,7 +573,7 @@ def build_batch_rollup_query(
         -- the unnest(uuid[][]) → scalar gotcha. NULLs coalesced to
         -- empty array so the LATERAL stays safe.
         SELECT
-            COALESCE(j.spec->>'batch_id', j.id::text) AS batch_id,
+            j.batch_key AS batch_id,
             COALESCE(
                 ARRAY_AGG(DISTINCT bid) FILTER (WHERE bid IS NOT NULL),
                 ARRAY[]::uuid[]
@@ -674,7 +679,7 @@ def build_batch_rollup_query(
         -- e.g. PREEMPTIVE single-resource), scope_ids is empty; the
         -- ``total_expected`` CTE below falls back to all_res_ids.
         SELECT
-            COALESCE(j.spec->>'batch_id', j.id::text) AS batch_id,
+            j.batch_key AS batch_id,
             COALESCE(
                 ARRAY_AGG(DISTINCT bid) FILTER (WHERE bid IS NOT NULL),
                 ARRAY[]::uuid[]
@@ -763,23 +768,20 @@ def build_batch_rollup_query(
         -- dispatcher recorded withholding it. Both withhold reasons are
         -- recorded facts (see _withheld_children_cte); neither is
         -- inferred from coverage or timing.
-        SELECT
-            e.batch_id,
-            COUNT(*) FILTER (
-                WHERE o.child_resource_id IS NULL
-                  AND df.child_resource_id IS NULL
-                  AND oh.child_resource_id IS NULL
-            ) AS missing_t2
-        FROM expected_t2 e
-        LEFT JOIN observed_t2 o
-               ON o.batch_id = e.batch_id
-              AND o.child_resource_id = e.child_resource_id
-        LEFT JOIN deferred_t2 df
-               ON df.batch_id = e.batch_id
-              AND df.child_resource_id = e.child_resource_id
-        LEFT JOIN overlap_held_t2 oh
-               ON oh.batch_id = e.batch_id
-              AND oh.child_resource_id = e.child_resource_id
+        --
+        -- EXCEPT, not three LEFT JOINs: the planner estimates expected_t2 at
+        -- 1 row and nest-looped the joins, comparing every expected child
+        -- with every observed one (66M comparisons, 5.5 s on TM's 30 days,
+        -- quadratic in history). Set difference is hashed. Same count:
+        -- expected_t2 holds each (batch, child) once, and a batch with no
+        -- missing child has no row here, which the final SELECT reads as 0.
+        SELECT batch_id, COUNT(*) AS missing_t2
+        FROM (
+            SELECT batch_id, child_resource_id FROM expected_t2
+            EXCEPT SELECT batch_id, child_resource_id FROM observed_t2
+            EXCEPT SELECT batch_id, child_resource_id FROM deferred_t2
+            EXCEPT SELECT batch_id, child_resource_id FROM overlap_held_t2
+        ) missing
         GROUP BY 1
     ),
     entra_count AS (
