@@ -725,12 +725,10 @@ async def publish_unchanged_inventory(session, *, lease: CaptureLease, inventory
 
 
 def chat_overlay_enabled(env=None) -> bool:
-    """``CHAT_OVERLAY_ENABLED`` = 1/true/yes/on builds chat overlays; off (the default) copies every
-    unchanged chat's rows forward as before. Off until the catalogue readers that still filter
-    ``snapshot_items.snapshot_id`` directly (snapshot-service _catalogue_*, chat_presentation,
-    chat export, restore-worker, chat DR) read through snapshot_items_effective()."""
+    """``CHAT_OVERLAY_ENABLED`` = 0/false/no/off copies every unchanged chat's rows forward as before.
+    Every catalogue reader goes through snapshot_items_effective / shared.snapshot_reuse.chat_rows."""
     flag = str((os.environ if env is None else env).get("CHAT_OVERLAY_ENABLED", "") or "").strip().lower()
-    return flag in ("1", "true", "yes", "on")
+    return flag not in ("0", "false", "no", "off")
 
 
 def _env_float(name, default):

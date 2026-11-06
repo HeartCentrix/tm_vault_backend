@@ -62,7 +62,7 @@ def changed_only(source, *names):
 def small_tenant(monkeypatch):
     # Three-message chats: one changed chat is far above the 25% compaction ratio meant for real users.
     monkeypatch.setenv("CHAT_OVERLAY_MAX_RATIO", "1")
-    monkeypatch.setenv("CHAT_OVERLAY_ENABLED", "true")
+    monkeypatch.delenv("CHAT_OVERLAY_ENABLED", raising=False)   # default on
 
 
 async def test_incremental_with_one_changed_chat_owns_only_that_chats_rows(store, source_adapter):
@@ -108,7 +108,7 @@ async def test_incremental_with_one_changed_chat_owns_only_that_chats_rows(store
     assert await effective(store, second.snapshot_id) == await expected_rows(store, second.snapshot_id)
 
 
-@pytest.mark.parametrize("env", [{"CHAT_OVERLAY_ENABLED": "false"}, {"CHAT_OVERLAY_ENABLED": ""}, {"CHAT_OVERLAY_MAX_RATIO": "0.25"},
+@pytest.mark.parametrize("env", [{"CHAT_OVERLAY_ENABLED": "false"}, {"CHAT_OVERLAY_MAX_RATIO": "0.25"},
                                  {"CHAT_OVERLAY_MAX_AGE_DAYS": "0"}])
 async def test_kill_switch_and_compaction_copy_every_unchanged_chat_as_before(store, source_adapter, monkeypatch, env):
     source = source_adapter.source
