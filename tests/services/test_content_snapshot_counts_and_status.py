@@ -70,7 +70,8 @@ def test_calendar_list_excludes_deleted_tombstones():
 def test_the_badge_rollup_still_excludes_deleted():
     """The other side of the same equality — if this ever stops excluding
     them, calendar must stop too or the numbers diverge again."""
-    assert "COALESCE(si.is_deleted, false) = false" in _mod._CONTENT_ROLLUP_SQL
+    # newest row decides (a OneDrive tombstone hides the file from its deletion on)
+    assert "WHERE NOT latest.deleted" in _mod._CONTENT_ROLLUP_SQL
 
 
 def test_every_content_list_that_feeds_a_badge_agrees_on_deleted():

@@ -671,6 +671,16 @@ async def _post_export_notification(url: str, payload: Dict) -> None:
         )
 
 
+# A drive file Graph reported deleted is stored as an is_deleted row with no blob (OneDrive
+# ONEDRIVE_RECORD_DELETIONS, SharePoint library tombstones). As the newest row of its item it means
+# "deleted by this point": recovery hides it and restore must not try to write it.
+_FILE_TOMBSTONE_TYPES = ("ONEDRIVE_FILE", "FILE")
+
+
+def _is_file_tombstone(item) -> bool:
+    return bool(getattr(item, "is_deleted", False)) and getattr(item, "item_type", None) in _FILE_TOMBSTONE_TYPES
+
+
 class RestoreWorker:
     """Main restore worker that processes restore jobs from RabbitMQ queues"""
 
@@ -1113,6 +1123,8 @@ class RestoreWorker:
                 base_stmt = base_stmt.where(or_(*clauses))
 
         rows = list((await session.execute(base_stmt)).scalars().all()) if sibling_ids else []
+        # Newest-wins first, then drop items whose newest row is a deletion (a file deleted by then).
+        rows = [r for r in rows if not _is_file_tombstone(r)]
         if catalogue_ids:
             exact = select(SnapshotItem).where(SnapshotItem.snapshot_id.in_(catalogue_ids))
             if folder_paths or item_ids:
@@ -1222,9 +1234,9 @@ class RestoreWorker:
         if not sibling_ids:
             sibling_ids = set(picked_uuids)
 
-        # Inner: DISTINCT external_id newest-wins; outer: COUNT(*).
+        # Inner: DISTINCT external_id newest-wins; outer: COUNT(*) of the live ones.
         inner = (
-            select(SnapshotItem.id)
+            select(SnapshotItem.id, SnapshotItem.item_type, SnapshotItem.is_deleted)
             .join(Snapshot, Snapshot.id == SnapshotItem.snapshot_id)
             .where(SnapshotItem.snapshot_id.in_(sibling_ids))
             .order_by(SnapshotItem.external_id, Snapshot.created_at.desc())
@@ -1246,8 +1258,10 @@ class RestoreWorker:
             if clauses:
                 inner = inner.where(_or(*clauses))
 
+        latest = inner.subquery()
         cnt = (await session.execute(
-            select(func.count()).select_from(inner.subquery())
+            select(func.count()).select_from(latest).where(
+                ~(latest.c.is_deleted.is_(True) & latest.c.item_type.in_(_FILE_TOMBSTONE_TYPES)))
         )).scalar_one()
         return int(cnt or 0)
 
@@ -1401,15 +1415,11 @@ class RestoreWorker:
 
             if not batch:
                 break
-            if excluded_uuids:
-                batch = [r for r in batch if r.id not in excluded_uuids]
-            if not batch:
-                # Whole batch excluded — keep paging.
-                # Use the highest external_id we saw in the original batch.
-                last_ext = batch[-1].external_id if batch else last_ext
-                continue
-            yield batch
+            # Cursor from the unfiltered batch: a wholly excluded batch kept the old cursor and re-read it forever.
             last_ext = batch[-1].external_id
+            batch = [r for r in batch if r.id not in excluded_uuids and not _is_file_tombstone(r)]
+            if batch:
+                yield batch
 
     # ==================== Restore Handlers ====================
 
