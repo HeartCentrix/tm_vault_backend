@@ -9272,7 +9272,11 @@ class BackupWorker:
                         "CALENDAR_SUBCALENDAR_REFRESH_HOURS", "24",
                     ))
                     # Full events sweep (masters + events outside the window): at most once per
-                    # refresh window per calendar, same clock as the sub-calendar throttle.
+                    # SWEEP_HOURS per calendar (weekly). It only adds masters and out-of-window
+                    # events — deletions come from the delta's @removed, which still runs every run.
+                    SWEEP_HOURS = float(os.environ.get(
+                        "CALENDAR_EVENTS_SWEEP_HOURS", "168",
+                    ))
                     swept_map: Dict[str, str] = dict(
                         (resource.extra_data or {}).get("calendar_events_swept_at") or {}
                     )
@@ -9461,7 +9465,7 @@ class BackupWorker:
                         elif _should_skip_subcalendar(
                             last_fetched_iso=swept_map.get(cal_id),
                             now_dt=now_utc,
-                            refresh_hours=SUB_REFRESH_HOURS,
+                            refresh_hours=SWEEP_HOURS,
                         ):
                             new_swept_map[cal_id] = swept_map[cal_id]
                         else:
