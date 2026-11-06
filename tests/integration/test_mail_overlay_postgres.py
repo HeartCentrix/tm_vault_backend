@@ -302,11 +302,32 @@ class Mailbox:
             await self.carry(tenant_id=str(self.db.tenant), resource_id=str(self.rid), target_snapshot_id=str(sid),
                              current_job_id=job, tombstoned_ids=sorted(tombs),
                              excluded_paths=None if self.tier1 else sorted(rebootstrap), **kwargs)
-        async with self.db.factory.begin() as session:
-            await session.execute(text("UPDATE snapshots SET status = :st, completed_at = created_at WHERE id = :s"),
-                                  {"s": sid, "st": status.name})
+        await self.settle(sid, job, status)
         self.snapshots.append(sid)
         return sid
+
+    async def settle(self, sid, job, status):
+        """The worker's settle: totals over the snapshot's inventory, delta against the prior."""
+        from sqlalchemy import func, select
+        from shared.snapshot_reuse import items_scope
+        child = ("CHAT_ATTACHMENT", "EMAIL_ATTACHMENT", "CHAT_HOSTED_CONTENT")
+        delta = _worker_module().BackupWorker._compute_snapshot_delta_from_prior
+        async with self.db.factory.begin() as session:
+            items, size = (await session.execute(select(
+                func.count(models.SnapshotItem.id).filter(~models.SnapshotItem.item_type.in_(child)),
+                func.coalesce(func.sum(models.SnapshotItem.content_size), 0),
+            ).where(await items_scope(session, sid)))).one()
+            new, added = await delta(session, sid, self.rid, items, size, current_job_id=job)
+            await session.execute(text(
+                "UPDATE snapshots SET status = :st, completed_at = created_at, item_count = :n, bytes_total = :b, "
+                "new_item_count = :new, bytes_added = :added WHERE id = :s"),
+                {"s": sid, "st": status.name, "n": items, "b": size, "new": new, "added": added})
+
+    async def counters(self, sid=None):
+        async with self.db.factory() as session:
+            return tuple((await session.execute(text(
+                "SELECT item_count, bytes_total, new_item_count, bytes_added FROM snapshots WHERE id = :s"),
+                {"s": sid or self.snapshots[-1]})).one())
 
     async def inventory(self, sid=None):
         async with self.db.factory() as session:
@@ -334,6 +355,7 @@ class Twin:
         await self.full.run(**ops)
         got, want = await self.overlay.inventory(), await self.full.inventory()
         assert got == want, (sorted(set(got) - set(want)), sorted(set(want) - set(got)))
+        assert await self.overlay.counters() == await self.full.counters()
         return got
 
 
@@ -356,6 +378,8 @@ async def test_one_new_message_writes_only_that_message(twin):
     await t.run(add=[("new-1", "Inbox", 2)])
     assert tuple(await t.overlay.shape()) == (base, None, 3, 0)
     assert (await t.full.shape())[2] == 60 + 60 + 3
+    # 61 messages, one of them new; bytes are every row's size, the added ones are the new rows'
+    assert await t.overlay.counters() == (61, 60 * 101 + 60 * 7 + 101 + 14, 1, 101 + 14)
 
 
 async def test_deleted_message_is_a_removal_and_hides_its_attachments(twin):
@@ -507,3 +531,21 @@ async def test_random_histories_match_the_full_copy(twin, monkeypatch):
             await t.run(**ops)
             made += (await t.overlay.shape())[0] is not None
         assert made > 5, f"seed {seed} built only {made} overlays"
+
+
+async def test_whitelisted_pointer_checks_the_overlays_inherited_rows(db):
+    """A shared/room mailbox may point at its prior only if every prior message sits in a kept
+    folder; for an overlay prior that includes the base rows it inherits."""
+    from shared.mail_snapshot_reuse import reuse_unchanged_mail_snapshot
+    rid = await db.resource(models.ResourceType.SHARED_MAILBOX)
+    base, _ = await db.snapshot(rid, models.SnapshotStatus.COMPLETED)
+    await db.item(base, "stale", metadata={"raw": {"parentFolderId": "fid-gone"}})
+    overlay, _ = await db.snapshot(rid, models.SnapshotStatus.COMPLETED, overlay_base_id=base)
+    await db.item(overlay, "fresh", metadata={"raw": {"parentFolderId": "fid-inbox"}})
+    target, job = await db.snapshot(rid)
+    async with db.factory.begin() as session:
+        assert await reuse_unchanged_mail_snapshot(session, resource_id=rid, target_snapshot_id=target,
+                                                   current_job_id=job, keep_folder_ids=["fid-inbox"]) is None
+    async with db.factory.begin() as session:
+        assert await reuse_unchanged_mail_snapshot(session, resource_id=rid, target_snapshot_id=target,
+                                                   current_job_id=job, keep_folder_ids=["fid-inbox", "fid-gone"]) == overlay

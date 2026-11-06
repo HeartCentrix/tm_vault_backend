@@ -152,7 +152,43 @@ __all__ = [
     "SnapshotNotFound",
     "resolve_snapshot_items_target",
     "resolve_many",
+    "items_scope",
+    "item_in_snapshot",
 ]
+
+
+async def items_scope(session: AsyncSession, snapshot_id: UUIDLike):
+    """WHERE clause on ``SnapshotItem`` selecting ``snapshot_id``'s inventory. A full snapshot (or a
+    pointer to one) keeps today's ``snapshot_id = target`` plan; an overlay, or a pointer to one,
+    selects ``snapshot_items_effective`` (base + own rows, docs/mail-overlay-snapshots.md).
+    Raises ``SnapshotNotFound``."""
+    from sqlalchemy import func, select
+    from shared.models import SnapshotItem
+    sid = _coerce_uuid(snapshot_id)
+    row = (await session.execute(text("""
+        SELECT t.id AS target_id, t.overlay_base_id
+          FROM snapshots s JOIN snapshots t ON t.id = COALESCE(s.reuse_chain_root_id, s.id)
+         WHERE s.id = :sid
+    """), {"sid": str(sid)})).first()
+    if row is None:
+        raise SnapshotNotFound(str(sid))
+    target = _coerce_uuid(row.target_id)
+    if row.overlay_base_id is None:
+        return SnapshotItem.snapshot_id == target
+    effective = func.snapshot_items_effective(target).table_valued("id")
+    return SnapshotItem.id.in_(select(effective.c.id))
+
+
+async def item_in_snapshot(session: AsyncSession, item_id: UUIDLike, snapshot_id: UUIDLike) -> bool:
+    """True when the row ``item_id`` is part of ``snapshot_id``'s inventory - its own row, the
+    row of the full snapshot a pointer names, or a base row an overlay inherits."""
+    try:
+        iid, sid = _coerce_uuid(item_id), _coerce_uuid(snapshot_id)
+    except (ValueError, TypeError, AttributeError):
+        return False
+    return bool(await session.scalar(text(
+        "SELECT EXISTS (SELECT 1 FROM snapshot_items_effective(CAST(:sid AS uuid)) e WHERE e.id = CAST(:iid AS uuid))"),
+        {"sid": str(sid), "iid": str(iid)}))
 
 
 async def items_snapshot_id(session: AsyncSession, snapshot_id: UUIDLike) -> uuid.UUID:

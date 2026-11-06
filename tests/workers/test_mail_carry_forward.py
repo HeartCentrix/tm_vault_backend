@@ -850,16 +850,17 @@ def test_unchanged_reuse_has_a_kill_switch():
 
 
 def test_inline_finalize_counts_the_rows_a_pointer_resolves_to():
-    """A pointer owns no rows; recounting its own would zero the totals copied from the prior."""
+    """A pointer owns no rows and an overlay only its changes; recounting its own rows would zero or
+    shrink the totals."""
     end = _SRC.index("persisted_count = int(_row[0] or 0)")
     block = _SRC[end - 1500:end]
-    assert "resolve_snapshot_items_target(" in block
-    assert "SnapshotItem.snapshot_id == _items_of" in block
+    assert "items_scope(" in block
+    assert ".where(_items_of)" in block
 
 
 def test_orphan_reaper_counts_the_rows_a_pointer_resolves_to():
     body = re.sub(r"\s+", " ", _method_src("_reap_orphan_snapshots_for_job"))
-    assert "FROM snapshot_items WHERE snapshot_id = COALESCE( (SELECT reuse_chain_root_id FROM snapshots WHERE id = :sid), :sid)" in body
+    assert "FROM snapshot_items_effective(CAST(:sid AS uuid))" in body
 
 
 def test_partitioned_union_carry_points_an_unchanged_mailbox_at_its_prior():
@@ -871,10 +872,11 @@ def test_partitioned_union_carry_points_an_unchanged_mailbox_at_its_prior():
 
 
 def test_partitioned_finalize_counts_the_rows_a_pointer_resolves_to():
-    """Its own rows are 0 for a pointer: the count would zero the totals and mark it FAILED."""
+    """Its own rows are 0 for a pointer (and only the changes for an overlay): the count would zero
+    the totals and mark it FAILED."""
     flat = re.sub(r"\s+", " ", _method_src("_finalize_partitioned_snapshot"))
-    assert "resolve_snapshot_items_target(" in flat
-    assert ".where(SnapshotItem.snapshot_id == _items_of)" in flat
+    assert "items_scope(" in flat
+    assert ".where(_items_of)" in flat
 
 
 def test_shared_mailbox_carry_points_an_unchanged_mailbox_at_its_prior():

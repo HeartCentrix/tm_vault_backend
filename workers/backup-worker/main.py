@@ -5353,6 +5353,7 @@ class BackupWorker:
                         "CHAT_ATTACHMENT", "EMAIL_ATTACHMENT", "CHAT_HOSTED_CONTENT", "ARCHIVE_ATTACHMENT",
                     ))),
                     func.coalesce(func.sum(SnapshotItem.content_size), 0),
+                # A deferred copy's target is a full snapshot: overlays and pointers never defer.
                 ).where(SnapshotItem.snapshot_id == snapshot.id))).one()
                 total_items, total_bytes = int(row[0] or 0), int(row[1] or 0)
                 partition = await session.get(SnapshotPartition, workflow.partition_id) if workflow.partition_id else None
@@ -13746,18 +13747,19 @@ class BackupWorker:
                 async with async_session_factory() as _count_sess:
                     # An unchanged mailbox's reuse snapshot owns no rows; count
                     # the full snapshot it names (shared.snapshot_reuse).
-                    from shared.snapshot_reuse import resolve_snapshot_items_target, SnapshotNotFound
+                    # An overlay owns only what changed since its base (shared.snapshot_reuse).
+                    from shared.snapshot_reuse import items_scope, SnapshotNotFound
                     try:
-                        _items_of = (await resolve_snapshot_items_target(_count_sess, snapshot.id)).target_id
+                        _items_of = await items_scope(_count_sess, snapshot.id)
                     except SnapshotNotFound:
-                        _items_of = snapshot.id
+                        _items_of = SnapshotItem.snapshot_id == snapshot.id
                     _row = (await _count_sess.execute(
                         select(
                             func.count(SnapshotItem.id).filter(
                                 ~SnapshotItem.item_type.in_(CHILD_ITEM_TYPES)
                             ),
                             func.coalesce(func.sum(SnapshotItem.content_size), 0),
-                        ).where(SnapshotItem.snapshot_id == _items_of)
+                        ).where(_items_of)
                     )).one()
                     persisted_count = int(_row[0] or 0)
                     persisted_bytes = int(_row[1] or 0)
@@ -18845,18 +18847,19 @@ class BackupWorker:
             )
             # An unchanged mailbox's reuse snapshot owns no rows; count the
             # full snapshot it names (shared.snapshot_reuse).
-            from shared.snapshot_reuse import resolve_snapshot_items_target, SnapshotNotFound
+            # An overlay owns only what changed since its base (shared.snapshot_reuse).
+            from shared.snapshot_reuse import items_scope, SnapshotNotFound
             try:
-                _items_of = (await resolve_snapshot_items_target(session, snapshot_id)).target_id
+                _items_of = await items_scope(session, snapshot_id)
             except SnapshotNotFound:
-                _items_of = snapshot_id
+                _items_of = SnapshotItem.snapshot_id == snapshot_id
             _row = (await session.execute(
                 select(
                     func.count(SnapshotItem.id).filter(
                         ~SnapshotItem.item_type.in_(CHILD_ITEM_TYPES)
                     ),
                     func.coalesce(func.sum(SnapshotItem.content_size), 0),
-                ).where(SnapshotItem.snapshot_id == _items_of)
+                ).where(_items_of)
             )).one()
             persisted_count = int(_row[0] or 0)
             persisted_bytes = int(_row[1] or 0)
@@ -28580,7 +28583,8 @@ class BackupWorker:
         try:
             async with async_session_factory() as _s:
                 row = (await _s.execute(
-                    text("SELECT COUNT(*), COALESCE(SUM(content_size) FILTER (WHERE blob_path IS NOT NULL), 0) FROM snapshot_items WHERE snapshot_id = :sid"),
+                    text("SELECT COUNT(*), COALESCE(SUM(content_size) FILTER (WHERE blob_path IS NOT NULL), 0) "
+                         "FROM snapshot_items_effective(CAST(:sid AS uuid))"),
                     {"sid": str(snapshot.id)},
                 )).first()
             if row:
@@ -30419,12 +30423,11 @@ class BackupWorker:
                 "  count(*) FILTER (WHERE cur.item_type NOT IN "
                 "    ('CHAT_ATTACHMENT','EMAIL_ATTACHMENT','CHAT_HOSTED_CONTENT')), "
                 "  COALESCE(SUM(cur.content_size), 0) "
-                "FROM snapshot_items cur "
-                "WHERE cur.snapshot_id = :cur "
-                "  AND NOT EXISTS ("
-                "    SELECT 1 FROM snapshot_items pri "
-                "    WHERE pri.snapshot_id = :pri "
-                "      AND pri.external_id = cur.external_id "
+                # Inventories, not own rows: an overlay owns only what changed since its base.
+                "FROM snapshot_items_effective(CAST(:cur AS uuid)) cur "
+                "WHERE NOT EXISTS ("
+                "    SELECT 1 FROM snapshot_items_effective(CAST(:pri AS uuid)) pri "
+                "    WHERE pri.external_id = cur.external_id "
                 "      AND pri.item_type = cur.item_type)"
             ),
             {"cur": str(snapshot_id), "pri": str(prior_id)},
@@ -30727,9 +30730,8 @@ class BackupWorker:
                         text(f"""
                             SELECT count(*) AS n,
                                    COALESCE(sum(content_size), 0) AS b
-                            -- a reuse snapshot (unchanged mailbox) owns no rows
-                            FROM snapshot_items WHERE snapshot_id = COALESCE(
-                                (SELECT reuse_chain_root_id FROM snapshots WHERE id = :sid), :sid)
+                            -- a pointer owns no rows, an overlay only its changes
+                            FROM snapshot_items_effective(CAST(:sid AS uuid))
                         """),
                         {"sid": sid},
                     )).first()

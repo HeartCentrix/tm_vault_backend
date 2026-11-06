@@ -50,7 +50,7 @@ async def reuse_unchanged_mail_snapshot(session, *, resource_id, target_snapshot
     COMPLETED one would miss the PARTIAL run's mail), or the target already owns rows. Pointers
     always name a full snapshot, so a chain is never more than one hop. ``keep_folder_ids`` (the
     shared/room mailbox carry's folder whitelist): every prior message must sit in one of them, as
-    that copy drops the rest and pathless rows."""
+    that copy drops the rest and pathless rows (an overlay prior's inherited base rows included)."""
     params = {"rid": str(resource_id), "tsid": str(target_snapshot_id),
               "jid": str(current_job_id) if current_job_id else None}
     prior = (await session.execute(text(
@@ -59,8 +59,8 @@ async def reuse_unchanged_mail_snapshot(session, *, resource_id, target_snapshot
     if prior is None or prior.status != "COMPLETED":
         return None
     if keep_folder_ids is not None and await session.scalar(text(
-            "SELECT EXISTS (SELECT 1 FROM snapshot_items x WHERE x.snapshot_id = CAST(:prior AS UUID) "
-            "AND x.item_type = 'EMAIL' AND COALESCE(x.metadata::jsonb->'raw'->>'parentFolderId', '') "
+            "SELECT EXISTS (SELECT 1 FROM snapshot_items_effective(CAST(:prior AS UUID)) x "
+            "WHERE x.item_type = 'EMAIL' AND COALESCE(x.metadata::jsonb->'raw'->>'parentFolderId', '') "
             "<> ALL(CAST(:keep AS TEXT[])))"), {"prior": str(prior.id), "keep": list(keep_folder_ids)}):
         return None
     from shared.snapshot_reuse import point_at
