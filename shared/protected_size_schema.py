@@ -48,17 +48,15 @@ DDL = (
     "CREATE INDEX ON protected_size_targets(resource_id,event_id) WHERE acknowledged_at IS NULL",
     """CREATE TABLE protected_size_jobs(resource_id uuid NOT NULL,snapshot_id uuid NOT NULL,cursor uuid,
         phase text NOT NULL DEFAULT 'source',PRIMARY KEY(resource_id,snapshot_id))""",
-    """CREATE TABLE protected_size_refs(resource_id uuid NOT NULL,snapshot_id uuid NOT NULL,item_id uuid NOT NULL,
-        identity_id bigint NOT NULL,created_at timestamp,size bigint NOT NULL,
-        PRIMARY KEY(resource_id,snapshot_id,item_id))""",
-    "CREATE INDEX protected_size_ref_winner ON protected_size_refs(resource_id,identity_id,created_at DESC NULLS FIRST,item_id DESC)",
-    "CREATE INDEX protected_size_ref_item ON protected_size_refs(resource_id,item_id)",
     """CREATE TABLE protected_size_tenant_turns(tenant_id uuid PRIMARY KEY,last_turn timestamptz NOT NULL)""",
     """CREATE TABLE protected_size_identities(id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         resource_id uuid NOT NULL,identity_hash text NOT NULL,identity text NOT NULL)""",
     "CREATE INDEX protected_size_identity_lookup ON protected_size_identities(resource_id,identity_hash)",
+    # One row per retained identity: winning size plus an anchor item. Every eligible item of
+    # the identity at or after the anchor key has that size (invariant in shared.protected_size).
     """CREATE TABLE protected_size_winners(resource_id uuid NOT NULL,identity_id bigint NOT NULL,
-        size bigint NOT NULL,PRIMARY KEY(resource_id,identity_id))""",
+        size bigint NOT NULL,snapshot_id uuid,item_id uuid,created_at timestamp,PRIMARY KEY(resource_id,identity_id))""",
+    "CREATE INDEX IF NOT EXISTS protected_size_winner_anchor ON protected_size_winners(resource_id,snapshot_id,item_id)",
     "CREATE INDEX IF NOT EXISTS ix_protected_size_snapshot_items_identity ON snapshot_items(id)",
     "CREATE INDEX IF NOT EXISTS ix_protected_size_snapshot_items_page ON snapshot_items(snapshot_id,id)",
     "CREATE INDEX IF NOT EXISTS ix_protected_size_snapshots_page ON snapshots(id)",
@@ -72,6 +70,17 @@ ONLINE_INDEXES = (
     ("ix_protected_size_snapshot_items_page", "snapshot_items", "(snapshot_id,id)"),
     ("ix_protected_size_snapshots_page", "snapshots", "(id)"),
 )
+
+
+# Migration 0024: per-item refs (one row per resource/snapshot/item) become one anchor per
+# winner. Pre-0024 the winner is the newest ref, so anchoring it there holds the invariant.
+ANCHOR_COLUMNS = ("ALTER TABLE protected_size_winners ADD COLUMN IF NOT EXISTS snapshot_id uuid,"
+                  "ADD COLUMN IF NOT EXISTS item_id uuid,ADD COLUMN IF NOT EXISTS created_at timestamp")
+ANCHOR_INDEX = ("protected_size_winner_anchor", "protected_size_winners", "(resource_id,snapshot_id,item_id)")
+ANCHOR_BACKFILL = """UPDATE protected_size_winners w SET snapshot_id=f.snapshot_id,item_id=f.item_id,created_at=f.created_at
+  FROM protected_size_winners p CROSS JOIN LATERAL (SELECT snapshot_id,item_id,created_at FROM protected_size_refs r
+    WHERE r.resource_id=p.resource_id AND r.identity_id=p.identity_id ORDER BY created_at DESC,item_id DESC LIMIT 1) f
+  WHERE p.item_id IS NULL AND w.resource_id=p.resource_id AND w.identity_id=p.identity_id"""
 
 
 def build_index_online(conn, name, table, columns):
@@ -319,7 +328,7 @@ def statements(schema, runtime_role=None):
     BEGIN
       EXECUTE pg_catalog.format('GRANT SELECT,INSERT,UPDATE ON resource_protected_bytes TO %I',selected_role);
       EXECUTE pg_catalog.format('GRANT SELECT,UPDATE ON protected_size_control TO %I',selected_role);
-      EXECUTE pg_catalog.format('GRANT SELECT,INSERT,UPDATE,DELETE ON protected_size_snapshots,protected_size_targets,protected_size_jobs,protected_size_refs TO %I',selected_role);
+      EXECUTE pg_catalog.format('GRANT SELECT,INSERT,UPDATE,DELETE ON protected_size_snapshots,protected_size_targets,protected_size_jobs TO %I',selected_role);
       EXECUTE pg_catalog.format('GRANT SELECT,INSERT,DELETE ON protected_size_identities,protected_size_winners,protected_size_retired TO %I',selected_role);
       EXECUTE pg_catalog.format('GRANT SELECT,INSERT,UPDATE ON protected_size_tenant_turns TO %I',selected_role);
       EXECUTE pg_catalog.format('GRANT SELECT,DELETE ON protected_size_journal,protected_size_event_snapshots,protected_size_orphans TO %I',selected_role);
