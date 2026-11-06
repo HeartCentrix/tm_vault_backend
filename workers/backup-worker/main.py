@@ -4528,6 +4528,25 @@ def sharepoint_cursor_blocking_failures(stats: Dict[str, Any]) -> int:
     )
 
 
+def sharepoint_advanceable_drive_tokens(stats: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
+    """The new per-drive cursors this run may persist, ``{site_id: {drive_id: deltaLink}}``.
+
+    A drive's deltaLink is registered only after that drive's walk completes, and a failed
+    download leaves a hole only in ITS drive's delta stream — so a drive failure holds back
+    that drive's cursor alone. Holding back every drive of the site let one persistently
+    failing library make every other library re-download a growing change set each run.
+    enum_fail, or a drive failure not attributed to a drive, still holds back every cursor.
+    """
+    failed = stats.get("failed_drive_ids") or set()
+    if (int(stats.get("enum_fail", 0) or 0) or None in failed
+            or (int(stats.get("drive_fail", 0) or 0) and not failed)):
+        return {}
+    return {
+        site: {d: t for d, t in (per or {}).items() if t and d not in failed}
+        for site, per in (stats.get("new_drive_tokens") or {}).items()
+    }
+
+
 def _entra_item_display_name(item_data: Dict[str, Any]) -> str:
     """Human-readable name for an item persisted by the generic Entra /
     legacy per-object backup path.
@@ -30053,6 +30072,7 @@ class BackupWorker:
                         )
                     except Exception as exc:
                         stats["drive_fail"] += 1
+                        stats.setdefault("failed_drive_ids", set()).add(item.get("_drive_id"))
                         print(f"[{self.worker_id}]   [SP_FILE FAIL] {item.get('name','?')}: "
                               f"{type(exc).__name__}: {exc}")
                         continue
@@ -30086,6 +30106,7 @@ class BackupWorker:
                             stats["drive_bytes"] += r.get("size", 0)
                         else:
                             stats["drive_fail"] += 1
+                            stats.setdefault("failed_drive_ids", set()).add(item.get("_drive_id"))
                             print(f"[{self.worker_id}]   [SP_FILE FAIL] "
                                   f"{r.get('file_name','?')}: method={r.get('method','?')} "
                                   f"reason={r.get('reason','no reason')}")
@@ -30263,39 +30284,40 @@ class BackupWorker:
         # every failure actually observed in 48h of fleet logs was REST-side —
         # so that change added hole-capable behaviour to a path with no
         # demonstrated problem.
+        # Per drive (2026-11-06): a drive failure holds back only that drive's cursor; see
+        # sharepoint_advanceable_drive_tokens. enum_fail still holds back every drive.
+        _sp_advance_tokens = sharepoint_advanceable_drive_tokens(stats)
         if _sp_cursor_blocking:
             print(f"[{self.worker_id}] [SHAREPOINT] {_sp_cursor_blocking} drive/enumeration "
-                  f"failure(s) — NOT advancing drive delta cursors (holes would be "
-                  f"permanent); next run re-enumerates")
+                  f"failure(s) — NOT advancing the delta cursor of drive(s) "
+                  f"{sorted(map(str, stats.get('failed_drive_ids') or [])) or 'ALL'} (holes would be "
+                  f"permanent); next run re-enumerates them")
         elif _sp_rest_fail:
             print(f"[{self.worker_id}] [SHAREPOINT] {_sp_rest_fail} list/REST file(s) failed "
                   f"but the drive delta is unaffected (REST re-walks in full every run) — "
                   f"advancing drive delta cursors")
-        if stats["new_drive_tokens"] and not _sp_cursor_blocking:
-            for _site_id_key, _per_drive in stats["new_drive_tokens"].items():
-                for _drive_id, _tok in (_per_drive or {}).items():
-                    if not _tok:
-                        continue
-                    await self._upsert_sharepoint_drive_delta(
-                        resource.id, str(_drive_id), str(_tok),
-                    )
+        for _site_id_key, _per_drive in _sp_advance_tokens.items():
+            for _drive_id, _tok in _per_drive.items():
+                await self._upsert_sharepoint_drive_delta(
+                    resource.id, str(_drive_id), str(_tok),
+                )
 
         # Legacy dual-write — kept for one release as rollback safety;
         # new sharepoint_drive_delta table is authoritative. Same
         # cursor-advance gate as above: a rollback to the legacy reader
         # must not resume from cursors that skip undownloaded files.
-        if (stats["new_subsite_tokens"] or stats["new_drive_tokens"]) and not _sp_cursor_blocking:
+        if (stats["new_subsite_tokens"] and not _sp_cursor_blocking) or any(_sp_advance_tokens.values()):
             async with async_session_factory() as sess:
                 r = await sess.get(Resource, resource.id)
                 if r:
                     r.extra_data = r.extra_data or {}
-                    if stats["new_subsite_tokens"]:
+                    if stats["new_subsite_tokens"] and not _sp_cursor_blocking:
                         existing_subsite_tokens = (r.extra_data.get("subsite_delta_tokens") or {}).copy()
                         existing_subsite_tokens.update(stats["new_subsite_tokens"])
                         r.extra_data["subsite_delta_tokens"] = existing_subsite_tokens
-                    if stats["new_drive_tokens"]:
+                    if _sp_advance_tokens:
                         existing_drive_tokens = (r.extra_data.get("drive_delta_tokens_by_site") or {}).copy()
-                        for site_id_key, per_drive in stats["new_drive_tokens"].items():
+                        for site_id_key, per_drive in _sp_advance_tokens.items():
                             merged = (existing_drive_tokens.get(site_id_key) or {}).copy()
                             merged.update(per_drive)
                             existing_drive_tokens[site_id_key] = merged
