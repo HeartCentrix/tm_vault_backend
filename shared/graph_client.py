@@ -4021,10 +4021,9 @@ class GraphClient:
         Get channels in a Teams team.
         Graph API: GET /teams/{team-id}/channels
         """
-        # $top=50: Teams channel/message collections cap at 50 — $top>50 returns
-        # 400 (the shared pager's $top-preserve turned that into a hard failure).
-        # Pagination below fetches the rest.
-        result = await self._get(f"{self.GRAPH_URL}/teams/{team_id}/channels", params={"$top": "50"})
+        # No $top: the channels collection rejects it outright (400 "Query option
+        # 'Top' is not allowed", live 2026-11-06). Pagination below fetches the rest.
+        result = await self._get(f"{self.GRAPH_URL}/teams/{team_id}/channels")
         all_value = result.get("value", [])
 
         # Follow pagination
