@@ -921,14 +921,14 @@ class Settings:
         # override up (to 60-80) only after measuring 429 rates and
         # confirming no compliance flag.
         self.GRAPH_APP_PACE_REQS_PER_SEC = float(
-            os.getenv("GRAPH_APP_PACE_REQS_PER_SEC", "40.0")
+            os.getenv("GRAPH_APP_PACE_REQS_PER_SEC", "60.0")
         )
         # Per-stream (= per concurrent backup) sustained rate cap.
         # 1.0 → 2.0 so individual user backups can issue ~2 Graph calls/sec
         # of sustained work. The per-app rate-limiter still caps the
         # aggregate, so a single fat user can't monopolize an app.
         self.GRAPH_STREAM_PACE_REQS_PER_SEC = float(
-            os.getenv("GRAPH_STREAM_PACE_REQS_PER_SEC", "2.0")
+            os.getenv("GRAPH_STREAM_PACE_REQS_PER_SEC", "4.0")
         )
         # EXPERIMENTAL (default off): spread a single stream's page fetches
         # across the multi-app pool from the FIRST page instead of pinning
@@ -969,7 +969,7 @@ class Settings:
         # tail latency on hot tenants.
         self.GRAPH_THROTTLE_BACKOFF_SECONDS = [
             int(x) for x in os.getenv(
-                "GRAPH_THROTTLE_BACKOFF_SECONDS", "10,30,60,180,300"
+                "GRAPH_THROTTLE_BACKOFF_SECONDS", "60,120,240,480,600"
             ).split(",") if x.strip()
         ]
         # Sequence for transient network errors (not throttle).
@@ -985,7 +985,7 @@ class Settings:
         # only a 250ms safety margin is needed to avoid micro-burst
         # contention.
         self.GRAPH_POST_THROTTLE_BRAKE_MS = int(
-            os.getenv("GRAPH_POST_THROTTLE_BRAKE_MS", "250")
+            os.getenv("GRAPH_POST_THROTTLE_BRAKE_MS", "500")
         )
         # Hard cap on total wait time per stream. After this, raise and let
         # RabbitMQ redeliver (resume from last checkpoint).
