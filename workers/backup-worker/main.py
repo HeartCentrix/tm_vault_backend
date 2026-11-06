@@ -21208,6 +21208,25 @@ class BackupWorker:
                 raise ChatCatalogueWorkLeaseMoved("OneDrive job lease ownership moved")
             return live
 
+        async def _record_capture_progress(session, files_done, bytes_done):
+            if not partition_record:
+                return
+            pid = uuid.UUID(partition_record["partition_id"])
+            fence_sql, fence_params = _partition_lease_fence(pid)
+            result = await session.execute(text(f"""
+                UPDATE snapshot_partitions
+                   SET payload = COALESCE(payload::jsonb, '{{}}'::jsonb)
+                       || jsonb_build_object('onedrive_capture_progress',
+                            jsonb_build_object('version', 1,
+                                'files', CAST(:files AS bigint), 'bytes', CAST(:bytes AS bigint)))
+                 WHERE id = :pid AND snapshot_id = :sid
+                   AND partition_type = 'ONEDRIVE_FILES' AND status = 'IN_PROGRESS'
+                   {fence_sql}
+            """), {"pid": pid, "sid": snapshot.id, "files": files_done,
+                     "bytes": bytes_done, **fence_params})
+            if result.rowcount != 1:
+                raise ChatCatalogueWorkLeaseMoved("OneDrive progress ownership moved")
+
         # Load existing checkpoint (resume path). Rows are authoritative even
         # when a legacy job checkpoint was evicted by a sibling. Only the source
         # identity committed with the blob can vouch for bytes; mutable raw
@@ -21235,6 +21254,11 @@ class BackupWorker:
                     if file_receipt_matches(source=downloaded_source, current=current_files[external_id],
                             drive_id=drive_id, blob_path=blob_path, content_size=size):
                         checkpoint.record_file_done(external_id=external_id, size=size)
+            # Receipts include resumed work; absolute counters cannot double-count
+            # replay. Keep these separate from terminal upload/delta accounting.
+            if partition_record:
+                await _record_capture_progress(session, checkpoint.files_done_count, checkpoint.bytes_done)
+                await session.commit()
 
         file_sem = asyncio.Semaphore(file_concurrency)
         state = {"uploaded_count": 0, "bytes_uploaded": 0, "failed_count": 0}
@@ -21587,6 +21611,7 @@ class BackupWorker:
                     snap.new_item_count = max(snap.new_item_count or 0, state["uploaded_count"])
                     snap.bytes_total = max(snap.bytes_total or 0, committed_bytes)
                     snap.bytes_added = max(snap.bytes_added or 0, state["bytes_uploaded"])
+                    await _record_capture_progress(session, committed_count, committed_bytes)
                     await session.commit()
                 # Drop buffered links only after their transaction committed.
                 # On failure the final flush retries them; failure there aborts
