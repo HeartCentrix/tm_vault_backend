@@ -22,6 +22,7 @@ from contextlib import contextmanager
 import functools
 import json
 import re
+import signal
 import uuid
 import hashlib
 import logging
@@ -4784,10 +4785,15 @@ class BackupWorker:
         try:
             await self._consume_backup_queues()
         finally:
-            if self._provider_work_runner is not None:
-                await self._provider_work_runner.close()
-            if self._copy_work_runner is not None:
-                await self._copy_work_runner.close()
+            await self._close_work_runners()
+
+    async def _close_work_runners(self):
+        """Stop provider/copy claims once: a running provider turn suspends with
+        worker_interrupted and a copy claim returns to READY (SIGTERM or exit)."""
+        runners = [r for r in (getattr(self, "_provider_work_runner", None),
+                               getattr(self, "_copy_work_runner", None)) if r is not None]
+        self._provider_work_runner = self._copy_work_runner = None
+        await asyncio.gather(*(r.close() for r in runners))
 
     async def _consume_backup_queues(self):
         # Broker connect can retry indefinitely. SQL copy recovery is already
@@ -33396,6 +33402,32 @@ class BackupWorker:
 
 # ==================== Entry Point ====================
 
+async def _run_until_drained(worker, drain_s):
+    """Run the worker. On SIGTERM stop queue intake (prefetched deliveries are
+    requeued) and provider/copy claims at once, give in-flight queue handlers
+    drain_s, then cancel the rest; RabbitMQ redelivers their unacked messages."""
+    loop = asyncio.get_running_loop()
+    term = asyncio.Event()
+    loop.add_signal_handler(signal.SIGTERM, term.set)
+    run, waiter = asyncio.create_task(worker.start()), asyncio.create_task(term.wait())
+    try:
+        await asyncio.wait({run, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        if not term.is_set():
+            return await run
+        print(f"[main] SIGTERM: draining in-flight work for up to {drain_s:.0f}s")
+        run.cancel()
+        _, pending = await asyncio.wait({run, asyncio.create_task(worker._close_work_runners())}, timeout=drain_s)
+        if pending:
+            print(f"[main] drain bound {drain_s:.0f}s reached; cancelling unfinished work for redelivery")
+            for task in pending:
+                task.cancel()
+            await asyncio.wait(pending, timeout=10)
+        print("[main] drain finished")
+    finally:
+        waiter.cancel()
+        loop.remove_signal_handler(signal.SIGTERM)
+
+
 async def main():
     from shared.storage.startup import startup_router, shutdown_router
     from shared import core_metrics
@@ -33411,7 +33443,7 @@ async def main():
         print("[main] at-rest encryption hook installed")
     worker = BackupWorker()
     try:
-        await worker.start()
+        await _run_until_drained(worker, float(os.getenv("BACKUP_WORKER_DRAIN_SECONDS", "300")))
     finally:
         # Tombstone heartbeat so the reconciliation sweeper picks up
         # any in-flight work immediately rather than waiting the full

@@ -13,6 +13,8 @@ spec:
     metadata: { labels: { app: backup-worker, stack: tmvault } }
     spec:
       imagePullSecrets: [ { name: harbor-creds } ]
+      # SIGTERM drain: BACKUP_WORKER_DRAIN_SECONDS (300s default) + 30s for runner close and heartbeat tombstone.
+      terminationGracePeriodSeconds: 330
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -228,6 +230,8 @@ spec:
     metadata: { labels: { app: backup-worker-heavy, stack: tmvault } }
     spec:
       imagePullSecrets: [ { name: harbor-creds } ]
+      # SIGTERM drain: BACKUP_WORKER_DRAIN_SECONDS (300s default) + 30s for runner close and heartbeat tombstone.
+      terminationGracePeriodSeconds: 330
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001

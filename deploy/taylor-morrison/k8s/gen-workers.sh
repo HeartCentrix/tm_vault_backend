@@ -29,6 +29,9 @@ for name in $WORKERS; do
   else
     replicas=1
   fi
+  # backup-worker drains for BACKUP_WORKER_DRAIN_SECONDS (300s) on SIGTERM.
+  grace=30
+  [ "$name" = "backup-worker" ] && grace=330
   cat >> "$OUT" <<YAML
 ---
 apiVersion: apps/v1
@@ -41,6 +44,7 @@ spec:
     metadata: { labels: { app: $name, stack: tmvault } }
     spec:
       imagePullSecrets: [ { name: harbor-creds } ]
+      terminationGracePeriodSeconds: $grace
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -92,6 +96,7 @@ spec:
     metadata: { labels: { app: backup-worker-heavy, stack: tmvault } }
     spec:
       imagePullSecrets: [ { name: harbor-creds } ]
+      terminationGracePeriodSeconds: 330
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
