@@ -123,6 +123,9 @@ async def test_overlapping_cycles_all_progress_within_their_own_cap(tiers):
 
     by_queue = {q for q, _ in published}
     assert by_queue == {"backup.high", "backup.normal"}
+    # The worker fans a batch out per resource onto message["queue"] (default backup.urgent, shared with
+    # manual "Backup now"). Each tier's lane must survive the fan-out so Gold keeps its priority.
+    assert all(m.get("queue") == q for q, m in published), {(q, m.get("queue")) for q, m in published}
     # Every resource has a prior backup: every scheduled job is incremental.
     assert all(m["type"] == "INCREMENTAL" and not m["forceFullBackup"] for _, m in published)
     async with store.factory() as db:

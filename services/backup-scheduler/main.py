@@ -2990,6 +2990,10 @@ async def _dispatch_resources(
             # spawns downstream (Tier-2 handoff, heavy-lane OneDrive)
             # land in the same Activity group.
             message["batchId"] = dispatch_batch_id
+            # The worker fans the batch out per resource onto message["queue"] (default backup.urgent,
+            # shared with manual "Backup now"): carry the tier's lane so Gold (backup.high) keeps
+            # priority over Silver/Bronze (backup.normal) and scheduled work stays off the manual lane.
+            message["queue"] = group_queue
             pending.append((job, group_queue, message, effective_full_backup,
                             resource_type, len(resource_ids)))
 
