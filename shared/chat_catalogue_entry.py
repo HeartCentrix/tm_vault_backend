@@ -174,7 +174,9 @@ async def catalogue_snapshot_result(session, snapshot_id, *, force_recount=False
     count, logical_bytes = (await session.execute(select(func.count().filter(primary),
         func.coalesce(func.sum(SnapshotItem.content_size), 0)).where(
             SnapshotItem.snapshot_id == (snapshot.reuse_chain_root_id or snapshot_id)))).one()
-    prior = None if snapshot.reuse_chain_root_id else await session.scalar(select(Snapshot.id).where(Snapshot.resource_id == snapshot.resource_id,
+    # A prior backup that points at an earlier one holds no rows: compare with the rows it stands for.
+    prior = None if snapshot.reuse_chain_root_id else await session.scalar(select(
+        func.coalesce(Snapshot.reuse_chain_root_id, Snapshot.id)).where(Snapshot.resource_id == snapshot.resource_id,
         Snapshot.id != snapshot_id, Snapshot.job_id != snapshot.job_id,
         Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL]),
         Snapshot.created_at <= snapshot.created_at).order_by(Snapshot.created_at.desc(), Snapshot.id.desc()).limit(1))

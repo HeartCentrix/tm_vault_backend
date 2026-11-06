@@ -1453,3 +1453,71 @@ async def test_renamed_chat_folder_copies_rows_instead_of_pointing(store, adapte
     async with store.factory() as session:
         assert (await session.get(Snapshot, scope.snapshot_id)).reuse_of_snapshot_id is None
     assert {row[5] for row in await chat_rows(store, scope.snapshot_id)} == {"chats/Renamed", "chats/chat-beta"}
+
+
+async def test_new_counts_after_a_pointer_backup_count_only_new_versions(store, adapters, monkeypatch):
+    """Railway 2026-11-06 change incremental: after a no-change run whose backups pointed at their prior
+    (no rows of their own), the next backup compared its rows with the pointer's zero rows, so every
+    linked chat counted as new (Bhavya: new_item_count == item_count = 5,375, 143 MiB "added") while
+    the run wrote 2 new versions. New counts compare with the rows the prior backup stands for."""
+    from shared.models import Snapshot, SnapshotStatus
+    from shared.chat_catalogue_entry import catalogue_snapshot_result
+    monkeypatch.setenv("CHAT_INCREMENTAL_REUSE", "true")
+    first = await _two_chat_backup(store, adapters)
+    pointer = await store.new_scope()
+    assert await _link_all(adapters, store, first, pointer) == {"chat-alpha", "chat-beta"}
+    async with store.factory.begin() as session:
+        (await session.get(Snapshot, pointer.snapshot_id)).status = SnapshotStatus.COMPLETED
+    current = await store.new_scope()
+    renamed = {"chat-alpha": "chats/Renamed", "chat-beta": "chats/chat-beta"}   # rows are copied, not pointed
+    assert await _link_all(adapters, store, pointer, current, folders=renamed) == {"chat-alpha", "chat-beta"}
+    async with store.factory() as session:
+        counts = await catalogue_snapshot_result(session, current.snapshot_id, force_recount=True)
+        original = await catalogue_snapshot_result(session, first.snapshot_id, force_recount=True)
+    assert (counts["item_count"], counts["bytes_total"]) == (original["item_count"], original["bytes_total"])
+    assert (counts["new_item_count"], counts["bytes_added"]) == (0, 0)
+
+
+async def test_unavailable_content_does_not_make_a_chat_changed(store, adapters, monkeypatch):
+    """Railway 2026-11-06: a 1:1 chat holding a call recording Microsoft never serves (its hosted video
+    answers 404/500) was recorded byte-less and unavailable. That record alone must leave the chat
+    reusable by both incremental paths (own unchanged capture and the delta bulk link)."""
+    from shared.chat_capture_graph import ChatGraphError
+    monkeypatch.setenv("CHAT_INCREMENTAL_REUSE", "true")
+    adapters.source.messages = [message(hosted=True)]
+    adapters.source.hosted_error = ChatGraphError("Graph capture hosted_content failed with HTTP 500", status_code=500)
+    first_scope, first = await run_capture(store, adapters)
+    assert first.outcome == "complete"
+    adapters.source.latest_change = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    reused = await reuse(adapters, store, replace(await store.new_scope(), chat_id=first_scope.chat_id))
+    assert reused is not None and reused.outcome == "complete" and reused.inventory_id == first.inventory_id
+    scope = replace(await store.new_scope(), chat_id=first_scope.chat_id)
+
+    async def probe(chat_id):
+        return datetime(2020, 1, 1, tzinfo=timezone.utc)
+    assert await adapters.capture.link_unchanged_chats(scopes={scope.chat_id: scope}, folders={scope.chat_id: "chats/x"},
+        filter_hashes={}, session_factory=store.factory, source_snapshot_id=first_scope.snapshot_id,
+        latest_change=probe) == {scope.chat_id}
+
+
+async def test_rereading_a_chat_does_not_retry_hosted_content_recorded_unavailable(store, adapters):
+    """Railway 2026-11-06: each re-read of that chat (a genuine change elsewhere in it) fetched the
+    recording again (chat_capture_failure phase=CHAT_HOSTED_CONTENT status=500). Hosted content
+    recorded unavailable stays so; a new hosted item in the chat is still fetched."""
+    from shared.chat_capture_graph import ChatGraphError
+    from shared.chat_catalogue_identity import SOURCE_UNAVAILABLE_FIELD
+    adapters.source.messages = [message(hosted=True), dict(message("other"), id="other")]
+    adapters.source.hosted_error = ChatGraphError("Graph capture hosted_content failed with HTTP 500", status_code=500)
+    await run_capture(store, adapters)
+    assert adapters.source.hosted_downloads == 1
+    adapters.source.hosted_error = None
+    adapters.source.messages[1]["body"] = {"content": "edited"}            # a genuine change: the chat is re-read
+    _, again = await run_capture(store, adapters)
+    assert again.outcome == "complete" and again.item_count == 3
+    assert adapters.source.hosted_downloads == 1                          # the recorded one is not fetched again
+    async with store.factory() as session:
+        hosted = (await session.scalars(select(ChatItemVersion).where(ChatItemVersion.item_type == "CHAT_HOSTED_CONTENT"))).all()
+    assert len(hosted) == 1 and hosted[0].payload[SOURCE_UNAVAILABLE_FIELD] is True
+    adapters.source.messages.append(hosted_message(1))                    # a new image is captured normally
+    _, grown = await run_capture(store, adapters)
+    assert grown.outcome == "complete" and grown.item_count == 5 and adapters.source.hosted_downloads > 1
