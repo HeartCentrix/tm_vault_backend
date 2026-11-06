@@ -97,7 +97,7 @@ def resource_type_enabled(resource_type: str, policy: Any) -> bool:
             or getattr(policy, "calendars", False)
         )
 
-    if resource_type in {"ENTRA_GROUP", "DYNAMIC_GROUP"}:
+    if resource_type in {"ENTRA_GROUP", "DYNAMIC_GROUP", "M365_GROUP"}:
         return bool(
             getattr(policy, "backup_entra_id", False)
             or getattr(policy, "group_mailbox", False)
