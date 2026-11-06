@@ -6817,6 +6817,7 @@ class BackupWorker:
         _is_partitioned_run = bool(
             (result or {}).get("partitioned"),
         )
+        _fresh = None
         if not _is_partitioned_run:
             try:
                 async with async_session_factory() as _refresh:
@@ -6837,7 +6838,7 @@ class BackupWorker:
             )
         else:
             async with async_session_factory() as s:
-                await self.complete_snapshot(s, snapshot, result)
+                await self.complete_snapshot(s, snapshot, result, settled_row=_fresh)
 
         # Safety reaper — catches any fire-and-forget background task
         # inside THIS resource's handler (e.g. the USER_CHATS hosted-
@@ -6889,7 +6890,7 @@ class BackupWorker:
             # `snapshot` still says COMPLETED.
             async with async_session_factory() as s:
                 await self._stamp_resource_from_snapshot_row(
-                    s, resource, job_id, snapshot.id, result,
+                    s, resource, job_id, snapshot.id, result, skip_if_stamped=True,
                 )
 
             # Audit event — fire-and-forget over HTTP, no DB session needed.
@@ -30419,7 +30420,7 @@ class BackupWorker:
     async def _stamp_resource_from_snapshot_row(
         self, session: AsyncSession, resource: Resource,
         job_id: Optional[uuid.UUID], snapshot_id: uuid.UUID,
-        result: Dict = None,
+        result: Dict = None, *, skip_if_stamped: bool = False,
     ) -> None:
         """update_resource_backup_info driven by the snapshot row's COMMITTED
         status, never the caller's in-memory Snapshot: an inline settle, a
@@ -30442,6 +30443,13 @@ class BackupWorker:
             _rs_status, _rs_terminal = resource_stamp_for_snapshot(
                 _row.status, _row.extra_data,
             )
+        if skip_if_stamped and _rs_terminal:
+            # The handler's inline settle already stamped this job's outcome
+            # (storage subtree sum included); a second stamp only recounts it.
+            _live = await session.get(Resource, resource.id, populate_existing=True)
+            if (_live is not None and _live.last_backup_job_id == job_id
+                    and _live.last_backup_status == _rs_status):
+                return
         await self.update_resource_backup_info(
             session, resource, job_id, snapshot_id, result,
             status=_rs_status, terminal=_rs_terminal,
@@ -30812,7 +30820,8 @@ class BackupWorker:
         finally:
             lease_unregister('snapshots', snapshot_id)
 
-    async def complete_snapshot(self, session: AsyncSession, snapshot: Snapshot, result: Dict):
+    async def complete_snapshot(self, session: AsyncSession, snapshot: Snapshot, result: Dict, *,
+                                settled_row=None):
         """Mark snapshot as completed with result data.
 
         Partitioned-snapshot guard: when the coordinator role finishes
@@ -30864,6 +30873,12 @@ class BackupWorker:
         if extra.get("partitioned") is True:
             # Last-finisher owns this snapshot's terminal state.
             return
+        # The handler's inline settle already landed COMPLETED/PARTIAL (``settled_row``
+        # is the committed row): the terminal write below can never change such a row
+        # ("prior attempt landed" or a fence miss), so skip recomputing it and report
+        # what landed. A FAILED row keeps the recovery write; a token still persists.
+        settled = settled_row if (settled_row is not None and not result.get("new_delta_token")
+            and settled_row.status in (SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL)) else None
         now = datetime.utcnow()
         snapshot.completed_at = now
         # Legacy handlers report item_count/bytes_added only and both pairs
@@ -30877,7 +30892,7 @@ class BackupWorker:
             snapshot.bytes_added,
             snapshot.bytes_total,
         ) = snapshot_counters_from_result(result)
-        if "new_item_count" not in result:
+        if "new_item_count" not in result and settled is None:
             snapshot.new_item_count, snapshot.bytes_added = await self._compute_snapshot_delta_from_prior(
                 session, snapshot.id, snapshot.resource_id,
                 result.get("item_count", 0), result.get("bytes_added", 0),
@@ -30912,7 +30927,7 @@ class BackupWorker:
         )
         if (snapshot.extra_data or {}).get("copy_required_failed"):
             proposed = SnapshotStatus.PARTIAL if snapshot.item_count else SnapshotStatus.FAILED
-        snapshot.status = await _coerce_snapshot_terminal_on_cancel(
+        snapshot.status = settled.status if settled is not None else await _coerce_snapshot_terminal_on_cancel(
             snapshot, proposed,
         )
 
@@ -30958,6 +30973,12 @@ class BackupWorker:
             duration = (now - snapshot.started_at).total_seconds()
             snapshot.duration_secs = int(duration)
 
+        if settled is not None:
+            for field in ("status", "type", "item_count", "new_item_count", "bytes_total",
+                          "bytes_added", "completed_at", "duration_secs", "extra_data"):
+                setattr(snapshot, field, getattr(settled, field))
+            lease_unregister("snapshots", snapshot.id)  # the skipped terminal write's release
+
         # Capture metric values BEFORE merge/commit. After merge the
         # original snapshot instance becomes detached + expired, and
         # reading a column attribute (e.g. resource_id) would either
@@ -30980,7 +31001,7 @@ class BackupWorker:
         # still-running coordinator to FAILED gets corrected when the
         # surviving run finishes (load-bearing recovery flow, observed
         # on OneDrive force-fulls).
-        landed = await self._write_snapshot_terminal(
+        landed = True if settled is not None else await self._write_snapshot_terminal(
             session, snapshot,
             allowed_from=(SnapshotStatus.IN_PROGRESS, SnapshotStatus.FAILED),
         )
