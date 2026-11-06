@@ -67,6 +67,13 @@ _SHARDS = text("""
      WHERE snapshot_id = :sid AND status = 'FAILED'
 """)
 
+# The Activity panel shows any job with a FAILED/PARTIAL provider_work leaf as "Partial — Some backup
+# content could not be captured" (provider_observability → INCOMPLETE), whatever the job status says.
+_PROVIDER = text("""
+    UPDATE provider_work SET state = 'COMPLETED'
+     WHERE snapshot_id = :sid AND state IN ('FAILED', 'PARTIAL')
+""")
+
 # promote_pending_delta_link semantics: only the owning snapshot's pending link moves.
 _CURSOR = text("""
     UPDATE resources
@@ -152,6 +159,7 @@ async def settle_rescued_onedrive_snapshot(session, snapshot_id) -> bool:
     params = {"sid": snapshot_id, "sid_text": str(snapshot_id), "rid": row.resource_id, "jid": row.job_id}
     await session.execute(_SNAPSHOT, params)
     await session.execute(_SHARDS, params)
+    await session.execute(_PROVIDER, params)
     await session.execute(_CURSOR, params)
     await session.execute(_STAMP, params)
     await session.execute(_JOB, params)
