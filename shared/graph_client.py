@@ -4645,12 +4645,11 @@ class GraphClient:
                     token = await self._get_token()
                     continue
                 raise
-            except (
-                httpx.ReadTimeout,
-                httpx.ConnectTimeout,
-                httpx.RemoteProtocolError,
-                httpx.PoolTimeout,
-            ) as e:
+            except httpx.TransportError as e:
+                # All network-level transients, as in _get_hardened. A reset
+                # HTTP/2 connection fails every stream on it with ReadError/
+                # WriteError (Railway 2026-11-06: 158 of 178 in one MIME-BULK);
+                # httpcore drops that connection, so the retry gets a fresh one.
                 last_err = e
                 if attempt < max_attempts - 1:
                     await asyncio.sleep(backoff_s)
