@@ -58,15 +58,22 @@ def _graph_attachments(mailbox: str) -> List[Dict[str, Any]]:
 class Graph:
     """Fake Graph that counts list/content sub-requests and attachment bytes it sent."""
 
-    def __init__(self, mailbox: str, attachments=None):
+    def __init__(self, mailbox: str, attachments=None, internet_message_id=None):
         self.attachments = attachments if attachments is not None else _graph_attachments(mailbox)
+        self.internet_message_id = internet_message_id
         self.calls = 0
         self.bytes = 0
+        self.id_lookups = 0
 
     async def batch(self, requests):
         out = {}
         for r in requests:
             self.calls += 1
+            if "/attachments" not in r.url:     # GET message ?$select=internetMessageId
+                self.id_lookups += 1
+                assert r.url.endswith("?$select=internetMessageId"), r.url
+                out[r.id] = BatchResponse(r.id, 200, {}, {"id": r.id, "internetMessageId": self.internet_message_id})
+                continue
             metadata_only = "$select=" in r.url
             value = []
             for att in self.attachments:
@@ -258,6 +265,20 @@ async def test_name_mismatch_downloads(env):
     bob = Graph("bob", changed)
     await env.backup("bob", bob)
     assert bob.bytes == len(REPORT) + len(LOGO)
+
+
+async def test_listing_without_internet_message_id_looks_it_up_and_reuses(env):
+    """A mail delta cursor created before internetMessageId was selected keeps its old $select, so
+    changed messages arrive without it (Railway 2026-11-06: a PDF sent to three mailboxes was
+    downloaded three times, mail_attachment_contents stayed empty). The id is looked up, 20 messages
+    per $batch, and reuse works."""
+    imid = "<q3-report@tm.example>"
+    alice = Graph("alice", internet_message_id=imid)
+    _restorable(await env.backup("alice", alice, internet_message_id=None), "alice", env.store)
+    bob = Graph("bob", internet_message_id=imid)
+    _restorable(await env.backup("bob", bob, internet_message_id=None), "bob", env.store)
+    assert (alice.id_lookups, bob.id_lookups) == (1, 1)
+    assert bob.bytes == 0
 
 
 @pytest.mark.parametrize("imid", [None, ""])

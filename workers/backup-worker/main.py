@@ -14183,6 +14183,27 @@ class BackupWorker:
         from shared import mail_attachment_reuse as _reuse
         reuse_map: Dict[Tuple[str, str], Any] = {}
         downloaded: List[Tuple[str, tuple, Dict[str, Any]]] = []
+        if _reuse.reuse_enabled():
+            # A delta cursor made before internetMessageId was selected keeps its old $select, so its
+            # messages arrive without it (Railway 2026-11-06: one PDF to three mailboxes downloaded
+            # three times). Look it up: one small $batch per 20 such messages.
+            _no_imid = [m for m in messages_with_attachments if m.get("id") and not m.get("internetMessageId")]
+            for start in range(0, len(_no_imid), batch_limit):
+                chunk = {m["id"]: m for m in _no_imid[start:start + batch_limit]}
+                try:
+                    _ids = await graph_client.batch([
+                        BatchRequest(id=mid, method="GET", url=f"/users/{user_id}/messages/{mid}?$select=internetMessageId")
+                        for mid in chunk])
+                except (ProviderDeferred, ProviderBudgetExhausted):
+                    raise
+                except BatchReadError as be:
+                    _ids = be.responses
+                except Exception:
+                    continue   # no id: these copies download as before
+                for mid, resp in _ids.items():
+                    body = getattr(resp, "body", None)
+                    if getattr(resp, "status", 0) == 200 and isinstance(body, dict) and body.get("internetMessageId"):
+                        chunk[mid]["internetMessageId"] = body["internetMessageId"]
         imid_of = {m.get("id"): m.get("internetMessageId") for m in messages_with_attachments}
         if _reuse.reuse_enabled():
             _stored = await _reuse.load_candidates(
