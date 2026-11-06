@@ -248,3 +248,47 @@ async def test_original_ownership_is_required_when_uploaded_blob_is_linked(store
     async with store.factory() as session:
         row = await session.scalar(select(models.SnapshotItem).where(models.SnapshotItem.snapshot_id == env.scope.snapshot_id))
         assert row.blob_path is None
+
+
+# 2026-11-06: an AUTO_RETRY of Amit's FAILED OneDrive run (no delta cursor → full listing)
+# downloaded and stored all 127 GiB again although the failed run had already blobbed
+# 788/788 files. A later run of the same resource reuses receipt-proven bytes instead.
+async def retry_after(store, bw, monkeypatch, first_items, retry_items, prior_status):
+    first = await setup_worker(store, bw, monkeypatch, first_items)
+    assert await first.run() == (len(first_items), 1024 * len(first_items))
+    async with store.factory.begin() as session:
+        (await session.get(models.Snapshot, first.scope.snapshot_id)).status = prior_status
+    retry = await setup_worker(store, bw, monkeypatch, retry_items)
+    streamed = []
+
+    async def stream(**kwargs):
+        streamed.append(kwargs["blob_path"])
+        return {"success": True, "content_sha256": "content-digest"}
+    retry.worker._stream_graph_to_backend = stream
+    result = await retry.run()
+    async with store.factory() as session:
+        row = await session.scalar(select(models.SnapshotItem).where(
+            models.SnapshotItem.snapshot_id == retry.scope.snapshot_id))
+    return first, result, streamed, row
+
+
+@pytest.mark.parametrize("prior_status", [models.SnapshotStatus.FAILED, models.SnapshotStatus.PARTIAL,
+                                          models.SnapshotStatus.COMPLETED])
+async def test_later_run_reuses_bytes_an_earlier_run_already_stored(store, bw, monkeypatch, prior_status):
+    first, result, streamed, row = await retry_after(store, bw, monkeypatch, [file_item()], [file_item()], prior_status)
+    assert streamed == [] and result == (0, 0)
+    assert row.blob_path == f"{first.scope.snapshot_id}/file-1"
+    assert row.extra_data["onedrive_download_source"]["eTag"] == "version-1"
+
+
+async def test_changed_file_version_is_downloaded_again(store, bw, monkeypatch):
+    _first, result, streamed, row = await retry_after(store, bw, monkeypatch, [file_item()],
+        [file_item(eTag="version-2")], models.SnapshotStatus.FAILED)
+    assert result == (1, 1024) and len(streamed) == 1
+    assert row.blob_path == streamed[0]
+
+
+async def test_snapshot_being_deleted_is_never_a_reuse_source(store, bw, monkeypatch):
+    _first, result, streamed, _row = await retry_after(store, bw, monkeypatch, [file_item()], [file_item()],
+        models.SnapshotStatus.PENDING_DELETION)
+    assert result == (1, 1024) and len(streamed) == 1

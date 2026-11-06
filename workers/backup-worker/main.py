@@ -21243,10 +21243,62 @@ class BackupWorker:
         state_lock = asyncio.Lock()
         total_files = len(ordered)
 
+        # Bytes an EARLIER run of this resource already stored for the same
+        # file version are pointed at, not downloaded and stored again. A run
+        # without a delta cursor (the AUTO_RETRY of a FAILED run) re-copied
+        # all 127 GiB of Amit's OneDrive on 2026-11-06 although the failed run
+        # held 788/788 blobs. The flush re-verifies each reused receipt against
+        # Graph exactly like a fresh download, and retention keeps a blob while
+        # any item still references it (select_deletable_blob_paths).
+        # ponytail: a source snapshot whose retention delete is already past
+        # the reference check could race this; PENDING_DELETION is excluded.
+        reused: set = set()
+        wanted = [fid for fid, f in current_files.items()
+                  if not checkpoint.is_done(fid) and int(f.get("size") or 0) > 0]
+        if wanted:
+            async with async_session_factory() as session:
+                prior_snaps = select(Snapshot.id).where(
+                    Snapshot.resource_id == resource.id, Snapshot.id != snapshot.id,
+                    Snapshot.backend_id == snapshot.backend_id,
+                    Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL,
+                                         SnapshotStatus.FAILED]))
+                for id_chunk in iter_hydration_chunks(wanted):
+                    priors = (await session.execute(select(
+                        SnapshotItem.external_id, SnapshotItem.blob_path,
+                        SnapshotItem.content_size, SnapshotItem.content_hash,
+                        SnapshotItem.extra_data, SnapshotItem.snapshot_id,
+                    ).where(
+                        SnapshotItem.snapshot_id.in_(prior_snaps),
+                        SnapshotItem.tenant_id == tenant.id,
+                        SnapshotItem.item_type == "ONEDRIVE_FILE",
+                        SnapshotItem.external_id.in_(id_chunk),
+                        SnapshotItem.blob_path.is_not(None), SnapshotItem.blob_path != "",
+                        SnapshotItem.is_deleted.is_(False),
+                    ).order_by(SnapshotItem.created_at.desc()))).all()
+                    for external_id, blob_path, size, sha, metadata, source_snap in priors:
+                        source = (metadata or {}).get("onedrive_download_source")
+                        if external_id in reused or not file_receipt_matches(
+                                source=source, current=current_files[external_id],
+                                drive_id=drive_id, blob_path=blob_path, content_size=size):
+                            continue
+                        reused.add(external_id)
+                        download_sources[external_id] = source
+                        updates.append((external_id, blob_path, size, sha or "", {
+                            "raw": current_files[external_id],
+                            "sha256": (metadata or {}).get("sha256"),
+                            "quickxor": (metadata or {}).get("quickxor"),
+                            "reused_from_snapshot": str(source_snap),
+                            "blobbed_at": datetime.utcnow().isoformat() + "Z",
+                        }))
+            if reused:
+                print(f"[{self.worker_id}] [USER_ONEDRIVE] {resource.display_name}: "
+                      f"reusing {len(reused)} file(s) already stored by an earlier run")
+
         # Resolve URLs only when a file consumer needs its batch. Waiting on
         # every partition URL first discarded ready work on provider deferral.
         pending_ids = [f["id"] for f in ordered
-                       if not checkpoint.is_done(f["id"]) and int(f.get("size") or 0) > 0]
+                       if not checkpoint.is_done(f["id"]) and f["id"] not in reused
+                       and int(f.get("size") or 0) > 0]
         batch_positions = {key: index // 20 for index, key in enumerate(pending_ids)}
         prefetch_concurrency = max(1, min(file_concurrency,
             int(os.getenv("ONEDRIVE_PREFETCH_CONCURRENCY", "16"))))
@@ -21601,7 +21653,7 @@ class BackupWorker:
                     f"(~{_live_check['count']} files in)"
                 )
             file_id = f.get("id")
-            if not file_id or checkpoint.is_done(file_id):
+            if not file_id or checkpoint.is_done(file_id) or file_id in reused:
                 return
             file_name = f.get("name") or "(unnamed)"
             size_hint = int(f.get("size") or 0)
