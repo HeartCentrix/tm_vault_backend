@@ -67,3 +67,14 @@ def test_chat_pointer_follows_the_backup_it_reuses_not_the_catalogue_copy():
     root = types.SimpleNamespace(id="root", dr_replication_status="replicated", dr_blob_path="dr/root")
     asyncio.run(_drw.replicate_snapshot(pointer, _TENANT, _Session(root)))
     assert (pointer.dr_replication_status, pointer.dr_blob_path) == ("replicated", "dr/root")
+
+
+def test_overlay_waits_for_its_base_before_copying_its_own_rows():
+    """An overlay's inventory is its base's rows plus its own: replicating only its own blobs
+    before the base is in DR would register an incomplete DR copy."""
+    overlay = _pointer()
+    overlay.reuse_chain_root_id, overlay.overlay_base_id = None, "root"
+    base = types.SimpleNamespace(id="root", dr_replication_status="pending", dr_blob_path=None)
+    asyncio.run(_drw.replicate_snapshot(overlay, _TENANT, _Session(base)))
+    assert (overlay.dr_replication_status, overlay.dr_blob_path, overlay.dr_replication_attempts) == ("pending", None, 0)
+    assert "overlay base root" in overlay.dr_error

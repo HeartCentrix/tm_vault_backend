@@ -330,6 +330,15 @@ async def replicate_snapshot(snapshot: Snapshot, tenant: Tenant, session):
         snapshot.dr_error = None
         return
 
+    base_id = getattr(snapshot, "overlay_base_id", None)
+    if base_id is not None:
+        # An overlay's inventory is its base's rows plus its own (docs/mail-overlay-snapshots.md):
+        # copy its own blobs only once the base is in DR; until then it stays pending.
+        base = await session.get(Snapshot, base_id)
+        if base is None or base.dr_replication_status != "replicated":
+            snapshot.dr_error = f"waiting for overlay base {base_id} to replicate"
+            return
+
     if (getattr(snapshot, "extra_data", None) or {}).get("chat_inventory_format") == 1:
         await _replicate_catalogue_snapshot(snapshot, tenant, session)
         return
