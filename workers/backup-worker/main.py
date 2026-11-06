@@ -16981,6 +16981,26 @@ class BackupWorker:
             self._shard_enum_failures = ledger
         return ledger
 
+    async def _owned_elsewhere(self, tenant, resource_type, external_id, snapshot, what) -> bool:
+        """True (logged and recorded on the snapshot) when another protected resource already backs up
+        this content, so a group or channel backup skips it (each piece is backed up once).
+        GROUP_CONTENT_DEDUP_ENABLED=false backs it up here as before."""
+        if os.getenv("GROUP_CONTENT_DEDUP_ENABLED", "true").strip().lower() in ("0", "false", "no", "off"):
+            return False
+        from shared.sla_workloads import protected_owner_id
+        try:
+            async with async_session_factory() as _s:
+                owner = await protected_owner_id(_s, tenant.id, resource_type, external_id)
+        except Exception as exc:
+            logger.warning("[%s] owner lookup for %s failed, backing it up here: %s", self.worker_id, what, exc)
+            return False
+        if not owner:
+            return False
+        print(f"[{self.worker_id}]   [DEDUP] {what}: backed up by {resource_type} {owner}, skipped here")
+        if snapshot is not None:
+            await self._patch_snapshot_extra_data(snapshot.id, {f"covered_by_{what}": owner})
+        return True
+
     async def _note_no_mailbox(self, graph_client, user_id, snapshot, kind, exc=None) -> bool:
         """True (reason logged and recorded on the snapshot) when the user has no mailbox. Without
         ``exc`` one probe classifies it; the caller then completes the run with 0 items."""
@@ -24734,7 +24754,8 @@ class BackupWorker:
             # TEAMS_CHANNEL handler uses — so the Group's Recovery view
             # ("Team Channels" tab) has data without needing a separate
             # TEAMS_CHANNEL resource backup.
-            if is_unified and has_team:
+            if is_unified and has_team and not await self._owned_elsewhere(
+                    tenant, "TEAMS_CHANNEL", obj_id, snapshot, "team_channels"):
                 try:
                     channel_items, channel_bytes = await self._backup_team_channels(
                         resource, tenant, snapshot, graph_client, obj_id,
@@ -24763,8 +24784,9 @@ class BackupWorker:
                         f"{graph_client.GRAPH_URL}/groups/{obj_id}/sites/root",
                     )
                     raw_site_id = site_resp.get("id", "")  # "hostname,guid,guid"
-                    if raw_site_id:
-                        site_ext_id = raw_site_id.replace(",", "/")
+                    site_ext_id = raw_site_id.replace(",", "/")
+                    if raw_site_id and not await self._owned_elsewhere(
+                            tenant, "SHAREPOINT_SITE", site_ext_id, snapshot, "team_site"):
                         from types import SimpleNamespace as _SN
                         site_proxy = _SN(
                             id=resource.id,
@@ -25297,12 +25319,14 @@ class BackupWorker:
                 # Group mailbox.
                 try:
                     # New signature: (count, bytes). Items persist inline
-                    # via _bulk_upsert_snapshot_items.
-                    mbx_count, mbx_bytes = await self.backup_group_mailbox_content(
-                        resource, tenant, snapshot, graph_client,
-                    )
-                    item_count += mbx_count
-                    bytes_added += mbx_bytes
+                    # via _bulk_upsert_snapshot_items. The group mailbox belongs
+                    # to the M365_GROUP backup when that group is protected.
+                    if not await self._owned_elsewhere(tenant, "M365_GROUP", team_id, snapshot, "group_mailbox"):
+                        mbx_count, mbx_bytes = await self.backup_group_mailbox_content(
+                            resource, tenant, snapshot, graph_client,
+                        )
+                        item_count += mbx_count
+                        bytes_added += mbx_bytes
                 except Exception as mbx_exc:
                     logger.warning(
                         "[%s] Team group-mailbox backup skipped for %s: %s",
@@ -25316,8 +25340,9 @@ class BackupWorker:
                         f"{graph_client.GRAPH_URL}/groups/{team_id}/sites/root",
                     )
                     raw_site_id = site_resp.get("id", "")
-                    if raw_site_id:
-                        site_ext_id = raw_site_id.replace(",", "/")
+                    site_ext_id = raw_site_id.replace(",", "/")
+                    if raw_site_id and not await self._owned_elsewhere(
+                            tenant, "SHAREPOINT_SITE", site_ext_id, snapshot, "team_site"):
                         from types import SimpleNamespace as _SN
                         site_proxy = _SN(
                             id=resource.id,

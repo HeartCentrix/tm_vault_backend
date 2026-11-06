@@ -154,3 +154,19 @@ def filter_resource_map_by_policy_flags(
             ))
 
     return filtered, skipped
+
+
+async def protected_owner_id(session, tenant_id, resource_type: str, external_id: str):
+    """Id of the resource that protects ``(resource_type, external_id)`` in this tenant — not archived,
+    an SLA assigned, and that SLA enabling the workload — else None. Group and channel backups skip
+    content such an owner already backs up (its team site, group mailbox or channels)."""
+    from sqlalchemy import text
+    rows = (await session.execute(text(
+        "SELECT p.*, r.id::text AS owner_resource_id FROM resources r JOIN sla_policies p ON p.id = r.sla_policy_id "
+        "WHERE r.tenant_id = CAST(:tenant AS uuid) AND r.type::text = :rtype AND r.external_id = :ext "
+        "AND r.archived_at IS NULL"),
+        {"tenant": str(tenant_id), "rtype": resource_type, "ext": external_id})).mappings().all()
+    for row in rows:
+        if resource_type_enabled(resource_type, type("Policy", (), dict(row))):
+            return row["owner_resource_id"]
+    return None
