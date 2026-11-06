@@ -107,7 +107,7 @@ def init(metrics_port: Optional[int] = None) -> bool:
             return _ENABLED
         _INIT_DONE = True
         try:
-            from prometheus_client import Counter, Histogram, Gauge, start_http_server
+            from prometheus_client import Counter, Histogram, Gauge, REGISTRY, start_http_server
         except Exception as exc:
             logger.warning("[core_metrics] prometheus_client unavailable (%s) — metrics disabled", exc)
             return False
@@ -233,14 +233,25 @@ def init(metrics_port: Optional[int] = None) -> bool:
         port = metrics_port if metrics_port is not None else int(
             os.environ.get("CORE_METRICS_PORT", "9103")
         )
+        # `uvicorn --workers N`: with PROMETHEUS_MULTIPROC_DIR set (from
+        # process start, see the service Dockerfiles) every worker writes
+        # its samples there and whichever worker wins the port serves the
+        # sum; the losers keep counting.
+        registry = REGISTRY
+        multiproc_dir = os.environ.get("PROMETHEUS_MULTIPROC_DIR")
         try:
-            start_http_server(port)
+            if multiproc_dir:
+                from prometheus_client import CollectorRegistry, multiprocess
+                os.makedirs(multiproc_dir, exist_ok=True)
+                registry = CollectorRegistry()
+                multiprocess.MultiProcessCollector(registry)
+            start_http_server(port, registry=registry)
             logger.info("[core_metrics] HTTP server listening on :%d", port)
             _ENABLED = True
         except OSError as exc:
             logger.warning(
-                "[core_metrics] could not bind :%d (%s) — counters live, HTTP scrape disabled",
-                port, exc,
+                "[core_metrics] could not bind :%d (%s) — counters live, HTTP scrape %s",
+                port, exc, "served by another worker" if multiproc_dir else "disabled",
             )
             _ENABLED = False
         return _ENABLED

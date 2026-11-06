@@ -12,4 +12,7 @@ RUN groupadd --system --gid 10001 appuser \
     && chown -R 10001:10001 /app
 USER 10001
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 CMD python -c "import httpx; httpx.get('http://localhost:${PORT:-8006}/health')"
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8006} --workers 2"]
+# One shared sample dir per container so the worker that binds the
+# core_metrics port (9103) serves every uvicorn worker (shared/core_metrics.py).
+ENV PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus_multiproc
+CMD ["sh", "-c", "rm -rf \"$PROMETHEUS_MULTIPROC_DIR\" && uvicorn main:app --host 0.0.0.0 --port ${PORT:-8006} --workers 2"]
