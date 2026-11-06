@@ -2,7 +2,8 @@
 
 No history is read here. Transition-table capture is transactional and never
 locks a resource counter. Event triggers keep direct leaf writes covered when
-partitions are created/attached later; installing requires that DDL privilege.
+partitions are created/attached later; they need a superuser and are skipped
+(with a NOTICE) for a table-owner role.
 """
 
 import hashlib
@@ -88,8 +89,6 @@ def statements(schema, runtime_role=None):
            WHERE n.nspname={schema_literal} AND c.relname='protected_size_source_relations'),'SELECT'),false) THEN RETURN; END IF;"""
     ddl_event, drop_event = event_trigger_names(schema)
     event_name = '"' + ddl_event + '"'
-    yield """DO $fn$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=current_user AND rolsuper)
-      THEN RAISE EXCEPTION 'Protected-size migration requires a superuser to install partition DDL capture; no startup or privilege fallback is supported'; END IF; END $fn$"""
     # Validate the existing authorization contract before creating any ledger object.
     yield f"""DO $fn$
     DECLARE source_owner oid := (SELECT relowner FROM pg_class WHERE oid='snapshot_items'::regclass);
@@ -224,8 +223,15 @@ def statements(schema, runtime_role=None):
         END IF;
       END $fn$"""
     yield "REVOKE ALL ON FUNCTION protected_size_partition_ddl() FROM PUBLIC"
-    yield f"""CREATE EVENT TRIGGER {event_name} ON ddl_command_end WHEN TAG IN ('CREATE TABLE','ALTER TABLE')
-      EXECUTE FUNCTION protected_size_partition_ddl()"""
+    # Event triggers need a superuser. A table-owner role (Taylor Morrison's migrate job) installs
+    # everything else: writes through the existing tables and partitions are still captured; only a
+    # later manual partition change needs `SELECT protected_size_install_triggers()` run by hand.
+    superuser = "EXISTS(SELECT 1 FROM pg_roles WHERE rolname=current_user AND rolsuper)"
+    yield f"""DO $fn$ BEGIN IF {superuser} THEN
+      EXECUTE $ddl$CREATE EVENT TRIGGER {event_name} ON ddl_command_end WHEN TAG IN ('CREATE TABLE','ALTER TABLE')
+      EXECUTE FUNCTION protected_size_partition_ddl()$ddl$;
+      ELSE RAISE NOTICE 'protected-size: not a superuser, partition DDL capture skipped; after changing snapshots/snapshot_items partitions run SELECT protected_size_install_triggers()';
+      END IF; END $fn$"""
     yield f"""CREATE FUNCTION protected_size_partition_drop() RETURNS event_trigger LANGUAGE plpgsql SET search_path=pg_catalog,{q},pg_temp AS $fn$
       BEGIN
         {hook_guard}
@@ -234,7 +240,9 @@ def statements(schema, runtime_role=None):
         UPDATE protected_size_control SET discovery_done=false,discovery_cursor=NULL,discovery_phase='source',discovery_epoch=discovery_epoch+1;
       END IF; END $fn$"""
     yield "REVOKE ALL ON FUNCTION protected_size_partition_drop() FROM PUBLIC"
-    yield f"""CREATE EVENT TRIGGER "{drop_event}" ON sql_drop EXECUTE FUNCTION protected_size_partition_drop()"""
+    yield f"""DO $fn$ BEGIN IF {superuser} THEN
+      EXECUTE $ddl$CREATE EVENT TRIGGER "{drop_event}" ON sql_drop EXECUTE FUNCTION protected_size_partition_drop()$ddl$;
+      END IF; END $fn$"""
 
     yield f"""DO $fn$
     DECLARE source_role text := pg_catalog.pg_get_userbyid((SELECT relowner FROM pg_class WHERE oid='snapshot_items'::regclass));
