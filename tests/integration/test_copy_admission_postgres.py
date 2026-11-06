@@ -688,3 +688,36 @@ async def test_transient_abort_before_copy_does_not_consume_execution_failures(s
             task.ready_at = await db.scalar(select(func.clock_timestamp()))
         async with store.factory.begin() as db:
             current = await copy_work.claim(db, owner_id=uuid4())
+
+
+async def test_kept_claim_runs_the_next_batch_without_requeueing(store):
+    """Railway 2026-11-06: consecutive batches of one copy task ran ~8 s apart, ~3 s of SQL and a
+    ~5 s gap; each batch re-entered the fair queue and was claimed again. A claim now keeps its task
+    between batches; each batch still re-fences state, generation and owner under row locks."""
+    _, task_id, claim = await queued(store, rows=3)
+    first = await api().run_batch(store.factory, claim, batch_size=1, keep_claim=True)
+    assert (first.status, first.rows) == ('RUNNING', 1)
+    async with store.factory() as db:
+        task = await db.get(models.CopyWorkTask, task_id)
+        assert (task.state, task.generation, task.lease_owner_id, task.checkpoint, task.attempts) == (
+            'RUNNING', claim.generation, claim.owner_id, 1, 1)
+        assert await copy_work.claim(db, owner_id=uuid4()) is None  # nobody else takes it meanwhile
+        await db.rollback()
+    second = await api().run_batch(store.factory, claim, batch_size=1, keep_claim=True)
+    third = await api().run_batch(store.factory, claim, batch_size=1, keep_claim=True)
+    assert (second.status, third.status) == ('RUNNING', 'COMPLETED')
+    async with store.factory() as db:
+        task = await db.get(models.CopyWorkTask, task_id)
+        assert (task.state, task.row_count, task.lease_owner_id) == ('COMPLETED', 3, None)
+
+
+async def test_kept_claim_returns_to_the_fair_queue_before_its_lease_runs_out(store):
+    _, task_id, claim = await queued(store, rows=3)
+    async with store.factory.begin() as db:
+        task = await db.get(models.CopyWorkTask, task_id)
+        task.lease_expires_at = await db.scalar(select(func.clock_timestamp())) + timedelta(seconds=30)
+    result = await api().run_batch(store.factory, claim, batch_size=1, keep_claim=True, statement_timeout_ms=60000)
+    assert result.status == 'READY'
+    async with store.factory() as db:
+        task = await db.get(models.CopyWorkTask, task_id)
+        assert (task.state, task.lease_owner_id, task.checkpoint) == ('READY', None, 1)

@@ -82,6 +82,19 @@ async def test_run_once_reclaims_expired_task_generation_without_lost_checkpoint
     await runner.close()
 
 
+async def test_run_once_keeps_its_claim_across_batches_while_the_lease_allows(store):
+    _, task_id, _, _ = await pending(store)
+    async with store.factory() as db:
+        claimed_before = (await db.get(models.CopyWorkTask, task_id)).generation
+    runner = api().CopyWorkRunner(store.factory, completer(store, []), concurrency=1, batch_size=1)
+    result = await runner.run_once()
+    assert result.status == 'COMPLETED'
+    async with store.factory() as db:
+        task = await db.get(models.CopyWorkTask, task_id)
+        assert (task.row_count, task.generation) == (2, claimed_before + 1)  # two batches, one claim
+    await runner.close()
+
+
 async def test_recovery_finds_settled_workflow_when_final_notification_was_lost(store):
     _, _, workflow_id, _ = await pending(store, task_state='COMPLETED')
     calls = []
