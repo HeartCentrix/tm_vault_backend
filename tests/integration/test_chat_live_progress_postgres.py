@@ -157,3 +157,33 @@ async def test_failed_advisory_refresh_preserves_publication_and_replay_repairs_
     await source_adapter.run(scope)
     assert await counters(store, scope) == (1, first["bytes_total"], 0, 0)
     assert source_adapter.source.message_calls == ["chat-alpha", "chat-alpha"]
+
+
+async def test_live_new_count_is_only_changed_messages_and_ends_at_final_delta(store):
+    # Activity showed the running total (34,951) then the final delta (20); users read it as a full re-backup.
+    old = [message(graph_id="m1"), message(graph_id="m2")]
+    beta = [message(graph_id="b1")]
+    first, _, _ = await store.capture(old)
+    await store.capture(beta, scope=replace(first, chat_id="chat-beta"))
+    async with store.factory.begin() as session:
+        (await session.get(models.Snapshot, first.snapshot_id)).status = models.SnapshotStatus.COMPLETED
+    second = await store.new_scope()
+    seen = []
+    for scope, items in ((replace(second, chat_id="chat-beta"), beta),
+                         (second, [*old, message("edited", graph_id="m3")])):
+        await store.capture(items, scope=scope)
+        await refresh(store, scope)
+        await refresh(store, scope)  # replayed refresh never double counts
+        async with store.factory() as session:
+            snapshot = await session.get(models.Snapshot, second.snapshot_id)
+            seen.append(((snapshot.extra_data or {}).get("chat_live_new_items"), snapshot.item_count))
+    assert seen == [(0, 1), (1, 4)]
+    async with store.factory() as session:
+        assert (await chat_catalogue_entry.catalogue_snapshot_result(session, second.snapshot_id))["new_item_count"] == 1
+
+
+async def test_first_capture_live_new_count_is_everything(store):
+    scope, _, _ = await store.capture([message()])
+    await refresh(store, scope)
+    async with store.factory() as session:
+        assert (await session.get(models.Snapshot, scope.snapshot_id)).extra_data["chat_live_new_items"] == 1

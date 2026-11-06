@@ -154,6 +154,39 @@ async def adopt_chat_catalogue(session, *, resource_id, snapshot_id, writer_enab
     return True
 
 
+async def _prior_snapshot_id(session, snapshot):
+    """The prior backup whose rows, whatever form they take, this run's delta compares with."""
+    return await session.scalar(select(Snapshot.id).where(
+        Snapshot.resource_id == snapshot.resource_id,
+        Snapshot.id != snapshot.id, Snapshot.job_id != snapshot.job_id,
+        Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL]),
+        Snapshot.created_at <= snapshot.created_at).order_by(Snapshot.created_at.desc(), Snapshot.id.desc()).limit(1))
+
+
+async def _chat_new_items(session, scope, prior):
+    """Primary items of this chat's published inventory whose version the prior backup lacks.
+    Reads only this chat's inventory (index probes into the prior's rows), never an effective set."""
+    inventory = await session.scalar(select(SnapshotChatInventory.inventory_id).where(
+        SnapshotChatInventory.snapshot_id == scope.snapshot_id, SnapshotChatInventory.chat_id == scope.chat_id))
+    if inventory is None:
+        return 0
+    from shared.snapshot_reuse import items_snapshot_id
+    target = await items_snapshot_id(session, prior)
+    if inventory == await session.scalar(select(SnapshotChatInventory.inventory_id).where(
+            SnapshotChatInventory.snapshot_id == target, SnapshotChatInventory.chat_id == scope.chat_id)):
+        return 0  # linked or reused unchanged chat
+    # ponytail: ignores the prior overlay's own-row shadowing and removals; both can only undercount,
+    # and final settlement recounts exactly.
+    return int(await session.scalar(text("""
+        SELECT count(*) FROM chat_inventory_items ii JOIN chat_item_versions v ON v.id = ii.version_id
+         WHERE ii.inventory_id = :inv AND v.item_type NOT IN ('CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT')
+           AND NOT EXISTS (SELECT 1 FROM snapshot_items p
+                            WHERE p.snapshot_id IN (:t, COALESCE((SELECT overlay_base_id FROM snapshots WHERE id = :t), :t))
+                              AND p.item_type = v.item_type AND p.external_id = ii.logical_key
+                              AND p.chat_version_id = ii.version_id)"""),
+        {"inv": inventory, "t": target}) or 0)
+
+
 async def catalogue_snapshot_result(session, snapshot_id, *, force_recount=False):
     """Count narrow physical links; current versions never need history payloads."""
     snapshot = await session.get(Snapshot, snapshot_id)
@@ -174,12 +207,7 @@ async def catalogue_snapshot_result(session, snapshot_id, *, force_recount=False
     totals = ("SELECT count(*) FILTER (WHERE e.item_type NOT IN ('CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT')), "
               "COALESCE(sum(e.content_size), 0) FROM snapshot_items_effective(CAST(:s AS uuid)) e ")
     count, logical_bytes = (await session.execute(text(totals), {"s": str(snapshot_id)})).one()
-    # The prior backup's rows, whatever form it takes, are what this run compares with.
-    prior = None if snapshot.reuse_chain_root_id else await session.scalar(select(Snapshot.id).where(
-        Snapshot.resource_id == snapshot.resource_id,
-        Snapshot.id != snapshot_id, Snapshot.job_id != snapshot.job_id,
-        Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL]),
-        Snapshot.created_at <= snapshot.created_at).order_by(Snapshot.created_at.desc(), Snapshot.id.desc()).limit(1))
+    prior = None if snapshot.reuse_chain_root_id else await _prior_snapshot_id(session, snapshot)
     if snapshot.reuse_chain_root_id:
         new_count, new_bytes = 0, 0
     elif prior is None:
@@ -214,6 +242,24 @@ async def refresh_catalogue_progress(session, scope):
     # final settlement still reconciles their complete physical inventory.
     snapshot.item_count = max(int(snapshot.item_count or 0), int(primary_count))
     snapshot.bytes_total = max(int(snapshot.bytes_total or 0), int(logical_bytes))
+    # Activity shows new/changed messages while running (the total read as "re-backing up everything").
+    # Kept apart from new_item_count, which stays the settled delta. Per chat, so a replayed refresh
+    # replaces rather than adds.
+    extra = dict(snapshot.extra_data or {})
+    prior = None if snapshot.reuse_chain_root_id else await _prior_snapshot_id(session, snapshot)
+    if snapshot.reuse_chain_root_id:
+        live_new = 0
+    elif prior is None:  # first backup: everything is new
+        live_new = snapshot.item_count
+    else:
+        per_chat = dict(extra.get("chat_live_new") or {})
+        per_chat[scope.chat_id] = await _chat_new_items(session, scope, prior)
+        per_chat = {cid: n for cid, n in per_chat.items() if n}
+        extra["chat_live_new"] = per_chat
+        live_new = sum(per_chat.values())
+    extra["chat_live_new_items"] = max(int(extra.get("chat_live_new_items") or 0), int(live_new))
+    if extra != (snapshot.extra_data or {}):
+        snapshot.extra_data = extra
     await session.flush()
 
 

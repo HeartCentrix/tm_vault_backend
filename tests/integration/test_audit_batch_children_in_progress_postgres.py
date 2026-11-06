@@ -60,6 +60,12 @@ async def test_in_progress_child_shows_items_and_bytes_so_far(store, monkeypatch
     assert chats["status"] == "IN_PROGRESS"
     assert chats["itemCount"] == 1231
     assert chats["bytesAdded"] == 78419186
+    # A chat catalogue run publishes its running new/changed count; Activity shows that, not the total.
+    async with store.factory.begin() as session:
+        (await session.get(models.Snapshot, snap_id)).extra_data = {"chat_inventory_format": 1, "chat_live_new_items": 20}
+    chats = next(c for r in (await _as.get_batch_children(batch_id))["resources"] for c in (r.get("children") or [])
+                 if c["type"] == "USER_CHATS")
+    assert (chats["itemCount"], chats["itemCountTotal"]) == (20, 1231)
 
 
 async def test_parentless_resources_of_any_type_are_listed_in_the_drilldown(store, monkeypatch):
