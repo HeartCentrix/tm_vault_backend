@@ -56,6 +56,11 @@ async def test_rehydrates_every_id_before_deleting(monkeypatch):
         return None
 
     monkeypatch.setattr(rc, "_rehydrate_reuse_heir", _fake_rehydrate)
+
+    async def _no_overlays(session, sid, *, pointer_heir, doomed_ids):
+        return None
+
+    monkeypatch.setattr(rc, "_rehydrate_overlay_dependents", _no_overlays)
     sess = _FakeSession()
 
     n = await rc._delete_snapshots(sess, doomed)
