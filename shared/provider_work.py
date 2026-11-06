@@ -11,6 +11,7 @@ import os
 from uuid import UUID, uuid4
 from sqlalchemy import case, delete, exists, func, select, update
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 from shared.models import (Job, Snapshot, SnapshotPartition, Resource, SlaPolicy,
     ProviderWork, ProviderWorkUnit, ProviderWorkQueue, ProviderWorkControl)
@@ -208,12 +209,48 @@ async def _owned(session, claim, *, allow_terminal=False, share_job=True):
     return row, job, snapshot, partition
 
 
-async def claim_due_work(session, *, owner_id, lease_seconds=120, _clamp_rounds=0):
+async def claim_due_work(session, *, owner_id, lease_seconds=120):
     if lease_seconds <= 0:
         raise ValueError('provider lease must be positive')
-    await session.execute(insert(ProviderWorkControl).values(id='global', enabled=enabled()).on_conflict_do_nothing())
-    control = await session.scalar(select(ProviderWorkControl).where(ProviderWorkControl.id == 'global')
+    owner_id = _uuid(owner_id)
+    # The cluster-wide control lock covers only capacity, the fair choice and a committed
+    # reservation (it counts as running at once); validation runs in the caller's transaction.
+    async with AsyncSession(session.bind, expire_on_commit=False) as reserving:
+        async with reserving.begin():
+            reserved = await _reserve_due_work(reserving, owner_id=owner_id, lease_seconds=lease_seconds)
+    if reserved is None:
+        return None
+    # ponytail: if this transaction aborts, the reservation holds its slot until the lease
+    # expires (lease_seconds), like a worker that crashed right after claiming.
+    return await _admit_reserved(session, reserved, owner_id=owner_id)
+
+
+@dataclass(frozen=True)
+class _Reservation:
+    work_id: UUID
+    snapshot_id: UUID
+    partition_id: UUID | None
+    generation: int
+    prior: tuple
+
+
+async def _charge(session, row, amount):
+    keys = (row.tenant_queue_key, row.policy_queue_key, row.resource_queue_key)
+    # Match ensure_work's tenant -> policy -> resource lock order before charging.
+    await session.execute(select(ProviderWorkQueue.key).where(ProviderWorkQueue.key.in_(keys))
+        .order_by(case({key: index for index, key in enumerate(keys)}, value=ProviderWorkQueue.key))
+        .with_for_update())
+    await session.execute(update(ProviderWorkQueue).where(ProviderWorkQueue.key.in_(keys))
+        .values(virtual_finish=ProviderWorkQueue.virtual_finish + amount / ProviderWorkQueue.weight))
+
+
+async def _reserve_due_work(session, *, owner_id, lease_seconds):
+    control_query = (select(ProviderWorkControl).where(ProviderWorkControl.id == 'global')
         .with_for_update(skip_locked=True))
+    control = await session.scalar(control_query)
+    if control is None:
+        await session.execute(insert(ProviderWorkControl).values(id='global', enabled=enabled()).on_conflict_do_nothing())
+        control = await session.scalar(control_query)
     if control is None or not control.enabled:
         return None
     now = await session.scalar(select(func.clock_timestamp()))
@@ -223,43 +260,24 @@ async def claim_due_work(session, *, owner_id, lease_seconds=120, _clamp_rounds=
     tq, pq, rq = (aliased(ProviderWorkQueue) for _ in range(3))
     due = (((ProviderWork.state == 'WAITING') & (ProviderWork.next_eligible_at <= now)) |
         (ProviderWork.state.in_(('DRAINING', 'RESUMING')) & (ProviderWork.lease_expires_at <= now)))
-    candidates = (await session.scalars(select(ProviderWork).join(tq, tq.key == ProviderWork.tenant_queue_key)
-        .join(pq, pq.key == ProviderWork.policy_queue_key).join(rq, rq.key == ProviderWork.resource_queue_key)
-        .where(due, ProviderWork.protocol_version == control.epoch, ProviderWork.tenant_id.notin_(
-            select(ProviderWork.tenant_id).where(running).group_by(ProviderWork.tenant_id)
-                .having(func.count() >= control.tenant_capacity)))
-        .order_by(tq.virtual_finish, pq.virtual_finish, rq.virtual_finish, ProviderWork.queue_entered_at, ProviderWork.id)
-        .limit(64))).all()
-    for hint in candidates:
-        try:
-            job, snapshot, partition = await _parents(session, hint.snapshot_id, hint.partition_id,
-                skip_locked=True, share_job=True)
-        except ProviderWorkConflict:
-            continue
-        row = await session.scalar(select(ProviderWork).where(ProviderWork.id == hint.id).with_for_update(skip_locked=True)
-            .execution_options(populate_existing=True))
+    skipped = []
+    for _ in range(64):
+        row = await session.scalar(select(ProviderWork).join(tq, tq.key == ProviderWork.tenant_queue_key)
+            .join(pq, pq.key == ProviderWork.policy_queue_key).join(rq, rq.key == ProviderWork.resource_queue_key)
+            .where(due, ProviderWork.protocol_version == control.epoch, ProviderWork.id.notin_(skipped),
+                ProviderWork.tenant_id.notin_(select(ProviderWork.tenant_id).where(running)
+                    .group_by(ProviderWork.tenant_id).having(func.count() >= control.tenant_capacity)))
+            .order_by(tq.virtual_finish, pq.virtual_finish, rq.virtual_finish, ProviderWork.queue_entered_at, ProviderWork.id)
+            .limit(1).with_for_update(of=ProviderWork, skip_locked=True).execution_options(populate_existing=True))
         if row is None:
-            continue
-        if not _active(job, snapshot, partition):
-            leaf_status = partition.status if partition else snapshot.status.value
-            terminal = leaf_status in ('COMPLETED', 'PARTIAL', 'FAILED')
-            unresolved = await session.scalar(select(exists(select(ProviderWorkUnit.id).where(
-                ProviderWorkUnit.work_id == row.id, ProviderWorkUnit.state != 'COMPLETED'))))
-            row.state = (('PARTIAL' if leaf_status == 'COMPLETED' and unresolved else leaf_status)
-                if terminal and job.status.value != 'CANCELLED' else 'CANCELLED')
-            row.parent_settle_pending = terminal and row.state != 'CANCELLED'
-            await session.execute(update(ProviderWorkUnit).where(ProviderWorkUnit.work_id == row.id,
-                ProviderWorkUnit.state.in_(('PENDING', 'RUNNING'))).values(state='FAILED'))
-            row.generation += 1
-            continue
-        if row.state not in ACTIVE or (row.lease_expires_at and row.lease_expires_at > now and row.state != 'WAITING'):
-            continue
-        leaf = partition or snapshot
-        if (leaf.lease_token != row.parent_lease_token or (partition is None and
-            (snapshot.lease_token != row.snapshot_lease_token or job.lease_token != row.job_lease_token))):
-            row.state, row.last_reason, row.parent_settle_pending = 'FAILED', 'parent_generation_changed', False
-            row.generation += 1
-            row.lease_owner_id = row.lease_expires_at = None
+            return None
+        # Skip a leaf whose parents are busy without waiting under the control lock.
+        probe = select(Job.id).join(Snapshot, Snapshot.job_id == Job.id).where(Snapshot.id == row.snapshot_id)
+        if row.partition_id:
+            probe = probe.join(SnapshotPartition, SnapshotPartition.snapshot_id == Snapshot.id).where(
+                SnapshotPartition.id == row.partition_id)
+        if await session.scalar(probe.with_for_update(skip_locked=True, read=True, key_share=True)) is None:
+            skipped.append(row.id)
             continue
         if (row.continuation or {}).get('queue_was_cooling'):
             for key, column in ((row.tenant_queue_key, ProviderWork.tenant_queue_key),
@@ -278,59 +296,99 @@ async def claim_due_work(session, *, owner_id, lease_seconds=120, _clamp_rounds=
             row.continuation = {**row.continuation, 'queue_was_cooling': False}
             await session.flush()
             # Re-sort after changing service clocks; do not use the stale order.
-            if _clamp_rounds >= 63:
-                return None
-            return await claim_due_work(session, owner_id=owner_id, lease_seconds=lease_seconds,
-                _clamp_rounds=_clamp_rounds + 1)
-        # A copy continuation owns its distinct drain until its receipts settle.
-        from shared.models import CopyWorkflow
-        copy = await session.scalar(select(CopyWorkflow).where(CopyWorkflow.target_snapshot_id == snapshot.id,
-            CopyWorkflow.partition_id.is_not_distinct_from(row.partition_id), CopyWorkflow.state.in_(ACTIVE)).with_for_update())
-        if copy is not None and copy.state != 'DRAINING':
             continue
-        from shared.models import ChatCaptureAttempt, ChatInventoryItem, SnapshotChatInventory, SnapshotItem
-        # Expired provider ownership fences the capture even while its longer
-        # local keeper lease remains live. Only exact unpublished links move.
-        while True:
-            old_attempts = (await session.scalars(select(ChatCaptureAttempt).where(
-                ChatCaptureAttempt.snapshot_id == snapshot.id,
-                ChatCaptureAttempt.partition_id.is_not_distinct_from(row.partition_id),
-                (ChatCaptureAttempt.partition_lease_token if partition else ChatCaptureAttempt.snapshot_lease_token) == leaf.lease_token,
-                ChatCaptureAttempt.state.in_(('CREATED','ENUMERATING','CONTENT_PENDING','VERIFYING','READY')),
-                ~exists(select(SnapshotChatInventory.chat_id).where(
-                    SnapshotChatInventory.snapshot_id == snapshot.id,
-                    SnapshotChatInventory.chat_id == ChatCaptureAttempt.chat_id)))
-                .order_by(ChatCaptureAttempt.id).limit(128).with_for_update())).all()
-            if not old_attempts:
-                break
-            for attempt in old_attempts:
-                matching = exists(select(ChatInventoryItem.logical_key).where(
-                    ChatInventoryItem.inventory_id == attempt.staged_inventory_id,
-                    ChatInventoryItem.logical_key == SnapshotItem.external_id,
-                    ChatInventoryItem.version_id == SnapshotItem.chat_version_id))
-                await session.execute(delete(SnapshotItem).where(SnapshotItem.snapshot_id == snapshot.id, matching))
-                attempt.state, attempt.failure_reason = 'SUPERSEDED', 'provider_owner_expired'
-            await session.flush()
-        leaf.lease_token += 1
-        leaf.lease_owner_id, leaf.lease_expires_at = _uuid(owner_id), now + timedelta(seconds=lease_seconds)
-        if partition:
-            partition.status = 'IN_PROGRESS'
-        snapshot.extra_data = {**(snapshot.extra_data or {}), 'provider_phase': 'RUNNING', 'provider_next_eligible_at': None}
-        row.state, row.lease_owner_id, row.lease_expires_at = 'RESUMING', leaf.lease_owner_id, leaf.lease_expires_at
+        prior = (row.state, row.lease_owner_id, row.lease_expires_at)
+        row.state, row.lease_owner_id = 'RESUMING', owner_id
+        row.lease_expires_at = now + timedelta(seconds=lease_seconds)
         row.generation += 1
-        row.parent_lease_token, row.snapshot_lease_token, row.job_lease_token = leaf.lease_token, snapshot.lease_token, job.lease_token
-        if copy is not None:
-            copy.parent_lease_token, copy.snapshot_lease_token, copy.job_lease_token = row.parent_lease_token, row.snapshot_lease_token, row.job_lease_token
-        keys = (row.tenant_queue_key, row.policy_queue_key, row.resource_queue_key)
-        # Match ensure_work's tenant -> policy -> resource lock order before charging.
-        await session.execute(select(ProviderWorkQueue.key).where(ProviderWorkQueue.key.in_(keys))
-            .order_by(case({key: index for index, key in enumerate(keys)}, value=ProviderWorkQueue.key))
-            .with_for_update())
-        await session.execute(update(ProviderWorkQueue).where(ProviderWorkQueue.key.in_(keys))
-            .values(virtual_finish=ProviderWorkQueue.virtual_finish + 1.0 / ProviderWorkQueue.weight))
+        await _charge(session, row, 1.0)
         await session.flush()
-        return _receipt(row)
+        return _Reservation(row.id, row.snapshot_id, row.partition_id, row.generation, prior)
     return None
+
+
+async def _admit_reserved(session, reserved, *, owner_id):
+    async def reservation(release):
+        row = await session.scalar(select(ProviderWork).where(ProviderWork.id == reserved.work_id)
+            .with_for_update().execution_options(populate_existing=True))
+        if (row is None or row.state != 'RESUMING' or row.generation != reserved.generation
+                or row.lease_owner_id != owner_id):
+            return None  # cancelled or re-reserved meanwhile; that writer owns the row now
+        if release:
+            # A turn that never ran: put the row back as it was and refund its fair charge.
+            row.state, row.lease_owner_id, row.lease_expires_at = reserved.prior
+            await _charge(session, row, -1.0)
+        return row
+    try:
+        job, snapshot, partition = await _parents(session, reserved.snapshot_id, reserved.partition_id,
+            skip_locked=True, share_job=True)
+    except ProviderWorkConflict:
+        await reservation(release=True)
+        return None
+    row = await reservation(release=False)
+    if row is None:
+        return None
+    if not _active(job, snapshot, partition):
+        await reservation(release=True)
+        leaf_status = partition.status if partition else snapshot.status.value
+        terminal = leaf_status in ('COMPLETED', 'PARTIAL', 'FAILED')
+        unresolved = await session.scalar(select(exists(select(ProviderWorkUnit.id).where(
+            ProviderWorkUnit.work_id == row.id, ProviderWorkUnit.state != 'COMPLETED'))))
+        row.state = (('PARTIAL' if leaf_status == 'COMPLETED' and unresolved else leaf_status)
+            if terminal and job.status.value != 'CANCELLED' else 'CANCELLED')
+        row.parent_settle_pending = terminal and row.state != 'CANCELLED'
+        await session.execute(update(ProviderWorkUnit).where(ProviderWorkUnit.work_id == row.id,
+            ProviderWorkUnit.state.in_(('PENDING', 'RUNNING'))).values(state='FAILED'))
+        row.generation += 1
+        return None
+    leaf = partition or snapshot
+    if (leaf.lease_token != row.parent_lease_token or (partition is None and
+        (snapshot.lease_token != row.snapshot_lease_token or job.lease_token != row.job_lease_token))):
+        await reservation(release=True)
+        row.state, row.last_reason, row.parent_settle_pending = 'FAILED', 'parent_generation_changed', False
+        row.generation += 1
+        row.lease_owner_id = row.lease_expires_at = None
+        return None
+    # A copy continuation owns its distinct drain until its receipts settle.
+    from shared.models import CopyWorkflow
+    copy = await session.scalar(select(CopyWorkflow).where(CopyWorkflow.target_snapshot_id == snapshot.id,
+        CopyWorkflow.partition_id.is_not_distinct_from(row.partition_id), CopyWorkflow.state.in_(ACTIVE)).with_for_update())
+    if copy is not None and copy.state != 'DRAINING':
+        await reservation(release=True)
+        return None
+    from shared.models import ChatCaptureAttempt, ChatInventoryItem, SnapshotChatInventory, SnapshotItem
+    # Expired provider ownership fences the capture even while its longer
+    # local keeper lease remains live. Only exact unpublished links move.
+    while True:
+        old_attempts = (await session.scalars(select(ChatCaptureAttempt).where(
+            ChatCaptureAttempt.snapshot_id == snapshot.id,
+            ChatCaptureAttempt.partition_id.is_not_distinct_from(row.partition_id),
+            (ChatCaptureAttempt.partition_lease_token if partition else ChatCaptureAttempt.snapshot_lease_token) == leaf.lease_token,
+            ChatCaptureAttempt.state.in_(('CREATED','ENUMERATING','CONTENT_PENDING','VERIFYING','READY')),
+            ~exists(select(SnapshotChatInventory.chat_id).where(
+                SnapshotChatInventory.snapshot_id == snapshot.id,
+                SnapshotChatInventory.chat_id == ChatCaptureAttempt.chat_id)))
+            .order_by(ChatCaptureAttempt.id).limit(128).with_for_update())).all()
+        if not old_attempts:
+            break
+        for attempt in old_attempts:
+            matching = exists(select(ChatInventoryItem.logical_key).where(
+                ChatInventoryItem.inventory_id == attempt.staged_inventory_id,
+                ChatInventoryItem.logical_key == SnapshotItem.external_id,
+                ChatInventoryItem.version_id == SnapshotItem.chat_version_id))
+            await session.execute(delete(SnapshotItem).where(SnapshotItem.snapshot_id == snapshot.id, matching))
+            attempt.state, attempt.failure_reason = 'SUPERSEDED', 'provider_owner_expired'
+        await session.flush()
+    leaf.lease_token += 1
+    leaf.lease_owner_id, leaf.lease_expires_at = owner_id, row.lease_expires_at
+    if partition:
+        partition.status = 'IN_PROGRESS'
+    snapshot.extra_data = {**(snapshot.extra_data or {}), 'provider_phase': 'RUNNING', 'provider_next_eligible_at': None}
+    row.parent_lease_token, row.snapshot_lease_token, row.job_lease_token = leaf.lease_token, snapshot.lease_token, job.lease_token
+    if copy is not None:
+        copy.parent_lease_token, copy.snapshot_lease_token, copy.job_lease_token = row.parent_lease_token, row.snapshot_lease_token, row.job_lease_token
+    await session.flush()
+    return _receipt(row)
 
 
 async def renew_work(session, claim, *, lease_seconds=120):
