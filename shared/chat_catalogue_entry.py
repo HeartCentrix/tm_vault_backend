@@ -289,6 +289,7 @@ def chat_folder(chat, principal_id):
             name = member.get("displayName")
             if isinstance(name, str) and name.strip() and str(member.get("userId") or "").lower() != me:
                 others.append(name.strip())
+        others.sort(key=lambda n: (n.casefold(), n))  # Graph's member order varies between runs
         if not others:
             display = "Chat " + hashlib.sha256(chat["id"].encode()).hexdigest()[:8]
         elif str(chat.get("chatType") or "").lower() == "oneonone":

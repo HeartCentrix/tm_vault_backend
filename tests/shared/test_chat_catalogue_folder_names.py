@@ -55,3 +55,13 @@ def test_visible_history_start_reads_the_principal_membership():
     assert visible_history_start({"members": [member("Me", ME) | {"visibleHistoryStartDateTime": "0001-01-01T00:00:00Z"}]}, ME) is None
     assert visible_history_start({"members": [member("Other", "2")]}, ME) is None
     assert visible_history_start({"members": [member("Me", ME) | {"visibleHistoryStartDateTime": "garbage"}]}, ME) is None
+
+
+def test_group_label_does_not_depend_on_graph_member_order():
+    """Graph returns members in a different order between runs (Railway 2026-11-06 incr #1:
+    'Amit Mishra, Harsh Sharma, Rohit Sharma' then 'Amit Mishra, Rohit Sharma, Harsh Sharma').
+    The changed label made every unchanged chat backup copy its rows instead of pointing at the prior."""
+    others = [member("Rohit Sharma", "2"), member("harsh Sharma", "3"), member("Amit Mishra", "4")]
+    a = {"id": "19:g@thread.v2", "topic": None, "chatType": "group", "members": [member("Me", ME), *others]}
+    b = dict(a, members=[*reversed(others), member("Me", ME)])
+    assert chat_folder(a, ME) == chat_folder(b, ME) == "chats/Amit Mishra, harsh Sharma, Rohit Sharma"
