@@ -321,3 +321,60 @@ async def test_lazy_large_archive_census_has_bounded_descriptor_pages(store):
     print({'archive_scale_rows': count, 'pages': pages, 'max_page_descriptors': 1000,
         'rss_peak_bytes': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
         'elapsed_seconds': round(time.monotonic() - started, 2)})
+
+
+async def _short_children(store, name, declared, listed):
+    ledger = await capture(store)
+    root = await ledger.claim_scope()
+    await ledger.page(root, {'value': [{'id': 'f1', 'displayName': name, 'childFolderCount': declared}]}, BASE)
+    items = await ledger.claim_scope()
+    await ledger.page(items, {'value': []}, items['next_url'])
+    children = await ledger.claim_scope()
+    await ledger.page(children, {'value': [{'id': f'c{i}', 'childFolderCount': 0} for i in range(listed)]},
+                      children['next_url'])
+    return ledger
+
+
+async def _children_row(store):
+    async with store.factory() as db:
+        return await db.scalar(select(models.ArchiveFolderWork).where(
+            models.ArchiveFolderWork.phase == 'children', models.ArchiveFolderWork.folder_id == 'f1'))
+
+
+def _graph(hidden_children):
+    calls = []
+    async def read_folder(url, params=None, **_):
+        calls.append(url)
+        if 'includeHiddenFolders=true' in url:
+            return {'value': [{'id': f'h{i}'} for i in range(hidden_children)]}
+        return {'id': 'f1', 'childFolderCount': 7}
+    return read_folder, calls
+
+
+async def test_hidden_system_child_folders_are_not_a_coverage_loss(store):
+    # Live 2026-11-06: Contacts declares 7 child folders, plain childFolders returns 0,
+    # includeHiddenFolders=true returns all 7 (Recipient Cache, GAL Contacts, ...).
+    ledger = await _short_children(store, 'Contacts', 7, 0)
+    assert (await _children_row(store)).gap_kind == 'count_shortfall'
+    read_folder, calls = _graph(7)
+    await ledger.repair(read_folder=read_folder)
+    row = await _children_row(store)
+    assert (row.state, row.gap_kind, row.evidence['hidden_children']) == ('complete', None, 7)
+    assert any('includeHiddenFolders=true' in c for c in calls)
+    assert (await ledger.summary())['items_enumerated'] == 0  # hidden folders are counted, not backed up
+
+
+async def test_conversation_history_child_graph_never_lists_is_not_a_loss(store):
+    # Live 2026-11-06: Conversation History declares 1 child; v1.0 and beta, with or without
+    # includeHiddenFolders, return none (Teams' system folder).
+    ledger = await _short_children(store, 'Conversation History', 1, 0)
+    await ledger.repair(read_folder=_graph(0)[0])
+    row = await _children_row(store)
+    assert (row.state, row.gap_kind, row.evidence['unlisted_system_children']) == ('complete', None, 1)
+
+
+async def test_child_folders_missing_even_with_hidden_ones_stay_a_gap(store):
+    ledger = await _short_children(store, 'Projects', 5, 3)
+    await ledger.repair(read_folder=_graph(3)[0])
+    row = await _children_row(store)
+    assert row.state != 'complete' and 'hidden_children' not in (row.evidence or {})

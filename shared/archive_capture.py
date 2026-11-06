@@ -434,8 +434,46 @@ class ArchiveCapture:
                 else:
                     await self._refresh_count(scope, read_folder, after=True)
 
+    async def _explain_hidden_children(self, read_folder):
+        """A short childFolders listing is no loss when Graph's hidden system folders make up the
+        difference (Contacts declares 7, lists 0, includeHiddenFolders=true returns all 7) or when
+        it is Conversation History's one child Graph never lists (v1.0 and beta, live 2026-11-06).
+        Hidden folders are counted, not backed up; any other shortfall stays a gap."""
+        async with self.factory() as db:
+            rows = list((await db.scalars(select(Folder).where(Folder.snapshot_id == self.fence.snapshot_id,
+                Folder.capture_generation == self.generation, Folder.state == 'unresolved',
+                Folder.phase == 'children', Folder.gap_kind == 'count_shortfall').limit(100))).all())
+            scopes = [{c.name: getattr(r, c.key) for c in Folder.__table__.columns} for r in rows]
+        for scope in scopes:
+            url, ids = f"{scope['base_url']}/{scope['folder_id']}/childFolders?includeHiddenFolders=true&$top=200", set()
+            try:
+                for _ in range(50):
+                    page = await read_folder(url)
+                    ids.update(c['id'] for c in page.get('value', []) if isinstance(c, dict) and c.get('id'))
+                    url = page.get('@odata.nextLink')
+                    if not url:
+                        break
+            except Exception:
+                continue  # unexplained: the normal repair path still re-reads it
+            declared, observed = scope['declared_count'] or 0, scope['observed_count'] or 0
+            # ponytail: matches the English folder name; a localized Conversation History stays a gap.
+            unlisted = 1 if (declared - max(len(ids), observed) == 1
+                             and (scope['display_path'] or '').rsplit('/', 1)[-1] == 'Conversation History') else 0
+            if len(ids) + unlisted < declared:
+                continue
+            async with self.factory.begin() as db:
+                await self.lock(db)
+                row = await self._scope(db, scope)
+                if (row.state, row.gap_kind) != ('unresolved', 'count_shortfall'):
+                    continue
+                row.state, row.gap_kind = 'complete', None
+                extra = {'unlisted_system_children': unlisted} if unlisted else {'hidden_children': len(ids) - observed}
+                row.evidence = {**(row.evidence or {}), **extra}
+
     async def repair(self, read_folder=None):
         """One finite repair turn, respecting persisted provider cooldowns."""
+        if read_folder:
+            await self._explain_hidden_children(read_folder)
         async with self.factory.begin() as db:
             await self.lock(db)
             rows = list((await db.scalars(select(Folder).where(Folder.snapshot_id == self.fence.snapshot_id,
