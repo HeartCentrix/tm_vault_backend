@@ -9,10 +9,17 @@
 --
 -- Run OUTSIDE a transaction (CREATE INDEX CONCURRENTLY and per-batch COMMIT), as the schema owner:
 --   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c 'SET search_path TO <schema>' -f this_file
--- If interrupted during the index build: DROP INDEX CONCURRENTLY protected_size_winner_anchor; rerun.
+-- An index left INVALID by an interrupted build is dropped and rebuilt on rerun.
 -- Does not touch alembic_version.
 SET lock_timeout = '5s';
 ALTER TABLE protected_size_winners ADD COLUMN IF NOT EXISTS snapshot_id uuid,ADD COLUMN IF NOT EXISTS item_id uuid,ADD COLUMN IF NOT EXISTS created_at timestamp;
+-- CONCURRENTLY waits for every transaction older than itself (railway: lock timeout after 5s on a
+-- busy DB). That wait blocks no writer, so let it wait.
+SET lock_timeout = 0;
+SET statement_timeout = 0;
+SELECT 'DROP INDEX CONCURRENTLY protected_size_winner_anchor'
+ WHERE EXISTS (SELECT 1 FROM pg_index WHERE indexrelid = to_regclass('protected_size_winner_anchor') AND NOT indisvalid)
+\gexec
 CREATE INDEX CONCURRENTLY IF NOT EXISTS protected_size_winner_anchor ON protected_size_winners(resource_id,snapshot_id,item_id);
 DO $fn$
   DECLARE cur_r uuid := '00000000-0000-0000-0000-000000000000'; cur_i bigint := -9223372036854775808;
