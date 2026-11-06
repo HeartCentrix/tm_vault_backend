@@ -884,6 +884,19 @@ async def _delete_snapshots(
     if not ids:
         return 0
     doomed = set(ids)
+    folds = {}
+    for sid in ids:
+        target = await _sparse_fold_target(session, sid, doomed)
+        if target is False:
+            doomed.discard(sid)
+        elif target is not None:
+            folds[sid] = target
+    if len(doomed) < len(ids):
+        logger.warning("[retention] kept %d sparse snapshot(s): no later kept restore point to fold them into",
+                       len(ids) - len(doomed))
+        ids = [i for i in ids if i in doomed]
+        if not ids:
+            return 0
     # Per-id rehydration sweep BEFORE the bulk delete. Most ids will
     # have no descendants (the common case is full snapshots aging
     # out), so the EXISTS probe short-circuits cheaply. Overlays come
@@ -892,6 +905,9 @@ async def _delete_snapshots(
     for sid in ids:
         heir = await _rehydrate_reuse_heir(session, sid, doomed_ids=doomed)
         await _rehydrate_overlay_dependents(session, sid, pointer_heir=heir, doomed_ids=doomed)
+    # After the heirs took their copies: the doomed sparse rows still current move to the next kept point.
+    for sid, (keeper, window) in folds.items():
+        await _fold_sparse_rows(session, sid, keeper, window)
     # Both deletes are scoped to the SAME re-qualified set: deleting the
     # items of a row we then decline to delete would leave a surviving
     # snapshot with no inventory — worse than either outcome.
@@ -903,6 +919,85 @@ async def _delete_snapshots(
         if audit_events and sid in audit_events:
             session.add(audit_events[sid])
     return result.rowcount or 0
+
+
+# Item types captured as deltas: a snapshot holds only what changed, and Recovery and restore rebuild a restore
+# point by unioning every earlier snapshot of the resource (snapshot-service _resolve_sibling_snapshot_ids,
+# restore-worker fetch_snapshot_items), newest row per external_id winning. These are the types for which that
+# union is the only copy of an unchanged item: OneDrive (snapshot-service ONEDRIVE_ITEM_TYPES), SharePoint library
+# files (the 'FILE' leg of _SP_SITE_ROW_IDS; list rows and SHAREPOINT_FILE come from the point itself), calendar
+# and contacts (CONTACT_ITEM_TYPES). Everything else is re-captured whole every run (mail/archive overlays, chat
+# catalogue, SharePoint lists), so its doomed rows have a newer complete copy and are not folded.
+SPARSE_ITEM_TYPES = ("FILE", "ONEDRIVE_FILE", "FILE_VERSION", "CALENDAR_EVENT", "USER_CONTACT", "CONTACT")
+# Statuses the union leaves out (_resolve_sibling_snapshot_ids).
+_NOT_IN_UNION = ("FAILED", "PENDING_DELETION")
+FOLD_BATCH = 5000
+
+
+async def _sparse_fold_target(session: AsyncSession, sid, doomed: Set[uuid.UUID]):
+    """Where a doomed snapshot's sparse rows must go: ``(keeper, window)``, None when it holds none the union
+    reads, or False when no later restore point survives to take them (the snapshot must then be kept).
+
+    keeper = the next surviving snapshot of the resource in the union; window = every union snapshot after the
+    doomed one up to the keeper, doomed or not — a row there supersedes the doomed row."""
+    row = (await session.execute(text(
+        "SELECT d.resource_id, d.created_at FROM snapshots d WHERE d.id = CAST(:d AS uuid) "
+        "AND d.status::text <> ALL(CAST(:out AS text[])) AND EXISTS (SELECT 1 FROM snapshot_items si "
+        "WHERE si.snapshot_id = d.id AND si.item_type = ANY(CAST(:types AS text[])))"),
+        {"d": str(sid), "out": list(_NOT_IN_UNION), "types": list(SPARSE_ITEM_TYPES)})).first()
+    if row is None:
+        return None
+    keeper = (await session.execute(text(
+        "SELECT id, created_at, status::text AS status FROM snapshots WHERE resource_id = :r AND created_at > :t "
+        "AND id <> ALL(CAST(:doomed AS uuid[])) AND status::text <> ALL(CAST(:out AS text[])) "
+        "ORDER BY created_at, id LIMIT 1"),
+        {"r": row.resource_id, "t": row.created_at, "doomed": [str(x) for x in doomed],
+         "out": list(_NOT_IN_UNION)})).first()
+    if keeper is None or keeper.status not in ("COMPLETED", "PARTIAL"):
+        return False
+    window = (await session.execute(text(
+        "SELECT id FROM snapshots WHERE resource_id = :r AND created_at > :t AND created_at <= :k "
+        "AND status::text <> ALL(CAST(:out AS text[]))"),
+        {"r": row.resource_id, "t": row.created_at, "k": keeper.created_at, "out": list(_NOT_IN_UNION)})).scalars().all()
+    return keeper.id, [str(w) for w in window]
+
+
+async def _fold_sparse_rows(session: AsyncSession, sid, keeper, window) -> None:
+    """Move every sparse row of ``sid`` that no snapshot in ``window`` supersedes (same external_id, the union's
+    key) into ``keeper``; drop the superseded ones. Moving keeps the row, its capture time and its blob reference,
+    so the keeper reads exactly as before and blob GC still sees the path referenced. Tombstones move too: a
+    later deletion stays deleted. Each batch shrinks ``sid``, so the cost is O(sparse rows in sid), one
+    (snapshot_id, external_id) index probe per window snapshot per row."""
+    moved_rows = moved_bytes = 0
+    while True:
+        seen, moved, size = (await session.execute(text("""
+            WITH batch AS (
+                SELECT id FROM snapshot_items
+                 WHERE snapshot_id = CAST(:d AS uuid) AND item_type = ANY(CAST(:types AS text[]))
+                 LIMIT :n),
+            moved AS (
+                UPDATE snapshot_items si SET snapshot_id = CAST(:k AS uuid) FROM batch b
+                 WHERE si.id = b.id AND NOT EXISTS (
+                       SELECT 1 FROM snapshot_items l
+                        WHERE l.snapshot_id = ANY(CAST(:window AS uuid[])) AND l.external_id = si.external_id)
+                RETURNING si.id, si.content_size),
+            dropped AS (
+                DELETE FROM snapshot_items si USING batch b
+                 WHERE si.id = b.id AND NOT EXISTS (SELECT 1 FROM moved m WHERE m.id = si.id) RETURNING 1)
+            SELECT (SELECT count(*) FROM batch), (SELECT count(*) FROM moved),
+                   (SELECT COALESCE(sum(content_size), 0) FROM moved)
+        """), {"d": str(sid), "k": str(keeper), "window": window, "types": list(SPARSE_ITEM_TYPES),
+               "n": FOLD_BATCH})).one()
+        moved_rows, moved_bytes = moved_rows + moved, moved_bytes + int(size)
+        if seen < FOLD_BATCH:
+            break
+    if moved_rows:
+        await session.execute(text(
+            "UPDATE snapshots SET item_count = COALESCE(item_count, 0) + :n, "
+            "bytes_total = COALESCE(bytes_total, 0) + :b WHERE id = CAST(:k AS uuid)"),
+            {"n": moved_rows, "b": moved_bytes, "k": str(keeper)})
+    logger.info("[retention] folded %d sparse row(s) of doomed snapshot=%s into kept snapshot=%s",
+                moved_rows, sid, keeper)
 
 
 async def _rehydrate_reuse_heir(

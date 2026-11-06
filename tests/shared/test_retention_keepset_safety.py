@@ -596,6 +596,10 @@ def test_delete_re_asserts_the_in_flight_guard_at_delete_time(monkeypatch):
 
     rehydrated: List[Any] = []
 
+    async def _no_sparse_rows(sess, sid, doomed):   # sparse fold: tests/integration
+        return None
+    monkeypatch.setattr(rc, "_sparse_fold_target", _no_sparse_rows)
+
     async def _fake_rehydrate(sess, sid, *, doomed_ids):
         rehydrated.append(sid)
         return None
