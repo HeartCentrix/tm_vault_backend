@@ -352,13 +352,18 @@ async def copy_manifest_batch(session, task, *, limit: int) -> dict:
           AND phase=(SELECT phase FROM copy_work_items WHERE task_id=:task_id AND ordinal>:checkpoint ORDER BY ordinal LIMIT 1)
          ORDER BY ordinal LIMIT :limit) w) sized
          WHERE run_bytes - pg_column_size(payload) < :max_bytes
+    ), batch_parents AS MATERIALIZED (
+        -- Read each stored json payload once. Correlated on the payload, a fresh-statistics plan
+        -- re-parsed it for every target row it compared (10.5 s of a 10.7 s batch, locally).
+        SELECT DISTINCT COALESCE(b.payload->>'parent_external_id',
+                                 split_part(b.payload->>'external_id','::',1)) AS external_id
+          FROM batch b WHERE b.payload->>'item_type'='EMAIL_ATTACHMENT'
     ), batch_validity AS MATERIALIZED (
         SELECT NOT EXISTS (
-            SELECT 1 FROM batch b WHERE b.payload->>'item_type'='EMAIL_ATTACHMENT'
-              AND NOT EXISTS (SELECT 1 FROM snapshot_items parent
+            SELECT 1 FROM batch_parents bp
+             WHERE NOT EXISTS (SELECT 1 FROM snapshot_items parent
                   WHERE parent.snapshot_id=:tsid AND parent.item_type='EMAIL'
-                    AND parent.external_id=COALESCE(b.payload->>'parent_external_id',
-                        split_part(b.payload->>'external_id','::',1)))) AS ok
+                    AND parent.external_id=bp.external_id)) AS ok
     ), changed AS (
     """
     if task.kind == "CHAT_RENAME":

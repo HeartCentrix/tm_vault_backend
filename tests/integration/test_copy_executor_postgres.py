@@ -417,3 +417,32 @@ def test_batch_byte_cap_is_configurable(monkeypatch):
     finally:
         monkeypatch.delenv("COPY_BATCH_MAX_BYTES")
         importlib.reload(module)
+
+
+async def test_attachment_parent_check_reads_each_stored_payload_once(store):
+    """Local measurement 2026-11-06: with fresh copy_work_items statistics the planner checked each
+    attachment's parent by walking the target's rows and re-reading the row's stored json payload
+    for every comparison (130 attachments x ~236 target rows, 10.5 s of a 10.7 s batch, growing as
+    the target fills). A whole batch must stay inside a few seconds of statement budget."""
+    async with store.factory() as s:
+        await s.execute(text("""
+            INSERT INTO snapshot_items(id,snapshot_id,tenant_id,item_type,external_id,name,content_size,metadata)
+            SELECT gen_random_uuid(),:s,:t,'EMAIL','m' || lpad(n::text,5,'0'),'m',1,'{}'
+              FROM generate_series(1,2000) n CROSS JOIN (VALUES (CAST(:src AS uuid)),(CAST(:tgt AS uuid))) v(s)
+        """.replace(":s,", "v.s,")), {"t": store.tenant, "src": store.source, "tgt": store.target})
+        await s.commit()
+    for n in range(150):
+        await store.add(f"m{2000 - n:05d}::att", kind="EMAIL_ATTACHMENT", parent=f"m{2000 - n:05d}",
+                        metadata={"inline_b64": os.urandom(40000).hex()})
+    task = await store.task("MAIL_CARRY")
+    await prepare(store, task)
+    copied, result = 0, {"done": False}
+    for _ in range(5):  # EMAIL phase, then byte-capped attachment batches
+        async with store.factory() as s:
+            await s.execute(text("SET statement_timeout = '5s'"))
+            result = await executor().copy_manifest_batch(s, task, limit=20000)
+            await s.commit()
+        task.checkpoint, copied = result["cursor"], copied + result["rows"]
+        if result["done"]:
+            break
+    assert result["done"] and copied == 150
