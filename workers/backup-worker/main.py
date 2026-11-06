@@ -4686,6 +4686,20 @@ def _library_tombstone_row(snapshot, tenant_id, item: Dict[str, Any]) -> Dict[st
     }
 
 
+def _onedrive_tombstone_row(snapshot, tenant_id, item: Dict[str, Any]) -> Dict[str, Any]:
+    """A OneDrive file Graph's delta reports deleted, recorded in this run's snapshot so the newest
+    restore point stops showing it while older ones keep their live copy (cf. _library_tombstone_row)."""
+    parent_path = (item.get("parentReference") or {}).get("path") or ""
+    folder = (parent_path.split(":", 1)[1] if ":" in parent_path else parent_path) or "/"
+    return {
+        "id": uuid.uuid4(), "snapshot_id": snapshot.id, "tenant_id": tenant_id, "backend_id": snapshot.backend_id,
+        "external_id": str(item.get("id")), "item_type": "ONEDRIVE_FILE",
+        "name": (item.get("name") or str(item.get("id")))[:255], "folder_path": folder,
+        "content_size": 0, "blob_path": None, "is_deleted": True,
+        "metadata": {"raw": item, "deleted": True},
+    }
+
+
 def _unseen_library_files(prior_rows, seen_by_drive: Dict[str, Set[str]]):
     """prior_rows: newest (external_id, name, folder_path, is_deleted, drive_id) per file before this run.
     A full listing that did not return a still-visible file means it was deleted."""
@@ -9002,6 +9016,7 @@ class BackupWorker:
                         await self._mark_snapshot_full(snapshot)
                     out = []
                     deleted_ids: List[str] = []
+                    deleted_items: List[Dict[str, Any]] = []
                     new_delta_link: Optional[str] = None
                     if saved_delta:
                         next_url = saved_delta
@@ -9037,19 +9052,19 @@ class BackupWorker:
                                 next_url = f"{graph_client.GRAPH_URL}/drives/{drive_id}/root/delta"
                                 out = []
                                 deleted_ids = []
+                                deleted_items = []
                                 pages_seen = 0
                                 continue
                             raise
                         for f in page.get("value", []):
                             # Deletions (@removed annotation OR deleted
-                            # facet). We don't actively tombstone prior
-                            # rows — restore reads the last-known-good
-                            # snapshot per file — but we must not
-                            # re-download or emit them as live files.
+                            # facet): never re-downloaded or emitted as live
+                            # files; recorded below as is_deleted rows.
                             if is_delta_tombstone(f):
                                 _id = f.get("id")
                                 if _id:
                                     deleted_ids.append(_id)
+                                    deleted_items.append(f)
                                 continue
                             # Skip the root folder itself (no name / no parentReference).
                             if not f.get("parentReference"):
@@ -9103,6 +9118,18 @@ class BackupWorker:
                                 f"[{self.worker_id}] [USER_ONEDRIVE] "
                                 f"deltaLink stash failed: {_e}"
                             )
+
+                    # Record deletions so the newest restore point hides them. The cursor only
+                    # advances when this snapshot COMPLETES, so a failed run re-reports them.
+                    # Off until Recovery's OneDrive reads drop is_deleted rows AFTER the
+                    # newest-wins dedup (they filter before it, and /onedrive/ids not at all).
+                    if (deleted_items and snapshot is not None
+                            and os.getenv("ONEDRIVE_RECORD_DELETIONS", "false").strip().lower() in ("1", "true", "yes", "on")):
+                        for _i in range(0, len(deleted_items), 1000):
+                            await self._insert_snapshot_item_rows([
+                                _onedrive_tombstone_row(snapshot, resource.tenant_id, d)
+                                for d in deleted_items[_i:_i + 1000]
+                            ])
 
                     if saved_delta:
                         print(
