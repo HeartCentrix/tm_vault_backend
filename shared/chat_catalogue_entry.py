@@ -801,7 +801,8 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
             if yield_requested and processed < len(keys):
                 yield_provider_turn()
             # No chat read this turn: nothing to re-check, and a full re-list costs pages at 1 request/s per user.
-            if processed or allowed is not None:
+            # An empty listing is still confirmed: an empty backup must not rest on one answer.
+            if processed or allowed is not None or not chats:
                 final_chats = set(await _chat_list(source))
                 if (allowed is None and final_chats != set(chats)) or (allowed is not None and allowed - final_chats):
                     errors.append("chat visibility changed during resource capture")
