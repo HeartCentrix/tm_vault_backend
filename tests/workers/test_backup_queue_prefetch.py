@@ -48,3 +48,28 @@ async def test_dedicated_queue_prefetch(monkeypatch, queue, heavy, normal, dedic
     worker = SimpleNamespace(_backup_queue_name=queue, worker_id="test", _supervised_consume=subscribe)
     await scope["_consume_backup_queues"](worker)
     assert subscriptions == [(queue, expected)]
+
+
+async def test_light_pool_consumes_each_sla_lane_independently(monkeypatch):
+    """Gold (backup.high) and Silver/Bronze (backup.normal) each get their own
+    consumer and prefetch budget, so a full lane can never block the other."""
+    for name in ("BACKUP_HIGH_PREFETCH", "BACKUP_NORMAL_PREFETCH", "BACKUP_URGENT_PREFETCH",
+                 "BACKUP_WORKER_DEDICATED_ONLY", "BACKUP_HEAVY_QUEUE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ONEDRIVE_RETRY_QUEUE_ENABLED", "false")
+    source = Path(__file__).resolve().parents[2] / "workers/backup-worker/main.py"
+    tree = ast.parse(source.read_text())
+    method = next(node for node in ast.walk(tree)
+                  if isinstance(node, ast.AsyncFunctionDef) and node.name == "_consume_backup_queues")
+    scope = {"asyncio": asyncio, "os": os, "message_bus": SimpleNamespace(connect=AsyncMock()),
+             "settings": SimpleNamespace(ONEDRIVE_PARTITION_ENABLED=False)}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"), scope)
+    subscriptions = {}
+
+    async def subscribe(queue_name, prefetch):
+        subscriptions[queue_name] = prefetch
+
+    worker = SimpleNamespace(_backup_queue_name="backup.normal", worker_id="t", _supervised_consume=subscribe)
+    await scope["_consume_backup_queues"](worker)
+    assert subscriptions["backup.high"] > 0 and subscriptions["backup.normal"] > 0
+    assert subscriptions["backup.urgent"] > 0
