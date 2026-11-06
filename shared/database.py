@@ -66,6 +66,7 @@ REQUIRED_TABLES = (
     "chat_inventories", "chat_inventory_items", "snapshot_chat_inventories",
     "chat_catalogue_pins",
     "chat_presentation_plans", "chat_presentation_drafts", "snapshot_chat_presentations",
+    "snapshot_overlay_removals",
 )
 
 REQUIRED_COLUMNS = {
@@ -407,6 +408,10 @@ async def verify_runtime_schema() -> bool:
         if not required.issubset(columns):
             logger.error("[DB INIT] Missing schema columns: %s", sorted(required-columns))
             return False
+        if not (await conn.execute(text("SELECT to_regprocedure(:fn) IS NOT NULL"), {
+                "fn": f"{settings.DB_SCHEMA}.snapshot_items_effective(uuid)"})).scalar():
+            logger.error("[DB INIT] Missing snapshot_items_effective(); apply Alembic revision 0021")
+            return False
         return await _has_required_catalogue_constraints(conn)
 
 
@@ -461,6 +466,109 @@ SNAPSHOT_REUSE_VALIDATE_FUNCTION = """CREATE OR REPLACE FUNCTION validate_snapsh
             RETURN NEW;
         END;
         $$ LANGUAGE plpgsql;"""
+
+
+# Overlay mail snapshots (docs/mail-overlay-snapshots.md). The ONE definition of a snapshot's
+# inventory: a pointer resolves to its chain root; the root's own rows; plus, for an overlay, the
+# mail rows of its full base that it neither owns (by item_type, external_id) nor removed, and
+# whose parent email (attachments) is visible. A full snapshot's second branch is empty. LANGUAGE
+# sql + STABLE + single SELECT so the planner inlines it and pushes the caller's predicates down.
+SNAPSHOT_ITEMS_EFFECTIVE_FUNCTION = """CREATE OR REPLACE FUNCTION snapshot_items_effective(p_snapshot_id uuid)
+        RETURNS SETOF snapshot_items LANGUAGE sql STABLE AS $$
+        SELECT o.* FROM snapshot_items o
+         WHERE o.snapshot_id = (SELECT COALESCE(s.reuse_chain_root_id, s.id) FROM snapshots s
+                                 WHERE s.id = p_snapshot_id)
+        UNION ALL
+        SELECT b.* FROM snapshot_items b
+         WHERE b.snapshot_id = (SELECT t.overlay_base_id FROM snapshots s
+                                  JOIN snapshots t ON t.id = COALESCE(s.reuse_chain_root_id, s.id)
+                                 WHERE s.id = p_snapshot_id)
+           AND b.item_type IN ('EMAIL', 'EMAIL_ATTACHMENT')
+           AND NOT EXISTS (SELECT 1 FROM snapshot_items o
+                            WHERE o.snapshot_id = (SELECT COALESCE(s.reuse_chain_root_id, s.id) FROM snapshots s
+                                                    WHERE s.id = p_snapshot_id)
+                              AND o.item_type = b.item_type AND o.external_id = b.external_id)
+           AND NOT EXISTS (SELECT 1 FROM snapshot_overlay_removals r
+                            WHERE r.snapshot_id = (SELECT COALESCE(s.reuse_chain_root_id, s.id) FROM snapshots s
+                                                    WHERE s.id = p_snapshot_id)
+                              AND r.item_type = b.item_type AND r.external_id = b.external_id)
+           AND (b.item_type = 'EMAIL'
+                OR EXISTS (SELECT 1 FROM snapshot_items o
+                            WHERE o.snapshot_id = (SELECT COALESCE(s.reuse_chain_root_id, s.id) FROM snapshots s
+                                                    WHERE s.id = p_snapshot_id)
+                              AND o.item_type = 'EMAIL'
+                              AND o.external_id = COALESCE(b.parent_external_id, split_part(b.external_id, '::', 1)))
+                OR (EXISTS (SELECT 1 FROM snapshot_items p
+                             WHERE p.snapshot_id = (SELECT t.overlay_base_id FROM snapshots s
+                                                      JOIN snapshots t ON t.id = COALESCE(s.reuse_chain_root_id, s.id)
+                                                     WHERE s.id = p_snapshot_id)
+                               AND p.item_type = 'EMAIL'
+                               AND p.external_id = COALESCE(b.parent_external_id, split_part(b.external_id, '::', 1)))
+                    AND NOT EXISTS (SELECT 1 FROM snapshot_overlay_removals r
+                                     WHERE r.snapshot_id = (SELECT COALESCE(s.reuse_chain_root_id, s.id)
+                                                              FROM snapshots s WHERE s.id = p_snapshot_id)
+                                       AND r.item_type = 'EMAIL'
+                                       AND r.external_id = COALESCE(b.parent_external_id,
+                                                                    split_part(b.external_id, '::', 1)))))
+        $$;"""
+
+SNAPSHOT_OVERLAY_VALIDATE_FUNCTION = """CREATE OR REPLACE FUNCTION validate_snapshot_overlay_base()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            IF NEW.overlay_base_id IS NULL THEN
+                RETURN NEW;
+            END IF;
+            IF NEW.reuse_of_snapshot_id IS NOT NULL THEN
+                RAISE EXCEPTION 'snapshot % cannot be both a reuse pointer and an overlay', NEW.id;
+            END IF;
+            -- Single level: the base is a FULL snapshot (neither overlay nor pointer) of the same resource.
+            PERFORM 1 FROM snapshots b
+              WHERE b.id = NEW.overlay_base_id AND b.id <> NEW.id
+                AND b.resource_id = NEW.resource_id
+                AND b.overlay_base_id IS NULL AND b.reuse_of_snapshot_id IS NULL;
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'overlay_base_id % invalid for snapshot % (must be a full snapshot of the same resource)',
+                    NEW.overlay_base_id, NEW.id;
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;"""
+
+# Applied after the tables exist: by init_db (bootstrap), migration 0021, the manual Railway script
+# scripts/2026_11_06_mail_overlay_snapshots.sql, and every Base.metadata.create_all on PostgreSQL.
+MAIL_OVERLAY_ROUTINES = [
+    SNAPSHOT_ITEMS_EFFECTIVE_FUNCTION,
+    SNAPSHOT_OVERLAY_VALIDATE_FUNCTION,
+    "DROP TRIGGER IF EXISTS snapshots_overlay_validate ON snapshots",
+    "CREATE TRIGGER snapshots_overlay_validate BEFORE INSERT OR UPDATE OF overlay_base_id, reuse_of_snapshot_id "
+    "ON snapshots FOR EACH ROW EXECUTE FUNCTION validate_snapshot_overlay_base()",
+]
+MAIL_OVERLAY_DDL = [
+    "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS overlay_base_id UUID REFERENCES snapshots(id) ON DELETE RESTRICT",
+    "CREATE INDEX IF NOT EXISTS ix_snapshots_overlay_base ON snapshots (overlay_base_id) "
+    "WHERE overlay_base_id IS NOT NULL",
+    "CREATE TABLE IF NOT EXISTS snapshot_overlay_removals ("
+    "snapshot_id UUID NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE, "
+    "item_type VARCHAR NOT NULL, external_id VARCHAR NOT NULL, "
+    "PRIMARY KEY (snapshot_id, item_type, external_id))",
+    *MAIL_OVERLAY_ROUTINES,
+]
+
+
+def _install_mail_overlay_routines(target, connection, **kw):
+    """create_all builds the overlay column + table from the models; the function and trigger
+    follow whenever the tables they read exist (a create_all of a table subset skips them)."""
+    if connection.dialect.name != "postgresql":
+        return
+    from sqlalchemy import inspect as sa_inspect
+    inspector = sa_inspect(connection)
+    if all(inspector.has_table(t) for t in ("snapshots", "snapshot_items", "snapshot_overlay_removals")):
+        for ddl in MAIL_OVERLAY_ROUTINES:
+            connection.execute(text(ddl))
+
+
+from sqlalchemy import event as _sa_event  # noqa: E402
+_sa_event.listen(Base.metadata, "after_create", _install_mail_overlay_routines)
 
 
 async def init_db() -> None:
@@ -1562,6 +1670,8 @@ async def init_db() -> None:
         # together (reuse snapshot); validation trigger below enforces.
         "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS reuse_of_snapshot_id UUID REFERENCES snapshots(id) ON DELETE RESTRICT;",
         "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS reuse_chain_root_id UUID REFERENCES snapshots(id) ON DELETE RESTRICT;",
+        # Overlay mail snapshots (MAIL_OVERLAY_DDL below; docs/mail-overlay-snapshots.md).
+        MAIL_OVERLAY_DDL[0] + ";",
         # Distributed reconciliation lease columns (2026-05-16 design).
         # Three columns per work table: who holds the lease, when it
         # expires, and a monotonic fence token. The fence token defends
@@ -1771,6 +1881,7 @@ async def init_db() -> None:
         "BEFORE INSERT OR UPDATE OF reuse_of_snapshot_id, reuse_chain_root_id "
         "ON snapshots FOR EACH ROW "
         "EXECUTE FUNCTION validate_snapshot_reuse_target();",
+        *MAIL_OVERLAY_DDL,
     ]
 
     alter_statements = [

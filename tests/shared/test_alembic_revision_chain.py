@@ -67,7 +67,8 @@ EXPECTED_CHAIN = [
     ('0018', '0017'),
     ('0019', '0018'),            # PARTIAL job status
     ('0020', '0019'),            # activity rollup lookup indexes
-    ('0022', '0020'),            # SKIPPED snapshot status (re-chain onto 0021 at merge)
+    ('0021', '0020'),            # overlay mail snapshots
+    ('0022', '0021'),            # SKIPPED snapshot status
 ]
 
 # Substring that must appear in the module docstring of each pending revision,
@@ -87,6 +88,7 @@ PENDING_SUBJECTS = {
     "0018": "an archive may point at a PARTIAL prior",
     "0019": "PARTIAL job status",
     "0020": "Activity rollup lookup indexes",
+    "0021": "Overlay mail snapshots",
     "0022": "SKIPPED snapshot status",
 }
 

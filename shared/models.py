@@ -588,6 +588,14 @@ class Snapshot(Base):
         ForeignKey(SNAPSHOT_ID_FOREIGN_KEY, ondelete="RESTRICT"),
         nullable=True,
     )
+    # Overlay snapshot (docs/mail-overlay-snapshots.md): owns only the rows changed since this FULL
+    # base snapshot, plus snapshot_overlay_removals; readers use snapshot_items_effective(). NULL on
+    # full snapshots and pointers. Trigger snapshots_overlay_validate keeps it single-level.
+    overlay_base_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey(SNAPSHOT_ID_FOREIGN_KEY, ondelete="RESTRICT"),
+        nullable=True,
+    )
     # Reconciliation lease (2026-05-16 design).
     lease_owner_id = Column(UUID(as_uuid=True), nullable=True)
     lease_expires_at = Column(DateTime(timezone=True), nullable=True)
@@ -654,6 +662,17 @@ class SnapshotItem(Base):
     chat_version_id = Column(UUID(as_uuid=True), ForeignKey("chat_item_versions.id", ondelete="RESTRICT",
                              name="fk_snapshot_items_chat_version"), nullable=True, index=True)
     created_at = Column(DateTime, default=utcnow)
+
+
+class SnapshotOverlayRemoval(Base):
+    """A base row an overlay snapshot hides (deleted, folder re-bootstrapped, dropped by the carry's
+    filters). Keyed like snapshot_items' natural key; removing an EMAIL also hides its base
+    attachments unless the overlay owns that email."""
+    __tablename__ = "snapshot_overlay_removals"
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey(SNAPSHOT_ID_FOREIGN_KEY, ondelete="CASCADE"),
+                         primary_key=True)
+    item_type = Column(String, primary_key=True)
+    external_id = Column(String, primary_key=True)
 
 
 class SnapshotPartition(Base):
