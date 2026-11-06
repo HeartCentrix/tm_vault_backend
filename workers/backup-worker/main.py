@@ -4528,6 +4528,25 @@ def sharepoint_cursor_blocking_failures(stats: Dict[str, Any]) -> int:
     )
 
 
+def sharepoint_advanceable_drive_tokens(stats: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
+    """The new per-drive cursors this run may persist, ``{site_id: {drive_id: deltaLink}}``.
+
+    A drive's deltaLink is registered only after that drive's walk completes, and a failed
+    download leaves a hole only in ITS drive's delta stream — so a drive failure holds back
+    that drive's cursor alone. Holding back every drive of the site let one persistently
+    failing library make every other library re-download a growing change set each run.
+    enum_fail, or a drive failure not attributed to a drive, still holds back every cursor.
+    """
+    failed = stats.get("failed_drive_ids") or set()
+    if (int(stats.get("enum_fail", 0) or 0) or None in failed
+            or (int(stats.get("drive_fail", 0) or 0) and not failed)):
+        return {}
+    return {
+        site: {d: t for d, t in (per or {}).items() if t and d not in failed}
+        for site, per in (stats.get("new_drive_tokens") or {}).items()
+    }
+
+
 def _entra_item_display_name(item_data: Dict[str, Any]) -> str:
     """Human-readable name for an item persisted by the generic Entra /
     legacy per-object backup path.
@@ -4664,6 +4683,20 @@ def _library_tombstone_row(snapshot, tenant_id, item: Dict[str, Any]) -> Dict[st
         "folder_path": _drive_item_folder_path(item), "content_size": 0, "blob_path": None, "is_deleted": True,
         "metadata": {"structured": {"drive_id": drive_id, "site_label": item.get("_site_label"),
                                     "library": item.get("_drive_name"), "deleted": True}},
+    }
+
+
+def _onedrive_tombstone_row(snapshot, tenant_id, item: Dict[str, Any]) -> Dict[str, Any]:
+    """A OneDrive file Graph's delta reports deleted, recorded in this run's snapshot so the newest
+    restore point stops showing it while older ones keep their live copy (cf. _library_tombstone_row)."""
+    parent_path = (item.get("parentReference") or {}).get("path") or ""
+    folder = (parent_path.split(":", 1)[1] if ":" in parent_path else parent_path) or "/"
+    return {
+        "id": uuid.uuid4(), "snapshot_id": snapshot.id, "tenant_id": tenant_id, "backend_id": snapshot.backend_id,
+        "external_id": str(item.get("id")), "item_type": "ONEDRIVE_FILE",
+        "name": (item.get("name") or str(item.get("id")))[:255], "folder_path": folder,
+        "content_size": 0, "blob_path": None, "is_deleted": True,
+        "metadata": {"raw": item, "deleted": True},
     }
 
 
@@ -8983,6 +9016,7 @@ class BackupWorker:
                         await self._mark_snapshot_full(snapshot)
                     out = []
                     deleted_ids: List[str] = []
+                    deleted_items: List[Dict[str, Any]] = []
                     new_delta_link: Optional[str] = None
                     if saved_delta:
                         next_url = saved_delta
@@ -9018,19 +9052,19 @@ class BackupWorker:
                                 next_url = f"{graph_client.GRAPH_URL}/drives/{drive_id}/root/delta"
                                 out = []
                                 deleted_ids = []
+                                deleted_items = []
                                 pages_seen = 0
                                 continue
                             raise
                         for f in page.get("value", []):
                             # Deletions (@removed annotation OR deleted
-                            # facet). We don't actively tombstone prior
-                            # rows — restore reads the last-known-good
-                            # snapshot per file — but we must not
-                            # re-download or emit them as live files.
+                            # facet): never re-downloaded or emitted as live
+                            # files; recorded below as is_deleted rows.
                             if is_delta_tombstone(f):
                                 _id = f.get("id")
                                 if _id:
                                     deleted_ids.append(_id)
+                                    deleted_items.append(f)
                                 continue
                             # Skip the root folder itself (no name / no parentReference).
                             if not f.get("parentReference"):
@@ -9084,6 +9118,24 @@ class BackupWorker:
                                 f"[{self.worker_id}] [USER_ONEDRIVE] "
                                 f"deltaLink stash failed: {_e}"
                             )
+
+                    # Record deletions so the newest restore point hides them. The cursor only
+                    # advances when this snapshot COMPLETES, so a failed run re-reports them.
+                    # Off until Recovery's OneDrive reads drop is_deleted rows AFTER the
+                    # newest-wins dedup (they filter before it, and /onedrive/ids not at all).
+                    _record_deletions = snapshot is not None and os.getenv(
+                        "ONEDRIVE_RECORD_DELETIONS", "false").strip().lower() in ("1", "true", "yes", "on")
+                    if deleted_items and _record_deletions:
+                        for _i in range(0, len(deleted_items), 1000):
+                            await self._insert_snapshot_item_rows([
+                                _onedrive_tombstone_row(snapshot, resource.tenant_id, d)
+                                for d in deleted_items[_i:_i + 1000]
+                            ])
+                    # A full walk (first run, 410 re-bootstrap, force-full) carries no deletions:
+                    # tombstone what the last restore point shows but this complete walk did not return.
+                    if _record_deletions and not saved_delta and pages_seen <= 10000:
+                        await self._tombstone_unseen_onedrive_files(
+                            snapshot, resource.tenant_id, {r[2] for r in out})
 
                     if saved_delta:
                         print(
@@ -9253,7 +9305,11 @@ class BackupWorker:
                         "CALENDAR_SUBCALENDAR_REFRESH_HOURS", "24",
                     ))
                     # Full events sweep (masters + events outside the window): at most once per
-                    # refresh window per calendar, same clock as the sub-calendar throttle.
+                    # SWEEP_HOURS per calendar (weekly). It only adds masters and out-of-window
+                    # events — deletions come from the delta's @removed, which still runs every run.
+                    SWEEP_HOURS = float(os.environ.get(
+                        "CALENDAR_EVENTS_SWEEP_HOURS", "168",
+                    ))
                     swept_map: Dict[str, str] = dict(
                         (resource.extra_data or {}).get("calendar_events_swept_at") or {}
                     )
@@ -9442,7 +9498,7 @@ class BackupWorker:
                         elif _should_skip_subcalendar(
                             last_fetched_iso=swept_map.get(cal_id),
                             now_dt=now_utc,
-                            refresh_hours=SUB_REFRESH_HOURS,
+                            refresh_hours=SWEEP_HOURS,
                         ):
                             new_swept_map[cal_id] = swept_map[cal_id]
                         else:
@@ -22772,6 +22828,29 @@ class BackupWorker:
             await self._insert_snapshot_item_rows(rows[i:i + 1000])
         return len(rows)
 
+    async def _tombstone_unseen_onedrive_files(self, snapshot: Snapshot, tenant_id, seen_ids: Set[str]) -> int:
+        """A full OneDrive walk reports no deletions: a file the newest earlier restore point still shows
+        but the walk did not return was deleted (cf. _tombstone_unseen_library_files)."""
+        from sqlalchemy import text as _text
+        async with async_session_factory() as sess:
+            prior = (await sess.execute(_text("""
+                SELECT DISTINCT ON (si.external_id) si.external_id, si.name, si.folder_path, si.is_deleted
+                FROM snapshot_items si JOIN snapshots s ON s.id = si.snapshot_id
+                WHERE s.resource_id = :rid AND s.id <> :sid AND s.created_at <= :at
+                  AND s.status IN ('COMPLETED', 'PARTIAL') AND si.item_type = 'ONEDRIVE_FILE'
+                ORDER BY si.external_id, s.created_at DESC, si.id DESC"""),
+                {"rid": snapshot.resource_id, "sid": snapshot.id, "at": snapshot.created_at})).all()
+        rows = []
+        for ext_id, name, folder, deleted in prior:
+            if deleted or ext_id in seen_ids:
+                continue
+            row = _onedrive_tombstone_row(snapshot, tenant_id, {"id": ext_id, "name": name})
+            row["folder_path"] = folder
+            rows.append(row)
+        for i in range(0, len(rows), 1000):
+            await self._insert_snapshot_item_rows(rows[i:i + 1000])
+        return len(rows)
+
     async def backup_single_file(self, resource: Resource, tenant: Tenant, snapshot: Snapshot,
                                  file_item: Dict, graph_client: GraphClient, job_id: uuid.UUID) -> Dict:
         """
@@ -22842,6 +22921,36 @@ class BackupWorker:
             return {"success": True, "size": existing_props.get("size", 0),
                     "method": "skipped_already_present",
                     "item_id": file_id, "file_name": file_name}
+
+        # Unchanged since the resource's last backup (same drive item, Graph quickXorHash and
+        # size): point at that stored copy instead of downloading it again — the HEAD above only
+        # sees this snapshot's own path. Retention keeps a blob while any row references it.
+        qxh = ((file_item.get("file") or {}).get("hashes") or {}).get("quickXorHash")
+        if qxh and file_size_hint:
+            from shared.blob_dedup import find_unchanged_file_blob
+            async with async_session_factory() as _sess:
+                unchanged = await find_unchanged_file_blob(
+                    _sess, resource_id=resource.id, external_id=file_id, quickxor=qxh,
+                    size=file_size_hint, exclude_snapshot_id=snapshot.id,
+                )
+            # The stored copy must still be there (retention, manual cleanup); a failed probe downloads.
+            # Presence only: an encrypted backend's stored size is not the file size.
+            try:
+                _donor = await shard.get_blob_properties(container, unchanged[0]) if unchanged else None
+            except Exception:
+                _donor = None
+            if _donor:
+                await self._create_file_snapshot_item(
+                    snapshot, tenant, file_id, file_name, file_size_hint, unchanged[0],
+                    {"sha256": unchanged[1], "quickxor": qxh}, file_item, drive_id,
+                    graph_client=graph_client,
+                )
+                await self._capture_file_version_history(
+                    graph_client, tenant, snapshot, drive_id, file_id, file_name,
+                    file_item, container, shard, source_etag,
+                )
+                return {"success": True, "size": 0, "method": "reused_unchanged",
+                        "blob_path": unchanged[0], "item_id": file_id, "file_name": file_name}
 
         return await self._stream_file_snapshot(
             tenant, snapshot, file_item, graph_client, drive_id, file_id, file_name,
@@ -23070,6 +23179,7 @@ class BackupWorker:
         row = {
             "snapshot_id": snapshot.id,
             "tenant_id": tenant.id,
+            "backend_id": snapshot.backend_id,  # restore resolves the store by item.backend_id
             "external_id": file_id,
             "item_type": "FILE",
             "name": file_name,
@@ -24871,8 +24981,12 @@ class BackupWorker:
                 print(f"[{self.worker_id}]   [PROFILE] Done — {profile.get('displayName', 'N/A')}")
                 return [("USER_PROFILE", profile)]
 
+            # A protected Tier-2 USER_CONTACTS / USER_CALENDAR child backs this content up
+            # incrementally, and Recovery reads that child — re-reading it all here every
+            # run only duplicated it (O(mailbox) per user per day).
             async def fetch_contacts():
-                if not backup_contacts:
+                if not backup_contacts or await self._owned_elsewhere(
+                        tenant, "USER_CONTACTS", f"{obj_id}:contacts", snapshot, "user_contacts"):
                     return []
                 print(f"[{self.worker_id}]   [CONTACTS] Fetching...")
                 try:
@@ -24887,7 +25001,8 @@ class BackupWorker:
                     raise
 
             async def fetch_calendar():
-                if not backup_calendars:
+                if not backup_calendars or await self._owned_elsewhere(
+                        tenant, "USER_CALENDAR", f"{obj_id}:calendar", snapshot, "user_calendar"):
                     return [], None
                 print(f"[{self.worker_id}]   [CALENDAR] Fetching...")
                 try:
@@ -25722,6 +25837,9 @@ class BackupWorker:
                 await sess.commit()
             total_items += len(channel_info_rows)
 
+        _saved_channel_tokens = (resource.extra_data or {}).get("channel_delta_tokens", {}) or {}
+        _new_channel_tokens: Dict[str, str] = {}  # saved once after the gather (parallel saves race)
+
         # Parallelize channel drain across one worker. Mirrors the
         # TEAMS_CHANNEL handler's asyncio.gather pattern in
         # _backup_teams_resource — channels are independent so there's
@@ -25733,7 +25851,11 @@ class BackupWorker:
             ch_id = ch.get("id")
             ch_name = ch.get("displayName", ch_id)
             try:
-                msgs = await graph_client.get_channel_messages(team_id, ch_id)
+                # Resume from the saved per-channel token (same key as the TEAMS_CHANNEL
+                # handler); a stale token falls back to a full read in get_channel_messages.
+                msgs = await graph_client.get_channel_messages(
+                    team_id, ch_id, delta_token=_saved_channel_tokens.get(ch_id),
+                )
             except Exception as exc:
                 logger.warning(
                     "[%s] Channel messages fetch failed for %s/%s: %s",
@@ -25853,6 +25975,8 @@ class BackupWorker:
                     sess.add_all(db_items)
                     await sess.commit()
                 local_items = len(db_items)
+            if msgs.get("@odata.deltaLink"):
+                _new_channel_tokens[ch_id] = msgs["@odata.deltaLink"]
             return local_items, local_bytes
 
         ch_results = await asyncio.gather(
@@ -25863,6 +25987,13 @@ class BackupWorker:
             if isinstance(r, tuple):
                 total_items += r[0]
                 total_bytes += r[1]
+        if _new_channel_tokens:
+            async with async_session_factory() as sess:
+                r = await sess.get(Resource, resource.id)
+                if r:
+                    r.extra_data = r.extra_data or {}
+                    r.extra_data.setdefault("channel_delta_tokens", {}).update(_new_channel_tokens)
+                    await sess.commit()
 
         print(f"[{self.worker_id}]   [CHANNELS] {resource.display_name}: persisted {total_items} messages, {total_bytes} bytes")
         return total_items, total_bytes
@@ -28020,78 +28151,31 @@ class BackupWorker:
         #    Recovery right-pane can render them without N×M refetches.
         if "GROUPS" in _ep_categories:
             groups = await _safe_fetch(f"{base}/groups", {"$top": "999", "$select": "id,displayName,mail,description,groupTypes,securityEnabled,mailEnabled,visibility,membershipRule,createdDateTime"})
-            # Bulk-resolve owners + members via /v1.0/$batch (perf #6
-            # 2026-05-17): was 2 serial Graph calls per group (N groups
-            # = 2N round-trips). graph_client.batch chunks at
-            # GRAPH_BATCH_MAX_SIZE internally, so a tenant with 200
-            # groups goes from 400 sequential calls to ~20 $batch posts.
-            from shared.graph_batch import BatchRequest as _BReq
+            # Owners + members are paged reads (_get follows @odata.nextLink), 8 groups at a
+            # time. A $batch cannot follow nextLink inside a sub-response, so graph_batch
+            # rejects these $top URLs — the old $batch attempt always raised and fell back here.
             _gids = [g.get("id") for g in groups if g.get("id")]
             _gowners_by_gid: Dict[str, List[Dict[str, Any]]] = {}
             _gmembers_by_gid: Dict[str, List[Dict[str, Any]]] = {}
-            if _gids:
-                _gbt0 = time.monotonic()
-                _g_reqs: List[_BReq] = []
-                for _gid in _gids:
-                    _g_reqs.append(_BReq(
-                        id=f"own::{_gid}", method="GET",
-                        url=(
-                            f"/groups/{_gid}/owners?$top=50"
-                            f"&$select=id,displayName,userPrincipalName,mail"
-                        ),
-                    ))
-                    _g_reqs.append(_BReq(
-                        id=f"mem::{_gid}", method="GET",
-                        url=(
-                            f"/groups/{_gid}/members?$top=50"
-                            f"&$select=id,displayName,userPrincipalName,mail"
-                        ),
-                    ))
-                try:
-                    _g_resp = await graph_client.batch(_g_reqs)
-                    for _rid, _r in _g_resp.items():
-                        if not (200 <= _r.status < 300):
-                            continue
-                        _vals = ((_r.body or {}).get("value") or [])
-                        if _rid.startswith("own::"):
-                            _gowners_by_gid[_rid[5:]] = _vals
-                        elif _rid.startswith("mem::"):
-                            _gmembers_by_gid[_rid[5:]] = _vals
-                    print(
-                        f"[{self.worker_id}] [PERF] entra groups owners+"
-                        f"members $batch: {len(_gids)} groups in "
-                        f"{time.monotonic() - _gbt0:.2f}s"
-                    )
-                except Exception as _ge:
-                    logger.warning(
-                        "[%s] [ENTRA_DIR] groups $batch owners/members "
-                        "failed (%s) — falling back to parallel per-group "
-                        "(asyncio.gather sem=8)",
-                        self.worker_id, _ge,
-                    )
-                    _gsem = asyncio.Semaphore(8)
+            _gsem = asyncio.Semaphore(8)
 
-                    async def _one_gid(_gid: str):
-                        async with _gsem:
-                            _o = await _safe_fetch(
-                                f"{base}/groups/{_gid}/owners",
-                                {"$top": "50", "$select": "id,displayName,userPrincipalName,mail"},
-                            )
-                            _m = await _safe_fetch(
-                                f"{base}/groups/{_gid}/members",
-                                {"$top": "50", "$select": "id,displayName,userPrincipalName,mail"},
-                            )
-                            return _gid, _o, _m
-
-                    _g_par_results = await asyncio.gather(
-                        *(_one_gid(_g) for _g in _gids),
-                        return_exceptions=True,
+            async def _one_gid(_gid: str):
+                async with _gsem:
+                    _o = await _safe_fetch(
+                        f"{base}/groups/{_gid}/owners",
+                        {"$top": "999", "$select": "id,displayName,userPrincipalName,mail"},
                     )
-                    for _r in _g_par_results:
-                        if isinstance(_r, tuple):
-                            _gid, _o, _m = _r
-                            _gowners_by_gid[_gid] = _o
-                            _gmembers_by_gid[_gid] = _m
+                    _m = await _safe_fetch(
+                        f"{base}/groups/{_gid}/members",
+                        {"$top": "999", "$select": "id,displayName,userPrincipalName,mail"},
+                    )
+                    return _gid, _o, _m
+
+            for _r in await asyncio.gather(*(_one_gid(_g) for _g in _gids), return_exceptions=True):
+                if isinstance(_r, tuple):
+                    _gid, _o, _m = _r
+                    _gowners_by_gid[_gid] = _o
+                    _gmembers_by_gid[_gid] = _m
 
             for g in groups:
                 gid = g.get("id")
@@ -30032,6 +30116,7 @@ class BackupWorker:
                         )
                     except Exception as exc:
                         stats["drive_fail"] += 1
+                        stats.setdefault("failed_drive_ids", set()).add(item.get("_drive_id"))
                         print(f"[{self.worker_id}]   [SP_FILE FAIL] {item.get('name','?')}: "
                               f"{type(exc).__name__}: {exc}")
                         continue
@@ -30065,6 +30150,7 @@ class BackupWorker:
                             stats["drive_bytes"] += r.get("size", 0)
                         else:
                             stats["drive_fail"] += 1
+                            stats.setdefault("failed_drive_ids", set()).add(item.get("_drive_id"))
                             print(f"[{self.worker_id}]   [SP_FILE FAIL] "
                                   f"{r.get('file_name','?')}: method={r.get('method','?')} "
                                   f"reason={r.get('reason','no reason')}")
@@ -30242,39 +30328,40 @@ class BackupWorker:
         # every failure actually observed in 48h of fleet logs was REST-side —
         # so that change added hole-capable behaviour to a path with no
         # demonstrated problem.
+        # Per drive (2026-11-06): a drive failure holds back only that drive's cursor; see
+        # sharepoint_advanceable_drive_tokens. enum_fail still holds back every drive.
+        _sp_advance_tokens = sharepoint_advanceable_drive_tokens(stats)
         if _sp_cursor_blocking:
             print(f"[{self.worker_id}] [SHAREPOINT] {_sp_cursor_blocking} drive/enumeration "
-                  f"failure(s) — NOT advancing drive delta cursors (holes would be "
-                  f"permanent); next run re-enumerates")
+                  f"failure(s) — NOT advancing the delta cursor of drive(s) "
+                  f"{sorted(map(str, stats.get('failed_drive_ids') or [])) or 'ALL'} (holes would be "
+                  f"permanent); next run re-enumerates them")
         elif _sp_rest_fail:
             print(f"[{self.worker_id}] [SHAREPOINT] {_sp_rest_fail} list/REST file(s) failed "
                   f"but the drive delta is unaffected (REST re-walks in full every run) — "
                   f"advancing drive delta cursors")
-        if stats["new_drive_tokens"] and not _sp_cursor_blocking:
-            for _site_id_key, _per_drive in stats["new_drive_tokens"].items():
-                for _drive_id, _tok in (_per_drive or {}).items():
-                    if not _tok:
-                        continue
-                    await self._upsert_sharepoint_drive_delta(
-                        resource.id, str(_drive_id), str(_tok),
-                    )
+        for _site_id_key, _per_drive in _sp_advance_tokens.items():
+            for _drive_id, _tok in _per_drive.items():
+                await self._upsert_sharepoint_drive_delta(
+                    resource.id, str(_drive_id), str(_tok),
+                )
 
         # Legacy dual-write — kept for one release as rollback safety;
         # new sharepoint_drive_delta table is authoritative. Same
         # cursor-advance gate as above: a rollback to the legacy reader
         # must not resume from cursors that skip undownloaded files.
-        if (stats["new_subsite_tokens"] or stats["new_drive_tokens"]) and not _sp_cursor_blocking:
+        if (stats["new_subsite_tokens"] and not _sp_cursor_blocking) or any(_sp_advance_tokens.values()):
             async with async_session_factory() as sess:
                 r = await sess.get(Resource, resource.id)
                 if r:
                     r.extra_data = r.extra_data or {}
-                    if stats["new_subsite_tokens"]:
+                    if stats["new_subsite_tokens"] and not _sp_cursor_blocking:
                         existing_subsite_tokens = (r.extra_data.get("subsite_delta_tokens") or {}).copy()
                         existing_subsite_tokens.update(stats["new_subsite_tokens"])
                         r.extra_data["subsite_delta_tokens"] = existing_subsite_tokens
-                    if stats["new_drive_tokens"]:
+                    if _sp_advance_tokens:
                         existing_drive_tokens = (r.extra_data.get("drive_delta_tokens_by_site") or {}).copy()
-                        for site_id_key, per_drive in stats["new_drive_tokens"].items():
+                        for site_id_key, per_drive in _sp_advance_tokens.items():
                             merged = (existing_drive_tokens.get(site_id_key) or {}).copy()
                             merged.update(per_drive)
                             existing_drive_tokens[site_id_key] = merged
