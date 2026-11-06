@@ -54,6 +54,21 @@ enabled = true
 dir = "/data/filerdb"
 TOML
 
+# Volume growth (Seaweed 3.71 reads /etc/seaweedfs/master.toml): grow when every
+# writable volume is past `threshold`, by `copy_1` volumes. Defaults 0.9 / 7 left
+# ~3.5 GB of 5 GB-volume headroom (~20 s of backup writes) while growth took ~60 s,
+# so every upload hit "No more writable volumes!" (2026-11-06). 0.5 / 16 = ~40 GB.
+GROW_COPY_1="${SEAWEED_GROWTH_COPY_1:-16}"
+GROW_THRESHOLD="${SEAWEED_GROWTH_THRESHOLD:-0.5}"
+cat > /etc/seaweedfs/master.toml <<TOML
+[master.volume_growth]
+copy_1 = ${GROW_COPY_1}
+copy_2 = 6
+copy_3 = 3
+copy_other = 1
+threshold = ${GROW_THRESHOLD}
+TOML
+
 start_cluster() {
   # master (background) — coordinates volume placement across the external
   # volume servers; volumeSizeLimitMB controls per-volume rollover.
