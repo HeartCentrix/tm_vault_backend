@@ -296,7 +296,10 @@ class GraphClient:
                 limits=httpx.Limits(
                     max_connections=200,
                     max_keepalive_connections=100,
-                    keepalive_expiry=300.0,
+                    # Under the ~4 min idle cutoff of cloud NAT/load balancers
+                    # (Azure 4 min): a socket idle past it is dropped silently
+                    # and the next request on it fails with ReadError.
+                    keepalive_expiry=120.0,
                 ),
                 # Several SharePoint/CDN download sites need 3xx
                 # redirect following (referenceAttachment shared URLs,
