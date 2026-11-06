@@ -772,3 +772,32 @@ async def test_partitioned_mailbox_union_carry_builds_an_overlay(db, carry, monk
     assert shape[0] == base
     names = {r[1] for r in await box.inventory(sid) if r[0] == "EMAIL"}
     assert "fresh-1" in names and "m002" not in names and len(names) == 40
+
+
+# ── Per-run Postgres cost: O(changes), not O(mailbox) ───────────────────────────────────────────
+
+async def _tuples_read(session):
+    """snapshot_items tuples this transaction has read so far (pg_stat_xact_* is per transaction)."""
+    return int(await session.scalar(text(
+        "SELECT COALESCE(seq_tup_read, 0) + COALESCE(idx_tup_fetch, 0) FROM pg_stat_xact_user_tables "
+        "WHERE relname = 'snapshot_items' AND schemaname = current_schema()")) or 0)
+
+
+async def test_overlay_new_item_count_reads_only_the_overlays_own_rows(twin):
+    t = await twin()
+    await t.run(add=[("new-1", "Inbox", 2)], change=["m005"])
+    box = t.overlay
+    sid, job = box.snapshots[-1], None
+    async with box.db.factory() as session:
+        job = await session.scalar(text("SELECT job_id FROM snapshots WHERE id = :s"), {"s": sid})
+        base_rows = await session.scalar(text(
+            "SELECT count(*) FROM snapshot_items WHERE snapshot_id = :b"), {"b": box.snapshots[0]})
+    async with box.db.factory.begin() as session:
+        await session.execute(text("ANALYZE snapshot_items"))   # production tables have statistics
+    delta = _worker_module().BackupWorker._compute_snapshot_delta_from_prior
+    async with box.db.factory.begin() as session:
+        before = await _tuples_read(session)
+        got = await delta(session, sid, box.rid, 0, 0, current_job_id=job)
+        read = await _tuples_read(session) - before
+    assert got == (await box.counters(sid))[2:]          # same answer the settle stored
+    assert read < base_rows, f"read {read} snapshot_items tuples for {base_rows} base rows"

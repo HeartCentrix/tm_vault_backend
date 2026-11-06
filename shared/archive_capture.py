@@ -677,7 +677,9 @@ class ArchiveCapture:
                         'SELECT EXISTS (SELECT 1 FROM archive_item_work WHERE snapshot_id=:sid '
                         'AND capture_generation=:gen AND copy_task_id IS NOT NULL)'), p):
                     return False     # (a queued copy task means an earlier attempt chose the full copy)
-                await db.execute(text('UPDATE snapshots SET overlay_base_id=:base WHERE id=:sid'), p)
+                await db.execute(text('UPDATE snapshots SET overlay_base_id=:base, extra_data=(COALESCE(extra_data::jsonb, '
+                                      "'{}'::jsonb) || jsonb_build_object('overlay_prior', CAST(:prior_text AS text)))::json "
+                                      'WHERE id=:sid'), {**p, 'prior_text': str(prior.id)})
                 if prior.overlay_base_id is not None:
                     columns = [c.name for c in SnapshotItem.__table__.columns]
                     exprs = ['gen_random_uuid()' if c == 'id' else ':sid' if c == 'snapshot_id' else 'src.' + c

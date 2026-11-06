@@ -30650,15 +30650,23 @@ class BackupWorker:
         # full-inventory reuse snapshots (only the grown rows are absent).
         # Matches item_count's CHILD_ITEM_TYPES exclusion for the count;
         # bytes sums all types like bytes_total.
+        # Inventories, not own rows: an overlay owns only what changed since its base. But compared with
+        # its own base or the prior it was built from, every row it inherits is already in that prior
+        # (each overlay hides at least what its prior hid), so only its own rows can be new: reading the
+        # whole inventory cost O(mailbox) per run.
+        overlay = (await session.execute(text(
+            "SELECT overlay_base_id, extra_data->>'mail_overlay_prior', extra_data->>'overlay_prior' "
+            "FROM snapshots WHERE id = CAST(:cur AS uuid)"), {"cur": str(snapshot_id)})).first()
+        own_only = bool(overlay and overlay[0] and str(prior_id) in {str(overlay[0]), overlay[1], overlay[2]})
         row = (await session.execute(
             text(
                 "SELECT "
                 "  count(*) FILTER (WHERE cur.item_type NOT IN "
                 "    ('CHAT_ATTACHMENT','EMAIL_ATTACHMENT','CHAT_HOSTED_CONTENT')), "
                 "  COALESCE(SUM(cur.content_size), 0) "
-                # Inventories, not own rows: an overlay owns only what changed since its base.
-                "FROM snapshot_items_effective(CAST(:cur AS uuid)) cur "
-                "WHERE NOT EXISTS ("
+                + ("FROM snapshot_items cur WHERE cur.snapshot_id = CAST(:cur AS uuid) AND " if own_only
+                   else "FROM snapshot_items_effective(CAST(:cur AS uuid)) cur WHERE ")
+                + "NOT EXISTS ("
                 "    SELECT 1 FROM snapshot_items_effective(CAST(:pri AS uuid)) pri "
                 "    WHERE pri.external_id = cur.external_id "
                 "      AND pri.item_type = cur.item_type "
@@ -30667,7 +30675,10 @@ class BackupWorker:
                 # Only file types — other hashes may cover volatile JSON.
                 "      AND NOT (cur.item_type IN ('ONEDRIVE_FILE','FILE') "
                 "               AND NULLIF(cur.content_hash, '') IS DISTINCT FROM pri.content_hash "
-                "               AND NULLIF(cur.content_hash, '') IS NOT NULL))"
+                "               AND NULLIF(cur.content_hash, '') IS NOT NULL)"
+                # OFFSET 0 keeps the probe a per-row subplan: the row's key then reaches the function's
+                # UNION ALL as an index condition. As an anti-join it scanned the prior's whole inventory.
+                + (" OFFSET 0)" if own_only else ")")
             ),
             {"cur": str(snapshot_id), "pri": str(prior_id)},
         )).first()
