@@ -128,13 +128,13 @@ async def resolve_selection(
     if not clauses:
         return []
 
-    # An unchanged mailbox's reuse snapshot owns no rows: select from the full one it names.
-    from shared.snapshot_reuse import items_snapshot_id
-    snap_uuid = await items_snapshot_id(session, snapshot_id)
-    stmt = select(SnapshotItem).where(
-        SnapshotItem.snapshot_id == snap_uuid,
-        or_(*clauses),
-    )
+    # The snapshot's inventory: a pointer's is the snapshot it names, an overlay's its base + own rows.
+    from shared.snapshot_reuse import SnapshotNotFound, items_scope
+    try:
+        scope = await items_scope(session, snapshot_id)
+    except SnapshotNotFound:
+        scope = SnapshotItem.snapshot_id == snapshot_id
+    stmt = select(SnapshotItem).where(scope, or_(*clauses))
     rows = (await session.execute(stmt)).scalars().all()
     if excluded_uuids:
         rows = [r for r in rows if r.id not in excluded_uuids]

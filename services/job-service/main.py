@@ -2525,8 +2525,9 @@ async def trigger_restore(
                 SnapshotItem.id.in_([_parse_uuid(i, "itemId") for i in item_ids])
             )
         elif snapshot_ids:
+            from shared.snapshot_reuse import items_scope_any
             stmt = sa_select(_func.coalesce(_func.sum(SnapshotItem.content_size), 0)).where(
-                SnapshotItem.snapshot_id.in_([_parse_uuid(s, "snapshotId") for s in snapshot_ids])
+                await items_scope_any(db, [_parse_uuid(s, "snapshotId") for s in snapshot_ids])
             )
         else:
             stmt = None
@@ -2613,9 +2614,10 @@ async def trigger_restore(
                 )
                 total_bytes = int((await db.execute(q)).scalar() or 0)
             elif snapshot_ids:
-                from shared.snapshot_reuse import items_snapshot_id
+                # Each snapshot's inventory (a pointer's target, an overlay's base + own rows).
+                from shared.snapshot_reuse import items_scope_any
                 q = sa_select(sa_func.coalesce(sa_func.sum(SnapshotItem.content_size), 0)).where(
-                    SnapshotItem.snapshot_id.in_([await items_snapshot_id(db, x) for x in snapshot_ids])
+                    await items_scope_any(db, snapshot_ids)
                 )
                 total_bytes = int((await db.execute(q)).scalar() or 0)
         except Exception:
@@ -2825,9 +2827,10 @@ async def trigger_export(
                 )
                 total_bytes = int((await db.execute(q)).scalar() or 0)
             elif snapshot_ids:
-                from shared.snapshot_reuse import items_snapshot_id
+                # Each snapshot's inventory (a pointer's target, an overlay's base + own rows).
+                from shared.snapshot_reuse import items_scope_any
                 q = sa_select(sa_func.coalesce(sa_func.sum(SnapshotItem.content_size), 0)).where(
-                    SnapshotItem.snapshot_id.in_([await items_snapshot_id(db, x) for x in snapshot_ids])
+                    await items_scope_any(db, snapshot_ids)
                 )
                 total_bytes = int((await db.execute(q)).scalar() or 0)
         except Exception:

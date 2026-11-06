@@ -153,6 +153,7 @@ __all__ = [
     "resolve_snapshot_items_target",
     "resolve_many",
     "items_scope",
+    "items_scope_any",
     "item_in_snapshot",
 ]
 
@@ -177,6 +178,18 @@ async def items_scope(session: AsyncSession, snapshot_id: UUIDLike):
         return SnapshotItem.snapshot_id == target
     effective = func.snapshot_items_effective(target).table_valued("id")
     return SnapshotItem.id.in_(select(effective.c.id))
+
+
+async def items_scope_any(session: AsyncSession, snapshot_ids):
+    """``items_scope`` OR-ed over several snapshots; an unknown id selects nothing."""
+    from sqlalchemy import false, or_
+    scopes = []
+    for sid in snapshot_ids:
+        try:
+            scopes.append(await items_scope(session, sid))
+        except (SnapshotNotFound, ValueError, TypeError, AttributeError):
+            continue
+    return or_(*scopes) if scopes else false()
 
 
 async def item_in_snapshot(session: AsyncSession, item_id: UUIDLike, snapshot_id: UUIDLike) -> bool:

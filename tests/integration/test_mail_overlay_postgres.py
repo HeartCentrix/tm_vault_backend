@@ -549,3 +549,118 @@ async def test_whitelisted_pointer_checks_the_overlays_inherited_rows(db):
     async with db.factory.begin() as session:
         assert await reuse_unchanged_mail_snapshot(session, resource_id=rid, target_snapshot_id=target,
                                                    current_job_id=job, keep_folder_ids=["fid-inbox", "fid-gone"]) == overlay
+
+
+# ── Readers: an overlay reads exactly like the full copy ────────────────────────────────────────
+
+def _load(name, relative):
+    import importlib.util
+    import sys
+    folder = str((Path(__file__).parents[2] / relative).parent)
+    if folder not in sys.path:
+        sys.path.insert(0, folder)   # worker dirs import their siblings (mail_restore, ...)
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, Path(__file__).parents[2] / relative)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[name]
+
+
+def _norm(rows, *keys):
+    return sorted(tuple(str(r.get(k)) for k in keys) for r in rows)
+
+
+async def _reader_twin(twin):
+    t = await twin()
+    await t.run(add=[("new-1", "Inbox", 2)], move=[("m004", "Archive")])
+    await t.run(delete=["m002"], change=["m005"])
+    return t
+
+
+async def test_single_snapshot_readers_see_the_overlays_inventory(twin, db):
+    api = _load("overlay_snapshot_api", "services/snapshot-service/main.py")
+    t = await _reader_twin(twin)
+    seen = []
+    for box in (t.overlay, t.full):
+        sid, rid = str(box.snapshots[-1]), str(box.rid)
+        async with db.factory() as session:
+            listed = await api.list_snapshot_items(sid, page=1, size=1000, itemType=None, db=session)
+            browsed = await api.browse_snapshot_items(rid, sid, page=1, size=1000, itemType="EMAIL", db=session)
+            found = await api.search_snapshot_items(rid, query="m00", item_type=None, folder_path=None,
+                                                    snapshot_id=sid, page=1, size=1000, db=session)
+            from shared.folder_resolver import resolve_selection
+            picked = await resolve_selection(session, snapshot_id=sid, item_ids=[], folder_paths=["Inbox"],
+                                             excluded_item_ids=[])
+        keys = ("itemType", "externalId", "name", "folderPath")
+        seen.append((listed.totalElements, _norm([i.model_dump() for i in listed.content], *keys),
+                     browsed.totalElements, _norm([i.model_dump() for i in browsed.content], *keys),
+                     found.totalElements, _norm([i.model_dump() for i in found.content], *keys),
+                     sorted((r.item_type, r.external_id, r.name) for r in picked)))
+    assert seen[0] == seen[1]
+    assert seen[0][0] == 60 + 60   # 60 + 1 new - 1 deleted messages; 60 + 2 new - 2 of the deleted attachments
+
+
+async def test_preview_content_and_attachments_of_an_inherited_message(twin, db):
+    """The Recovery UI asks for item X 'in snapshot S'; X may be a base row S inherits."""
+    api = _load("overlay_snapshot_api", "services/snapshot-service/main.py")
+    t = await _reader_twin(twin)
+    overlay, base = t.overlay.snapshots[-1], t.overlay.snapshots[0]
+    async with db.factory() as session:
+        rows = {(r.item_type, r.external_id): r for r in (await session.execute(text(
+            "SELECT id, item_type, external_id, snapshot_id FROM snapshot_items_effective(:s)"), {"s": overlay})).all()}
+        email, inline = rows[("EMAIL", "m007")], rows[("EMAIL_ATTACHMENT", "m007::0")]
+        assert email.snapshot_id == inline.snapshot_id == base
+        assert (await api.get_snapshot_item_detail(str(overlay), str(email.id), session)).externalId == "m007"
+        content = await api.get_item_content(str(overlay), str(inline.id), download=False, db=session)
+        assert content is not None
+        names = [a["name"] for a in await api.get_item_attachments(str(overlay), str(email.id), session)]
+        assert names == ["file0.txt"]
+        own = rows[("EMAIL", "new-1")]
+        assert [a["name"] for a in await api.get_item_attachments(str(overlay), str(own.id), session)] == [
+            "file0.txt", "file1.txt"]
+        hidden = (await session.execute(text(
+            "SELECT id FROM snapshot_items WHERE snapshot_id = :b AND external_id = 'm002' AND item_type = 'EMAIL'"),
+            {"b": base})).scalar_one()
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException):
+            await api.get_snapshot_item_detail(str(overlay), str(hidden), session)
+
+
+async def test_sibling_union_readers_and_restore_match_the_full_copy(twin, db, monkeypatch):
+    """Mail list, folder tree, restore / PST / ZIP selections union every snapshot up to S, newest
+    wins; base + overlays hold the same payloads as the full copies."""
+    api = _load("overlay_snapshot_api", "services/snapshot-service/main.py")
+    monkeypatch.setattr(api, "_count_session_factory", db.factory)
+    restore = _load("overlay_restore_worker", "workers/restore-worker/main.py")
+    worker = restore.RestoreWorker.__new__(restore.RestoreWorker)
+    t = await _reader_twin(twin)
+    seen = []
+    for box in (t.overlay, t.full):
+        sid = str(box.snapshots[-1])
+        async with db.factory() as session:
+            mail = await api.list_snapshot_emails(sid, page=1, size=500, folder=None, search=None, source=None,
+                                                  category=None, bodies="none", db=session)
+            folders = await api.get_snapshot_folders(snapshot_id=sid, item_type="EMAIL", category=None, page=1,
+                                                     size=50, db=session)
+            fetched = await worker.fetch_snapshot_items(session, [sid], [], folder_paths=["Archive"])
+            counted = await worker.count_snapshot_items(session, [sid], [])
+        streamed = [i async for batch in worker.stream_snapshot_items_by_group(db.factory, [sid], []) for i in batch]
+        seen.append((mail["totalElements"], _norm(mail["content"], "externalId", "subject", "folderPath"),
+                     folders["content"], sorted((i.item_type, i.external_id, i.name) for i in fetched), counted,
+                     sorted((i.item_type, i.external_id, i.name, i.folder_path) for i in streamed)))
+    assert seen[0] == seen[1]
+
+
+async def test_restore_and_export_size_estimates_cover_the_overlays_inventory(twin, db):
+    """job-service routes a restore/export by the selection's bytes; an overlay sized by its own
+    rows would send a whole-mailbox restore to the normal queue."""
+    from sqlalchemy import func, select
+    from shared.snapshot_reuse import items_scope_any
+    t = await _reader_twin(twin)
+    sizes = []
+    for box in (t.overlay, t.full):
+        async with db.factory() as session:
+            sizes.append(await session.scalar(select(func.coalesce(func.sum(models.SnapshotItem.content_size), 0))
+                                              .where(await items_scope_any(session, [str(box.snapshots[-1]), str(uuid4())]))))
+    assert sizes[0] == sizes[1] > 0
