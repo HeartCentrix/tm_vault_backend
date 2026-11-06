@@ -2091,6 +2091,9 @@ async def startup():
     # Primary mechanism is Azure lifecycle rule (ops/azure-lifecycle-exports.json);
     # this is a fallback for envs without lifecycle API access (local Azurite, restricted tenants).
     async def _exports_cleanup_daily():
+        from services.exports_cleanup import azure_export_storage_active
+        if not azure_export_storage_active():
+            return
         try:
             from services.exports_cleanup import cleanup_exports
             from shared.azure_storage import azure_storage_manager
@@ -2108,6 +2111,9 @@ async def startup():
         except Exception as exc:
             print(f"[backup-scheduler] chat_export_lifecycle failed: {exc}")
 
+    from services.exports_cleanup import azure_export_storage_active
+    if not azure_export_storage_active():
+        print("[backup-scheduler] INFO exports_cleanup: active storage backend is not Azure; Azure export lifecycle skipped")
     scheduler.add_job(_exports_cleanup_daily, "cron", hour=3, minute=0, timezone="UTC", id="exports_cleanup_daily")
 
     # Round 1.5 — daily retry of FAILED snapshots (one shot, throttled).

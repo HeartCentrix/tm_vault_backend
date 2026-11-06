@@ -38,6 +38,21 @@ async def cleanup_exports(
     return deleted
 
 
+def azure_export_storage_active() -> bool:
+    """False when the active storage backend is known and is not Azure
+    (TM: on-prem S3/SeaweedFS), so the Azure export jobs have nothing to
+    do. True when it is Azure or the router is not loaded yet."""
+    try:
+        from shared.storage.router import router
+        active = str(router.active_backend_id())
+        for backend in router.list_backends():
+            if str(backend.backend_id) == active:
+                return backend.kind == "azure_blob"
+    except Exception:  # noqa: BLE001
+        pass
+    return True
+
+
 async def apply_chat_export_lifecycle() -> None:
     """Delete expired exports (>TTL) and cool-tier anything >hot-threshold.
 
