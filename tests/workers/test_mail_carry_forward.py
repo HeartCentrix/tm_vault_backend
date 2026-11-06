@@ -904,7 +904,7 @@ def test_sharepoint_list_producer_carries_an_unchanged_list_forward():
     assert "await self._previous_sp_lists(snapshot, site_id)" in flat
     assert "sp_list_reusable(_sig, prior_lists.get(lst_id)" in flat
     assert '"rest_signature": _sig, "rest_walked_at": _reuse_walked or (_delta or (None,))[0] or _walked_now' in flat
-    copy = flat.index("await self._copy_forward_sp_list_rows(snapshot.id, prior_lists_id, site_id, lst_id)")
+    copy = flat.index("await self._copy_forward_sp_list_rows(snapshot.id, prior_lists_id, site_id, lst_id, overlay=sp_overlay)")
     assert copy < flat.index("iter_sharepoint_list_items_via_rest(", copy)
 
 
