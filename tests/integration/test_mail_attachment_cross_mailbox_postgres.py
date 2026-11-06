@@ -5,7 +5,8 @@ EMAIL_ATTACHMENT rows but 1,720 distinct contents, 991 MB pulled from Graph for 
 bytes. Blob storage was already deduped by content hash, but only AFTER every copy's bytes had
 come down from Graph. Now a copy whose attachments the tenant already stored (same
 internetMessageId, name, Graph size, content type, inline flag; blob still readable) lists
-attachment metadata only and points its own rows at the stored blob.
+attachment metadata only and points its own rows at the stored blob. The lookup reads a
+per-tenant table of distinct attachment contents (mail_attachment_contents), never snapshot_items.
 """
 from __future__ import annotations
 
@@ -104,10 +105,9 @@ async def env(monkeypatch):
     async with engine.begin() as conn:
         await conn.execute(text(f'CREATE SCHEMA "{schema}"'))
         await conn.run_sync(Base.metadata.create_all)
-        await conn.execute(text(reuse.INDEX_SQL))
     factory = async_sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setattr(reuse, "async_session_factory", factory)
-    monkeypatch.setattr(reuse, "_index_ready", None)
+    monkeypatch.setattr(reuse, "_table_ready", None)
     backend = uuid4()
     async with factory.begin() as s:
         s.add(models.StorageBackend(id=backend, kind="azure", name=uuid4().hex,
@@ -220,7 +220,20 @@ async def test_same_message_in_three_mailboxes_downloads_attachments_once(env):
     async with env.factory() as s:
         rows = (await s.execute(text("SELECT external_id, blob_path FROM snapshot_items "
                                      "WHERE item_type = 'EMAIL_ATTACHMENT'"))).all()
+        # One content row per distinct attachment, not per mailbox copy.
+        contents = (await s.execute(text("SELECT name, content_id FROM mail_attachment_contents"))).all()
     assert len(rows) == 6 and len({r.blob_path for r in rows}) == 2
+    assert sorted(contents) == [("Q3 report.pdf", None), ("image001.png", "image001.png@01DB")]
+
+
+async def test_lookup_is_a_primary_key_probe_not_a_snapshot_items_scan(env):
+    import shared.mail_attachment_reuse as reuse
+    async with env.factory() as s:
+        await s.execute(text("SET LOCAL enable_seqscan = off"))
+        plan = "\n".join(r[0] for r in await s.execute(
+            text("EXPLAIN " + reuse._CANDIDATES_SQL.text),
+            {"tenant": uuid4(), "imids": ["<a@x>", "<b@x>"]}))
+    assert "snapshot_items" not in plan and "mail_attachment_contents_pkey" in plan, plan
 
 
 async def test_kill_switch_restores_per_copy_download(env, monkeypatch):
@@ -262,12 +275,32 @@ async def test_reuse_never_crosses_tenants(env):
     assert other.bytes == len(REPORT) + len(LOGO)
 
 
-async def test_missing_blob_downloads(env):
+async def test_missing_blob_downloads_and_replaces_the_content_row(env):
     await env.backup("alice", Graph("alice"))
     env.store.blobs.clear()
     bob = Graph("bob")
-    _restorable(await env.backup("bob", bob), "bob", env.store)
+    bob_items = await env.backup("bob", bob)
+    _restorable(bob_items, "bob", env.store)
     assert bob.bytes == len(REPORT) + len(LOGO)
+    async with env.factory() as s:
+        paths = set((await s.execute(text("SELECT blob_path FROM mail_attachment_contents"))).scalars())
+    assert paths == {i.blob_path for i in bob_items}
+    carol = Graph("carol")
+    await env.backup("carol", carol)
+    assert carol.bytes == 0
+
+
+async def test_two_attachments_sharing_a_key_are_downloaded(env):
+    """Same name/size/type/inline flag, different bytes: the key cannot tell them apart."""
+    def twins(mailbox):
+        atts = _graph_attachments(mailbox)[:1]
+        twin = dict(atts[0], id=f"{mailbox}-att-twin",
+                    contentBytes=base64.b64encode(REPORT.replace(b"r", b"t")).decode())
+        return atts + [twin]
+    await env.backup("alice", Graph("alice", twins("alice")))
+    bob = Graph("bob", twins("bob"))
+    await env.backup("bob", bob)
+    assert bob.bytes == 2 * len(REPORT)
 
 
 async def test_lookup_failure_downloads_instead_of_failing_the_backup(env, monkeypatch):
@@ -283,14 +316,13 @@ async def test_lookup_failure_downloads_instead_of_failing_the_backup(env, monke
     assert bob.bytes == len(REPORT) + len(LOGO)
 
 
-async def test_without_the_index_reuse_stays_off(env, monkeypatch):
-    """An unindexed JSON filter over a tenant's snapshot_items (87 GB on Railway) costs more than
-    the download it saves."""
+async def test_without_the_contents_table_reuse_stays_off(env, monkeypatch):
+    """A worker deployed before the table exists downloads as before instead of failing."""
     import shared.mail_attachment_reuse as reuse
     await env.backup("alice", Graph("alice"))
     async with env.factory.begin() as s:
-        await s.execute(text(f"DROP INDEX {reuse.INDEX_NAME}"))
-    monkeypatch.setattr(reuse, "_index_ready", None)  # a worker started without the index
+        await s.execute(text("DROP TABLE mail_attachment_contents"))
+    monkeypatch.setattr(reuse, "_table_ready", None)  # a worker started without the table
     bob = Graph("bob")
     await env.backup("bob", bob)
     assert bob.bytes == len(REPORT) + len(LOGO)

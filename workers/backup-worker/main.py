@@ -14069,6 +14069,8 @@ class BackupWorker:
         # blobs. Any mismatch leaves the message on the full listing below.
         from shared import mail_attachment_reuse as _reuse
         reuse_map: Dict[Tuple[str, str], Any] = {}
+        downloaded: List[Tuple[str, tuple, Dict[str, Any]]] = []
+        imid_of = {m.get("id"): m.get("internetMessageId") for m in messages_with_attachments}
         if _reuse.reuse_enabled():
             _stored = await _reuse.load_candidates(
                 tenant.id, [m.get("internetMessageId") for m in messages_with_attachments])
@@ -14096,10 +14098,9 @@ class BackupWorker:
                     plan = _reuse.match(body["value"], _cand.get(mid) or [])
                     if not plan:
                         continue
-                    ok = True
-                    for hit in plan.values():
-                        ok = ok and await _reuse.blob_readable(shard, container, hit.blob_path, _probe)
-                    if not ok:
+                    oks = [await _reuse.usable(shard, container, tenant.id, imid_of[mid], hit, _probe)
+                           for hit in plan.values()]
+                    if not all(oks):
                         continue
                     att_lists_cache[mid] = [{**a, "contentId": plan[a["id"]].content_id} for a in body["value"]]
                     reuse_map.update({(mid, aid): hit for aid, hit in plan.items()})
@@ -14359,6 +14360,12 @@ class BackupWorker:
                             content_hash = None
 
                 resolved = (blob_path is not None) or (inline_b64 is not None)
+                _k = _reuse.key(att)
+                if hit is None and blob_path and content_hash and _k and imid_of.get(msg_id):
+                    downloaded.append((msg_id, _k, {
+                        "imid": imid_of[msg_id], "name": _k[0], "graph_size": _k[1], "content_type": _k[2],
+                        "is_inline": _k[3], "content_id": att.get("contentId") or att.get("contentID"),
+                        "blob_path": blob_path, "content_hash": content_hash, "content_size": size}))
                 return (
                     SnapshotItem(
                         id=uuid.uuid4(),
@@ -14387,9 +14394,6 @@ class BackupWorker:
                             # decode this instead of fetching from blob_path.
                             # blob_path stays None for inline rows.
                             "inline_b64": inline_b64,
-                            # Cross-mailbox reuse key (shared/mail_attachment_reuse.py).
-                            "internet_message_id": msg.get("internetMessageId") or None,
-                            "graph_size": declared_size,
                         },
                     ),
                     bytes_added,
@@ -14622,6 +14626,13 @@ class BackupWorker:
                 items, b = r
                 all_items.extend(items)
                 total_bytes += b
+        if _reuse.reuse_enabled() and downloaded:
+            # A key seen twice in one message cannot tell its contents apart: never record it.
+            _seen: Dict[Tuple[str, tuple], int] = {}
+            for _mid, _k, _ in downloaded:
+                _seen[(_mid, _k)] = _seen.get((_mid, _k), 0) + 1
+            await _reuse.remember(tenant.id, getattr(shard, "backend_id", None),
+                                  [row for _mid, _k, row in downloaded if _seen[(_mid, _k)] == 1])
         return all_items, total_bytes
 
     # ==================== Tier 2 USER_CHATS attachment capture ====================

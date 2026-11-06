@@ -1,10 +1,21 @@
--- Cross-mailbox mail attachment reuse index (alembic 0023), for Railway where alembic does not
--- run. psql autocommit (the default): CONCURRENTLY cannot run inside BEGIN. Idempotent.
--- Workers check for a VALID index once per process: restart them after it is built.
+-- Cross-mailbox mail attachment reuse table (alembic 0023), for Railway where alembic does not
+-- run. Service boot's create_all also creates it; this is for creating it ahead of the deploy.
+-- Idempotent. Workers check for the table once per process: restart them after creating it.
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_snapshot_items_mail_att_imid ON snapshot_items
-    (tenant_id, (metadata->>'internet_message_id')) WHERE item_type = 'EMAIL_ATTACHMENT';
+CREATE TABLE IF NOT EXISTS mail_attachment_contents (
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    internet_message_id VARCHAR NOT NULL,
+    name VARCHAR NOT NULL,
+    graph_size BIGINT NOT NULL,
+    content_type VARCHAR NOT NULL,
+    is_inline BOOLEAN NOT NULL,
+    content_id VARCHAR,
+    blob_path VARCHAR NOT NULL,
+    content_hash VARCHAR NOT NULL,
+    content_size BIGINT NOT NULL,
+    backend_id UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, internet_message_id, name, graph_size, content_type, is_inline)
+);
 
--- Verify: SELECT indisvalid FROM pg_index WHERE indexrelid = 'ix_snapshot_items_mail_att_imid'::regclass;
--- If false: DROP INDEX CONCURRENTLY ix_snapshot_items_mail_att_imid; and re-run.
--- Rollback: DROP INDEX CONCURRENTLY IF EXISTS ix_snapshot_items_mail_att_imid;
+-- Rollback (reuse turns itself off without the table): DROP TABLE IF EXISTS mail_attachment_contents;
