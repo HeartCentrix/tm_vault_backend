@@ -152,4 +152,96 @@ __all__ = [
     "SnapshotNotFound",
     "resolve_snapshot_items_target",
     "resolve_many",
+    "items_scope",
+    "items_scope_any",
+    "item_in_snapshot",
 ]
+
+
+async def items_scope(session: AsyncSession, snapshot_id: UUIDLike):
+    """WHERE clause on ``SnapshotItem`` selecting ``snapshot_id``'s inventory. A full snapshot (or a
+    pointer to one) keeps today's ``snapshot_id = target`` plan; an overlay, or a pointer to one,
+    selects ``snapshot_items_effective`` (base + own rows, docs/mail-overlay-snapshots.md).
+    Raises ``SnapshotNotFound``."""
+    from sqlalchemy import func, select
+    from shared.models import SnapshotItem
+    sid = _coerce_uuid(snapshot_id)
+    row = (await session.execute(text("""
+        SELECT t.id AS target_id, t.overlay_base_id
+          FROM snapshots s JOIN snapshots t ON t.id = COALESCE(s.reuse_chain_root_id, s.id)
+         WHERE s.id = :sid
+    """), {"sid": str(sid)})).first()
+    if row is None:
+        raise SnapshotNotFound(str(sid))
+    target = _coerce_uuid(row.target_id)
+    if row.overlay_base_id is None:
+        return SnapshotItem.snapshot_id == target
+    effective = func.snapshot_items_effective(target).table_valued("id")
+    return SnapshotItem.id.in_(select(effective.c.id))
+
+
+async def items_scope_any(session: AsyncSession, snapshot_ids):
+    """``items_scope`` OR-ed over several snapshots; an unknown id selects nothing."""
+    from sqlalchemy import false, or_
+    scopes = []
+    for sid in snapshot_ids:
+        try:
+            scopes.append(await items_scope(session, sid))
+        except (SnapshotNotFound, ValueError, TypeError, AttributeError):
+            continue
+    return or_(*scopes) if scopes else false()
+
+
+async def item_in_snapshot(session: AsyncSession, item_id: UUIDLike, snapshot_id: UUIDLike) -> bool:
+    """True when the row ``item_id`` is part of ``snapshot_id``'s inventory - its own row, the
+    row of the full snapshot a pointer names, or a base row an overlay inherits."""
+    try:
+        iid, sid = _coerce_uuid(item_id), _coerce_uuid(snapshot_id)
+    except (ValueError, TypeError, AttributeError):
+        return False
+    return bool(await session.scalar(text(
+        "SELECT EXISTS (SELECT 1 FROM snapshot_items_effective(CAST(:sid AS uuid)) e WHERE e.id = CAST(:iid AS uuid))"),
+        {"sid": str(sid), "iid": str(iid)}))
+
+
+async def items_snapshot_id(session: AsyncSession, snapshot_id: UUIDLike) -> uuid.UUID:
+    """``resolve_snapshot_items_target(...).target_id``, or the id itself when the snapshot row is
+    gone (callers keep their own not-found handling)."""
+    try:
+        return (await resolve_snapshot_items_target(session, snapshot_id)).target_id
+    except SnapshotNotFound:
+        return _coerce_uuid(snapshot_id)
+
+
+async def point_at(session: AsyncSession, *, target_snapshot_id: UUIDLike, prior_snapshot_id: UUIDLike,
+                   marker: str) -> bool:
+    """Make ``target`` a reuse snapshot of the full snapshot ``prior``: no rows of its own, the prior's
+    totals, nothing new; ``extra_data[marker]`` names the prior. False, with nothing written, when the
+    target already owns rows or points elsewhere. The validation trigger requires ``prior`` to be a
+    COMPLETED full snapshot of the same resource, started earlier."""
+    row = (await session.execute(text("""
+        UPDATE snapshots t SET reuse_of_snapshot_id = p.id, reuse_chain_root_id = p.id,
+            item_count = p.item_count, bytes_total = p.bytes_total, new_item_count = 0, bytes_added = 0,
+            extra_data = (COALESCE(t.extra_data::jsonb, '{}'::jsonb) || jsonb_build_object(CAST(:marker AS text), p.id::text))::json
+        FROM snapshots p
+        WHERE t.id = CAST(:target AS UUID) AND p.id = CAST(:prior AS UUID) AND t.reuse_of_snapshot_id IS NULL
+          AND NOT EXISTS (SELECT 1 FROM snapshot_items WHERE snapshot_id = t.id)
+        RETURNING t.id"""), {"target": str(target_snapshot_id), "prior": str(prior_snapshot_id), "marker": marker})).first()
+    return row is not None
+
+
+async def resolve_snapshot_ids(session: AsyncSession, snapshot_ids) -> list:
+    """Each id mapped to the snapshot whose rows it reads (itself, or the full snapshot a reuse snapshot
+    names), order kept; unknown or non-UUID ids are kept as given."""
+    def parsed(value):
+        try:
+            return _coerce_uuid(value)
+        except (ValueError, TypeError, AttributeError):
+            return None
+    values = list(snapshot_ids)
+    ids = [parsed(value) for value in values]
+    known = [str(i) for i in ids if i is not None]
+    rows = dict((await session.execute(text(
+        "SELECT id, COALESCE(reuse_chain_root_id, id) FROM snapshots WHERE id = ANY(CAST(:ids AS uuid[]))"),
+        {"ids": known})).all()) if known else {}
+    return [value if i is None else _coerce_uuid(rows.get(i, i)) for value, i in zip(values, ids)]

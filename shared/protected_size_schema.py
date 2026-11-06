@@ -2,7 +2,8 @@
 
 No history is read here. Transition-table capture is transactional and never
 locks a resource counter. Event triggers keep direct leaf writes covered when
-partitions are created/attached later; installing requires that DDL privilege.
+partitions are created/attached later; they need a superuser and are skipped
+(with a NOTICE) for a table-owner role.
 """
 
 import hashlib
@@ -64,6 +65,57 @@ DDL = (
 )
 
 
+# Built by migration 0014 before its transaction (build_index_online), so its own
+# CREATE INDEX IF NOT EXISTS below finds them and does not lock writes on big tables.
+ONLINE_INDEXES = (
+    ("ix_protected_size_snapshot_items_identity", "snapshot_items", "(id)"),
+    ("ix_protected_size_snapshot_items_page", "snapshot_items", "(snapshot_id,id)"),
+    ("ix_protected_size_snapshots_page", "snapshots", "(id)"),
+)
+
+
+def build_index_online(conn, name, table, columns):
+    """Create index ``name`` without blocking writes; ``conn`` is a sync connection in autocommit.
+
+    A plain CREATE INDEX blocks writes for the whole build (TM: snapshot_items ~532M rows).
+    PostgreSQL cannot build on a partitioned parent CONCURRENTLY, so a partitioned table gets an
+    ON ONLY parent index plus one concurrent build per partition, attached (the parent turns valid
+    when every partition is attached). Idempotent; an invalid index left by an interrupted
+    concurrent build is dropped and rebuilt."""
+    from sqlalchemy import text as _t
+
+    def validity(index):
+        return conn.execute(_t("SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass(:n)"),
+                            {"n": index}).scalar()
+
+    def attached(index):
+        return conn.execute(_t("SELECT 1 FROM pg_inherits WHERE inhrelid = to_regclass(:c)"), {"c": index}).scalar()
+
+    def build(index, relation):
+        state = validity(index)
+        if state is True:
+            return
+        if state is False and attached(index):  # an attached partition index cannot be dropped alone
+            conn.execute(_t(f'REINDEX INDEX CONCURRENTLY "{index}"'))
+            return
+        if state is False:
+            conn.execute(_t(f'DROP INDEX CONCURRENTLY IF EXISTS "{index}"'))
+        conn.execute(_t(f'CREATE INDEX CONCURRENTLY IF NOT EXISTS "{index}" ON {relation} {columns}'))
+
+    partitions = conn.execute(_t(
+        "SELECT i.inhrelid::regclass::text FROM pg_inherits i WHERE i.inhparent = to_regclass(:t) "
+        "ORDER BY i.inhrelid::regclass::text"), {"t": table}).scalars().all()
+    if not partitions:
+        build(name, table)
+        return
+    conn.execute(_t(f'CREATE INDEX IF NOT EXISTS "{name}" ON ONLY {table} {columns}'))
+    for n, partition in enumerate(partitions):
+        child = f"{name}_p{n}"
+        build(child, partition)
+        if not attached(child):
+            conn.execute(_t(f'ALTER INDEX "{name}" ATTACH PARTITION "{child}"'))
+
+
 def event_trigger_names(schema):
     suffix = hashlib.sha256(schema.encode()).hexdigest()[:20]
     return ("protected_size_ddl_" + suffix, "protected_size_drop_" + suffix)
@@ -88,8 +140,6 @@ def statements(schema, runtime_role=None):
            WHERE n.nspname={schema_literal} AND c.relname='protected_size_source_relations'),'SELECT'),false) THEN RETURN; END IF;"""
     ddl_event, drop_event = event_trigger_names(schema)
     event_name = '"' + ddl_event + '"'
-    yield """DO $fn$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=current_user AND rolsuper)
-      THEN RAISE EXCEPTION 'Protected-size migration requires a superuser to install partition DDL capture; no startup or privilege fallback is supported'; END IF; END $fn$"""
     # Validate the existing authorization contract before creating any ledger object.
     yield f"""DO $fn$
     DECLARE source_owner oid := (SELECT relowner FROM pg_class WHERE oid='snapshot_items'::regclass);
@@ -224,8 +274,15 @@ def statements(schema, runtime_role=None):
         END IF;
       END $fn$"""
     yield "REVOKE ALL ON FUNCTION protected_size_partition_ddl() FROM PUBLIC"
-    yield f"""CREATE EVENT TRIGGER {event_name} ON ddl_command_end WHEN TAG IN ('CREATE TABLE','ALTER TABLE')
-      EXECUTE FUNCTION protected_size_partition_ddl()"""
+    # Event triggers need a superuser. A table-owner role (Taylor Morrison's migrate job) installs
+    # everything else: writes through the existing tables and partitions are still captured; only a
+    # later manual partition change needs `SELECT protected_size_install_triggers()` run by hand.
+    superuser = "EXISTS(SELECT 1 FROM pg_roles WHERE rolname=current_user AND rolsuper)"
+    yield f"""DO $fn$ BEGIN IF {superuser} THEN
+      EXECUTE $ddl$CREATE EVENT TRIGGER {event_name} ON ddl_command_end WHEN TAG IN ('CREATE TABLE','ALTER TABLE')
+      EXECUTE FUNCTION protected_size_partition_ddl()$ddl$;
+      ELSE RAISE NOTICE 'protected-size: not a superuser, partition DDL capture skipped; after changing snapshots/snapshot_items partitions run SELECT protected_size_install_triggers()';
+      END IF; END $fn$"""
     yield f"""CREATE FUNCTION protected_size_partition_drop() RETURNS event_trigger LANGUAGE plpgsql SET search_path=pg_catalog,{q},pg_temp AS $fn$
       BEGIN
         {hook_guard}
@@ -234,7 +291,9 @@ def statements(schema, runtime_role=None):
         UPDATE protected_size_control SET discovery_done=false,discovery_cursor=NULL,discovery_phase='source',discovery_epoch=discovery_epoch+1;
       END IF; END $fn$"""
     yield "REVOKE ALL ON FUNCTION protected_size_partition_drop() FROM PUBLIC"
-    yield f"""CREATE EVENT TRIGGER "{drop_event}" ON sql_drop EXECUTE FUNCTION protected_size_partition_drop()"""
+    yield f"""DO $fn$ BEGIN IF {superuser} THEN
+      EXECUTE $ddl$CREATE EVENT TRIGGER "{drop_event}" ON sql_drop EXECUTE FUNCTION protected_size_partition_drop()$ddl$;
+      END IF; END $fn$"""
 
     yield f"""DO $fn$
     DECLARE source_role text := pg_catalog.pg_get_userbyid((SELECT relowner FROM pg_class WHERE oid='snapshot_items'::regclass));

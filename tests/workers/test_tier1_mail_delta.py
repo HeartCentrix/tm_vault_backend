@@ -62,8 +62,9 @@ RID = "1f880075-0000-4000-8000-000000000001"
 
 # ── pure helpers ──────────────────────────────────────────────────────────
 
-def test_tier1_delta_default_off():
-    assert _bw.tier1_mail_delta_enabled(RID, env={}) is False
+def test_tier1_delta_default_on():
+    # Shared/room mailboxes re-downloaded in full every run (TM: 611 GiB in 30 days).
+    assert _bw.tier1_mail_delta_enabled(RID, env={}) is True
 
 
 def test_tier1_delta_fleet_switch():

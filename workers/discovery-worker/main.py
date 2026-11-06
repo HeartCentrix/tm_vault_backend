@@ -812,6 +812,16 @@ async def _finalize_discovery(
     # Breadcrumb: a COMPLETED run that skipped stale-marking records why.
     run.error_message = stale_mark_note
 
+    # The singleton directory resource (apps, roles, CA, audit) is not a Graph list result, so the
+    # staging merge never creates it; only the retired in-process discovery did.
+    # Non-fatal like auto-protect: a failed insert must not fail the whole discovery.
+    try:
+        from shared.entra_directory import ensure_entra_directory
+        await ensure_entra_directory(db, tenant)
+    except Exception as exc:
+        logger.error("ENTRA_DIRECTORY singleton not ensured for tenant %s: %s: %s",
+                     getattr(tenant, "id", "?"), type(exc).__name__, exc)
+
     tenant.status = TenantStatus.ACTIVE
     tenant.last_discovery_at = now
 

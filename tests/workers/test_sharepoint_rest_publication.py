@@ -54,7 +54,7 @@ def run_row():
     # Execute the production method unchanged; replace only its external seams.
     exec(compile(ast.Module(body=[*helpers, fn], type_ignores=[]), str(path), "exec"), ns)
 
-    async def run(*, metadata=None, chunks=(b"abc",), metadata_error=None, after=None):
+    async def run(*, metadata=None, chunks=(b"abc",), metadata_error=None, after=None, listed=None):
         if metadata is None:
             metadata = {"Length": "3", "ETag": '"v1"', "UniqueId": "file", "UIVersionLabel": "1.0"}
         async def get_meta(*args):
@@ -72,7 +72,8 @@ def run_row():
             snapshot=SimpleNamespace(id=uuid.uuid4()), graph_client=SimpleNamespace(
                 get_sharepoint_file_metadata_via_rest=get_meta, stream_sharepoint_file_via_rest=stream),
             shard=None, container="container", stats=stats, work={
-                "row": {"Id": 1, "FileRef": "/sites/a/x", "FileLeafRef": "x", "FileSystemObjectType": 0},
+                "row": {"Id": 1, "FileRef": "/sites/a/x", "FileLeafRef": "x", "FileSystemObjectType": 0,
+                        **({"File": listed} if listed is not None else {})},
                 "lst_id": "list", "list_display": "List", "site_id": "site", "site_label": "Site",
                 "sp_hostname": "tenant.sharepoint.com", "sp_site_web_url": "https://tenant.sharepoint.com/sites/a"})
         return state, stats
@@ -122,3 +123,24 @@ async def test_valid_content_and_metadata_published(run_row):
     assert stats["rest_fail"] == 0
     assert stats["rest_files_ok"] == 1
     assert state["rows"][0]["content_hash"] == hashlib.sha256(b"abc").hexdigest()
+
+
+async def test_listed_file_identity_skips_the_first_metadata_request(run_row):
+    # The list page's $expand=File carries the same identity (live: 181/181 files), so only
+    # the post-download recheck reads metadata; the stored file metadata is that full recheck.
+    run, state, stats = run_row
+    await run(listed={"Length": "3", "ETag": '"v1"', "UniqueId": "file", "UIVersionLabel": "1.0"})
+    assert state["metadata_calls"] == 1
+    assert stats["rest_files_ok"] == 1 and len(state["uploads"]) == 1
+
+
+async def test_listed_identity_that_changed_before_download_is_rejected(run_row):
+    run, state, stats = run_row
+    await run(listed={"Length": "3", "ETag": '"v0"', "UniqueId": "file", "UIVersionLabel": "0.9"})
+    assert not state["uploads"] and stats["rest_fail"] == 1
+
+
+async def test_row_without_a_usable_listed_identity_reads_metadata_first(run_row):
+    run, state, stats = run_row
+    await run(listed={"ETag": '"v1"'})  # no Length
+    assert state["metadata_calls"] == 2 and stats["rest_files_ok"] == 1

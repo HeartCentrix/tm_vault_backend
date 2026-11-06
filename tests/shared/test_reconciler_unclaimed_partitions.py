@@ -50,7 +50,7 @@ _SCHEMA = [
     "CREATE TYPE snapshotstatus AS ENUM ('IN_PROGRESS','COMPLETED','FAILED',"
     "'PARTIAL','PENDING_DELETION')",
     "CREATE TYPE jobstatus AS ENUM ('QUEUED','PENDING','RUNNING','COMPLETED',"
-    "'FAILED','CANCELLED','CANCELLING','RETRYING')",
+    "'PARTIAL','FAILED','CANCELLED','CANCELLING','RETRYING')",
     """CREATE TABLE snapshot_partitions (
         id               uuid PRIMARY KEY,
         snapshot_id      uuid NOT NULL,
@@ -247,9 +247,12 @@ def test_never_claimed_queued_partition_is_not_failed_at_requeue_cap():
     _run(_body())
 
 
-def test_claimed_then_abandoned_partition_still_poisons_at_cap():
-    """The circuit breaker must survive for shards a worker really took."""
+def test_claimed_then_abandoned_partition_still_poisons_at_cap(monkeypatch):
+    """The circuit breaker must survive for shards a worker really took
+    (once the automatic replay budget is spent; see the auto-replay PG test)."""
+    import shared.reconciler as reconciler
     from shared.reconciler import RECONCILER_MAX_REQUEUE, sweep_orphans
+    monkeypatch.setattr(reconciler, "RECONCILER_DLQ_REPLAY_MAX", 0)
 
     async def _body():
         engine, factory = await _fresh_db()

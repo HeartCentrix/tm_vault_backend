@@ -207,8 +207,14 @@ async def _settle(factory, claim, **kwargs):
 
 
 async def run_batch(factory, claim: CopyClaim, *, batch_size=512,
-                    statement_timeout_ms=60000, lock_timeout_ms=5000) -> BatchResult:
-    """Run one bounded transaction. SQL locks survive lease expiry or lost workers."""
+                    statement_timeout_ms=60000, lock_timeout_ms=5000, keep_claim=False) -> BatchResult:
+    """Run one bounded transaction. SQL locks survive lease expiry or lost workers.
+
+    ``keep_claim``: when work remains and the claim's lease still outlasts a statement timeout,
+    the task stays RUNNING under this claim (status 'RUNNING') so the caller can run its next
+    batch without re-entering the fair queue. Every batch re-fences state, generation and owner
+    under row locks, and the lease is never extended: a lost worker's task is reclaimable when
+    the lease expires, as before, and the queue regains it within one lease."""
     if any(type(value) is not int or value < 1 for value in
            (batch_size, statement_timeout_ms, lock_timeout_ms)):
         raise ValueError('batch size and statement/lock timeouts must be positive integers')
@@ -243,13 +249,20 @@ async def run_batch(factory, claim: CopyClaim, *, batch_size=512,
                 task.row_count += result['rows']
                 task.bytes_count += result['bytes']
                 task.execution_s = float(task.execution_s or 0)+query_seconds
-                task.state = 'COMPLETED' if result['done'] else 'READY'
-                task.lease_owner_id = task.lease_expires_at = None
                 task.error = None
                 task.attempts = 0
-                if not result['done']:
-                    task.ready_at = task.queue_entered_at = await session.scalar(select(func.clock_timestamp()))
-                status = task.state
+                now = None if result['done'] else await session.scalar(select(func.clock_timestamp()))
+                if keep_claim and now is not None and task.lease_expires_at is not None and (
+                        task.lease_expires_at - now > timedelta(milliseconds=statement_timeout_ms)):
+                    # The next execution's reservation, exactly as claim() would make it.
+                    task.attempts = 1
+                    status = 'RUNNING'
+                else:
+                    task.state = 'COMPLETED' if result['done'] else 'READY'
+                    task.lease_owner_id = task.lease_expires_at = None
+                    if not result['done']:
+                        task.ready_at = task.queue_entered_at = now
+                    status = task.state
             return BatchResult(status, claim.task_id, result['rows'], result['bytes'], query_seconds)
         except _Stale:
             return BatchResult('STALE', claim.task_id, query_seconds=query_seconds)

@@ -85,6 +85,19 @@ async def adopt_chat_catalogue(session, *, resource_id, snapshot_id, writer_enab
     snapshot_format = (snapshot.extra_data or {}).get("chat_inventory_format")
     if snapshot_format == 1 and snapshot.status in {SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL, SnapshotStatus.FAILED}:
         return True
+    effective_policy = policy_id or resource.sla_policy_id
+    policy = await session.scalar(select(SlaPolicy).where(SlaPolicy.id == effective_policy)
+        .with_for_update(read=True)) if writer_enabled and effective_policy else None
+    protection = policy is not None and next((name for name, on in (("legal_hold", policy.legal_hold_enabled),
+        ("immutability", str(policy.immutability_mode or "None").lower() != "none"),
+        ("customer_key", str(policy.encryption_mode or "VAULT_MANAGED").upper() == "CUSTOMER_KEY")) if on), None)
+    if protection and resource_format != 1 and snapshot_format != 1:
+        # The catalogue writes every chat into one deduplicated tenant store
+        # (chat-catalogue-<tenant>) that gets no per-policy WORM, legal hold or
+        # CMK scope, so keep never-adopted resources on the legacy writer.
+        logging.getLogger(__name__).warning("chat_catalogue_legacy_fallback resource=%s snapshot=%s reason=%s",
+            resource_id, snapshot_id, protection)
+        writer_enabled = False
     if not writer_enabled:
         if resource_format == 1 or snapshot_format == 1:
             raise ChatCatalogueSuspended("catalogue writer is disabled for an adopted chat resource")
@@ -100,11 +113,7 @@ async def adopt_chat_catalogue(session, *, resource_id, snapshot_id, writer_enab
             snapshot.status != SnapshotStatus.IN_PROGRESS or resource.archived_at is not None or
             resource.deletion_queued_at is not None or str(getattr(resource.status, "value", resource.status)) == "PENDING_DELETION"):
         raise ChatCatalogueAdoptionError("capture snapshot, job or resource is no longer eligible")
-    effective_policy = policy_id or resource.sla_policy_id
-    policy = await session.scalar(select(SlaPolicy).where(SlaPolicy.id == effective_policy)
-        .with_for_update(read=True)) if effective_policy else None
-    if policy is not None and (policy.legal_hold_enabled or str(policy.immutability_mode or "None").lower() != "none" or
-            str(policy.encryption_mode or "VAULT_MANAGED").upper() == "CUSTOMER_KEY"):
+    if protection:
         raise ChatCatalogueProtectionUnsupported("catalogue capture does not yet support native legal hold, immutability or CUSTOMER_KEY policy")
     if snapshot_format != 1:
         other = await session.scalar(select(Snapshot.id).where(Snapshot.resource_id == resource_id,
@@ -161,13 +170,17 @@ async def catalogue_snapshot_result(session, snapshot_id, *, force_recount=False
             "outcome": snapshot.status.value.lower(), "failure_reason": extra.get("failure_reason") or extra.get("error"),
             "failed": snapshot.status == SnapshotStatus.FAILED}
     primary = SnapshotItem.item_type.notin_(["CHAT_ATTACHMENT", "CHAT_HOSTED_CONTENT"])
+    # A backup whose every chat was unchanged points at the full backup it reuses (no rows of its own).
     count, logical_bytes = (await session.execute(select(func.count().filter(primary),
-        func.coalesce(func.sum(SnapshotItem.content_size), 0)).where(SnapshotItem.snapshot_id == snapshot_id))).one()
-    prior = await session.scalar(select(Snapshot.id).where(Snapshot.resource_id == snapshot.resource_id,
+        func.coalesce(func.sum(SnapshotItem.content_size), 0)).where(
+            SnapshotItem.snapshot_id == (snapshot.reuse_chain_root_id or snapshot_id)))).one()
+    prior = None if snapshot.reuse_chain_root_id else await session.scalar(select(Snapshot.id).where(Snapshot.resource_id == snapshot.resource_id,
         Snapshot.id != snapshot_id, Snapshot.job_id != snapshot.job_id,
         Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL]),
         Snapshot.created_at <= snapshot.created_at).order_by(Snapshot.created_at.desc(), Snapshot.id.desc()).limit(1))
-    if prior is None:
+    if snapshot.reuse_chain_root_id:
+        new_count, new_bytes = 0, 0
+    elif prior is None:
         new_count, new_bytes = count, logical_bytes
     else:
         prior_versions = select(SnapshotItem.chat_version_id).where(SnapshotItem.snapshot_id == prior,
@@ -285,6 +298,7 @@ def chat_folder(chat, principal_id):
             name = member.get("displayName")
             if isinstance(name, str) and name.strip() and str(member.get("userId") or "").lower() != me:
                 others.append(name.strip())
+        others.sort(key=lambda n: (n.casefold(), n))  # Graph's member order varies between runs
         if not others:
             display = "Chat " + hashlib.sha256(chat["id"].encode()).hexdigest()[:8]
         elif str(chat.get("chatType") or "").lower() == "oneonone":
@@ -630,11 +644,13 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                 unchanged = [cid for cid in keys if changed is not None and cid not in changed and cid not in published]
                 if unchanged and since_snapshot and not full_backup:
                     from shared.chat_capture import link_unchanged_chats
+                    # First turn, every chat unchanged: the backup may point at its source (exact match only).
                     linked = await link_unchanged_chats(scopes={cid: chat_scope(cid) for cid in unchanged},
                         folders={cid: chat_folder(chats[cid], principal) for cid in unchanged},
                         filter_hashes={cid: filters[cid][1] for cid in unchanged},
                         session_factory=session_factory, source_snapshot_id=since_snapshot,
-                        latest_change=source.latest_message_change)
+                        latest_change=source.latest_message_change,
+                        whole_snapshot=not published and len(unchanged) == len(keys), external_chats=set(external))
                     if linked:
                         completed += len(linked)
                         keys = [cid for cid in keys if cid not in linked]

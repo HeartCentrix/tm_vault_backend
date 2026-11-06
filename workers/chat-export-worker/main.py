@@ -155,7 +155,10 @@ async def main() -> None:
         level=logging.INFO,
         format='{"ts":"%(asctime)s","lvl":"%(levelname)s","msg":"%(message)s","svc":"chat-export-worker"}',
     )
-    start_http_server(9102)
+    try:
+        start_http_server(9102)
+    except OSError as exc:  # port taken: lose the scrape, never the worker
+        log.warning("metrics port 9102 unavailable (%r); scrape disabled", exc)
     await health_server()
     await startup_router(required=True)
     from shared.crypto import bootstrap as enc_bootstrap

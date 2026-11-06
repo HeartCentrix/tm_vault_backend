@@ -601,6 +601,11 @@ def test_delete_re_asserts_the_in_flight_guard_at_delete_time(monkeypatch):
         return None
 
     monkeypatch.setattr(rc, "_rehydrate_reuse_heir", _fake_rehydrate)
+
+    async def _no_overlays(sess, sid, *, pointer_heir, doomed_ids):
+        return None
+
+    monkeypatch.setattr(rc, "_rehydrate_overlay_dependents", _no_overlays)
     events = {sid: SimpleNamespace(snapshot_id=sid) for sid in (doomed_a, went_live_b)}
     n = asyncio.run(rc._delete_snapshots(
         session, {doomed_a, went_live_b}, audit_events=events,

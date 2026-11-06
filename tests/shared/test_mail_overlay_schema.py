@@ -1,0 +1,20 @@
+"""The overlay DDL has one source (shared.database.MAIL_OVERLAY_DDL): bootstrap, alembic 0021 and
+the manual Railway script must all carry exactly it."""
+from pathlib import Path
+
+from shared.database import MAIL_OVERLAY_DDL
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_manual_railway_script_is_the_shared_ddl():
+    script = (ROOT / "scripts" / "2026_11_06_mail_overlay_snapshots.sql").read_text()
+    assert ";\n\n".join(MAIL_OVERLAY_DDL) + ";\n" in script
+    assert script.rstrip().endswith("COMMIT;") and "\nBEGIN;\n" in script
+
+
+def test_migration_and_bootstrap_apply_the_shared_ddl():
+    migration = (ROOT / "alembic" / "versions" / "0021_mail_overlay_snapshots.py").read_text()
+    assert "for ddl in MAIL_OVERLAY_DDL:" in migration
+    bootstrap = (ROOT / "shared" / "database.py").read_text()
+    assert "MAIL_OVERLAY_DDL[0]" in bootstrap and "*MAIL_OVERLAY_DDL," in bootstrap

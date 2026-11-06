@@ -93,10 +93,11 @@ async def test_unfinished_settlement_retries_are_durably_delayed(store, outcome)
     assert calls == 2
 
 
-async def test_success_clears_pending_only_after_terminal_parents_without_pinned_session(store):
+@pytest.mark.parametrize('job_status', ['COMPLETED', 'PARTIAL'])
+async def test_success_clears_pending_only_after_terminal_parents_without_pinned_session(store, job_status):
     receipt = await completed(store)
     async with store.factory.begin() as db:
-        (await db.get(models.Job, receipt.job_id)).status = models.JobStatus.COMPLETED
+        (await db.get(models.Job, receipt.job_id)).status = models.JobStatus[job_status]
 
     async def settle(work_id):
         assert store.engine.sync_engine.pool.checkedout() == 0

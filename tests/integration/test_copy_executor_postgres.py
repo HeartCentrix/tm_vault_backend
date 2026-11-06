@@ -11,6 +11,8 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from shared.database import SNAPSHOT_ITEMS_EFFECTIVE_FUNCTION
+
 pytestmark = pytest.mark.integration
 
 
@@ -28,7 +30,8 @@ async def store():
         for ddl in (
             "CREATE TABLE resources (id uuid PRIMARY KEY, tenant_id uuid NOT NULL)",
             "CREATE TABLE snapshots (id uuid PRIMARY KEY, resource_id uuid NOT NULL, job_id uuid, "
-            "status text, created_at timestamp, extra_data json, reuse_of_snapshot_id uuid, reuse_chain_root_id uuid)",
+            "status text, created_at timestamp, extra_data json, reuse_of_snapshot_id uuid, reuse_chain_root_id uuid, "
+            "overlay_base_id uuid)",
             "CREATE TABLE snapshot_partitions (snapshot_id uuid, partition_type text, payload json)",
             "CREATE TABLE chat_threads (id uuid PRIMARY KEY, tenant_id uuid, chat_id text)",
             "CREATE TABLE chat_thread_messages (chat_thread_id uuid, message_external_id text)",
@@ -38,6 +41,9 @@ async def store():
             "blob_path text, encryption_key_id text, backup_version integer, metadata json, is_deleted boolean, "
             "indexed_at timestamp, backend_id uuid, chat_version_id uuid, created_at timestamp, "
             "UNIQUE(snapshot_id,external_id,item_type))",
+            "CREATE TABLE snapshot_overlay_removals (snapshot_id uuid, item_type text, external_id text, "
+            "PRIMARY KEY (snapshot_id, item_type, external_id))",
+            SNAPSHOT_ITEMS_EFFECTIVE_FUNCTION,
             "CREATE TABLE copy_workflows (id uuid PRIMARY KEY, tenant_id uuid, job_id uuid, resource_id uuid, "
             "target_snapshot_id uuid REFERENCES snapshots(id), state text DEFAULT 'DRAINING', capture_attempt bigint DEFAULT 0, "
             "parent_settle_pending boolean DEFAULT false)",
@@ -52,9 +58,9 @@ async def store():
     tenant, resource, source, target, job, workflow, backend, version = [uuid.uuid4() for _ in range(8)]
     async with factory() as s:
         await s.execute(text("INSERT INTO resources VALUES (:r,:t)"), {"r": resource, "t": tenant})
-        await s.execute(text("INSERT INTO snapshots VALUES (:s,:r,:j,'COMPLETED','2026-01-01','{}',NULL,NULL)"),
+        await s.execute(text("INSERT INTO snapshots VALUES (:s,:r,:j,'COMPLETED','2026-01-01','{}',NULL,NULL,NULL)"),
                         {"s": source, "r": resource, "j": uuid.uuid4()})
-        await s.execute(text("INSERT INTO snapshots VALUES (:s,:r,:j,'IN_PROGRESS','2026-01-02','{}',NULL,NULL)"),
+        await s.execute(text("INSERT INTO snapshots VALUES (:s,:r,:j,'IN_PROGRESS','2026-01-02','{}',NULL,NULL,NULL)"),
                         {"s": target, "r": resource, "j": job})
         await s.execute(text("INSERT INTO copy_workflows(id,tenant_id,job_id,resource_id,target_snapshot_id) VALUES (:w,:t,:j,:r,:s)"),
                         {"w": workflow, "t": tenant, "j": job, "r": resource, "s": target})
@@ -405,3 +411,83 @@ async def test_batch_is_capped_by_stored_bytes_but_always_takes_one_row(store, m
     monkeypatch.setattr(executor(), "BATCH_MAX_BYTES", 1)
     assert (await batch(store, task, 20))["rows"] == 1
     assert [r["external_id"] for r in await store.rows()] == ["a", "b", "c"]
+
+
+def test_batch_byte_cap_is_configurable(monkeypatch):
+    """COPY_BATCH_MAX_BYTES sizes copy batches without a rebuild (operators tune it against
+    COPY_WORK_STATEMENT_TIMEOUT_MS)."""
+    module = executor()
+    monkeypatch.setenv("COPY_BATCH_MAX_BYTES", str(48 * 1024 * 1024))
+    try:
+        assert importlib.reload(module).BATCH_MAX_BYTES == 48 * 1024 * 1024
+    finally:
+        monkeypatch.delenv("COPY_BATCH_MAX_BYTES")
+        # Default: 32 MB (~12 s per batch at Railway's ~3 s per 8 MB, inside the 60 s budget).
+        assert importlib.reload(module).BATCH_MAX_BYTES == 32 * 1024 * 1024
+
+
+async def test_attachment_parent_check_reads_each_stored_payload_once(store):
+    """Local measurement 2026-11-06: with fresh copy_work_items statistics the planner checked each
+    attachment's parent by walking the target's rows and re-reading the row's stored json payload
+    for every comparison (130 attachments x ~236 target rows, 10.5 s of a 10.7 s batch, growing as
+    the target fills). A whole batch must stay inside a few seconds of statement budget."""
+    async with store.factory() as s:
+        await s.execute(text("""
+            INSERT INTO snapshot_items(id,snapshot_id,tenant_id,item_type,external_id,name,content_size,metadata)
+            SELECT gen_random_uuid(),:s,:t,'EMAIL','m' || lpad(n::text,5,'0'),'m',1,'{}'
+              FROM generate_series(1,2000) n CROSS JOIN (VALUES (CAST(:src AS uuid)),(CAST(:tgt AS uuid))) v(s)
+        """.replace(":s,", "v.s,")), {"t": store.tenant, "src": store.source, "tgt": store.target})
+        await s.commit()
+    for n in range(150):
+        await store.add(f"m{2000 - n:05d}::att", kind="EMAIL_ATTACHMENT", parent=f"m{2000 - n:05d}",
+                        metadata={"inline_b64": os.urandom(40000).hex()})
+    task = await store.task("MAIL_CARRY")
+    await prepare(store, task)
+    copied, result = 0, {"done": False}
+    for _ in range(5):  # EMAIL phase, then byte-capped attachment batches
+        async with store.factory() as s:
+            await s.execute(text("SET statement_timeout = '5s'"))
+            result = await executor().copy_manifest_batch(s, task, limit=20000)
+            await s.commit()
+        task.checkpoint, copied = result["cursor"], copied + result["rows"]
+        if result["done"]:
+            break
+    assert result["done"] and copied == 150
+
+
+async def _overlay_prior(store):
+    overlay = uuid.uuid4()
+    async with store.factory() as s:
+        await s.execute(text("INSERT INTO snapshots VALUES (:s,:r,:j,'COMPLETED','2026-01-01 12:00','{}',NULL,NULL,:b)"),
+                        {"s": overlay, "r": store.resource, "j": uuid.uuid4(), "b": store.source})
+        await s.execute(text("INSERT INTO snapshot_overlay_removals VALUES (:o,'EMAIL','gone')"), {"o": overlay})
+        await s.commit()
+    for ext in ("kept", "gone"):
+        await store.add(ext, kind="EMAIL")
+        await store.add(ext + "::att", kind="EMAIL_ATTACHMENT", parent=ext)
+    return overlay
+
+
+async def _copy(store):
+    task = await store.task("MAIL_CARRY")
+    await prepare(store, task)
+    while not (await batch(store, task, 20))["done"]:
+        pass
+    return task, [r["external_id"] for r in await store.rows()]
+
+
+async def test_mail_carry_from_an_overlay_prior_copies_base_plus_overlay_minus_removals(store):
+    """A compaction (any full copy) after an overlay copies the overlay's whole inventory."""
+    overlay = await _overlay_prior(store)
+    await store.add("new", kind="EMAIL", snapshot=overlay)
+    task, copied = await _copy(store)
+    assert task.params["prior_snapshot_id"] == str(overlay)
+    assert copied == ["kept", "new", "kept::att"]
+
+
+async def test_overlay_that_owns_no_rows_is_still_the_prior(store):
+    """Only deletions since the base: picking the base instead would resurrect them."""
+    overlay = await _overlay_prior(store)
+    task, copied = await _copy(store)
+    assert task.params["prior_snapshot_id"] == str(overlay)
+    assert copied == ["kept", "kept::att"]

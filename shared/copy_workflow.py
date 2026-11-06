@@ -456,9 +456,9 @@ async def begin_resume(factory, workflow_id, owner_id):
         if pending: return None
         if job is None or snapshot is None: raise CopyWorkConflict('copy resume parent missing')
         leaf=partition or snapshot
-        terminal=(partition.status in ('COMPLETED','FAILED') if partition else snapshot.status.value in ('COMPLETED','PARTIAL','FAILED'))
+        terminal=(partition.status in ('COMPLETED','FAILED') if partition else snapshot.status.value in ('COMPLETED','PARTIAL','FAILED','SKIPPED'))
         if terminal:
-            workflow.state='COMPLETED' if (partition.status=='COMPLETED' if partition else snapshot.status.value=='COMPLETED') else 'PARTIAL'
+            workflow.state='COMPLETED' if (partition.status=='COMPLETED' if partition else snapshot.status.value in ('COMPLETED','SKIPPED')) else 'PARTIAL'
             workflow.completed_at=now
             workflow.parent_settle_pending=True
             return None
@@ -505,7 +505,7 @@ async def finish_resume(factory, workflow_id, owner_id, failed=False):
         workflow=await session.scalar(select(CopyWorkflow).where(CopyWorkflow.id==workflow.id).with_for_update())
         if workflow.state!='RESUMING' or workflow.lease_owner_id!=_uuid(owner_id): return False
         leaf=partition or snapshot
-        terminal=partition.status in ('COMPLETED','FAILED') if partition else snapshot.status.value in ('COMPLETED','PARTIAL','FAILED')
+        terminal=partition.status in ('COMPLETED','FAILED') if partition else snapshot.status.value in ('COMPLETED','PARTIAL','FAILED','SKIPPED')
         if not terminal: raise CopyWorkConflict('copy continuation did not settle its leaf')
         gaps=await session.scalar(select(exists(select(CopyWorkTask.id).where(CopyWorkTask.workflow_id==workflow.id,CopyWorkTask.capture_attempt==workflow.capture_attempt,CopyWorkTask.state!='COMPLETED'))))
         workflow.state='PARTIAL' if failed or gaps else 'COMPLETED'
@@ -526,7 +526,7 @@ async def finish_parent_settlement(factory, workflow_id):
         if not workflow.parent_settle_pending: return True
         if workflow.state in ACTIVE_WORKFLOWS: return False
         if snapshot is None or job is None: return False
-        if snapshot.status.value not in ('COMPLETED','PARTIAL','FAILED') or job.status.value not in ('COMPLETED','FAILED','CANCELLED'):
+        if snapshot.status.value not in ('COMPLETED','PARTIAL','FAILED','SKIPPED') or job.status.value not in ('COMPLETED','PARTIAL','FAILED','CANCELLED'):
             return False
         workflow.parent_settle_pending=False
         task_ids=select(CopyWorkTask.id).where(CopyWorkTask.workflow_id==workflow.id)

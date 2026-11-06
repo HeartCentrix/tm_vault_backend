@@ -98,3 +98,14 @@ def test_filter_resource_map_supports_chat_only_policy():
 
     assert list(filtered) == ["chats"]
     assert [item.resource_id for item in skipped] == ["mail"]
+
+
+def test_m365_groups_follow_the_group_workloads_like_entra_groups():
+    # M365_GROUP had no mapping, so every bulk/scheduled backup skipped it as
+    # "workload_disabled" (Railway 2026-11-06: 16 of 16 dropped; TM: 3,564 groups,
+    # 0 snapshots in 30 days). Its handler backs up profile, members and the group mailbox.
+    from types import SimpleNamespace
+    from shared.sla_workloads import resource_type_enabled
+    assert resource_type_enabled("M365_GROUP", SimpleNamespace(backup_entra_id=True, group_mailbox=False))
+    assert resource_type_enabled("M365_GROUP", SimpleNamespace(backup_entra_id=False, group_mailbox=True))
+    assert not resource_type_enabled("M365_GROUP", SimpleNamespace(backup_entra_id=False, group_mailbox=False))

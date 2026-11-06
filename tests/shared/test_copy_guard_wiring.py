@@ -47,7 +47,7 @@ def test_every_reconciler_transition_has_atomic_pending_copy_guard(monkeypatch):
     session = RecordingSession()
     asyncio.run(reconciler.sweep_orphans(session))
     updates = [sql for sql in session.sql if "UPDATE " in sql]
-    assert len(updates) == 7
+    assert len(updates) == 8  # + the bounded DLQ replay (RECONCILER_DLQ_REPLAY_MAX)
     assert all("COPY_BARRIER_" in sql for sql in updates)
 
 

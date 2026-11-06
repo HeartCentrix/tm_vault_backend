@@ -289,6 +289,33 @@ def derive_batch_status(
     return ("Done", warnings or None)
 
 
+def job_partial_sql(job_expr: str) -> str:
+    """SQL predicate: the job left a PARTIAL or FAILED snapshot.
+
+    The job-level twin of derive_batch_status's "Done with warnings", which
+    counts the same rows (snapshots by job_id). A job that would finish
+    COMPLETED finishes PARTIAL when this holds; FAILED stays FAILED.
+    """
+    return (f"EXISTS (SELECT 1 FROM snapshots ps WHERE ps.job_id = {job_expr} "
+            "AND ps.status::text IN ('PARTIAL','FAILED'))")
+
+
+SNAPSHOT_REASON_SQL = ("COALESCE(ps.extra_data->>'failure_reason', ps.extra_data->>'degraded_reason', "
+                       "ps.extra_data->>'error')")
+
+
+def job_issues_sql(job_match: str) -> str:
+    """One row: how many resources of the matching jobs (``job_match`` filters ``j``) left a PARTIAL or
+    FAILED snapshot, and the first such resource's name and reason (failure_reason, else
+    degraded_reason, else error). TM #35: a PARTIAL backup must say why."""
+    order = f"({SNAPSHOT_REASON_SQL}) IS NULL, ps.created_at, ps.id"
+    return ("SELECT count(DISTINCT ps.resource_id) AS issue_count, "
+            f"(array_agg(r.display_name ORDER BY {order}))[1] AS issue_name, "
+            f"(array_agg({SNAPSHOT_REASON_SQL} ORDER BY {order}))[1] AS issue_reason "
+            "FROM snapshots ps JOIN jobs j ON j.id = ps.job_id JOIN resources r ON r.id = ps.resource_id "
+            f"WHERE ps.status::text IN ('PARTIAL','FAILED') AND {job_match}")
+
+
 def archive_backup_enabled() -> bool:
     """Whether Online Archive backup is on (default ON — mirrors
     archive_graph). Gates USER_ARCHIVE in both the batch DISPLAY rollup and the
@@ -329,28 +356,30 @@ def _withheld_children_cte(cte_name: str, spec_key: str, comment: str) -> str:
       * UUID shape filter before the cast — a non-UUID string would
         raise on ::uuid.
 
-    Absent key ⇒ zero rows ⇒ the LEFT JOIN in ``fanout`` leaves the child
-    counted as missing, i.e. EXACTLY today's behaviour for every batch
-    dispatched before the writer shipped. Never "expect nothing".
+    Absent key ⇒ zero rows ⇒ ``fanout`` still counts the child as
+    missing, i.e. EXACTLY today's behaviour for every batch dispatched
+    before the writer shipped. Never "expect nothing".
+
+    The scheduler stamps the SAME list on every job of a batch, so the
+    lists are collapsed to one per (batch, list) BEFORE unnesting. TM's
+    30 days: 2,289 jobs x ~86 ids = 197,868 elements, 5.4 s when every
+    element also re-read the job's spec (catalogue #20).
     """
+    ids = f"COALESCE((j.spec->'{spec_key}')::jsonb, '[]'::jsonb)"
     return f"""
     {cte_name} AS (
 {comment}
         SELECT DISTINCT
-            COALESCE(j.spec->>'batch_id', j.id::text) AS batch_id,
-            (d.value #>> '{{}}')::uuid                AS child_resource_id
-        FROM filtered_jobs j
-        CROSS JOIN LATERAL jsonb_array_elements(
-            CASE
-                WHEN jsonb_typeof(
-                        COALESCE((j.spec->'{spec_key}')::jsonb,
-                                 '[]'::jsonb)
-                     ) = 'array'
-                THEN COALESCE((j.spec->'{spec_key}')::jsonb,
-                              '[]'::jsonb)
-                ELSE '[]'::jsonb
-            END
-        ) AS d(value)
+            w.batch_id,
+            (d.value #>> '{{}}')::uuid AS child_resource_id
+        FROM (
+            SELECT DISTINCT
+                j.batch_key AS batch_id,
+                CASE WHEN jsonb_typeof({ids}) = 'array' THEN {ids}
+                     ELSE '[]'::jsonb END AS ids
+            FROM filtered_jobs j
+        ) w
+        CROSS JOIN LATERAL jsonb_array_elements(w.ids) AS d(value)
         WHERE (d.value #>> '{{}}') ~*
               '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$'
     )"""
@@ -478,7 +507,10 @@ def build_batch_rollup_query(
     ))
     sql = f"""
     WITH filtered_jobs AS (
-        SELECT *
+        -- batch_key is computed HERE, once per job. Every CTE that unnests
+        -- an array per job used to recompute it per element, re-detoasting
+        -- and re-parsing the whole json spec each time (catalogue #20).
+        SELECT j.*, COALESCE(j.spec->>'batch_id', j.id::text) AS batch_key
         FROM jobs j
         WHERE (CAST(:tid AS UUID) IS NULL OR j.tenant_id = CAST(:tid AS UUID))
           AND (CAST(:start_date AS TIMESTAMP) IS NULL OR j.created_at >= CAST(:start_date AS TIMESTAMP))
@@ -488,15 +520,15 @@ def build_batch_rollup_query(
     ),
     batches_all AS (
         SELECT
-            COALESCE(j.spec->>'batch_id', j.id::text)              AS batch_id,
+            j.batch_key                                            AS batch_id,
             j.tenant_id                                            AS tenant_id,
             MIN(j.created_at)                                      AS started_at,
             MAX(j.completed_at)                                    AS jobs_max_completed_at,
             ARRAY_AGG(j.id ORDER BY j.created_at)                  AS job_ids,
             BOOL_OR(j.status::text = 'CANCELLED')                  AS any_cancelled,
             BOOL_OR(j.status::text = 'FAILED')                     AS any_job_failed,
-            BOOL_OR(j.status::text = 'COMPLETED')                  AS any_job_completed,
-            BOOL_AND(j.status::text IN ('COMPLETED','FAILED','CANCELLED'))
+            BOOL_OR(j.status::text IN ('COMPLETED','PARTIAL'))     AS any_job_completed,
+            BOOL_AND(j.status::text IN ('COMPLETED','PARTIAL','FAILED','CANCELLED'))
                                                                     AS all_jobs_terminal,
             -- For non-bulk single-Job batches (no batch_resource_ids),
             -- carry through job.resource_id so we can resolve a real
@@ -541,7 +573,7 @@ def build_batch_rollup_query(
         -- the unnest(uuid[][]) → scalar gotcha. NULLs coalesced to
         -- empty array so the LATERAL stays safe.
         SELECT
-            COALESCE(j.spec->>'batch_id', j.id::text) AS batch_id,
+            j.batch_key AS batch_id,
             COALESCE(
                 ARRAY_AGG(DISTINCT bid) FILTER (WHERE bid IS NOT NULL),
                 ARRAY[]::uuid[]
@@ -629,7 +661,18 @@ def build_batch_rollup_query(
             b.batch_id,
             COUNT(*) FILTER (WHERE sp.status::text NOT IN ('COMPLETED','FAILED'))
                                                                     AS parts_pending,
-            MAX(sp.completed_at)                                    AS parts_max_completed_at
+            MAX(sp.completed_at)                                    AS parts_max_completed_at,
+            BOOL_AND(sp.partition_type = 'ONEDRIVE_FILES')            AS capture_is_onedrive,
+            BOOL_OR(sp.payload->'onedrive_capture_progress'->>'version' = '1')
+                                                                    AS capture_progress_known,
+            COALESCE(SUM(sp.total_bytes_est), 0)                     AS capture_expected_bytes,
+            COALESCE(SUM(sp.total_files), 0)                         AS capture_expected_files,
+            COALESCE(SUM(COALESCE(
+                (sp.payload->'onedrive_capture_progress'->>'bytes')::bigint,
+                sp.bytes_uploaded, 0)), 0)                          AS capture_bytes,
+            COALESCE(SUM(COALESCE(
+                (sp.payload->'onedrive_capture_progress'->>'files')::bigint,
+                sp.files_uploaded, 0)), 0)                          AS capture_files
         FROM batches b
         LEFT JOIN snapshot_partitions sp ON sp.job_id = ANY(b.job_ids)
         GROUP BY 1
@@ -647,7 +690,7 @@ def build_batch_rollup_query(
         -- e.g. PREEMPTIVE single-resource), scope_ids is empty; the
         -- ``total_expected`` CTE below falls back to all_res_ids.
         SELECT
-            COALESCE(j.spec->>'batch_id', j.id::text) AS batch_id,
+            j.batch_key AS batch_id,
             COALESCE(
                 ARRAY_AGG(DISTINCT bid) FILTER (WHERE bid IS NOT NULL),
                 ARRAY[]::uuid[]
@@ -736,23 +779,20 @@ def build_batch_rollup_query(
         -- dispatcher recorded withholding it. Both withhold reasons are
         -- recorded facts (see _withheld_children_cte); neither is
         -- inferred from coverage or timing.
-        SELECT
-            e.batch_id,
-            COUNT(*) FILTER (
-                WHERE o.child_resource_id IS NULL
-                  AND df.child_resource_id IS NULL
-                  AND oh.child_resource_id IS NULL
-            ) AS missing_t2
-        FROM expected_t2 e
-        LEFT JOIN observed_t2 o
-               ON o.batch_id = e.batch_id
-              AND o.child_resource_id = e.child_resource_id
-        LEFT JOIN deferred_t2 df
-               ON df.batch_id = e.batch_id
-              AND df.child_resource_id = e.child_resource_id
-        LEFT JOIN overlap_held_t2 oh
-               ON oh.batch_id = e.batch_id
-              AND oh.child_resource_id = e.child_resource_id
+        --
+        -- EXCEPT, not three LEFT JOINs: the planner estimates expected_t2 at
+        -- 1 row and nest-looped the joins, comparing every expected child
+        -- with every observed one (66M comparisons, 5.5 s on TM's 30 days,
+        -- quadratic in history). Set difference is hashed. Same count:
+        -- expected_t2 holds each (batch, child) once, and a batch with no
+        -- missing child has no row here, which the final SELECT reads as 0.
+        SELECT batch_id, COUNT(*) AS missing_t2
+        FROM (
+            SELECT batch_id, child_resource_id FROM expected_t2
+            EXCEPT SELECT batch_id, child_resource_id FROM observed_t2
+            EXCEPT SELECT batch_id, child_resource_id FROM deferred_t2
+            EXCEPT SELECT batch_id, child_resource_id FROM overlap_held_t2
+        ) missing
         GROUP BY 1
     ),
     entra_count AS (
@@ -850,7 +890,7 @@ def build_batch_rollup_query(
             COALESCE(u.users_total, 0)                     AS tier1_total,
             COUNT(DISTINCT s.resource_id) FILTER (
                 WHERE r.type::text = 'ENTRA_USER'
-                  AND s.status::text IN ('COMPLETED','PARTIAL','FAILED')
+                  AND s.status::text IN ('COMPLETED','PARTIAL','FAILED','SKIPPED')
             )                                              AS tier1_terminal,
             -- Tier-2 denominator: must always be ≥ the numerator so the
             -- fraction can't exceed 1.0.
@@ -892,7 +932,7 @@ def build_batch_rollup_query(
             COUNT(DISTINCT s.resource_id) FILTER (
                 WHERE r.type IS NOT NULL
                   AND r.type::text <> 'ENTRA_USER'
-                  AND s.status::text IN ('COMPLETED','PARTIAL','FAILED')
+                  AND s.status::text IN ('COMPLETED','PARTIAL','FAILED','SKIPPED')
             )                                              AS tier2_terminal
         FROM batches b
         LEFT JOIN tier1_users   u ON u.batch_id = b.batch_id
@@ -996,6 +1036,12 @@ def build_batch_rollup_query(
         COALESCE(sr.snap_failed, 0)         AS snap_failed,
         COALESCE(sr.snap_pending, 0)        AS snap_pending,
         COALESCE(pr.parts_pending, 0)       AS parts_pending,
+        COALESCE(pr.capture_is_onedrive, FALSE) AS capture_is_onedrive,
+        COALESCE(pr.capture_progress_known, FALSE) AS capture_progress_known,
+        COALESCE(pr.capture_expected_bytes, 0) AS capture_expected_bytes,
+        COALESCE(pr.capture_expected_files, 0) AS capture_expected_files,
+        COALESCE(pr.capture_bytes, 0)        AS capture_bytes,
+        COALESCE(pr.capture_files, 0)        AS capture_files,
         COALESCE(f.missing_t2, 0)           AS missing_t2,
         COALESCE(ls.skipped_no_license, 0)  AS skipped_no_license,
         COALESCE(te.expected_count, 0)      AS expected_count,
@@ -1178,6 +1224,22 @@ def shape_batch_row(row: Any) -> Dict[str, Any]:
             progress_pct = min(100, int(100 * terminal / denom))
         else:
             progress_pct = 0
+    # Compact, committed shard receipts provide live capture progress for a
+    # single OneDrive. Bulk runs retain resource weighting. Settlement still
+    # owns success/failure, and no inventory scan is needed on Activity polls.
+    total_data = 0
+    if (status == "In Progress" and single_type == "USER_ONEDRIVE"
+            and counts.snap_total == 1
+            and getattr(row, "capture_is_onedrive", False)
+            and getattr(row, "capture_progress_known", False)):
+        bytes_added = max(0, int(row.capture_bytes or 0))
+        total_data = max(0, int(row.capture_expected_bytes or 0))
+        captured_files = max(0, int(row.capture_files or 0))
+        expected_files = max(0, int(row.capture_expected_files or 0))
+        if total_data > 0:
+            progress_pct = min(99, 100 * bytes_added // total_data)
+        elif expected_files > 0:
+            progress_pct = min(99, 100 * captured_files // expected_files)
     # Clamp below 100 while still "In Progress" so status and percent
     # agree. The Tier-1=10/Tier-2=90 split makes the natural ceiling
     # 99 (e.g. Tier-1 done + 98 / 99 Tier-2 children done = 10 + 89 = 99),
@@ -1209,10 +1271,9 @@ def shape_batch_row(row: Any) -> Dict[str, Any]:
         "finish_time":    finish_iso,
         "details":        _format_details(status, bytes_added, counts),
         "data_backed_up": bytes_added,
-        # No true bytes_expected today — emit 0 instead of echoing
-        # bytes_added (which forced any "X of Y bytes" UI to a fake
-        # 100 %). Clients already treat 0 as "unknown total".
-        "total_data":     0,
+        # Unknown totals remain zero; never manufacture a denominator from
+        # bytes already captured. For shard captures this is the planned work.
+        "total_data":     total_data,
         "phase":          phase,
         "counts": {
             "total":       counts.snap_total,
@@ -1307,10 +1368,10 @@ async def _finalize_batch_if_complete(batch_id, session) -> Optional[str]:
          check (treated as direct leaves).
       2. Every Tier-2 child has a snapshot with ``created_at >
          batch.created_at`` AND ``status::text IN
-         ('COMPLETED','PARTIAL','FAILED')``.
+         ('COMPLETED','PARTIAL','FAILED','SKIPPED')``.
       3. Every ENTRA_USER itself has a snapshot with ``created_at >
          batch.created_at`` AND ``status::text IN
-         ('COMPLETED','PARTIAL','FAILED')``. Non-ENTRA scope entries
+         ('COMPLETED','PARTIAL','FAILED','SKIPPED')``. Non-ENTRA scope entries
          use this rule directly.
       4. No ``snapshot_partitions`` row for any of those snapshots has
          ``status::text IN ('QUEUED','IN_PROGRESS')``.
@@ -1451,7 +1512,7 @@ async def _finalize_batch_if_complete(batch_id, session) -> Optional[str]:
           FROM leaves l
           LEFT JOIN latest la ON la.resource_id = l.rid
          WHERE la.resource_id IS NULL
-            OR la.status NOT IN ('COMPLETED','PARTIAL','FAILED')
+            OR la.status NOT IN ('COMPLETED','PARTIAL','FAILED','SKIPPED')
             OR NOT la.copy_ready
     """), {"lids": leaf_ids, "created": batch_created_at})).all()
     if pending:

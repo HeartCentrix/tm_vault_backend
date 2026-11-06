@@ -3509,11 +3509,15 @@ class GraphClient:
             logger.warning("SharePoint supplemental list discovery failed: %s", type(exc).__name__)
         graph_result["_site_web_url"] = site_web_url
 
-        # Merge — prefer Graph's shape when both sources have the same id.
+        # Merge — prefer Graph's shape when both sources have the same id, keeping
+        # the REST item-change signal (Graph's list date does not track items).
         merged = list(graph_lists)
+        by_id = {gl.get("id"): gl for gl in merged if isinstance(gl, dict)}
         for rl in sp_lists:
             rl_id = rl.get("id")
-            if rl_id and rl_id not in seen_ids:
+            if rl_id in by_id:
+                by_id[rl_id]["_rest_signature"] = rl.get("_rest_signature")
+            elif rl_id and rl_id not in seen_ids:
                 merged.append(rl)
                 seen_ids.add(rl_id)
 
@@ -3701,7 +3705,7 @@ class GraphClient:
         """
         url = f"{site_web_url.rstrip('/')}/_api/web/lists"
         params = {"$top": "1000",
-            "$select": "Id,Title,Description,DefaultViewUrl,Created,LastItemModifiedDate,BaseTemplate,Hidden,IsCatalog,IsSystemList"}
+            "$select": "Id,Title,Description,DefaultViewUrl,Created,LastItemModifiedDate,LastItemDeletedDate,ItemCount,BaseTemplate,Hidden,IsCatalog,IsSystemList"}
         raw = []
         async for row in self._iter_sharepoint_rest_rows(hostname, url, params=params, stage="list_collection"):
             raw.append(row)
@@ -3728,6 +3732,8 @@ class GraphClient:
                 "webUrl": list_web_url,
                 "createdDateTime": lst.get("Created"),
                 "lastModifiedDateTime": lst.get("LastItemModifiedDate"),
+                # Item-level change signal: an incremental carries an unchanged list forward.
+                "_rest_signature": {"modified": lst.get("LastItemModifiedDate"), "deleted": lst.get("LastItemDeletedDate"), "count": lst.get("ItemCount"), "title": lst.get("Title")},
                 "lastModifiedBy": None,
                 "system": bool(lst.get("IsSystemList")),
                 "list": {
@@ -3794,17 +3800,29 @@ class GraphClient:
             # Catalog lists: drop $select so every declared column comes
             # back, and $expand FieldValuesAsText so lookup/url columns
             # render as strings (not OData shells).
+            # File: each row carries its file's (Length, ETag, version), so the worker skips one
+            # per-file metadata request (1 of 3 per file; live 181/181 identical, ~105 ms each).
             params: Optional[Dict[str, str]] = {
                 "$top": str(page_size),
-                "$expand": "FieldValuesAsText",
+                "$expand": "FieldValuesAsText,File",
             }
         else:
             params = {
                 "$top": str(page_size),
                 "$select": "Id,FileRef,FileLeafRef,FileSystemObjectType",
             }
-        async for row in self._iter_sharepoint_rest_rows(hostname, url, params=params, stage="list_page"):
-            yield row
+        yielded = False
+        try:
+            async for row in self._iter_sharepoint_rest_rows(hostname, url, params=params, stage="list_page"):
+                yielded = True
+                yield row
+        except ProviderReadError as exc:
+            # A list type that rejects $expand=File (none of 333 live lists did) is read as before.
+            if yielded or not all_fields or exc.status_code != 400:
+                raise
+            params = {"$top": str(page_size), "$expand": "FieldValuesAsText"}
+            async for row in self._iter_sharepoint_rest_rows(hostname, url, params=params, stage="list_page"):
+                yield row
 
     async def _iter_sharepoint_rest_rows(self, hostname, url, *, params, stage):
         next_url, seen = url, set()
@@ -4015,10 +4033,9 @@ class GraphClient:
         Get channels in a Teams team.
         Graph API: GET /teams/{team-id}/channels
         """
-        # $top=50: Teams channel/message collections cap at 50 — $top>50 returns
-        # 400 (the shared pager's $top-preserve turned that into a hard failure).
-        # Pagination below fetches the rest.
-        result = await self._get(f"{self.GRAPH_URL}/teams/{team_id}/channels", params={"$top": "50"})
+        # No $top: the channels collection rejects it outright (400 "Query option
+        # 'Top' is not allowed", live 2026-11-06). Pagination below fetches the rest.
+        result = await self._get(f"{self.GRAPH_URL}/teams/{team_id}/channels")
         all_value = result.get("value", [])
 
         # Follow pagination

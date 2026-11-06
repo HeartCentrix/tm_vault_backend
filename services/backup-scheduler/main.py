@@ -25,6 +25,7 @@ import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from shared.database import async_session_factory
+from shared.batch_rollup import job_partial_sql
 from shared.copy_workflow import (
     copy_source_pinned_sql, initialize_copy_guards, pending_copy_sql,
 )
@@ -751,7 +752,8 @@ async def startup():
                                    COALESCE(array_length(batch_resource_ids, 1), 0) AS n
                             FROM jobs
                             WHERE status NOT IN (
-                                'COMPLETED'::jobstatus, 'FAILED'::jobstatus,
+                                'COMPLETED'::jobstatus, 'PARTIAL'::jobstatus,
+                                'FAILED'::jobstatus,
                                 'CANCELLED'::jobstatus, 'CANCELLING'::jobstatus
                             )
                               AND batch_resource_ids IS NOT NULL
@@ -761,12 +763,13 @@ async def startup():
                             SELECT
                                 s.job_id,
                                 COUNT(*) FILTER (
-                                    WHERE s.status IN (
-                                        'COMPLETED','FAILED','PARTIAL'
+                                    WHERE s.status::text IN (
+                                        'COMPLETED','FAILED','PARTIAL','SKIPPED'
                                     )
                                 ) AS terminal,
                                 COUNT(*) FILTER (WHERE s.status='FAILED') AS failed,
-                                COUNT(*) FILTER (WHERE s.status='COMPLETED') AS completed,
+                                -- SKIPPED (concurrency placeholder) is done, not failed.
+                                COUNT(*) FILTER (WHERE s.status::text IN ('COMPLETED','SKIPPED')) AS completed,
                                 COUNT(*) FILTER (WHERE s.status='PARTIAL') AS partial,
                                 COALESCE(SUM(s.item_count) FILTER (
                                     WHERE s.status IN ('COMPLETED','PARTIAL')
@@ -779,14 +782,14 @@ async def startup():
                             GROUP BY s.job_id
                         )
                         UPDATE jobs j SET
-                            -- Terminal-status mapping matches jobstatus
-                            -- enum (COMPLETED / FAILED only — no PARTIAL
-                            -- at the Job level). Mixed-outcome bulks
-                            -- flip to COMPLETED with c.failed in result;
-                            -- only an all-failed bulk lands at FAILED.
+                            -- Same mapping as the worker finalizer: only
+                            -- an all-failed bulk lands at FAILED; any
+                            -- PARTIAL/FAILED child makes it PARTIAL.
                             status = (CASE
                                 WHEN c.completed = 0 AND c.partial = 0
                                     THEN 'FAILED'::jobstatus
+                                WHEN c.partial > 0 OR c.failed > 0
+                                    THEN 'PARTIAL'::jobstatus
                                 ELSE 'COMPLETED'::jobstatus
                             END),
                             completed_at = NOW(),
@@ -809,7 +812,8 @@ async def startup():
                           AND j.id = c.job_id
                           AND c.terminal >= bj.n
                           AND j.status NOT IN (
-                              'COMPLETED'::jobstatus, 'FAILED'::jobstatus,
+                              'COMPLETED'::jobstatus, 'PARTIAL'::jobstatus,
+                              'FAILED'::jobstatus,
                               'CANCELLED'::jobstatus, 'CANCELLING'::jobstatus
                           )
                         RETURNING j.id, j.status::text
@@ -846,7 +850,8 @@ async def startup():
                                    bytes_processed AS prev_bytes
                             FROM jobs
                             WHERE status IN (
-                                'COMPLETED'::jobstatus, 'FAILED'::jobstatus
+                                'COMPLETED'::jobstatus, 'PARTIAL'::jobstatus,
+                                'FAILED'::jobstatus
                             )
                               AND batch_resource_ids IS NOT NULL
                               AND array_length(batch_resource_ids, 1) > 0
@@ -855,7 +860,7 @@ async def startup():
                         counts AS (
                             SELECT
                                 s.job_id,
-                                COUNT(*) FILTER (WHERE s.status='COMPLETED') AS completed,
+                                COUNT(*) FILTER (WHERE s.status::text IN ('COMPLETED','SKIPPED')) AS completed,
                                 COUNT(*) FILTER (WHERE s.status='FAILED')    AS failed,
                                 COUNT(*) FILTER (WHERE s.status='PARTIAL')   AS partial,
                                 COALESCE(SUM(s.item_count) FILTER (
@@ -1286,6 +1291,14 @@ async def startup():
                        -- corrupted live run.
                        AND {copy_source_pinned_sql('s.id')}
                        AND (s.lease_expires_at IS NULL OR s.lease_expires_at < NOW())
+                       -- Never tear down a snapshot another one reads: an overlay's
+                       -- base or a pointer's target (its blobs are only referenced
+                       -- through it). Retention hands those to an heir first.
+                       AND NOT EXISTS (
+                           SELECT 1 FROM snapshots d
+                            WHERE (d.overlay_base_id = s.id OR d.reuse_chain_root_id = s.id)
+                              AND d.id <> s.id
+                       )
                        -- Defense against partitioned-shard double-cleanup.
                        AND NOT EXISTS (
                            SELECT 1 FROM snapshot_partitions sp
@@ -1810,10 +1823,10 @@ async def startup():
                                cardinality(j.batch_resource_ids) AS n_resources,
                                (SELECT count(*) FROM snapshots s
                                 WHERE s.job_id = j.id
-                                  AND s.status IN ('COMPLETED','FAILED','PARTIAL')) AS n_terminal,
+                                  AND s.status::text IN ('COMPLETED','FAILED','PARTIAL','SKIPPED')) AS n_terminal,
                                (SELECT count(*) FROM snapshots s
                                 WHERE s.job_id = j.id
-                                  AND s.status = 'COMPLETED') AS n_completed,
+                                  AND s.status::text IN ('COMPLETED','SKIPPED')) AS n_completed,
                                (SELECT COALESCE(SUM(s.item_count), 0) FROM snapshots s
                                 WHERE s.job_id = j.id) AS items_total,
                                (SELECT COALESCE(SUM(s.bytes_total), 0) FROM snapshots s
@@ -1825,7 +1838,9 @@ async def startup():
                           AND cardinality(j.batch_resource_ids) > 0
                     )
                     UPDATE jobs j SET
-                        status = 'COMPLETED'::jobstatus,
+                        status = (CASE WHEN {job_partial_sql('j.id')}
+                                       THEN 'PARTIAL' ELSE 'COMPLETED'
+                                  END)::jobstatus,
                         progress_pct = 100,
                         completed_at = NOW(),
                         updated_at = NOW(),
@@ -1883,12 +1898,12 @@ async def startup():
                                 WHERE s.job_id = j.id) AS n_existing,
                                (SELECT count(*) FROM snapshots s
                                 WHERE s.job_id = j.id
-                                  AND s.status NOT IN
+                                  AND s.status::text NOT IN
                                       ('COMPLETED','FAILED','PARTIAL',
-                                       'PENDING_DELETION')) AS n_nonterminal,
+                                       'PENDING_DELETION','SKIPPED')) AS n_nonterminal,
                                (SELECT count(*) FROM snapshots s
                                 WHERE s.job_id = j.id
-                                  AND s.status = 'COMPLETED') AS n_completed,
+                                  AND s.status::text IN ('COMPLETED','SKIPPED')) AS n_completed,
                                (SELECT COALESCE(SUM(s.item_count), 0)
                                 FROM snapshots s
                                 WHERE s.job_id = j.id) AS items_total,
@@ -1903,8 +1918,10 @@ async def startup():
                           AND (j.lease_expires_at IS NULL OR j.lease_expires_at < NOW())
                     )
                     UPDATE jobs j SET
+                        -- Resources are missing by definition here, so a
+                        -- run that captured anything is PARTIAL.
                         status = (CASE WHEN t.n_completed > 0
-                                       THEN 'COMPLETED' ELSE 'FAILED'
+                                       THEN 'PARTIAL' ELSE 'FAILED'
                                   END)::jobstatus,
                         progress_pct = 100,
                         completed_at = NOW(),
@@ -2004,9 +2021,11 @@ async def startup():
                 result = await session.execute(text(f"""
                     WITH agg AS (
                         SELECT s.job_id,
-                               COUNT(*) FILTER (WHERE s.status IN ('COMPLETED','PARTIAL')) AS n_ok,
-                               COUNT(*) FILTER (WHERE s.status NOT IN
-                                   ('COMPLETED','PARTIAL','FAILED','PENDING_DELETION')) AS n_pending,
+                               -- SKIPPED: concurrency placeholder, terminal and done.
+                               COUNT(*) FILTER (WHERE s.status::text IN ('COMPLETED','PARTIAL','SKIPPED')) AS n_ok,
+                               COUNT(*) FILTER (WHERE s.status IN ('PARTIAL','FAILED')) AS n_warn,
+                               COUNT(*) FILTER (WHERE s.status::text NOT IN
+                                   ('COMPLETED','PARTIAL','FAILED','PENDING_DELETION','SKIPPED')) AS n_pending,
                                MAX(s.completed_at) AS last_settled,
                                COALESCE(SUM(s.item_count), 0)  AS items_total,
                                COALESCE(SUM(s.bytes_total), 0) AS bytes_total
@@ -2014,7 +2033,8 @@ async def startup():
                         GROUP BY s.job_id
                     )
                     UPDATE jobs j SET
-                        status = (CASE WHEN a.n_ok > 0
+                        status = (CASE WHEN a.n_ok > 0 AND a.n_warn > 0 THEN 'PARTIAL'
+                                       WHEN a.n_ok > 0
                                        THEN 'COMPLETED' ELSE 'FAILED'
                                   END)::jobstatus,
                         progress_pct = 100,
@@ -2081,6 +2101,9 @@ async def startup():
     # Primary mechanism is Azure lifecycle rule (ops/azure-lifecycle-exports.json);
     # this is a fallback for envs without lifecycle API access (local Azurite, restricted tenants).
     async def _exports_cleanup_daily():
+        from services.exports_cleanup import azure_export_storage_active
+        if not azure_export_storage_active():
+            return
         try:
             from services.exports_cleanup import cleanup_exports
             from shared.azure_storage import azure_storage_manager
@@ -2098,6 +2121,9 @@ async def startup():
         except Exception as exc:
             print(f"[backup-scheduler] chat_export_lifecycle failed: {exc}")
 
+    from services.exports_cleanup import azure_export_storage_active
+    if not azure_export_storage_active():
+        print("[backup-scheduler] INFO exports_cleanup: active storage backend is not Azure; Azure export lifecycle skipped")
     scheduler.add_job(_exports_cleanup_daily, "cron", hour=3, minute=0, timezone="UTC", id="exports_cleanup_daily")
 
     # Round 1.5 — daily retry of FAILED snapshots (one shot, throttled).
@@ -3863,6 +3889,13 @@ async def _job_retry_tick() -> int:
                AND s.completed_at <= NOW() - make_interval(mins => :delay)
                -- a user cancel is final, not a failure to retry
                AND coalesce(s.extra_data->>'cancelled_at', '') = ''
+               -- per-file rescues still owed may settle it COMPLETED; a
+               -- re-run now re-copies the whole drive (127 GiB, 2026-11-06)
+               AND NOT EXISTS (
+                     SELECT 1 FROM onedrive_file_retries q
+                      WHERE q.snapshot_id = s.id
+                        AND q.status IN ('PENDING','IN_PROGRESS')
+                   )
                -- a failure the worker marked deterministic (e.g. the
                -- archive coverage gate) re-fails identically — retrying
                -- it is pure load. Absent flag = retryable.
@@ -4075,6 +4108,8 @@ async def run_backup_verification():
                     Snapshot.status == SnapshotStatus.COMPLETED,
                     Snapshot.completed_at >= cutoff,
                     Snapshot.item_count > 0,
+                    # Reuse snapshots own no rows; the snapshot they name is sampled itself.
+                    Snapshot.reuse_of_snapshot_id.is_(None),
                 ))
                 .order_by(func.random())
                 .limit(BACKUP_VERIFY_SAMPLE_SIZE)

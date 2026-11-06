@@ -98,7 +98,13 @@ CREATE TABLE snapshot_partitions (
     job_id uuid,
     snapshot_id uuid,
     status text,
-    completed_at timestamp
+    completed_at timestamp,
+    partition_type text DEFAULT 'ONEDRIVE_FILES',
+    total_files integer DEFAULT 0,
+    total_bytes_est bigint DEFAULT 0,
+    files_uploaded integer DEFAULT 0,
+    bytes_uploaded bigint DEFAULT 0,
+    payload json
 );
 CREATE TABLE batch_pending_users (
     batch_id uuid,
@@ -608,3 +614,71 @@ async def test_large_activity_window_does_not_rescan_all_batches_per_row(conn):
         inspected += node.get('Rows Removed by Join Filter', 0) * node.get('Actual Loops', 1)
         nodes.extend(node.get('Plans', []))
     assert inspected < count * 30, f'batch candidate rows repeatedly visited: {inspected}'
+
+
+@pytest.mark.parametrize(
+    'expected_bytes,captured_bytes,expected_files,captured_files,percent',
+    [(128, 64, 8, 4, 50), (128, 128, 8, 8, 99),
+     (128, 200, 8, 8, 99), (0, 0, 8, 4, 50), (0, 0, 0, 0, 0)],
+)
+async def test_single_onedrive_reports_committed_capture_before_parent_finishes(
+    conn, expected_bytes, captured_bytes, expected_files, captured_files, percent,
+):
+    import json
+    f = Fixture(conn)
+    rid = await f.resource('USER_ONEDRIVE')
+    jid = await f.job([rid], status='RUNNING')
+    sid = await f.snapshot(jid, rid, status='IN_PROGRESS')
+    # Two shards; the legacy parent counter only reflects the largest shard.
+    await conn.execute('UPDATE snapshots SET bytes_added=$1 WHERE id=$2', captured_bytes // 2, sid)
+    for _ in range(2):
+        await conn.execute(
+            'INSERT INTO snapshot_partitions (id,job_id,snapshot_id,status,total_files,'
+            ' total_bytes_est,payload) VALUES ($1,$2,$3,$4,$5,$6,$7::json)',
+            uuid.uuid4(), jid, sid, 'IN_PROGRESS', expected_files // 2,
+            expected_bytes // 2, json.dumps({'onedrive_capture_progress': {
+                'version': 1, 'files': captured_files // 2, 'bytes': captured_bytes // 2}}),
+        )
+    _, item = (await run_rollup(conn))[str(f.batch_id)]
+    assert item['status'] == 'In Progress'
+    assert item['progress_pct'] == percent
+    assert item['data_backed_up'] == captured_bytes
+    assert item['total_data'] == expected_bytes
+    assert item['counts']['done'] == 0
+
+
+async def test_bulk_progress_keeps_resource_weighting_even_with_partition_progress(conn):
+    import json
+    f = Fixture(conn)
+    rids = [await f.resource('USER_ONEDRIVE') for _ in range(2)]
+    jid = await f.job(rids, status='RUNNING')
+    for rid in rids:
+        sid = await f.snapshot(jid, rid, status='IN_PROGRESS')
+        await conn.execute(
+            'INSERT INTO snapshot_partitions (id,job_id,snapshot_id,status,total_files,'
+            ' total_bytes_est,payload) VALUES ($1,$2,$3,$4,2,100,$5::json)',
+            uuid.uuid4(), jid, sid, 'IN_PROGRESS', json.dumps({
+                'onedrive_capture_progress': {'version': 1, 'files': 1, 'bytes': 50}}),
+        )
+    _, item = (await run_rollup(conn))[str(f.batch_id)]
+    assert item['progress_pct'] == 0
+    assert item['total_data'] == 0
+
+
+@pytest.mark.parametrize('terminal', ['COMPLETED', 'PARTIAL', 'FAILED'])
+async def test_capture_counters_do_not_override_terminal_backup_result(conn, terminal):
+    import json
+    f = Fixture(conn)
+    rid = await f.resource('USER_ONEDRIVE')
+    jid = await f.job([rid], status='FAILED' if terminal == 'FAILED' else 'COMPLETED')
+    sid = await f.snapshot(jid, rid, status=terminal)
+    await conn.execute(
+        'INSERT INTO snapshot_partitions (id,job_id,snapshot_id,status,total_bytes_est,payload)'
+        ' VALUES ($1,$2,$3,$4,100,$5::json)', uuid.uuid4(), jid, sid, 'FAILED',
+        json.dumps({'onedrive_capture_progress': {'version': 1, 'files': 1, 'bytes': 50}}),
+    )
+    _, item = (await run_rollup(conn))[str(f.batch_id)]
+    assert item['status'] == ('Failed' if terminal == 'FAILED' else 'Done')
+    assert item['progress_pct'] == 100
+    assert item['data_backed_up'] == 1  # Settled snapshot remains authoritative.
+    assert bool(item['warnings']) == (terminal == 'PARTIAL')

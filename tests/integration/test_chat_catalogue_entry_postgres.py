@@ -277,22 +277,46 @@ async def test_resuming_published_chat_does_not_reenumerate_its_messages(store, 
     assert source_adapter.source.list_calls == 4
 
 
-@pytest.mark.parametrize("protection", ["hold", "immutability", "customer_key"])
-async def test_unsupported_native_protection_refuses_adoption_before_markers(store, protection):
+async def _protected_scope(store, values):
     scope = await legacy_scope(store)
     policy_id = uuid4()
     async with store.factory.begin() as session:
-        values = {"legal_hold_enabled": True} if protection == "hold" else (
-            {"immutability_mode": "Locked"} if protection == "immutability" else {"encryption_mode": "CUSTOMER_KEY"})
         session.add(models.SlaPolicy(id=policy_id, tenant_id=scope.tenant_id, name="Protected", **values))
         await session.flush()
         await session.execute(update(models.Resource).where(models.Resource.id == scope.resource_id)
             .values(sla_policy_id=policy_id))
-    with pytest.raises(api().ChatCatalogueProtectionUnsupported):
-        await prepare(store, scope, True)
-    assert await prepare(store, scope, False) is False
+    return scope
+
+
+@pytest.mark.parametrize("values,reason", [({"legal_hold_enabled": True}, "legal_hold"),
+    ({"immutability_mode": "Locked"}, "immutability"), ({"encryption_mode": "CUSTOMER_KEY"}, "customer_key")])
+async def test_native_protection_routes_unadopted_chats_to_legacy_writer(store, values, reason, caplog):
+    scope = await _protected_scope(store, values)
+    with caplog.at_level("WARNING", logger="shared.chat_catalogue_entry"):
+        assert await prepare(store, scope, True) is False
+    assert [r.getMessage() for r in caplog.records if "chat_catalogue_legacy_fallback" in r.getMessage()] == [
+        f"chat_catalogue_legacy_fallback resource={scope.resource_id} snapshot={scope.snapshot_id} reason={reason}"]
     async with store.factory.begin() as session:
         assert (await session.get(models.Resource, scope.resource_id)).extra_data.get("chat_inventory_format") is None
+        snapshot = await session.get(models.Snapshot, scope.snapshot_id)
+        assert snapshot.extra_data.get("chat_inventory_format") is None
+        assert snapshot.extra_data["chat_legacy_writer_entered"] is True
+
+
+async def test_unprotected_policy_still_adopts_catalogue(store):
+    scope = await _protected_scope(store, {})
+    assert await prepare(store, scope, True) is True
+    async with store.factory.begin() as session:
+        assert (await session.get(models.Resource, scope.resource_id)).extra_data["chat_inventory_format"] == 1
+
+
+async def test_native_protection_on_adopted_resource_still_refuses(store):
+    scope = await _protected_scope(store, {"legal_hold_enabled": True})
+    async with store.factory.begin() as session:
+        await session.execute(update(models.Resource).where(models.Resource.id == scope.resource_id)
+            .values(extra_data={"user_id": scope.principal_id, "chat_inventory_format": 1}))
+    with pytest.raises(api().ChatCatalogueProtectionUnsupported):
+        await prepare(store, scope, True)
 
 
 async def test_partition_capture_preserves_allowlist_and_original_fence(store, source_adapter):

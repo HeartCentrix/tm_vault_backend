@@ -1,7 +1,7 @@
 """Provider admission contention, quotas and service clocks on real PostgreSQL."""
 import asyncio
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
@@ -160,3 +160,94 @@ async def test_continuous_backlog_preserves_four_positive_policy_weights(store):
     counts = Counter(served)
     assert [counts[receipts[weight].work_id] for weight in (8, 4, 2, 1)] == [80, 40, 20, 10]
     assert all(receipts[1].work_id in served[start:start + 16] for start in range(135))
+
+
+async def _queue_finishes(store, work_id):
+    async with store.factory() as db:
+        row = await db.get(models.ProviderWork, work_id)
+        keys = (row.tenant_queue_key, row.policy_queue_key, row.resource_queue_key)
+        return [(await db.get(models.ProviderWorkQueue, key)).virtual_finish for key in keys]
+
+
+async def test_a_claim_validating_behind_a_busy_snapshot_does_not_hold_the_global_lock(store):
+    # Railway 2026-11-06: every claim held provider_work_control for its whole ~40 round-trip
+    # validation, so claims ran at ~0.4/s cluster-wide. Only capacity, the fair choice and the
+    # reservation belong under that lock.
+    first, second = await enqueue(store), await enqueue(store)
+    async with store.factory.begin() as blocker:
+        await blocker.execute(update(models.Snapshot).where(models.Snapshot.id == first.snapshot_id)
+            .values(extra_data={'busy': True}))
+        waiting = asyncio.create_task(claim(store))
+        await asyncio.sleep(.5)
+        other = await asyncio.wait_for(claim(store), 5)
+        assert other is not None and other.work_id == second.work_id
+    assert (await asyncio.wait_for(waiting, 5)).work_id == first.work_id
+
+
+async def test_rejected_validation_releases_the_reservation(store):
+    receipt = await enqueue(store)
+    before = await _queue_finishes(store, receipt.work_id)
+    async with store.factory.begin() as db:
+        db.add(models.CopyWorkflow(tenant_id=store.tenant, resource_id=store.resource, job_id=receipt.job_id,
+            target_snapshot_id=receipt.snapshot_id, leaf_key='snapshot:' + str(receipt.snapshot_id), state='WAITING'))
+    assert await claim(store) is None
+    async with store.factory() as db:
+        row = await db.get(models.ProviderWork, receipt.work_id)
+        assert (row.state, row.lease_owner_id, row.lease_expires_at) == ('WAITING', None, None)
+        snapshot = await db.get(models.Snapshot, receipt.snapshot_id)
+        assert (snapshot.lease_token, snapshot.lease_owner_id) == (0, None)
+    assert await _queue_finishes(store, receipt.work_id) == before, 'a turn that never ran is not charged'
+
+
+async def test_parent_generation_rejection_settles_without_charging_or_holding_capacity(store):
+    receipt = await enqueue(store)
+    before = await _queue_finishes(store, receipt.work_id)
+    async with store.factory.begin() as db:
+        await db.execute(update(models.Snapshot).where(models.Snapshot.id == receipt.snapshot_id).values(lease_token=9))
+    assert await claim(store) is None
+    async with store.factory() as db:
+        row = await db.get(models.ProviderWork, receipt.work_id)
+        assert (row.state, row.lease_owner_id, row.lease_expires_at) == ('FAILED', None, None)
+    assert await _queue_finishes(store, receipt.work_id) == before
+
+
+async def test_abandoned_reservation_is_reclaimable_after_its_lease(store):
+    # A worker that dies between reserving and validating leaves a reserved row whose
+    # leaf was never touched; the lease is the only thing that frees it.
+    receipt = await enqueue(store)
+    async with store.factory.begin() as db:
+        row = await db.get(models.ProviderWork, receipt.work_id)
+        row.state, row.lease_owner_id, row.generation = 'RESUMING', uuid4(), row.generation + 1
+        row.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=2)
+    assert await claim(store) is None
+    async with store.factory.begin() as db:
+        await db.execute(update(models.ProviderWork).values(lease_expires_at=datetime.now(timezone.utc) - timedelta(seconds=1)))
+    owner = await claim(store)
+    assert owner is not None and owner.generation > row.generation
+    async with store.factory.begin() as db:
+        await work.renew_work(db, owner)
+
+
+async def test_concurrent_claimers_never_double_claim_or_exceed_capacity(store):
+    receipts = [await enqueue(store) for _ in range(24)]
+    async with store.factory.begin() as db:
+        control = await db.get(models.ProviderWorkControl, 'global')
+        control.total_capacity, control.tenant_capacity = 16, 10
+
+    async def contender():
+        owners = []
+        for _ in range(40):
+            owner = await claim(store)
+            if owner is not None:
+                owners.append(owner)
+            await asyncio.sleep(.001)
+        return owners
+
+    owners = [owner for batch in await asyncio.gather(*(contender() for _ in range(12))) for owner in batch]
+    assert len(owners) == len({owner.work_id for owner in owners}) == 10
+    async with store.factory.begin() as db:
+        for owner in owners:
+            await work.renew_work(db, owner)
+        running = (await db.scalars(select(models.ProviderWork).where(models.ProviderWork.state == 'RESUMING'))).all()
+        assert {row.id for row in running} == {owner.work_id for owner in owners}
+        assert {row.id for row in running} <= {r.work_id for r in receipts}

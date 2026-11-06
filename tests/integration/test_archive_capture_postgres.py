@@ -1,7 +1,7 @@
 """Archive checkpoints use actual transactions in a unique disposable schema."""
 from dataclasses import replace
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from test_chat_catalogue_postgres import store
 from shared import models
 from shared.archive_capture import ArchiveCapture, ArchiveFence, ArchiveConflict
@@ -88,11 +88,11 @@ async def test_same_names_and_changed_identity_do_not_heal_gaps(store):
     assert (await ledger.manifest_batch())[0]['state'] == 'failed'
 
 
-async def observed_item(ledger, *, iid='i', ck='a'):
+async def observed_item(ledger, *, iid='i', ck='a', more=()):
     root = await ledger.claim_scope()
     await ledger.page(root, {'value': [{'id': 'f', 'childFolderCount': 0}]}, BASE)
     scope = await ledger.claim_scope()
-    await ledger.page(scope, {'value': [{'id': iid, 'changeKey': ck}]}, scope['next_url'])
+    await ledger.page(scope, {'value': [{'id': iid, 'changeKey': ck}, *more]}, scope['next_url'])
 
 
 def content_row(store, ledger, *, iid='i', ck='a', checksum='hash', path='opaque'):
@@ -141,10 +141,10 @@ async def test_copy_pins_and_attachments_resolve_only_after_actual_copy(store, m
             external_id='attachment', parent_external_id='i', item_type='ARCHIVE_ATTACHMENT', name='file',
             content_hash='att', blob_path='att-path', backend_id=store.backend, content_size=4))
     current = await capture(store)
-    await observed_item(current)
+    await observed_item(current, more=[{'id': 'new', 'changeKey': 'n'}])   # one new item: copy, not reuse
     with copy_workflow.copy_collection(current.fence.snapshot_id, expected_snapshot_token=0, expected_job_token=0) as collection:
         await current.classify(prior.fence.snapshot_id, copy_collection=collection)
-        assert (await current.summary())['files_failed'] == 1
+        assert (await current.summary())['files_failed'] == 2
         async with store.factory() as db:
             task = await db.scalar(select(models.CopyWorkTask))
             assert (await db.scalar(select(models.CopyWorkItem).where(models.CopyWorkItem.task_id == task.id))).source_snapshot_id == prior.fence.snapshot_id
@@ -161,10 +161,52 @@ async def test_copy_pins_and_attachments_resolve_only_after_actual_copy(store, m
     async with store.factory.begin() as db:
         snap = await db.get(models.Snapshot, current.fence.snapshot_id)
         result = await archive_final_gate(db, snap, generation=current.generation)
-        assert result['files_failed'] == 0
+        assert result['files_failed'] == 1   # the new item still awaits its export
         assert result['bytes_total'] == 7
         assert await db.scalar(select(models.SnapshotItem).where(models.SnapshotItem.snapshot_id == snap.id,
             models.SnapshotItem.item_type == 'ARCHIVE_ATTACHMENT'))
+
+
+async def _completed_prior(store, *, ck='a'):
+    from uuid import uuid4
+    prior = await capture(store)
+    await observed_item(prior, ck=ck)
+    await prior.commit_rows([content_row(store, prior, ck=ck)])
+    async with store.factory.begin() as db:
+        snap = await db.get(models.Snapshot, prior.fence.snapshot_id)
+        snap.status, snap.item_count, snap.bytes_total = models.SnapshotStatus.COMPLETED, 1, 7
+        db.add(models.SnapshotItem(id=uuid4(), snapshot_id=snap.id, tenant_id=store.tenant,
+            external_id='attachment', parent_external_id='i', item_type='ARCHIVE_ATTACHMENT', name='file',
+            content_hash='att', blob_path='att-path', backend_id=store.backend, content_size=4))
+    return prior
+
+
+async def test_unchanged_archive_points_at_its_prior_instead_of_copying(store):
+    """Every incremental copied the whole archive forward (ARCHIVE_CARRY), even unchanged: TM's largest
+    is 1.1 M items. A complete census whose every item is unchanged and one-to-one with the prior
+    points at it; every item is stored through the pointer and nothing counts as new."""
+    from shared.archive_capture import archive_final_gate
+    prior = await _completed_prior(store)
+    current = await capture(store)
+    await observed_item(current)
+    await current.classify(prior.fence.snapshot_id)
+    async with store.factory.begin() as db:
+        snap = await db.get(models.Snapshot, current.fence.snapshot_id)
+        result = await archive_final_gate(db, snap, generation=current.generation)
+        assert (snap.reuse_of_snapshot_id, snap.reuse_chain_root_id) == (prior.fence.snapshot_id,) * 2
+        own = await db.scalar(select(models.SnapshotItem.id).where(models.SnapshotItem.snapshot_id == snap.id))
+        tasks = await db.scalar(select(models.CopyWorkTask.id))
+    assert own is None and tasks is None
+    assert (result['files_succeeded'], result['files_failed'], result['new_item_count'], result['bytes_total']) == (1, 0, 0, 7)
+
+
+async def test_changed_archive_item_is_not_reused(store):
+    prior = await _completed_prior(store)
+    current = await capture(store)
+    await observed_item(current, ck='changed')
+    await current.classify(prior.fence.snapshot_id)
+    async with store.factory() as db:
+        assert (await db.get(models.Snapshot, current.fence.snapshot_id)).reuse_of_snapshot_id is None
 
 
 async def test_repaired_children_invalidate_old_subtree_observations(store):
@@ -279,3 +321,139 @@ async def test_lazy_large_archive_census_has_bounded_descriptor_pages(store):
     print({'archive_scale_rows': count, 'pages': pages, 'max_page_descriptors': 1000,
         'rss_peak_bytes': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
         'elapsed_seconds': round(time.monotonic() - started, 2)})
+
+
+async def _short_children(store, name, declared, listed):
+    ledger = await capture(store)
+    root = await ledger.claim_scope()
+    await ledger.page(root, {'value': [{'id': 'f1', 'displayName': name, 'childFolderCount': declared}]}, BASE)
+    items = await ledger.claim_scope()
+    await ledger.page(items, {'value': []}, items['next_url'])
+    children = await ledger.claim_scope()
+    await ledger.page(children, {'value': [{'id': f'c{i}', 'childFolderCount': 0} for i in range(listed)]},
+                      children['next_url'])
+    return ledger
+
+
+async def _children_row(store):
+    async with store.factory() as db:
+        return await db.scalar(select(models.ArchiveFolderWork).where(
+            models.ArchiveFolderWork.phase == 'children', models.ArchiveFolderWork.folder_id == 'f1'))
+
+
+def _graph(hidden_children):
+    calls = []
+    async def read_folder(url, params=None, **_):
+        calls.append(url)
+        if 'includeHiddenFolders=true' in url:
+            return {'value': [{'id': f'h{i}'} for i in range(hidden_children)]}
+        return {'id': 'f1', 'childFolderCount': 7}
+    return read_folder, calls
+
+
+async def test_hidden_system_child_folders_are_not_a_coverage_loss(store):
+    # Live 2026-11-06: Contacts declares 7 child folders, plain childFolders returns 0,
+    # includeHiddenFolders=true returns all 7 (Recipient Cache, GAL Contacts, ...).
+    ledger = await _short_children(store, 'Contacts', 7, 0)
+    assert (await _children_row(store)).gap_kind == 'count_shortfall'
+    read_folder, calls = _graph(7)
+    await ledger.repair(read_folder=read_folder)
+    row = await _children_row(store)
+    assert (row.state, row.gap_kind, row.evidence['hidden_children']) == ('complete', None, 7)
+    assert any('includeHiddenFolders=true' in c for c in calls)
+    assert (await ledger.summary())['items_enumerated'] == 0  # hidden folders are counted, not backed up
+
+
+async def test_conversation_history_child_graph_never_lists_is_not_a_loss(store):
+    # Live 2026-11-06: Conversation History declares 1 child; v1.0 and beta, with or without
+    # includeHiddenFolders, return none (Teams' system folder).
+    ledger = await _short_children(store, 'Conversation History', 1, 0)
+    await ledger.repair(read_folder=_graph(0)[0])
+    row = await _children_row(store)
+    assert (row.state, row.gap_kind, row.evidence['unlisted_system_children']) == ('complete', None, 1)
+
+
+async def test_child_folders_missing_even_with_hidden_ones_stay_a_gap(store):
+    ledger = await _short_children(store, 'Projects', 5, 3)
+    await ledger.repair(read_folder=_graph(3)[0])
+    row = await _children_row(store)
+    assert row.state != 'complete' and 'hidden_children' not in (row.evidence or {})
+
+
+async def _with_reuse_rule(store):
+    import re
+    from pathlib import Path
+    source = (Path(__file__).parents[2] / "shared" / "database.py").read_text()
+    function = re.search(r'"""(CREATE OR REPLACE FUNCTION validate_snapshot_reuse_target\(\).*?)"""', source, re.S).group(1)
+    async with store.factory.begin() as db:
+        await db.execute(text(function))
+        await db.execute(text("DROP TRIGGER IF EXISTS snapshots_reuse_validate ON snapshots"))
+        await db.execute(text("CREATE TRIGGER snapshots_reuse_validate BEFORE INSERT OR UPDATE OF reuse_of_snapshot_id, "
+                              "reuse_chain_root_id ON snapshots FOR EACH ROW EXECUTE FUNCTION validate_snapshot_reuse_target()"))
+
+
+async def _walk_with_failed_folder(ledger, *, failing='bad', ck='a'):
+    """One readable folder holding item 'i' and one folder whose item listing fails like TM's
+    Microsoft HTTP 500 folders."""
+    from shared.provider_read import ProviderReadError
+    root = await ledger.claim_scope()
+    await ledger.page(root, {'value': [{'id': 'f', 'displayName': 'Inbox', 'childFolderCount': 0},
+                                      {'id': failing, 'displayName': failing, 'childFolderCount': 0}]}, BASE)
+    while (scope := await ledger.claim_scope()) is not None:
+        if scope['folder_id'] == failing:
+            await ledger.fail_scope(scope, ProviderReadError('items_page', status=500))
+        else:
+            await ledger.page(scope, {'value': [{'id': 'i', 'changeKey': ck}]}, scope['next_url'])
+
+
+async def _partial_prior(store, *, failing='bad'):
+    prior = await capture(store)
+    await _walk_with_failed_folder(prior, failing=failing)
+    await prior.classify(None)
+    await prior.commit_rows([content_row(store, prior)])
+    async with store.factory.begin() as db:
+        snap = await db.get(models.Snapshot, prior.fence.snapshot_id)
+        snap.status, snap.item_count, snap.bytes_total = models.SnapshotStatus.PARTIAL, 1, 3
+    return prior
+
+
+async def test_archive_with_the_same_microsoft_failures_points_at_its_partial_prior(store):
+    """TM's archive is PARTIAL every run (the same 4 folders return Microsoft HTTP 500), so the pointer
+    never fired and ~857k rows were copied daily. Same failed folders + unchanged items: point at the
+    PARTIAL prior (marker names it), keep the same gap, and copy nothing."""
+    from shared.archive_capture import archive_final_gate
+    await _with_reuse_rule(store)
+    prior = await _partial_prior(store)
+    current = await capture(store)
+    await _walk_with_failed_folder(current)
+    await current.classify(prior.fence.snapshot_id)
+    async with store.factory.begin() as db:
+        snap = await db.get(models.Snapshot, current.fence.snapshot_id)
+        assert (snap.reuse_of_snapshot_id, snap.reuse_chain_root_id) == (prior.fence.snapshot_id,) * 2
+        assert snap.extra_data['archive_reused_partial_prior'] == str(prior.fence.snapshot_id)
+        result = await archive_final_gate(db, snap, generation=current.generation)
+        tasks = await db.scalar(select(models.CopyWorkTask.id))
+    assert tasks is None   # nothing copied
+    # Unchanged item stored through the pointer; the same folder gap stays visible (PARTIAL).
+    assert (result['files_succeeded'], result['items_failed'], result['folders_failed'], result['new_item_count']) == (1, 0, 1, 0)
+
+
+async def test_archive_with_different_failures_is_copied_not_reused(store):
+    await _with_reuse_rule(store)
+    prior = await _partial_prior(store, failing='bad')
+    current = await capture(store)
+    await _walk_with_failed_folder(current, failing='other')
+    await current.classify(prior.fence.snapshot_id)
+    async with store.factory() as db:
+        assert (await db.get(models.Snapshot, current.fence.snapshot_id)).reuse_of_snapshot_id is None
+
+
+async def test_reuse_rule_rejects_a_partial_target_without_the_archive_marker(store):
+    from shared.snapshot_reuse import point_at
+    await _with_reuse_rule(store)
+    prior = await _partial_prior(store)
+    current = await capture(store)
+    with pytest.raises(Exception, match='must be COMPLETED'):
+        async with store.factory.begin() as db:
+            await point_at(db, target_snapshot_id=current.fence.snapshot_id,
+                           prior_snapshot_id=prior.fence.snapshot_id, marker='mail_reused_prior')

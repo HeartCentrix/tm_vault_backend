@@ -120,14 +120,15 @@ def _selection(kind, params):
                 OR NOT EXISTS (SELECT 1 FROM snapshot_partitions sp
                                 WHERE sp.snapshot_id=s.id AND sp.partition_type='MAIL_FOLDERS'
                                   AND (sp.payload::jsonb) ? 'carry_forward'))
-           AND EXISTS (SELECT 1 FROM snapshot_items x WHERE x.snapshot_id=s.id
-                        AND x.item_type IN ('EMAIL','EMAIL_ATTACHMENT'))
+           AND (s.overlay_base_id IS NOT NULL OR EXISTS (SELECT 1 FROM snapshot_items x WHERE x.snapshot_id=s.id
+                        AND x.item_type IN ('EMAIL','EMAIL_ATTACHMENT')))
         """
     prior += " ORDER BY s.created_at DESC,s.id DESC LIMIT 1)"
     if kind == "MAIL_CARRY":
+        # The prior's inventory: an overlay prior is its base + its own rows (docs/mail-overlay-snapshots.md).
         return (prior + """,
             emails AS MATERIALIZED (
-                SELECT src.* FROM snapshot_items src JOIN source_choice p ON src.snapshot_id=p.id
+                SELECT src.* FROM source_choice p CROSS JOIN LATERAL snapshot_items_effective(p.id) src
                  WHERE src.item_type='EMAIL'
                    AND COALESCE(src.metadata->>'source_mailbox','primary')='primary'
                    AND NOT (COALESCE(src.folder_path,'')=ANY(CAST(:excluded_paths AS text[])))
@@ -138,7 +139,7 @@ def _selection(kind, params):
                 SELECT src.snapshot_id AS source_snapshot_id,0 AS phase,to_jsonb(src) AS payload FROM emails src
                 UNION ALL
                 SELECT src.snapshot_id,1,to_jsonb(src)
-                  FROM snapshot_items src JOIN source_choice p ON src.snapshot_id=p.id
+                  FROM source_choice p CROSS JOIN LATERAL snapshot_items_effective(p.id) src
                  WHERE src.item_type='EMAIL_ATTACHMENT'
                    AND (NOT :whitelist OR cardinality(CAST(:keep_folder_ids AS text[])) > 0) AND (
                      EXISTS (SELECT 1 FROM emails e WHERE e.external_id=COALESCE(src.parent_external_id,split_part(src.external_id,'::',1)))
@@ -329,7 +330,9 @@ async def prepare_manifest(session, task) -> None:
     task.params, task.prepared = dict(result["params"] or {}), True
 
 
-BATCH_MAX_BYTES = 8 * 1024 * 1024
+# Stored payload bytes per copy batch (always at least one row). Each batch statement must finish
+# inside COPY_WORK_STATEMENT_TIMEOUT_MS (default 60 s).
+BATCH_MAX_BYTES = int(os.getenv("COPY_BATCH_MAX_BYTES", str(32 * 1024 * 1024)))
 
 
 async def copy_manifest_batch(session, task, *, limit: int) -> dict:
@@ -350,13 +353,18 @@ async def copy_manifest_batch(session, task, *, limit: int) -> dict:
           AND phase=(SELECT phase FROM copy_work_items WHERE task_id=:task_id AND ordinal>:checkpoint ORDER BY ordinal LIMIT 1)
          ORDER BY ordinal LIMIT :limit) w) sized
          WHERE run_bytes - pg_column_size(payload) < :max_bytes
+    ), batch_parents AS MATERIALIZED (
+        -- Read each stored json payload once. Correlated on the payload, a fresh-statistics plan
+        -- re-parsed it for every target row it compared (10.5 s of a 10.7 s batch, locally).
+        SELECT DISTINCT COALESCE(b.payload->>'parent_external_id',
+                                 split_part(b.payload->>'external_id','::',1)) AS external_id
+          FROM batch b WHERE b.payload->>'item_type'='EMAIL_ATTACHMENT'
     ), batch_validity AS MATERIALIZED (
         SELECT NOT EXISTS (
-            SELECT 1 FROM batch b WHERE b.payload->>'item_type'='EMAIL_ATTACHMENT'
-              AND NOT EXISTS (SELECT 1 FROM snapshot_items parent
+            SELECT 1 FROM batch_parents bp
+             WHERE NOT EXISTS (SELECT 1 FROM snapshot_items parent
                   WHERE parent.snapshot_id=:tsid AND parent.item_type='EMAIL'
-                    AND parent.external_id=COALESCE(b.payload->>'parent_external_id',
-                        split_part(b.payload->>'external_id','::',1)))) AS ok
+                    AND parent.external_id=bp.external_id)) AS ok
     ), changed AS (
     """
     if task.kind == "CHAT_RENAME":

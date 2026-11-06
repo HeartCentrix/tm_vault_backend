@@ -114,6 +114,9 @@ async def resolve(sess, *, resource_id, snapshot_ids, thread_path: str | None,
         raise ValueError("INVALID_SELECTION")
     if not thread_path and not chat_id and not item_ids:
         raise ValueError("SCOPE_EMPTY")
+    # A backup whose every chat was unchanged points at the full backup it reuses.
+    from shared.snapshot_reuse import resolve_snapshot_ids
+    snapshot_ids = [str(i) for i in await resolve_snapshot_ids(sess, snapshot_ids or [])]
 
     Sn = aliased(Snapshot)
     CHAT_TYPES = ["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"]

@@ -66,6 +66,10 @@ async def test_required_copy_delegates_without_opening_inline_slot(
         pytest.fail("delegated copy must release its handler instead of polling a slot")
 
     monkeypatch.setattr(worker_module, "carry_forward_slot_session", inline_slot)
+    monkeypatch.setattr(worker_module, "_externalize_prior_mail_attachments", AsyncMock())
+    # A mailbox whose overlay does not apply (compaction, no prior) takes the delegated full copy.
+    import shared.mail_overlay
+    monkeypatch.setattr(shared.mail_overlay, "try_mail_overlay", AsyncMock(return_value=None))
     result = await getattr(worker_module, name)(**params)
     assert result is workflow.defer_current_copy.return_value
     call = workflow.defer_current_copy.await_args
@@ -73,6 +77,61 @@ async def test_required_copy_delegates_without_opening_inline_slot(
     assert call.kwargs.get("lane", "giant") == lane
     assert call.args[1]["target_snapshot_id"] == "target"
     assert not isinstance(result, int), "delegation must never masquerade as zero copied rows"
+
+
+@pytest.mark.parametrize("delegated", [True, False], ids=["copy-workflow", "direct-sql"])
+async def test_mail_carry_externalizes_prior_inline_attachments_before_copying(
+    monkeypatch, worker_module, workflow, delegated,
+):
+    """Every mail carry (USER_MAIL, partitioned union, tier-1 shared/room) goes through this helper.
+    The prior's inline attachment bytes move to blob storage before the copy is registered (its
+    manifest freezes row payloads) or the direct INSERT ... SELECT runs."""
+    order = []
+
+    async def externalize(tenant_id, resource_id, target_snapshot_id, current_job_id):
+        order.append(("externalize", target_snapshot_id, current_job_id))
+
+    def defer(kind, params, **kwargs):
+        order.append("register")
+        return workflow.defer_current_copy.return_value if delegated else None
+
+    class Stop(Exception):
+        pass
+
+    def slot(*args, **kwargs):
+        order.append("direct-copy")
+        raise Stop
+
+    monkeypatch.setattr(worker_module, "_externalize_prior_mail_attachments", externalize)
+    monkeypatch.setattr(worker_module, "carry_forward_slot_session", slot)
+    workflow.defer_current_copy.side_effect = defer
+    call = worker_module._carry_forward_prior_mail_snapshot_items(
+        tenant_id="tenant", resource_id="resource", target_snapshot_id="target", current_job_id="job")
+    if delegated:
+        assert await call is workflow.defer_current_copy.return_value
+    else:
+        with pytest.raises(Stop):
+            await call
+    assert order == [("externalize", "target", "job"), "register"] + ([] if delegated else ["direct-copy"])
+
+
+async def test_mail_carry_externalize_failure_never_blocks_the_copy(monkeypatch, worker_module):
+    """Best effort: the copy still carries any row left inline, exactly as before."""
+    import shared.mail_inline_attachments as externalizer
+    seen = {}
+
+    async def broken(factory, **kwargs):
+        seen.update(kwargs)
+        raise RuntimeError("object store unavailable")
+
+    monkeypatch.setattr(externalizer, "externalize_prior_mail_attachments", broken)
+    monkeypatch.setattr(worker_module, "azure_storage_manager", types.SimpleNamespace(
+        get_shard_for_resource=lambda resource_id, tenant_id: ("shard", resource_id, tenant_id),
+        get_container_name=lambda tenant_id, workload: f"backup-{workload}-{tenant_id}"))
+    await worker_module._externalize_prior_mail_attachments("tenant", "resource", "target", "job")
+    assert seen["shard"] == ("shard", "resource", "tenant")
+    assert seen["container"] == "backup-email-tenant"
+    assert (seen["target_snapshot_id"], seen["current_job_id"]) == ("target", "job")
 
 
 async def test_archive_required_copy_delegates_before_inline_slot(monkeypatch, workflow):

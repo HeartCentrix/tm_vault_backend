@@ -292,3 +292,32 @@ def test_in_progress_batch_drilldown_keeps_pending_child_workloads():
     out = prune_unrun_terminal_children(resources, "IN_PROGRESS")
 
     assert [child["type"] for child in out[0]["children"]] == ["USER_MAIL", "USER_CHATS"]
+
+
+def test_scope_label_names_the_resource_types_it_holds():
+    # Railway 2026-11-06: 6 Teams channels + 16 Microsoft 365 groups were labelled "22 users".
+    out = shape_activity_row(_row(total_scope_count=22,
+                                  scope_types=["M365_GROUP"] * 16 + ["TEAMS_CHANNEL"] * 6))
+    assert out["object"] == "16 Microsoft 365 groups, 6 Teams channels"
+    sites = shape_activity_row(_row(total_scope_count=1, scope_types=["SHAREPOINT_SITE"]))
+    assert sites["object"] == "1 SharePoint site"
+    users = shape_activity_row(_row(total_scope_count=10, scope_types=["ENTRA_USER"] * 10))
+    assert users["object"] == "10 users"
+
+
+def test_partial_batch_row_says_why():
+    # TM #35: a PARTIAL backup must tell the operator what went wrong, not only "Partial".
+    one = shape_activity_row(_row(status="PARTIAL", bytes_done=2048, issue_count=1, issue_name="Archive — Han Kim",
+                                  issue_reason="36 folder walk(s) failed"))
+    assert one["details"] == f"Partial — {_mod._fmt_bytes(2048)} backed up · Archive — Han Kim: 36 folder walk(s) failed"
+    many = shape_activity_row(_row(status="PARTIAL", bytes_done=0, issue_count=3, issue_name="Chats — Rohit",
+                                   issue_reason=None))
+    assert many["details"] == f"Partial — {_mod._fmt_bytes(0)} backed up · 3 resources with issues; first: Chats — Rohit: no reason recorded"
+    long = shape_activity_row(_row(status="PARTIAL", issue_count=1, issue_name="Mail", issue_reason="x" * 400))
+    assert len(long["details"]) < 260 and long["details"].endswith("…")
+
+
+def test_failed_batch_row_says_why():
+    out = shape_activity_row(_row(status="FAILED", issue_count=1, issue_name="Mail — Rohit", issue_reason="token expired"))
+    assert out["details"] == "Failed — Mail — Rohit: token expired"
+    assert shape_activity_row(_row(status="FAILED"))["details"] == "Failed"

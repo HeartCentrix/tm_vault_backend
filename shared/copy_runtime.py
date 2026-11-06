@@ -196,11 +196,16 @@ class CopyWorkRunner:
                         claim = await copy_work.claim(session, owner_id=self.owner_id)
                 if claim is None:
                     return None
-                result = await copy_admission.run_batch(self.factory, claim,
-                    batch_size=self.batch_size, statement_timeout_ms=self.statement_timeout_ms,
-                    lock_timeout_ms=self.lock_timeout_ms)
-                logger.info('copy_batch_result task_id=%s state=%s committed_rows=%d committed_bytes=%d execution_s=%.6f',
-                    result.task_id,result.status,result.rows,result.bytes,result.query_seconds)
+                # Keep the claimed task while it has work and its lease allows (run_batch). Railway
+                # 2026-11-06: re-claiming between batches cost ~5 s of round trips per batch.
+                while True:
+                    result = await copy_admission.run_batch(self.factory, claim,
+                        batch_size=self.batch_size, statement_timeout_ms=self.statement_timeout_ms,
+                        lock_timeout_ms=self.lock_timeout_ms, keep_claim=not self._closing)
+                    logger.info('copy_batch_result task_id=%s state=%s committed_rows=%d committed_bytes=%d execution_s=%.6f',
+                        result.task_id,result.status,result.rows,result.bytes,result.query_seconds)
+                    if result.status != 'RUNNING':
+                        break
             for workflow_id in await self._ready_workflows(task_id=claim.task_id):
                 await self._resume(workflow_id)
             if result.status == 'READY':

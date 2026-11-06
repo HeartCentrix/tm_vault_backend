@@ -154,6 +154,10 @@ class JobStatus(str, enum.Enum):
     PENDING = "PENDING"  # T0 migration: chat-export PENDING (queued-but-idempotency-safe)
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
+    # Finished, but a snapshot ended PARTIAL/FAILED: the activity feed's
+    # "Done with warnings" (shared.batch_rollup.job_partial_sql). Terminal
+    # wherever COMPLETED is. Migration 0019.
+    PARTIAL = "PARTIAL"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
     CANCELLING = "CANCELLING"  # T0 migration: transient state while worker wraps up
@@ -173,6 +177,10 @@ class SnapshotStatus(str, enum.Enum):
     FAILED = "FAILED"
     PARTIAL = "PARTIAL"
     PENDING_DELETION = "PENDING_DELETION"
+    # Cross-job concurrency placeholder: another job was already backing the
+    # resource up, so this job captured nothing (extra_data.skipped_concurrent
+    # stays set). Terminal, never a restore point; counts as done for the job.
+    SKIPPED = "SKIPPED"
 
     @classmethod
     def terminal(cls) -> tuple["SnapshotStatus", ...]:
@@ -187,7 +195,7 @@ class SnapshotStatus(str, enum.Enum):
         status lists from this method rather than hand-typing SQL literals
         (a stray 'CANCELLED' literal crashed the reaper via enum coercion).
         """
-        return (cls.COMPLETED, cls.FAILED, cls.PARTIAL, cls.PENDING_DELETION)
+        return (cls.COMPLETED, cls.FAILED, cls.PARTIAL, cls.PENDING_DELETION, cls.SKIPPED)
 
 
 class Organization(Base):
@@ -580,6 +588,14 @@ class Snapshot(Base):
         ForeignKey(SNAPSHOT_ID_FOREIGN_KEY, ondelete="RESTRICT"),
         nullable=True,
     )
+    # Overlay snapshot (docs/mail-overlay-snapshots.md): owns only the rows changed since this FULL
+    # base snapshot, plus snapshot_overlay_removals; readers use snapshot_items_effective(). NULL on
+    # full snapshots and pointers. Trigger snapshots_overlay_validate keeps it single-level.
+    overlay_base_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey(SNAPSHOT_ID_FOREIGN_KEY, ondelete="RESTRICT"),
+        nullable=True,
+    )
     # Reconciliation lease (2026-05-16 design).
     lease_owner_id = Column(UUID(as_uuid=True), nullable=True)
     lease_expires_at = Column(DateTime(timezone=True), nullable=True)
@@ -646,6 +662,17 @@ class SnapshotItem(Base):
     chat_version_id = Column(UUID(as_uuid=True), ForeignKey("chat_item_versions.id", ondelete="RESTRICT",
                              name="fk_snapshot_items_chat_version"), nullable=True, index=True)
     created_at = Column(DateTime, default=utcnow)
+
+
+class SnapshotOverlayRemoval(Base):
+    """A base row an overlay snapshot hides (deleted, folder re-bootstrapped, dropped by the carry's
+    filters). Keyed like snapshot_items' natural key; removing an EMAIL also hides its base
+    attachments unless the overlay owns that email."""
+    __tablename__ = "snapshot_overlay_removals"
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey(SNAPSHOT_ID_FOREIGN_KEY, ondelete="CASCADE"),
+                         primary_key=True)
+    item_type = Column(String, primary_key=True)
+    external_id = Column(String, primary_key=True)
 
 
 class SnapshotPartition(Base):
@@ -1905,6 +1932,16 @@ class CopyWorkItem(Base):
     phase = Column(Integer, nullable=False, default=0)
 
 
+def _env_capacity(name, default):
+    """Positive int from env (capacity defaults of the first-use control rows)."""
+    import os
+    try:
+        value = int(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
 class CopyWorkControl(Base):
     """One short transactional claim mutex and coordinated protocol settings."""
     __tablename__ = 'copy_work_control'
@@ -1914,7 +1951,8 @@ class CopyWorkControl(Base):
     micro_capacity = Column(Integer, nullable=False, default=3)
     giant_capacity = Column(Integer, nullable=False, default=3)
     total_capacity = Column(Integer, nullable=False, default=6)
-    tenant_capacity = Column(Integer, nullable=False, default=2)
+    # The row is created on first use. TM is one tenant: 2 serialised its whole cluster's copies.
+    tenant_capacity = Column(Integer, nullable=False, default=lambda: _env_capacity('COPY_TENANT_CAPACITY', 6))
     virtual_clock = Column(Float, nullable=False, default=0)
     __table_args__ = (CheckConstraint('micro_capacity > 0 AND giant_capacity > 0 AND total_capacity > 0 AND tenant_capacity > 0', name='ck_copy_control_capacity'),)
 
@@ -2005,8 +2043,10 @@ class ProviderWorkControl(Base):
     id = Column(String(16), primary_key=True, default='global')
     enabled = Column(Boolean, nullable=False, default=False)
     epoch = Column(BigInteger, nullable=False, default=1)
-    total_capacity = Column(Integer, nullable=False, default=8)
-    tenant_capacity = Column(Integer, nullable=False, default=4)
+    # Created on first use; TM sets no overrides. 8/4 capped TM's single tenant at 4 concurrent
+    # backups across 20 worker replicas. 40/40 is what Railway (also 10+10 replicas) runs.
+    total_capacity = Column(Integer, nullable=False, default=lambda: _env_capacity('PROVIDER_TOTAL_CAPACITY', 40))
+    tenant_capacity = Column(Integer, nullable=False, default=lambda: _env_capacity('PROVIDER_TENANT_CAPACITY', 40))
     control_reserve = Column(Integer, nullable=False, default=2)
     virtual_clock = Column(Float, nullable=False, default=0)
     __table_args__ = (CheckConstraint('total_capacity > 0 AND tenant_capacity > 0 AND control_reserve > 0', name='ck_provider_capacity'),)

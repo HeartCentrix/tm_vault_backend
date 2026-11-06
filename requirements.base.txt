@@ -62,5 +62,8 @@ boto3==1.34.131
 # --- Server-Sent Events (admin storage toggle stream) ---
 sse-starlette==1.8.2
 
+# --- Metrics (shared/core_metrics.py, sla_metrics.py, pst_metrics.py) ---
+prometheus_client>=0.20.0
+
 # --- Utilities ---
 python-dotenv==1.0.0

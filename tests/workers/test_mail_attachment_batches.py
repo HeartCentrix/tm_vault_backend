@@ -31,7 +31,7 @@ def capture(monkeypatch):
     names = {"_usermail_backup_attachments", "_record_enumeration_failure",
              "EnumerationFailed", "enumeration_failure_extra_data", "reconcile_enumeration_failure_status",
              "mailbox_batch_concurrency", "_mail_needs_attachments", "_mail_attachment_candidates",
-             "_mail_attachment_gap", "_degrade_for_attachment_gap"}
+             "_mail_attachment_gap", "_degrade_for_attachment_gap", "_maybe_inline_attachment"}
     nodes = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
              and n.name in names]
     snapshot = SimpleNamespace(id=uuid.uuid4(), status=SnapshotStatus.IN_PROGRESS,
@@ -54,8 +54,10 @@ def capture(monkeypatch):
         RESOURCE_LAST_BACKUP_TERMINAL_STATUSES=("COMPLETED", "PARTIAL", "FAILED"),
         async_session_factory=Session,
         azure_storage_manager=SimpleNamespace(get_shard_for_resource=lambda *args: object(),
-                                             get_container_name=lambda *args: "email"),
-        _maybe_inline_attachment=lambda content: base64.b64encode(content).decode(),
+                                             get_container_name=lambda *args: "email",
+                                             build_blob_path=lambda *parts: "/".join(map(str, parts))),
+        # These tests predate blob-backed mail attachments; they keep the old inline threshold.
+        _INLINE_ATTACHMENT_MAX_BYTES=256 * 1024, _MAIL_ATTACHMENT_INLINE_MAX_BYTES=256 * 1024,
         _extract_cid_refs_from_body=lambda body: {"inline"},
         ProviderDeferred=ProviderDeferred, ProviderBudgetExhausted=ProviderBudgetExhausted,
         ProviderTurnDeferred=ProviderTurnDeferred,
@@ -252,3 +254,48 @@ async def test_failed_bulk_mime_fetch_falls_back_to_the_single_message_fetch(cap
     await worker._usermail_backup_attachments(graph, resource, snapshot, tenant, "user",
                                               [{"id": "m", "body": {"content": "<img src='cid:inline'>"}}])
     assert single == ["m"]
+
+
+async def test_mail_attachment_bytes_go_to_blob_storage_not_the_row(capture, monkeypatch):
+    """Railway 2026-11-06 incremental #1: attachments <=256 KB rode in metadata.inline_b64, 95% of
+    the bytes every changed mailbox copied forward (Rohit 247 MB of 261 MB, 245 s of copy). New
+    captures, file and cid-only MIME images alike, store their bytes in blob storage."""
+    worker, resource, snapshot, tenant, ns = capture
+    ns["_MAIL_ATTACHMENT_INLINE_MAX_BYTES"] = 0  # production default
+    stored = {}
+
+    async def put(container, path, content, shard, **kwargs):
+        stored[path] = content
+        return {"success": True, "blob_path": path}
+
+    async def put_dedup(tenant_id, content_hash, container, path, content, shard, **kwargs):
+        return await put(container, path, content, shard)
+
+    import shared.azure_storage as storage
+    monkeypatch.setattr(storage, "upload_blob_with_dedup", put_dedup)
+    ns["upload_blob_with_retry"] = put
+    logo = b"\x89PNG" + b"x" * 4096
+    ns["_parse_mime_inline_parts"] = lambda mime: [
+        {"content_id": "inline", "payload": logo, "content_type": "image/png", "filename": None}]
+    small = attachment("notes")
+    large = {**attachment("report"), "contentBytes": base64.b64encode(b"r" * 2048).decode()}
+    graph = Graph([{"m": response("m", [small, large])}])
+
+    async def mime(user_id, ids):
+        return {"m": b"MIME"}
+
+    graph.get_messages_mime_concurrent = mime
+    items, size = await worker._usermail_backup_attachments(
+        graph, resource, snapshot, tenant, "user", [{"id": "m", "body": {"content": "<img src='cid:inline'>"}}])
+    by_id = {item.external_id: item for item in items}
+    assert set(by_id) == {"m::notes", "m::report", "m::mime::inline"}
+    expected = {"m::notes": b"abc", "m::report": b"r" * 2048, "m::mime::inline": logo}
+    for external_id, content in expected.items():
+        item = by_id[external_id]
+        assert item.extra_data.get("inline_b64") is None
+        assert item.extra_data["resolved"] is True and item.blob_path
+        assert stored[item.blob_path] == content
+        assert item.content_hash == item.content_checksum == hashlib.sha256(content).hexdigest()
+        assert item.content_size == len(content)
+    assert by_id["m::mime::inline"].extra_data["content_id"] == "inline"
+    assert size == sum(len(c) for c in expected.values())

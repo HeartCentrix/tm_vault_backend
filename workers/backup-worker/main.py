@@ -22,6 +22,7 @@ from contextlib import contextmanager
 import functools
 import json
 import re
+import signal
 import uuid
 import hashlib
 import logging
@@ -115,11 +116,19 @@ _PG_MAX_BIND_PARAMS = 32767
 _INLINE_ATTACHMENT_MAX_BYTES = int(
     os.getenv("INLINE_ATTACHMENT_MAX_BYTES", str(256 * 1024)),
 )
+# Mail attachments (EMAIL_ATTACHMENT) are blob-backed by default: an inline
+# row's bytes are re-copied by every changed mailbox's carry-forward
+# (Railway 2026-11-06 incremental #1: 95% of copied bytes, Rohit 247 MB of
+# 261 MB). Storage is SeaweedFS/S3, not Azure block lists, so the reasons
+# above no longer pay for that. Set >0 to inline attachments up to that size
+# again (the old behaviour was 262144). Chat keeps INLINE_ATTACHMENT_MAX_BYTES.
+_MAIL_ATTACHMENT_INLINE_MAX_BYTES = int(os.getenv("MAIL_ATTACHMENT_INLINE_MAX_BYTES", "0"))
 
 
-def _maybe_inline_attachment(content_bytes: Optional[bytes]) -> Optional[str]:
-    """Return base64-encoded content if it fits the inline threshold;
-    None if the bytes should go to Azure Blob instead.
+def _maybe_inline_attachment(content_bytes: Optional[bytes], max_bytes: Optional[int] = None) -> Optional[str]:
+    """Return base64-encoded content if it fits the inline threshold
+    (``max_bytes``, default INLINE_ATTACHMENT_MAX_BYTES); None if the bytes
+    should go to blob storage instead.
 
     Callers MUST handle both branches — inline path sets
     extra_data["inline_b64"] and leaves blob_path=None; blob path runs
@@ -127,7 +136,7 @@ def _maybe_inline_attachment(content_bytes: Optional[bytes]) -> Optional[str]:
     """
     if content_bytes is None:
         return None
-    if len(content_bytes) > _INLINE_ATTACHMENT_MAX_BYTES:
+    if len(content_bytes) > (_INLINE_ATTACHMENT_MAX_BYTES if max_bytes is None else max_bytes):
         return None
     import base64 as _b64
     return _b64.b64encode(content_bytes).decode("ascii")
@@ -1555,6 +1564,25 @@ async def _carry_forward_prior_chat_snapshot_items(
     return await run_owned_db_operation(copy_once)
 
 
+async def _externalize_prior_mail_attachments(tenant_id, resource_id, target_snapshot_id, current_job_id) -> None:
+    """Move the carry prior's inline attachment bytes to blob storage in place, so the copy moves
+    pointer rows instead of re-copying them (shared/mail_inline_attachments.py). Best effort: a row
+    left inline is still carried, as before, and the next carry retries it."""
+    try:
+        from shared.mail_inline_attachments import externalize_prior_mail_attachments
+        moved = await externalize_prior_mail_attachments(
+            async_session_factory, tenant_id=tenant_id, resource_id=resource_id,
+            target_snapshot_id=target_snapshot_id, current_job_id=current_job_id,
+            shard=azure_storage_manager.get_shard_for_resource(str(resource_id), str(tenant_id)),
+            container=azure_storage_manager.get_container_name(str(tenant_id), "email"))
+        if moved:
+            print(f"[MAIL-CARRY] resource {resource_id}: moved {moved} inline attachment(s) "
+                  f"of the prior snapshot to blob storage")
+    except Exception as exc:
+        print(f"[MAIL-CARRY] resource {resource_id}: inline attachments left in place: "
+              f"{type(exc).__name__}: {exc}")
+
+
 async def _carry_forward_prior_mail_snapshot_items(
     *,
     tenant_id: str,
@@ -1600,6 +1628,21 @@ async def _carry_forward_prior_mail_snapshot_items(
     keep_fids = sorted({str(f) for f in (keep_folder_ids or []) if f}) if keep_folder_ids is not None else None
     if keep_fids is not None and not keep_fids:
         return 0  # whitelist given but empty → nothing may be carried
+    from shared.mail_overlay import mail_overlay_enabled, try_mail_overlay
+    if mail_overlay_enabled():
+        # Own only what changed since a full base; the full copy below runs when the overlay is not
+        # applicable (no prior, compaction, error) and logs why (docs/mail-overlay-snapshots.md).
+        # One short transaction bounded by the compaction threshold: no giant-lane slot, so a
+        # handler never waits behind full copies for it.
+        overlay = await try_mail_overlay(
+            async_session_factory, resource_id=resource_id, target_snapshot_id=target_snapshot_id, current_job_id=current_job_id,
+            excluded_paths=excl_paths, tombstoned_ids=excl_ids, keep_folder_ids=keep_fids,
+            exclude_pathless=exclude_pathless,
+        )
+        if overlay is not None:
+            return overlay["carried"]
+    # Full copy path: before the copy is registered (its manifest freezes row payloads) or runs.
+    await _externalize_prior_mail_attachments(tenant_id, resource_id, target_snapshot_id, current_job_id)
     from shared.copy_workflow import defer_current_copy
     delegated = await defer_current_copy("MAIL_CARRY", {
         "tenant_id": str(tenant_id), "resource_id": str(resource_id),
@@ -1624,30 +1667,7 @@ async def _carry_forward_prior_mail_snapshot_items(
     # delta — must not restart the chain empty), is not a reuse-chain
     # pointer, and did not itself fail its carry-forward (its inventory is
     # known-incomplete).
-    prior_snapshot_sql = (
-        "(SELECT s2.id FROM snapshots s2 "
-        "  WHERE s2.resource_id = :rid "
-        "    AND s2.id <> :tsid "
-        "    AND s2.status IN ('COMPLETED', 'PARTIAL') "
-        "    AND s2.job_id IS DISTINCT FROM CAST(:jid AS UUID) "
-        "    AND s2.reuse_of_snapshot_id IS NULL "
-        "    AND s2.reuse_chain_root_id IS NULL "
-        "    AND COALESCE(s2.extra_data->>'mail_carry_forward_failed', 'false') <> 'true' "
-        "    AND COALESCE(s2.extra_data->>'mail_delta_only', 'false') <> 'true' "
-        "    AND COALESCE(s2.extra_data->>'mail_carry_forward_pending', 'false') <> 'true' "
-        "    AND s2.extra_data->>'cancelled_at' IS NULL "
-        "    AND s2.created_at < (SELECT t.created_at FROM snapshots t WHERE t.id = :tsid) "
-        "    AND (COALESCE(s2.extra_data->>'mail_union_carry_claimed', 'false') = 'true' "
-        "         OR NOT EXISTS (SELECT 1 FROM snapshot_partitions sp "
-        "                         WHERE sp.snapshot_id = s2.id "
-        "                           AND sp.partition_type = 'MAIL_FOLDERS' "
-        "                           AND (sp.payload::jsonb) ? 'carry_forward')) "
-        "    AND EXISTS (SELECT 1 FROM snapshot_items x "
-        "                 WHERE x.snapshot_id = s2.id "
-        "                   AND x.item_type IN ('EMAIL', 'EMAIL_ATTACHMENT')) "
-        "  ORDER BY s2.created_at DESC "
-        "  LIMIT 1)"
-    )
+    from shared.mail_snapshot_reuse import MAIL_PRIOR_SNAPSHOT_SQL as prior_snapshot_sql
     insert_prefix = (
         "INSERT INTO snapshot_items ("
         "  id, snapshot_id, tenant_id, item_type, external_id, "
@@ -1663,8 +1683,9 @@ async def _carry_forward_prior_mail_snapshot_items(
         "       COALESCE(src.backup_version, 1), src.metadata, "
         "       COALESCE(src.is_deleted, false), src.indexed_at, "
         "       src.backend_id, NOW() "
-        "  FROM snapshot_items src "
-        " WHERE src.snapshot_id = " + prior_snapshot_sql + " "
+        # The prior's inventory, which for an overlay prior is its base + its own rows.
+        "  FROM snapshot_items_effective(" + prior_snapshot_sql + ") src "
+        " WHERE true "
     )
     not_exists_sql = (
         "   AND NOT EXISTS ("
@@ -2706,6 +2727,22 @@ def suppressed_units_note(
     )[:300]
 
 
+def no_mailbox_reason(exc: BaseException) -> Optional[str]:
+    """Graph's answer for a user without an Exchange Online mailbox: 404 MailboxNotEnabledForRESTAPI
+    (live 2026-11-06: 28/28 such users, on mailFolders, calendar and contacts alike). That is a fact
+    about the tenant, not a failed backup: the run completes with 0 items and records this reason."""
+    response = getattr(exc, "response", None)
+    if getattr(response, "status_code", None) != 404:
+        return None
+    try:
+        code = ((response.json() or {}).get("error") or {}).get("code")
+    except Exception:
+        return None
+    if code != "MailboxNotEnabledForRESTAPI":
+        return None
+    return "No Exchange Online mailbox (Microsoft 404 MailboxNotEnabledForRESTAPI)"
+
+
 def evaluate_drain_honesty(
     *,
     planned: int,
@@ -3537,6 +3574,27 @@ def mail_carry_forward_excluded_paths(
     return sorted(out)
 
 
+def sp_list_reusable(signature, prior, now, max_age_hours=None):
+    """The prior full read time when a SharePoint list can be carried forward instead of re-read: its
+    REST item signature (last item modified / deleted date, item count, title) equals the prior
+    restore point's and that list was fully read within ``max_age_hours`` (SP_LIST_REUSE_MAX_AGE_HOURS,
+    default 168: column text such as a person's name can change without the list's date). Else None.
+    SP_LIST_UNCHANGED_REUSE_ENABLED=false always re-reads."""
+    if os.getenv("SP_LIST_UNCHANGED_REUSE_ENABLED", "true").strip().lower() in ("0", "false", "no", "off"):
+        return None
+    if not signature or not prior or not signature.get("modified") or prior.get("rest_signature") != signature:
+        return None
+    walked = prior.get("rest_walked_at")
+    try:
+        walked_at = datetime.fromisoformat(str(walked).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if walked_at.tzinfo is None:
+        walked_at = walked_at.replace(tzinfo=timezone.utc)
+    hours = float(max_age_hours if max_age_hours is not None else os.getenv("SP_LIST_REUSE_MAX_AGE_HOURS", "168"))
+    return walked if now - walked_at < timedelta(hours=hours) else None
+
+
 def mail_carry_forward_enabled(env: Optional[Dict[str, str]] = None) -> bool:
     """Kill switch for the mail carry-forward (both USER_MAIL and Tier-1).
     Default ON; ``MAIL_CARRY_FORWARD_ENABLED`` = 0/false/no/off disables it
@@ -3551,10 +3609,11 @@ def tier1_mail_delta_enabled(resource_id: Any, env: Optional[Dict[str, str]] = N
 
     Pure function; pinned by tests/workers/test_tier1_mail_delta.py.
 
-    Default OFF: MAILBOX / SHARED_MAILBOX / ROOM_MAILBOX keep the verbatim
-    legacy full walk (``_backup_mailbox_fullwalk``). ``TIER1_MAIL_DELTA_ENABLED``
-    = true/1/yes switches the fleet; ``TIER1_MAIL_DELTA_RESOURCE_IDS`` (comma
-    separated resource ids, case-insensitive) pilots individual mailboxes.
+    Default ON: MAILBOX / SHARED_MAILBOX / ROOM_MAILBOX read per-folder deltas
+    instead of re-downloading the whole mailbox every run.
+    ``TIER1_MAIL_DELTA_ENABLED`` = false/0/no/off restores the legacy full walk
+    (``_backup_mailbox_fullwalk``) fleet-wide; ``TIER1_MAIL_DELTA_RESOURCE_IDS``
+    (comma separated resource ids, case-insensitive) limits delta to those.
     """
     e = os.environ if env is None else env
     flag = str(e.get("TIER1_MAIL_DELTA_ENABLED", "") or "").strip().lower()
@@ -3564,7 +3623,7 @@ def tier1_mail_delta_enabled(resource_id: Any, env: Optional[Dict[str, str]] = N
         return True
     allow = str(e.get("TIER1_MAIL_DELTA_RESOURCE_IDS", "") or "")
     wanted = {p.strip().lower() for p in allow.split(",") if p.strip()}
-    return str(resource_id).strip().lower() in wanted
+    return not wanted or str(resource_id).strip().lower() in wanted
 
 
 def snapshot_counters_from_result(result: Optional[Dict[str, Any]]) -> Tuple[int, int, int, int]:
@@ -4290,18 +4349,37 @@ class AuditLogger:
     HTTP only — this aligns backup-worker with that convention.
     """
 
+    # Strong refs so in-flight sends are not garbage-collected mid-post.
+    # ponytail: sends still pending at worker shutdown are dropped; add a
+    # drain-on-shutdown if audit completeness across restarts matters.
+    _pending: set = set()
+
     def __init__(self):
         self.audit_url = f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log"
 
     async def log(self, **kwargs):
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post(
-                    self.audit_url, json=kwargs,
-                    headers=internal_audit_headers(),
-                )
-        except Exception as e:
-            print(f"[AuditLogger] HTTP failed: {e}")
+        """Schedule the POST and return at once: a slow or down
+        audit-service must never block or fail the backup."""
+        task = asyncio.create_task(self._send(kwargs))
+        AuditLogger._pending.add(task)
+        task.add_done_callback(AuditLogger._pending.discard)
+
+    async def _send(self, payload: dict) -> None:
+        action = payload.get("action")
+        for attempt in (1, 2):
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    await client.post(
+                        self.audit_url, json=payload,
+                        headers=internal_audit_headers(),
+                    )
+                return
+            except httpx.TransportError as e:  # includes every timeout
+                # Type + repr only: never the payload or headers.
+                print(f"[AuditLogger] {action} attempt {attempt}/2 failed: {type(e).__name__} {e!r}")
+            except Exception as e:
+                print(f"[AuditLogger] {action} failed: {type(e).__name__} {e!r}")
+                return
 
 
 #: Marker for the SharePoint catalog libraries (Web Part Gallery, Master Page
@@ -4347,8 +4425,9 @@ def record_sp_rest_failure(
 def partition_loss_degraded_reason(
     *, lost_files: int, shards_lossy: int, shards_failed: int,
     shards_total: int, enumeration_incomplete: bool,
+    first_error: Optional[str] = None,
 ) -> Optional[str]:
-    """Operator-readable reason for a PARTITION-derived PARTIAL.
+    """Operator-readable reason for a PARTITION-derived PARTIAL or FAILED.
 
     The partitioned finalize path derives PARTIAL from partition counters
     (``failure_state.files_failed`` on shards that still report COMPLETED,
@@ -4386,6 +4465,8 @@ def partition_loss_degraded_reason(
         )
     if not bits:
         return None
+    if shards_failed > 0 and first_error:
+        bits.append(f"first: {first_error[:300]}")
     return "; ".join(bits)
 
 
@@ -4721,10 +4802,15 @@ class BackupWorker:
         try:
             await self._consume_backup_queues()
         finally:
-            if self._provider_work_runner is not None:
-                await self._provider_work_runner.close()
-            if self._copy_work_runner is not None:
-                await self._copy_work_runner.close()
+            await self._close_work_runners()
+
+    async def _close_work_runners(self):
+        """Stop provider/copy claims once: a running provider turn suspends with
+        worker_interrupted and a copy claim returns to READY (SIGTERM or exit)."""
+        runners = [r for r in (getattr(self, "_provider_work_runner", None),
+                               getattr(self, "_copy_work_runner", None)) if r is not None]
+        self._provider_work_runner = self._copy_work_runner = None
+        await asyncio.gather(*(r.close() for r in runners))
 
     async def _consume_backup_queues(self):
         # Broker connect can retry indefinitely. SQL copy recovery is already
@@ -5235,7 +5321,7 @@ class BackupWorker:
                 await self._finalize_partitioned_snapshot(snapshot.id, job_id=job.id)
             async with async_session_factory() as session:
                 current = await session.get(Snapshot, snapshot.id)
-                if current.status not in (SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL, SnapshotStatus.FAILED):
+                if current.status not in (SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL, SnapshotStatus.FAILED, SnapshotStatus.SKIPPED):
                     return False
                 if job.batch_resource_ids:
                     await self._finalize_bulk_parent_if_complete(session, job.id)
@@ -5270,6 +5356,7 @@ class BackupWorker:
                         "CHAT_ATTACHMENT", "EMAIL_ATTACHMENT", "CHAT_HOSTED_CONTENT", "ARCHIVE_ATTACHMENT",
                     ))),
                     func.coalesce(func.sum(SnapshotItem.content_size), 0),
+                # A deferred copy's target is a full snapshot: overlays and pointers never defer.
                 ).where(SnapshotItem.snapshot_id == snapshot.id))).one()
                 total_items, total_bytes = int(row[0] or 0), int(row[1] or 0)
                 partition = await session.get(SnapshotPartition, workflow.partition_id) if workflow.partition_id else None
@@ -5395,7 +5482,7 @@ class BackupWorker:
                 await self._finalize_partitioned_snapshot(snapshot.id, tenant, resource, job.id)
             async with async_session_factory() as session:
                 current = await session.get(Snapshot, snapshot.id)
-                if current.status not in (SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL, SnapshotStatus.FAILED):
+                if current.status not in (SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL, SnapshotStatus.FAILED, SnapshotStatus.SKIPPED):
                     return False
                 if job.batch_resource_ids:
                     await self._finalize_bulk_parent_if_complete(session, job.id)
@@ -6489,8 +6576,9 @@ class BackupWorker:
             other_id, other_job, other_started = other_active
             # Create the snapshot row so this job's FANOUT/FINALIZE math
             # balances (consumer count must equal the bulk_fanout_seen
-            # expectation), then immediately mark it COMPLETED with
-            # skipped_concurrent so operators can see why no items were
+            # expectation), then immediately mark it SKIPPED (terminal,
+            # never a restore point) with skipped_concurrent so operators
+            # can see why no items were
             # ingested for this (job, resource) pair.
             try:
                 snapshot = await self.create_snapshot(resource, message, job_id)
@@ -6500,7 +6588,7 @@ class BackupWorker:
                 async with async_session_factory() as _skip_s:
                     _live = await _skip_s.get(Snapshot, snapshot.id)
                     if _live and _live.status == SnapshotStatus.IN_PROGRESS:
-                        _live.status = SnapshotStatus.COMPLETED
+                        _live.status = SnapshotStatus.SKIPPED
                         _live.completed_at = datetime.utcnow()
                         _live.duration_secs = 0
                         _live.item_count = 0
@@ -6515,14 +6603,14 @@ class BackupWorker:
             except Exception as _skip_exc:
                 print(
                     f"[{self.worker_id}] [SKIP_CONCURRENT] couldn't mark "
-                    f"skip-snapshot COMPLETED for resource={resource.id}: "
+                    f"skip-snapshot SKIPPED for resource={resource.id}: "
                     f"{_skip_exc}"
                 )
             print(
                 f"[{self.worker_id}] [SKIP_CONCURRENT] resource={resource.id} "
                 f"active in job={other_job} since {other_started} "
                 f"(this job={job_id}); created skip-snapshot {snapshot.id} "
-                f"COMPLETED skipped_concurrent=true."
+                f"SKIPPED skipped_concurrent=true."
             )
             return
 
@@ -6747,6 +6835,7 @@ class BackupWorker:
         _is_partitioned_run = bool(
             (result or {}).get("partitioned"),
         )
+        _fresh = None
         if not _is_partitioned_run:
             try:
                 async with async_session_factory() as _refresh:
@@ -6767,7 +6856,7 @@ class BackupWorker:
             )
         else:
             async with async_session_factory() as s:
-                await self.complete_snapshot(s, snapshot, result)
+                await self.complete_snapshot(s, snapshot, result, settled_row=_fresh)
 
         # Safety reaper — catches any fire-and-forget background task
         # inside THIS resource's handler (e.g. the USER_CHATS hosted-
@@ -6819,7 +6908,7 @@ class BackupWorker:
             # `snapshot` still says COMPLETED.
             async with async_session_factory() as s:
                 await self._stamp_resource_from_snapshot_row(
-                    s, resource, job_id, snapshot.id, result,
+                    s, resource, job_id, snapshot.id, result, skip_if_stamped=True,
                 )
 
             # Audit event — fire-and-forget over HTTP, no DB session needed.
@@ -7474,6 +7563,9 @@ class BackupWorker:
                     except Exception as e:
                         print(f"[{self.worker_id}] [USER_MAIL] folder tree fetch failed for {user_id}: {e}")
                         folder_tree_full = {}
+                    # The tree reader turns 403/404 into {}: a user without a mailbox is no failure.
+                    if not folder_tree_full and await self._note_no_mailbox(graph_client, user_id, snapshot, "USER_MAIL"):
+                        return []
                     # Path-only view for downstream code that just needs
                     # folder_tree[fid] → "/Inbox/Subfolder".
                     folder_tree: Dict[str, str] = {
@@ -8548,8 +8640,28 @@ class BackupWorker:
                                     f"not stamped: {_flag_err}"
                                 )
                     elif mail_carry_forward_enabled() and _cf_excluded is not None:
+                        # Nothing changed anywhere (no folder re-bootstrapped,
+                        # missing or evicted, no delete, no message, no row):
+                        # point at the prior snapshot instead of copying it.
+                        _mail_unchanged = (
+                            not _cf_excluded and not mail_tombstoned_ids and not out
+                            and not _mail_persisted_total and not _mail_folders_missing
+                            and not _mail_folders_token_evicted
+                        )
+                        from shared.mail_snapshot_reuse import reuse_if_unchanged
+                        _mail_reused_prior = await reuse_if_unchanged(
+                            async_session_factory, unchanged=_mail_unchanged,
+                            resource_id=str(resource.id), target_snapshot_id=str(snapshot.id),
+                            current_job_id=job_id,
+                        )
+                        if _mail_reused_prior:
+                            print(
+                                f"[{self.worker_id}] [USER_MAIL] "
+                                f"{resource.display_name or resource.id}: unchanged — "
+                                f"reusing prior snapshot {_mail_reused_prior} (no copy)"
+                            )
                         try:
-                            _cf_rows = await _carry_forward_prior_mail_snapshot_items(
+                            _cf_rows = 0 if _mail_reused_prior else await _carry_forward_prior_mail_snapshot_items(
                                 tenant_id=str(tenant.id),
                                 resource_id=str(resource.id),
                                 target_snapshot_id=str(snapshot.id),
@@ -8970,6 +9082,8 @@ class BackupWorker:
                         prior_deltas=_prior_contact_deltas,
                         enumeration_errors=_contact_enum_errors,
                     )
+                    if _contact_enum_errors and not out_rows and await self._note_no_mailbox(graph_client, user_id, snapshot, "USER_CONTACTS"):
+                        return []
                     folder_names = sorted({r[4] for r in out_rows})
                     # STASH the new delta links as PENDING — only the ones
                     # the helper successfully captured a deltaLink for.
@@ -9115,6 +9229,8 @@ class BackupWorker:
                         )
                         calendars = (cal_page or {}).get("value", []) or []
                     except Exception as _e:
+                        if await self._note_no_mailbox(graph_client, user_id, snapshot, "USER_CALENDAR", exc=_e):
+                            return []
                         # Fallback: at least hit the default calendar so we
                         # don't return zero events on a permissions blip.
                         logger.warning("[%s] Calendars enumeration failed for %s: %s", self.worker_id, user_id, _e)
@@ -13632,13 +13748,21 @@ class BackupWorker:
                     "CHAT_HOSTED_CONTENT",
                 )
                 async with async_session_factory() as _count_sess:
+                    # An unchanged mailbox's reuse snapshot owns no rows; count
+                    # the full snapshot it names (shared.snapshot_reuse).
+                    # An overlay owns only what changed since its base (shared.snapshot_reuse).
+                    from shared.snapshot_reuse import items_scope, SnapshotNotFound
+                    try:
+                        _items_of = await items_scope(_count_sess, snapshot.id)
+                    except SnapshotNotFound:
+                        _items_of = SnapshotItem.snapshot_id == snapshot.id
                     _row = (await _count_sess.execute(
                         select(
                             func.count(SnapshotItem.id).filter(
                                 ~SnapshotItem.item_type.in_(CHILD_ITEM_TYPES)
                             ),
                             func.coalesce(func.sum(SnapshotItem.content_size), 0),
-                        ).where(SnapshotItem.snapshot_id == snapshot.id)
+                        ).where(_items_of)
                     )).one()
                     persisted_count = int(_row[0] or 0)
                     persisted_bytes = int(_row[1] or 0)
@@ -14120,7 +14244,7 @@ class BackupWorker:
                     # 200-500 ms per-blob block-list commit which
                     # dominates wall-time on small-attachment-heavy
                     # mailboxes.
-                    inline_b64 = _maybe_inline_attachment(content_bytes)
+                    inline_b64 = _maybe_inline_attachment(content_bytes, _MAIL_ATTACHMENT_INLINE_MAX_BYTES)
                     if inline_b64 is not None:
                         bytes_added = size
                     else:
@@ -14296,7 +14420,7 @@ class BackupWorker:
                             p_hash = hashlib.sha256(payload).hexdigest()
                             p_size = len(payload)
                             p_blob: Optional[str] = None
-                            p_inline_b64 = _maybe_inline_attachment(payload)
+                            p_inline_b64 = _maybe_inline_attachment(payload, _MAIL_ATTACHMENT_INLINE_MAX_BYTES)
                             if p_inline_b64 is None:
                                 try:
                                     p_blob = await _upload_once_per_hash(
@@ -16932,6 +17056,49 @@ class BackupWorker:
             self._shard_enum_failures = ledger
         return ledger
 
+    async def _owned_elsewhere(self, tenant, resource_type, external_id, snapshot, what) -> bool:
+        """True (logged and recorded on the snapshot) when another protected resource already backs up
+        this content, so a group or channel backup skips it (each piece is backed up once).
+        GROUP_CONTENT_DEDUP_ENABLED=false backs it up here as before."""
+        if os.getenv("GROUP_CONTENT_DEDUP_ENABLED", "true").strip().lower() in ("0", "false", "no", "off"):
+            return False
+        from shared.sla_workloads import protected_owner_id
+        try:
+            async with async_session_factory() as _s:
+                owner = await protected_owner_id(_s, tenant.id, resource_type, external_id)
+        except Exception as exc:
+            logger.warning("[%s] owner lookup for %s failed, backing it up here: %s", self.worker_id, what, exc)
+            return False
+        if not owner:
+            return False
+        print(f"[{self.worker_id}]   [DEDUP] {what}: backed up by {resource_type} {owner}, skipped here")
+        if snapshot is not None:
+            marker = {f"covered_by_{what}": owner}
+            await self._patch_snapshot_extra_data(snapshot.id, marker)
+            # The terminal write persists the in-memory extra_data, not row-only keys.
+            snapshot.extra_data = {**(snapshot.extra_data or {}), **marker}
+        return True
+
+    async def _note_no_mailbox(self, graph_client, user_id, snapshot, kind, exc=None) -> bool:
+        """True (reason logged and recorded on the snapshot) when the user has no mailbox. Without
+        ``exc`` one probe classifies it; the caller then completes the run with 0 items."""
+        if exc is None:
+            try:
+                await graph_client._get(f"{graph_client.GRAPH_URL}/users/{user_id}/mailFolders",
+                                        params={"$top": "1", "$select": "id"})
+                return False
+            except Exception as probe_exc:
+                exc = probe_exc
+        reason = no_mailbox_reason(exc)
+        if not reason:
+            return False
+        print(f"[{self.worker_id}]   [{kind}] {user_id}: {reason} — completing with 0 items")
+        if snapshot is not None:
+            await self._patch_snapshot_extra_data(snapshot.id, {"no_mailbox": reason})
+            # The terminal write persists the in-memory extra_data, not row-only keys.
+            snapshot.extra_data = {**(getattr(snapshot, "extra_data", None) or {}), "no_mailbox": reason}
+        return True
+
     async def _patch_snapshot_extra_data(
         self, snapshot_id: uuid.UUID, patch: Dict[str, Any],
     ) -> bool:
@@ -18256,7 +18423,17 @@ class BackupWorker:
             )
             return 0
         try:
-            copied = await _carry_forward_prior_mail_snapshot_items(
+            # No shard re-bootstrapped a folder or saw a delete, and no shard
+            # wrote a row (checked by the reuse itself): point, don't copy.
+            from shared.mail_snapshot_reuse import reuse_if_unchanged
+            _reused = await reuse_if_unchanged(
+                async_session_factory,
+                unchanged=not union_paths and not union_tombs
+                and all(bool(cf.get("resumed_any")) for cf in recorded),
+                resource_id=str(head[1]), target_snapshot_id=str(snapshot_id),
+                current_job_id=head[2],
+            )
+            copied = 0 if _reused else await _carry_forward_prior_mail_snapshot_items(
                 tenant_id=str(head[0]),
                 resource_id=str(head[1]),
                 target_snapshot_id=str(snapshot_id),
@@ -18671,13 +18848,21 @@ class BackupWorker:
                 "EMAIL_ATTACHMENT",
                 "CHAT_HOSTED_CONTENT",
             )
+            # An unchanged mailbox's reuse snapshot owns no rows; count the
+            # full snapshot it names (shared.snapshot_reuse).
+            # An overlay owns only what changed since its base (shared.snapshot_reuse).
+            from shared.snapshot_reuse import items_scope, SnapshotNotFound
+            try:
+                _items_of = await items_scope(session, snapshot_id)
+            except SnapshotNotFound:
+                _items_of = SnapshotItem.snapshot_id == snapshot_id
             _row = (await session.execute(
                 select(
                     func.count(SnapshotItem.id).filter(
                         ~SnapshotItem.item_type.in_(CHILD_ITEM_TYPES)
                     ),
                     func.coalesce(func.sum(SnapshotItem.content_size), 0),
-                ).where(SnapshotItem.snapshot_id == snapshot_id)
+                ).where(_items_of)
             )).one()
             persisted_count = int(_row[0] or 0)
             persisted_bytes = int(_row[1] or 0)
@@ -18769,7 +18954,9 @@ class BackupWorker:
                           bool_or(COALESCE(
                               (failure_state::jsonb ->> 'enumeration_incomplete')::boolean, false
                           )) AS enum_incomplete,
-                          COUNT(*) FILTER (WHERE status IN ('QUEUED','IN_PROGRESS')) AS pending
+                          COUNT(*) FILTER (WHERE status IN ('QUEUED','IN_PROGRESS')) AS pending,
+                          (array_agg(failure_state::jsonb ->> 'message' ORDER BY partition_index)
+                             FILTER (WHERE status = 'FAILED'))[1] AS first_error
                           FROM snapshot_partitions
                          WHERE snapshot_id = :sid
                         """
@@ -18781,6 +18968,7 @@ class BackupWorker:
                 _d_failed = int(getattr(derived_row, "failed", 0) or 0)
                 _d_lossy = int(getattr(derived_row, "lossy", 0) or 0)
                 _d_pending = int(getattr(derived_row, "pending", 0) or 0)
+                _derived_status = None
                 if _d_n > 0 and _d_pending == 0:
                     if (snap.extra_data or {}).get("copy_required_failed"):
                         _derived_status = SnapshotStatus.PARTIAL if persisted_count else SnapshotStatus.FAILED
@@ -18822,7 +19010,9 @@ class BackupWorker:
                 # extra_data == {"partition_reconciled": true} and nothing
                 # else — the operator saw "Partial" with no cause anywhere on
                 # the row (observed on "IT Projects", both runs, 2026-08-13).
-                if not _pf_degraded and _derived_status == SnapshotStatus.PARTIAL:
+                # FAILED too: an all-shards-failed run read "Failed: no reason
+                # recorded" (OneDrive — Amit Mishra, 2026-11-06).
+                if not _pf_degraded and _derived_status in (SnapshotStatus.PARTIAL, SnapshotStatus.FAILED):
                     _pf_degraded = partition_loss_degraded_reason(
                         lost_files=int(getattr(derived_row, "lost_files", 0) or 0),
                         shards_lossy=_d_lossy,
@@ -18831,6 +19021,7 @@ class BackupWorker:
                         enumeration_incomplete=bool(
                             getattr(derived_row, "enum_incomplete", False)
                         ),
+                        first_error=getattr(derived_row, "first_error", None),
                     )
                     if _pf_degraded:
                         snap.extra_data = {
@@ -19024,6 +19215,10 @@ class BackupWorker:
             f"{persisted_count} items, "
             f"{persisted_bytes / (1024 * 1024):.1f} MB)"
         )
+        # Rescues that landed before this finalize leave FAILED shards behind;
+        # settle now or nothing ever will (no further rescue fires).
+        if new_status in ("FAILED", "PARTIAL"):
+            await self._settle_rescued_onedrive_snapshot(snapshot_id)
 
         # Emit partitioned-snapshot metrics. Same shape as complete_snapshot
         # so dashboards aggregate cleanly across partitioned and
@@ -21013,6 +21208,25 @@ class BackupWorker:
                 raise ChatCatalogueWorkLeaseMoved("OneDrive job lease ownership moved")
             return live
 
+        async def _record_capture_progress(session, files_done, bytes_done):
+            if not partition_record:
+                return
+            pid = uuid.UUID(partition_record["partition_id"])
+            fence_sql, fence_params = _partition_lease_fence(pid)
+            result = await session.execute(text(f"""
+                UPDATE snapshot_partitions
+                   SET payload = COALESCE(payload::jsonb, '{{}}'::jsonb)
+                       || jsonb_build_object('onedrive_capture_progress',
+                            jsonb_build_object('version', 1,
+                                'files', CAST(:files AS bigint), 'bytes', CAST(:bytes AS bigint)))
+                 WHERE id = :pid AND snapshot_id = :sid
+                   AND partition_type = 'ONEDRIVE_FILES' AND status = 'IN_PROGRESS'
+                   {fence_sql}
+            """), {"pid": pid, "sid": snapshot.id, "files": files_done,
+                     "bytes": bytes_done, **fence_params})
+            if result.rowcount != 1:
+                raise ChatCatalogueWorkLeaseMoved("OneDrive progress ownership moved")
+
         # Load existing checkpoint (resume path). Rows are authoritative even
         # when a legacy job checkpoint was evicted by a sibling. Only the source
         # identity committed with the blob can vouch for bytes; mutable raw
@@ -21040,6 +21254,11 @@ class BackupWorker:
                     if file_receipt_matches(source=downloaded_source, current=current_files[external_id],
                             drive_id=drive_id, blob_path=blob_path, content_size=size):
                         checkpoint.record_file_done(external_id=external_id, size=size)
+            # Receipts include resumed work; absolute counters cannot double-count
+            # replay. Keep these separate from terminal upload/delta accounting.
+            if partition_record:
+                await _record_capture_progress(session, checkpoint.files_done_count, checkpoint.bytes_done)
+                await session.commit()
 
         file_sem = asyncio.Semaphore(file_concurrency)
         state = {"uploaded_count": 0, "bytes_uploaded": 0, "failed_count": 0}
@@ -21048,10 +21267,117 @@ class BackupWorker:
         state_lock = asyncio.Lock()
         total_files = len(ordered)
 
+        # Bytes an EARLIER run of this resource already stored for the same
+        # file version are pointed at, not downloaded and stored again. A run
+        # without a delta cursor (the AUTO_RETRY of a FAILED run) re-copied
+        # all 127 GiB of Amit's OneDrive on 2026-11-06 although the failed run
+        # held 788/788 blobs. The flush re-verifies each reused receipt against
+        # Graph exactly like a fresh download, and retention keeps a blob while
+        # any item still references it (select_deletable_blob_paths).
+        reused: set = set()
+        reuse_source_items = {}
+        wanted = [fid for fid, f in current_files.items()
+                  if not checkpoint.is_done(fid) and int(f.get("size") or 0) > 0]
+        if wanted:
+            async with async_session_factory() as session:
+                from sqlalchemy.orm import aliased
+                current = aliased(Snapshot)
+                prior_snaps = select(Snapshot.id).where(
+                    Snapshot.resource_id == resource.id, Snapshot.id != snapshot.id,
+                    Snapshot.backend_id == select(current.backend_id)
+                        .where(current.id == snapshot.id).scalar_subquery(),
+                    Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL,
+                                         SnapshotStatus.FAILED]))
+                for id_chunk in iter_hydration_chunks(wanted):
+                    priors = (await session.execute(select(
+                        SnapshotItem.external_id, SnapshotItem.blob_path,
+                        SnapshotItem.content_size, SnapshotItem.content_hash,
+                        SnapshotItem.extra_data, SnapshotItem.snapshot_id,
+                        SnapshotItem.id, SnapshotItem.content_checksum,
+                    ).where(
+                        SnapshotItem.snapshot_id.in_(prior_snaps),
+                        SnapshotItem.tenant_id == tenant.id,
+                        SnapshotItem.item_type == "ONEDRIVE_FILE",
+                        SnapshotItem.external_id.in_(id_chunk),
+                        SnapshotItem.blob_path.is_not(None), SnapshotItem.blob_path != "",
+                        SnapshotItem.is_deleted.is_(False),
+                    ).order_by(SnapshotItem.created_at.desc()))).all()
+                    for external_id, blob_path, size, sha, metadata, source_snap, source_item, checksum in priors:
+                        source = (metadata or {}).get("onedrive_download_source")
+                        if external_id in reused or not file_receipt_matches(
+                                source=source, current=current_files[external_id],
+                                drive_id=drive_id, blob_path=blob_path, content_size=size):
+                            continue
+                        reused.add(external_id)
+                        reuse_source_items[external_id] = source_item
+                        download_sources[external_id] = source
+                        updates.append((external_id, blob_path, size, checksum or sha or "", {
+                            "raw": current_files[external_id],
+                            "sha256": (metadata or {}).get("sha256"),
+                            "quickxor": (metadata or {}).get("quickxor"),
+                            "reused_from_snapshot": str(source_snap),
+                            "blobbed_at": datetime.utcnow().isoformat() + "Z",
+                        }))
+                if reused:
+                    # Pin references before Graph I/O. Cleanup must first claim
+                    # the donor snapshot; SHARE locks serialize that claim with
+                    # this target-link commit. A claim that won becomes a miss.
+                    live = await _owned_snapshot(session)
+                    source_ids = sorted({uuid.UUID(row[4]["reused_from_snapshot"]) for row in updates})
+                    valid_sources = set((await session.scalars(select(Snapshot.id).where(
+                        Snapshot.id.in_(source_ids), Snapshot.resource_id == resource.id,
+                        Snapshot.backend_id == live.backend_id,
+                        Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL,
+                                             SnapshotStatus.FAILED]),
+                    ).order_by(Snapshot.id).with_for_update(read=True))).all())
+                    source_rows = (await session.scalars(select(SnapshotItem).where(
+                        SnapshotItem.id.in_(list(reuse_source_items.values())),
+                        SnapshotItem.snapshot_id.in_(valid_sources),
+                        SnapshotItem.is_deleted.is_(False),
+                    ).order_by(SnapshotItem.id).with_for_update(read=True))).all()
+                    sources = {item.id: item for item in source_rows}
+                    pinned = []
+                    for row in updates:
+                        ext_id, path, size, sha, _extra = row
+                        source = sources.get(reuse_source_items[ext_id])
+                        if (source is not None and source.blob_path == path
+                            and (source.content_checksum or source.content_hash or "") == sha
+                            and file_receipt_matches(
+                                source=(source.extra_data or {}).get("onedrive_download_source"),
+                                current=current_files[ext_id], drive_id=drive_id,
+                                blob_path=source.blob_path, content_size=source.content_size)):
+                            pinned.append(row)
+                        else:
+                            reused.discard(ext_id)
+                            download_sources.pop(ext_id, None)
+                    updates[:] = pinned
+                    for start in range(0, len(pinned), 500):
+                        params = {"sid": snapshot.id}
+                        values = []
+                        for i, (ext_id, path, size, sha, _extra) in enumerate(pinned[start:start + 500]):
+                            values.append(f"(:e{i}, :p{i}, CAST(:s{i} AS bigint), :h{i})")
+                            params.update({f"e{i}": ext_id, f"p{i}": path, f"s{i}": size, f"h{i}": sha})
+                        matched = (await session.execute(text(f"""
+                            UPDATE snapshot_items AS si
+                               SET blob_path = v.path, content_size = v.size,
+                                   content_hash = v.sha, content_checksum = v.sha
+                              FROM (VALUES {','.join(values)}) AS v(ext_id, path, size, sha)
+                             WHERE si.snapshot_id = :sid AND si.external_id = v.ext_id
+                               AND si.item_type = 'ONEDRIVE_FILE' AND si.is_deleted = false
+                            RETURNING si.external_id
+                        """), params)).scalars().all()
+                        if set(matched) != {row[0] for row in pinned[start:start + 500]}:
+                            raise RuntimeError("OneDrive required reuse target rows missing")
+                    await session.commit()
+            if reused:
+                print(f"[{self.worker_id}] [USER_ONEDRIVE] {resource.display_name}: "
+                      f"reusing {len(reused)} file(s) already stored by an earlier run")
+
         # Resolve URLs only when a file consumer needs its batch. Waiting on
         # every partition URL first discarded ready work on provider deferral.
         pending_ids = [f["id"] for f in ordered
-                       if not checkpoint.is_done(f["id"]) and int(f.get("size") or 0) > 0]
+                       if not checkpoint.is_done(f["id"]) and f["id"] not in reused
+                       and int(f.get("size") or 0) > 0]
         batch_positions = {key: index // 20 for index, key in enumerate(pending_ids)}
         prefetch_concurrency = max(1, min(file_concurrency,
             int(os.getenv("ONEDRIVE_PREFETCH_CONCURRENCY", "16"))))
@@ -21337,6 +21663,7 @@ class BackupWorker:
                     snap.new_item_count = max(snap.new_item_count or 0, state["uploaded_count"])
                     snap.bytes_total = max(snap.bytes_total or 0, committed_bytes)
                     snap.bytes_added = max(snap.bytes_added or 0, state["bytes_uploaded"])
+                    await _record_capture_progress(session, committed_count, committed_bytes)
                     await session.commit()
                 # Drop buffered links only after their transaction committed.
                 # On failure the final flush retries them; failure there aborts
@@ -21406,7 +21733,7 @@ class BackupWorker:
                     f"(~{_live_check['count']} files in)"
                 )
             file_id = f.get("id")
-            if not file_id or checkpoint.is_done(file_id):
+            if not file_id or checkpoint.is_done(file_id) or file_id in reused:
                 return
             file_name = f.get("name") or "(unnamed)"
             size_hint = int(f.get("size") or 0)
@@ -21914,6 +22241,22 @@ class BackupWorker:
                 error=error, permanent=permanent, delay_seconds=delay)
             await session.commit()
 
+    async def _settle_rescued_onedrive_snapshot(self, snapshot_id) -> None:
+        """FAILED/PARTIAL → COMPLETED once the retry queue rescued every lost
+        file (shared/onedrive_rescue_settle.py). Best-effort: never fails a
+        rescue or a finalize."""
+        from shared.onedrive_rescue_settle import settle_rescued_onedrive_snapshot
+        try:
+            async with async_session_factory() as session:
+                settled = await settle_rescued_onedrive_snapshot(session, snapshot_id)
+                await session.commit()
+            if settled:
+                print(f"[{self.worker_id}] [ONEDRIVE_RETRY] snapshot {snapshot_id} "
+                      f"settled COMPLETED: every lost file rescued")
+        except Exception as exc:
+            print(f"[{self.worker_id}] [ONEDRIVE_RETRY] settle {snapshot_id} failed: "
+                  f"{type(exc).__name__}: {exc}")
+
     async def _retry_one_onedrive_file(self, *, retry_id, attempt: int,
                                        max_attempts: int, lease_seconds: float, retry_slot) -> None:
         from shared.onedrive_retry import owned_retry, renew_retry, RetryOwnershipLost
@@ -21980,6 +22323,7 @@ class BackupWorker:
             ok, error = await asyncio.wait_for(transfer, timeout=timeout) if timeout > 0 else await transfer
             if ok:
                 print(f"[{self.worker_id}] [ONEDRIVE_RETRY] {retry_id} RESCUED on attempt {attempt}")
+                await self._settle_rescued_onedrive_snapshot(row.snapshot_id)
             else:
                 await release(error)
         except asyncio.CancelledError:
@@ -22297,6 +22641,42 @@ class BackupWorker:
             "item_count": sum(r.get("item_count", 0) for r in results if isinstance(r, dict)),
             "bytes_added": sum(r.get("bytes_added", 0) for r in results if isinstance(r, dict)),
         }
+
+    async def _previous_sp_lists(self, snapshot: Snapshot, site_id: str):
+        """(prior snapshot id, {list id: list row metadata}) of the latest earlier COMPLETED restore point
+        for this site's lists; (None, {}) when there is none. A PARTIAL prior may miss list rows."""
+        from sqlalchemy import text as _text
+        async with async_session_factory() as sess:
+            prev = (await sess.execute(_text("""
+                SELECT s.id, s.status::text FROM snapshots s WHERE s.resource_id = :rid AND s.id <> :sid
+                  AND s.created_at <= :at AND s.status IN ('COMPLETED', 'PARTIAL')
+                ORDER BY s.created_at DESC LIMIT 1"""),
+                {"rid": snapshot.resource_id, "sid": snapshot.id, "at": snapshot.created_at})).first()
+            if prev is None or prev[1] != "COMPLETED":
+                return None, {}
+            rows = (await sess.execute(_text("""
+                SELECT external_id, metadata FROM snapshot_items WHERE snapshot_id = :prev
+                  AND item_type = 'SHAREPOINT_LIST' AND metadata->>'site_id' = :site"""),
+                {"prev": prev[0], "site": site_id})).all()
+        return prev[0], {r[0]: (json.loads(r[1]) if isinstance(r[1], str) else r[1]) or {} for r in rows}
+
+    async def _copy_forward_sp_list_rows(self, snapshot_id, prior_snapshot_id, site_id: str, list_id: str) -> int:
+        """Copy an unchanged list's rows from the prior restore point in one statement (blobs are
+        retained, so their paths stay valid). Returns the rows copied."""
+        from sqlalchemy import text as _text
+        columns = [c.name for c in SnapshotItem.__table__.columns]
+        values = ["gen_random_uuid()" if c == "id" else "CAST(:sid AS uuid)" if c == "snapshot_id"
+                  else "now() AT TIME ZONE 'utc'" if c == "created_at" else "src." + c for c in columns]
+        async with async_session_factory() as sess:
+            copied = (await sess.execute(_text(
+                "INSERT INTO snapshot_items (" + ",".join(columns) + ") SELECT " + ",".join(values) + """
+                FROM snapshot_items src WHERE src.snapshot_id = CAST(:prior AS uuid)
+                  AND src.metadata->>'source' = 'sp_rest' AND src.metadata->>'site_id' = :site
+                  AND src.metadata->>'list_id' = :list
+                ON CONFLICT (snapshot_id, external_id, item_type) DO NOTHING"""),
+                {"sid": str(snapshot_id), "prior": str(prior_snapshot_id), "site": site_id, "list": list_id})).rowcount
+            await sess.commit()
+        return int(copied or 0)
 
     async def _previous_sp_rest_rows(self, snapshot: Snapshot, site_id: str) -> Dict[str, Dict[str, Any]]:
         """The latest earlier restore point's list rows for this site (every run re-reads every list)."""
@@ -24614,7 +24994,8 @@ class BackupWorker:
             # TEAMS_CHANNEL handler uses — so the Group's Recovery view
             # ("Team Channels" tab) has data without needing a separate
             # TEAMS_CHANNEL resource backup.
-            if is_unified and has_team:
+            if is_unified and has_team and not await self._owned_elsewhere(
+                    tenant, "TEAMS_CHANNEL", obj_id, snapshot, "team_channels"):
                 try:
                     channel_items, channel_bytes = await self._backup_team_channels(
                         resource, tenant, snapshot, graph_client, obj_id,
@@ -24643,8 +25024,9 @@ class BackupWorker:
                         f"{graph_client.GRAPH_URL}/groups/{obj_id}/sites/root",
                     )
                     raw_site_id = site_resp.get("id", "")  # "hostname,guid,guid"
-                    if raw_site_id:
-                        site_ext_id = raw_site_id.replace(",", "/")
+                    site_ext_id = raw_site_id.replace(",", "/")
+                    if raw_site_id and not await self._owned_elsewhere(
+                            tenant, "SHAREPOINT_SITE", site_ext_id, snapshot, "team_site"):
                         from types import SimpleNamespace as _SN
                         site_proxy = _SN(
                             id=resource.id,
@@ -25177,12 +25559,14 @@ class BackupWorker:
                 # Group mailbox.
                 try:
                     # New signature: (count, bytes). Items persist inline
-                    # via _bulk_upsert_snapshot_items.
-                    mbx_count, mbx_bytes = await self.backup_group_mailbox_content(
-                        resource, tenant, snapshot, graph_client,
-                    )
-                    item_count += mbx_count
-                    bytes_added += mbx_bytes
+                    # via _bulk_upsert_snapshot_items. The group mailbox belongs
+                    # to the M365_GROUP backup when that group is protected.
+                    if not await self._owned_elsewhere(tenant, "M365_GROUP", team_id, snapshot, "group_mailbox"):
+                        mbx_count, mbx_bytes = await self.backup_group_mailbox_content(
+                            resource, tenant, snapshot, graph_client,
+                        )
+                        item_count += mbx_count
+                        bytes_added += mbx_bytes
                 except Exception as mbx_exc:
                     logger.warning(
                         "[%s] Team group-mailbox backup skipped for %s: %s",
@@ -25196,8 +25580,9 @@ class BackupWorker:
                         f"{graph_client.GRAPH_URL}/groups/{team_id}/sites/root",
                     )
                     raw_site_id = site_resp.get("id", "")
-                    if raw_site_id:
-                        site_ext_id = raw_site_id.replace(",", "/")
+                    site_ext_id = raw_site_id.replace(",", "/")
+                    if raw_site_id and not await self._owned_elsewhere(
+                            tenant, "SHAREPOINT_SITE", site_ext_id, snapshot, "team_site"):
                         from types import SimpleNamespace as _SN
                         site_proxy = _SN(
                             id=resource.id,
@@ -28191,9 +28576,14 @@ class BackupWorker:
         # strand messages the cursors would otherwise skip next run.
         await _raise_if_job_cancelled(getattr(snapshot, "job_id", None))
 
+        held_fids: Set[str] = set()
         fresh_count, fresh_bytes, persist_failed_fids = await self._persist_tier1_mail_items(
-            graph_client, resource, snapshot, tenant, items,
+            graph_client, resource, snapshot, tenant, items, held_out=held_fids,
         )
+        if held_fids:
+            ok_keys -= held_fids
+            print(f"[{self.worker_id}]   [TIER1-MAIL] {len(held_fids)} folder(s) keep their cursor: an "
+                  f"attachment list came back corrupt twice from Microsoft (not a failure)")
         if persist_failed_fids:
             # Rows for these folders did not all land: their cursors must
             # not advance (the next run re-fetches idempotently).
@@ -28228,7 +28618,21 @@ class BackupWorker:
         keep_fids = sorted(set(primary_tree) - fresh_complete)
         if saved and keep_fids and mail_carry_forward_enabled():
             try:
-                carried = await _carry_forward_prior_mail_snapshot_items(
+                # Nothing changed (no message, delete, failed/evicted/bootstrapped
+                # or vanished folder, no row): point at the prior, don't copy.
+                _tier1_unchanged = (
+                    not items and not tombstoned and not failed and not evicted
+                    and not fresh_complete and not persist_failed_fids and not gone_fids
+                    and not fresh_count
+                )
+                from shared.mail_snapshot_reuse import reuse_if_unchanged
+                _reused = await reuse_if_unchanged(
+                    async_session_factory, unchanged=_tier1_unchanged,
+                    resource_id=str(resource.id), target_snapshot_id=str(snapshot.id),
+                    current_job_id=getattr(snapshot, "job_id", None),
+                    keep_folder_ids=keep_fids,
+                )
+                carried = 0 if _reused else await _carry_forward_prior_mail_snapshot_items(
                     tenant_id=str(tenant.id),
                     resource_id=str(resource.id),
                     target_snapshot_id=str(snapshot.id),
@@ -28341,7 +28745,8 @@ class BackupWorker:
         try:
             async with async_session_factory() as _s:
                 row = (await _s.execute(
-                    text("SELECT COUNT(*), COALESCE(SUM(content_size) FILTER (WHERE blob_path IS NOT NULL), 0) FROM snapshot_items WHERE snapshot_id = :sid"),
+                    text("SELECT COUNT(*), COALESCE(SUM(content_size) FILTER (WHERE blob_path IS NOT NULL), 0) "
+                         "FROM snapshot_items_effective(CAST(:sid AS uuid))"),
                     {"sid": str(snapshot.id)},
                 )).first()
             if row:
@@ -28507,6 +28912,7 @@ class BackupWorker:
         snapshot: Snapshot,
         tenant: Tenant,
         items: List[Dict[str, Any]],
+        held_out: Optional[Set[str]] = None,
     ) -> Tuple[int, int, Set[str]]:
         """Persist Tier-1 mailbox messages (blob + inline raw + source_mailbox
         rows) and the attachments of those flagged hasAttachments. Extracted
@@ -28608,11 +29014,15 @@ class BackupWorker:
         att_msgs = [m for m in items if m.get("hasAttachments")]
         if att_msgs:
             att_failed: Set[str] = set()
+            att_held: Set[str] = set()
             att_count, att_bytes = await self._backup_message_attachments(
                 graph_client, resource, snapshot, tenant, container, shard, att_msgs,
-                failed_out=att_failed,
+                failed_out=att_failed, held_out=att_held,
             )
             failed_msg_ids_all |= att_failed
+            if held_out is not None:
+                held_out |= {str(m.get("_source_folder_id")) for m in att_msgs
+                             if str(m.get("id")) in att_held and m.get("_source_folder_id")}
             item_count += att_count
             bytes_added += att_bytes
             print(f"[{self.worker_id}]   [ATTACHMENTS] Captured {att_count} email attachment(s), {att_bytes} bytes")
@@ -28633,6 +29043,7 @@ class BackupWorker:
         shard,
         messages_with_attachments: List[Dict[str, Any]],
         failed_out: Optional[Set[str]] = None,
+        held_out: Optional[Set[str]] = None,
     ) -> Tuple[int, int]:
         """For each message flagged hasAttachments, list and capture its
         attachments. fileAttachment binaries are downloaded as separate blobs;
@@ -28650,9 +29061,25 @@ class BackupWorker:
                 return [], 0
             async with sem:
                 try:
-                    attachments = await graph_client.list_message_attachments(
-                        resource.external_id, msg_id,
-                    )
+                    try:
+                        attachments = await graph_client.list_message_attachments(
+                            resource.external_id, msg_id,
+                        )
+                    except httpx.DecodingError:
+                        # Microsoft sometimes sends a corrupt gzip body: ask once more.
+                        attachments = await graph_client.list_message_attachments(
+                            resource.external_id, msg_id,
+                        )
+                except httpx.DecodingError as e:
+                    # Twice corrupt: not a failed backup. Say why; the folder's cursor holds so
+                    # the next run reads this message's attachments again.
+                    print(f"[{self.worker_id}]   [ATTACHMENT LIST] msg {msg_id}: Microsoft returned a corrupt "
+                          f"compressed response twice ({e}); attachments re-read next run")
+                    if held_out is not None:
+                        held_out.add(str(msg_id))
+                    elif failed_out is not None:
+                        failed_out.add(str(msg_id))
+                    return [], 0
                 except Exception as e:
                     print(f"[{self.worker_id}]   [ATTACHMENT LIST FAIL] msg {msg_id}: {type(e).__name__}: {e}")
                     if failed_out is not None:
@@ -29293,6 +29720,11 @@ class BackupWorker:
                 previous_rows = {}
                 logger.warning("SharePoint previous list rows for %s unavailable: %s", site_label, exc)
             try:
+                prior_lists_id, prior_lists = await self._previous_sp_lists(snapshot, site_id)
+            except Exception as exc:
+                prior_lists_id, prior_lists = None, {}
+                logger.warning("SharePoint previous lists for %s unavailable: %s", site_label, exc)
+            try:
                 drive_urls: Optional[Set[str]] = _drive_web_urls(
                     await graph_client.list_sharepoint_site_drives(site_id))
             except Exception as exc:
@@ -29411,6 +29843,11 @@ class BackupWorker:
                 # maps to the column literally named "metadata" (see the
                 # _create_file_snapshot_item note — keying "extra_data" here
                 # raises CompileError "Unconsumed column names").
+                # Unchanged list (same item signature, full read within a week): carry its rows.
+                _sig = lst.get("_rest_signature")
+                _walked_now = datetime.now(timezone.utc).isoformat()
+                _reuse_walked = (sp_list_reusable(_sig, prior_lists.get(lst_id), datetime.now(timezone.utc))
+                                 if prior_lists_id else None)
                 list_row = {
                     "id": uuid.uuid4(),
                     "snapshot_id": snapshot.id,
@@ -29438,6 +29875,7 @@ class BackupWorker:
                         "is_library": is_library,
                         "web_url": lst.get("webUrl"),
                         "last_modified": lst.get("lastModifiedDateTime"),
+                        "rest_signature": _sig, "rest_walked_at": _reuse_walked or _walked_now,
                     },
                 }
                 try:
@@ -29472,6 +29910,16 @@ class BackupWorker:
                 if not (sp_hostname and sp_site_web_url):
                     logger.warning("Cannot derive SP site URL for %s, skipping list items", site_label)
                     continue
+                if _reuse_walked:
+                    try:
+                        _copied = await self._copy_forward_sp_list_rows(snapshot.id, prior_lists_id, site_id, lst_id)
+                        if _copied or not (_sig or {}).get("count"):
+                            stats["lists_reused"] = stats.get("lists_reused", 0) + 1
+                            stats["list_rows_reused"] = stats.get("list_rows_reused", 0) + _copied
+                            continue
+                    except Exception as exc:
+                        logger.warning("SharePoint list carry-forward failed for %s/%s, reading it: %s",
+                                       site_label, display, exc)
 
                 try:
                     # all_fields defaults to True now — every list returns
@@ -29894,10 +30342,15 @@ class BackupWorker:
             file_info, ghosted = previous.get("file"), bool(previous.get("ghosted"))
         elif srv_rel and not is_folder:
             try:
-                file_info = await graph_client.get_sharepoint_file_metadata_via_rest(
-                    sp_hostname, sp_site_web_url, srv_rel,
-                )
-                file_identity = sharepoint_file_identity(file_info)
+                try:
+                    # The list page's $expand=File carries the identity: no metadata request.
+                    file_info = row.get("File") if isinstance(row.get("File"), dict) else None
+                    file_identity = sharepoint_file_identity(file_info)
+                except ProviderReadError:
+                    file_info = await graph_client.get_sharepoint_file_metadata_via_rest(
+                        sp_hostname, sp_site_web_url, srv_rel,
+                    )
+                    file_identity = sharepoint_file_identity(file_info)
                 size = file_identity[0]
                 if size == 0:
                     stats["rest_rows_size_zero"] += 1
@@ -29938,6 +30391,7 @@ class BackupWorker:
                         )
                         if sharepoint_file_identity(current_info) != file_identity:
                             raise ProviderReadError("file_version_changed")
+                        file_info = current_info  # store the full metadata, as before
                         upload_result = await upload_blob_with_retry_from_file(
                             container_name=container,
                             blob_path=blob_path_candidate,
@@ -30101,8 +30555,10 @@ class BackupWorker:
         ]
         if current_job_id is not None:
             filters.append(Snapshot.job_id != current_job_id)
+        # A reuse snapshot (unchanged mailbox) owns no rows: compare with the
+        # full snapshot it names, or the next run counts everything as new.
         prior = (await session.execute(
-            select(Snapshot.id, Snapshot.item_count, Snapshot.bytes_total)
+            select(func.coalesce(Snapshot.reuse_chain_root_id, Snapshot.id), Snapshot.item_count, Snapshot.bytes_total)
             .where(*filters)
             .order_by(desc(Snapshot.completed_at))
             .limit(1)
@@ -30129,12 +30585,11 @@ class BackupWorker:
                 "  count(*) FILTER (WHERE cur.item_type NOT IN "
                 "    ('CHAT_ATTACHMENT','EMAIL_ATTACHMENT','CHAT_HOSTED_CONTENT')), "
                 "  COALESCE(SUM(cur.content_size), 0) "
-                "FROM snapshot_items cur "
-                "WHERE cur.snapshot_id = :cur "
-                "  AND NOT EXISTS ("
-                "    SELECT 1 FROM snapshot_items pri "
-                "    WHERE pri.snapshot_id = :pri "
-                "      AND pri.external_id = cur.external_id "
+                # Inventories, not own rows: an overlay owns only what changed since its base.
+                "FROM snapshot_items_effective(CAST(:cur AS uuid)) cur "
+                "WHERE NOT EXISTS ("
+                "    SELECT 1 FROM snapshot_items_effective(CAST(:pri AS uuid)) pri "
+                "    WHERE pri.external_id = cur.external_id "
                 "      AND pri.item_type = cur.item_type)"
             ),
             {"cur": str(snapshot_id), "pri": str(prior_id)},
@@ -30144,7 +30599,7 @@ class BackupWorker:
     async def _stamp_resource_from_snapshot_row(
         self, session: AsyncSession, resource: Resource,
         job_id: Optional[uuid.UUID], snapshot_id: uuid.UUID,
-        result: Dict = None,
+        result: Dict = None, *, skip_if_stamped: bool = False,
     ) -> None:
         """update_resource_backup_info driven by the snapshot row's COMMITTED
         status, never the caller's in-memory Snapshot: an inline settle, a
@@ -30167,6 +30622,13 @@ class BackupWorker:
             _rs_status, _rs_terminal = resource_stamp_for_snapshot(
                 _row.status, _row.extra_data,
             )
+        if skip_if_stamped and _rs_terminal:
+            # The handler's inline settle already stamped this job's outcome
+            # (storage subtree sum included); a second stamp only recounts it.
+            _live = await session.get(Resource, resource.id, populate_existing=True)
+            if (_live is not None and _live.last_backup_job_id == job_id
+                    and _live.last_backup_status == _rs_status):
+                return
         await self.update_resource_backup_info(
             session, resource, job_id, snapshot_id, result,
             status=_rs_status, terminal=_rs_terminal,
@@ -30430,7 +30892,8 @@ class BackupWorker:
                         text(f"""
                             SELECT count(*) AS n,
                                    COALESCE(sum(content_size), 0) AS b
-                            FROM snapshot_items WHERE snapshot_id = :sid
+                            -- a pointer owns no rows, an overlay only its changes
+                            FROM snapshot_items_effective(CAST(:sid AS uuid))
                         """),
                         {"sid": sid},
                     )).first()
@@ -30535,7 +30998,8 @@ class BackupWorker:
         finally:
             lease_unregister('snapshots', snapshot_id)
 
-    async def complete_snapshot(self, session: AsyncSession, snapshot: Snapshot, result: Dict):
+    async def complete_snapshot(self, session: AsyncSession, snapshot: Snapshot, result: Dict, *,
+                                settled_row=None):
         """Mark snapshot as completed with result data.
 
         Partitioned-snapshot guard: when the coordinator role finishes
@@ -30587,6 +31051,12 @@ class BackupWorker:
         if extra.get("partitioned") is True:
             # Last-finisher owns this snapshot's terminal state.
             return
+        # The handler's inline settle already landed COMPLETED/PARTIAL (``settled_row``
+        # is the committed row): the terminal write below can never change such a row
+        # ("prior attempt landed" or a fence miss), so skip recomputing it and report
+        # what landed. A FAILED row keeps the recovery write; a token still persists.
+        settled = settled_row if (settled_row is not None and not result.get("new_delta_token")
+            and settled_row.status in (SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL)) else None
         now = datetime.utcnow()
         snapshot.completed_at = now
         # Legacy handlers report item_count/bytes_added only and both pairs
@@ -30600,7 +31070,7 @@ class BackupWorker:
             snapshot.bytes_added,
             snapshot.bytes_total,
         ) = snapshot_counters_from_result(result)
-        if "new_item_count" not in result:
+        if "new_item_count" not in result and settled is None:
             snapshot.new_item_count, snapshot.bytes_added = await self._compute_snapshot_delta_from_prior(
                 session, snapshot.id, snapshot.resource_id,
                 result.get("item_count", 0), result.get("bytes_added", 0),
@@ -30635,7 +31105,7 @@ class BackupWorker:
         )
         if (snapshot.extra_data or {}).get("copy_required_failed"):
             proposed = SnapshotStatus.PARTIAL if snapshot.item_count else SnapshotStatus.FAILED
-        snapshot.status = await _coerce_snapshot_terminal_on_cancel(
+        snapshot.status = settled.status if settled is not None else await _coerce_snapshot_terminal_on_cancel(
             snapshot, proposed,
         )
 
@@ -30681,6 +31151,12 @@ class BackupWorker:
             duration = (now - snapshot.started_at).total_seconds()
             snapshot.duration_secs = int(duration)
 
+        if settled is not None:
+            for field in ("status", "type", "item_count", "new_item_count", "bytes_total",
+                          "bytes_added", "completed_at", "duration_secs", "extra_data"):
+                setattr(snapshot, field, getattr(settled, field))
+            lease_unregister("snapshots", snapshot.id)  # the skipped terminal write's release
+
         # Capture metric values BEFORE merge/commit. After merge the
         # original snapshot instance becomes detached + expired, and
         # reading a column attribute (e.g. resource_id) would either
@@ -30703,7 +31179,7 @@ class BackupWorker:
         # still-running coordinator to FAILED gets corrected when the
         # surviving run finishes (load-bearing recovery flow, observed
         # on OneDrive force-fulls).
-        landed = await self._write_snapshot_terminal(
+        landed = True if settled is not None else await self._write_snapshot_terminal(
             session, snapshot,
             allowed_from=(SnapshotStatus.IN_PROGRESS, SnapshotStatus.FAILED),
         )
@@ -32228,11 +32704,15 @@ class BackupWorker:
                     f"{getattr(status, 'name', status)} ignored — job is {_cur}"
                 )
                 return
+            from shared.batch_rollup import job_partial_sql
+            if status == JobStatus.COMPLETED and await session.scalar(
+                    text(f"SELECT {job_partial_sql(':jid')}"), {"jid": job_id}):
+                status = JobStatus.PARTIAL
             job.status = status
             job.result = result
-            if status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
+            if status in (JobStatus.COMPLETED, JobStatus.PARTIAL, JobStatus.FAILED, JobStatus.CANCELLED):
                 job.completed_at = datetime.utcnow()
-            if status == JobStatus.COMPLETED:
+            if status in (JobStatus.COMPLETED, JobStatus.PARTIAL):
                 job.progress_pct = 100
             await session.commit()
 
@@ -32247,7 +32727,7 @@ class BackupWorker:
         that died mid-run (the scheduler reconciler settles those rows
         FAILED, worker-side nothing ran). A resource a sibling job carried
         to COMPLETED / PARTIAL / IN_PROGRESS meanwhile, or whose
-        skipped_concurrent husk is COMPLETED, is left alone. last_backup_at
+        skipped_concurrent husk is SKIPPED, is left alone. last_backup_at
         is NOT touched — see update_resource_backup_info. Own session: the
         caller's may be the dead connection that just made the flip retry.
         Plan: jobs_pkey → resources_pkey ANY(batch_resource_ids) → anti-join
@@ -32294,18 +32774,14 @@ class BackupWorker:
         is NULL) the bulk path was never used, so this helper is a
         no-op and the caller falls back to the legacy
         ``update_job_status`` flip. Returns the terminal status the
-        parent landed in ('COMPLETED' or 'FAILED') if we flipped,
-        else None.
+        parent landed in ('COMPLETED', 'PARTIAL' or 'FAILED') if we
+        flipped, else None.
 
-        Terminal-status mapping — only the two values the
-        ``jobstatus`` enum actually has (COMPLETED, FAILED). The
-        codebase has never had a Job-level PARTIAL. Snapshots CAN
-        be PARTIAL (snapshot-level outcome of a single resource),
-        but the bulk Job rolls up to: COMPLETED if any child made
-        progress (counts.completed > 0 or counts.partial > 0);
-        FAILED only when every single child failed. Operators see
-        the per-resource breakdown via the snapshots table — Job
-        status is the coarse outcome.
+        Terminal-status mapping: FAILED only when every single child
+        failed; otherwise PARTIAL when any child is PARTIAL/FAILED or
+        never got a snapshot row (the activity feed's "Done with
+        warnings"), else COMPLETED. Operators see the per-resource
+        breakdown via the snapshots table.
 
         Late-finalize reconcile (Bug B fix): partition consumers
         commit their snapshot.bytes_added AFTER the snapshot's
@@ -32394,10 +32870,11 @@ class BackupWorker:
                     counts AS (
                         SELECT
                           COUNT(*) FILTER (
-                              WHERE status IN ('COMPLETED','FAILED','PARTIAL')
+                              WHERE status::text IN ('COMPLETED','FAILED','PARTIAL','SKIPPED')
                           ) AS terminal,
                           COUNT(*) FILTER (WHERE status = 'FAILED') AS failed,
-                          COUNT(*) FILTER (WHERE status = 'COMPLETED') AS completed,
+                          -- SKIPPED (concurrency placeholder) is done, not failed.
+                          COUNT(*) FILTER (WHERE status::text IN ('COMPLETED','SKIPPED')) AS completed,
                           COUNT(*) FILTER (WHERE status = 'PARTIAL') AS partial,
                           COALESCE(SUM(item_count) FILTER (
                               WHERE status IN ('COMPLETED','PARTIAL')), 0) AS items,
@@ -32413,11 +32890,13 @@ class BackupWorker:
                         -- has reached COMPLETED/FAILED.
                         status = (CASE
                             WHEN e.prev_status IN (
-                                'COMPLETED','FAILED','CANCELLED','CANCELLING'
+                                'COMPLETED','PARTIAL','FAILED','CANCELLED','CANCELLING'
                             ) THEN j.status
                             WHEN c.terminal < e.n THEN j.status
                             WHEN p.n_pending > 0 THEN j.status
                             WHEN c.completed = 0 AND c.partial = 0 THEN 'FAILED'::jobstatus
+                            WHEN c.partial > 0 OR c.failed > 0 OR m.n_missing > 0
+                                THEN 'PARTIAL'::jobstatus
                             ELSE 'COMPLETED'::jobstatus
                         END),
                         completed_at = (CASE
@@ -32427,7 +32906,7 @@ class BackupWorker:
                         END),
                         progress_pct = (CASE
                             WHEN e.prev_status IN (
-                                'COMPLETED','FAILED','CANCELLED','CANCELLING'
+                                'COMPLETED','PARTIAL','FAILED','CANCELLED','CANCELLING'
                             ) THEN COALESCE(j.progress_pct, 100)
                             ELSE GREATEST(
                                 COALESCE(j.progress_pct, 0),
@@ -32511,9 +32990,9 @@ class BackupWorker:
             # terminal). Late-arriving bytes-only reconcile calls fire
             # silently — they update bytes_processed but don't flip
             # status, so logging them every time would be noise.
-            terminal_states = {"COMPLETED", "FAILED", "CANCELLED", "CANCELLING"}
+            terminal_states = {"COMPLETED", "PARTIAL", "FAILED", "CANCELLED", "CANCELLING"}
             if (prev_status not in terminal_states
-                and new_status in ("COMPLETED", "FAILED")
+                and new_status in ("COMPLETED", "PARTIAL", "FAILED")
                 and int(terminal) >= int(expected)
                 and int(parts_pending) == 0):
                 print(
@@ -33122,6 +33601,32 @@ class BackupWorker:
 
 # ==================== Entry Point ====================
 
+async def _run_until_drained(worker, drain_s):
+    """Run the worker. On SIGTERM stop queue intake (prefetched deliveries are
+    requeued) and provider/copy claims at once, give in-flight queue handlers
+    drain_s, then cancel the rest; RabbitMQ redelivers their unacked messages."""
+    loop = asyncio.get_running_loop()
+    term = asyncio.Event()
+    loop.add_signal_handler(signal.SIGTERM, term.set)
+    run, waiter = asyncio.create_task(worker.start()), asyncio.create_task(term.wait())
+    try:
+        await asyncio.wait({run, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        if not term.is_set():
+            return await run
+        print(f"[main] SIGTERM: draining in-flight work for up to {drain_s:.0f}s")
+        run.cancel()
+        _, pending = await asyncio.wait({run, asyncio.create_task(worker._close_work_runners())}, timeout=drain_s)
+        if pending:
+            print(f"[main] drain bound {drain_s:.0f}s reached; cancelling unfinished work for redelivery")
+            for task in pending:
+                task.cancel()
+            await asyncio.wait(pending, timeout=10)
+        print("[main] drain finished")
+    finally:
+        waiter.cancel()
+        loop.remove_signal_handler(signal.SIGTERM)
+
+
 async def main():
     from shared.storage.startup import startup_router, shutdown_router
     from shared import core_metrics
@@ -33137,7 +33642,7 @@ async def main():
         print("[main] at-rest encryption hook installed")
     worker = BackupWorker()
     try:
-        await worker.start()
+        await _run_until_drained(worker, float(os.getenv("BACKUP_WORKER_DRAIN_SECONDS", "300")))
     finally:
         # Tombstone heartbeat so the reconciliation sweeper picks up
         # any in-flight work immediately rather than waiting the full

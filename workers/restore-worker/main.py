@@ -1066,7 +1066,8 @@ class RestoreWorker:
             for picked in picked_rows:
                 if (picked.extra_data or {}).get("chat_inventory_format") == 1:
                     self._require_catalogue_restore_point(picked)
-                    catalogue_ids.add(picked.id)
+                    # A backup whose every chat was unchanged reuses a full backup's rows.
+                    catalogue_ids.add(picked.reuse_chain_root_id or picked.id)
                     continue
                 rows = (
                     await session.execute(

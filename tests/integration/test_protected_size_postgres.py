@@ -1314,8 +1314,8 @@ async def test_runtime_role_preflight_rejects_before_ledger_ddl(runtime_store, f
         elif failure == "split_owner":
             await db.execute(text(f'ALTER TABLE snapshots OWNER TO "{selected}"'))
         # Even an executor committing each yielded statement must fail before schema changes.
+        # The runtime-role preflight is the first statement (no superuser gate since 0014 allows table owners).
         entries = iter(statements(runtime_store.schema, runtime_role=selected))
-        await db.execute(text(next(entries)))
         with pytest.raises(Exception, match=expected):
             async with db.begin_nested():
                 await db.execute(text(next(entries)))

@@ -25,7 +25,7 @@ async def copy_guard_db(monkeypatch):
         await conn.execute(text(f'CREATE SCHEMA "{schema}"'))
         for ddl in (
             "CREATE TYPE snapshotstatus AS ENUM ('IN_PROGRESS','COMPLETED','PARTIAL','FAILED','PENDING_DELETION')",
-            "CREATE TYPE jobstatus AS ENUM ('QUEUED','RUNNING','COMPLETED','FAILED','CANCELLED','CANCELLING','RETRYING')",
+            "CREATE TYPE jobstatus AS ENUM ('QUEUED','RUNNING','COMPLETED','PARTIAL','FAILED','CANCELLED','CANCELLING','RETRYING')",
             "CREATE TABLE resources (id uuid PRIMARY KEY, type text DEFAULT 'USER_MAILBOX', archived_at timestamp, sla_policy_id uuid)",
             "CREATE TABLE backup_batches (id uuid PRIMARY KEY, status text DEFAULT 'IN_PROGRESS', "
             "created_at timestamp DEFAULT NOW()-INTERVAL '3 days', scope_user_ids uuid[], completed_at timestamp)",
@@ -37,7 +37,7 @@ async def copy_guard_db(monkeypatch):
             "lease_token bigint DEFAULT 0, started_at timestamp DEFAULT NOW()-INTERVAL '2 days', "
             "created_at timestamp DEFAULT NOW()-INTERVAL '2 days', completed_at timestamp, duration_secs int, "
             "item_count bigint DEFAULT 1, bytes_total bigint DEFAULT 1, hc_drain_status text, "
-            "reuse_chain_root_id uuid, reuse_of_snapshot_id uuid, extra_data json DEFAULT '{}')",
+            "reuse_chain_root_id uuid, reuse_of_snapshot_id uuid, overlay_base_id uuid, extra_data json DEFAULT '{}')",
             "CREATE TABLE snapshot_partitions (id uuid PRIMARY KEY, snapshot_id uuid, job_id uuid, "
             "tenant_id uuid, resource_id uuid, status text DEFAULT 'IN_PROGRESS', lease_owner_id uuid, "
             "lease_expires_at timestamp, lease_token bigint DEFAULT 0, worker_id uuid, "

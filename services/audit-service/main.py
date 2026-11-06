@@ -25,13 +25,16 @@ from typing import Any, NamedTuple, Optional, List, Dict, Set, Tuple
 from fastapi import FastAPI, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, func, asc, desc, and_, or_, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 import asyncio
 import httpx
 
 from shared.database import async_session_factory, Base
+from shared.db_retry import first_db_sqlstate
 from shared.models import AuditEvent, Resource, Tenant, Organization, Job, JobStatus, SlaPolicy, ResourceType
 from shared.config import settings
+from shared.batch_rollup import SNAPSHOT_REASON_SQL, job_issues_sql
 from shared.graph_client import GraphClient
 from shared.multi_app_manager import multi_app_manager
 from shared.message_bus import message_bus
@@ -77,7 +80,18 @@ def _fmt_bytes(b: int) -> str:
     return f"{b:.1f} PB"
 
 
-def _compute_details(job: Job) -> str:
+async def _job_issue_texts(db, jobs) -> Dict[str, str]:
+    """Why each PARTIAL job is partial (TM #35), keyed by job id."""
+    ids = [str(j.id) for j in jobs if j.status == JobStatus.PARTIAL]
+    if not ids:
+        return {}
+    rows = (await db.execute(text(
+        "SELECT x.id::text AS job_id, i.* FROM unnest(CAST(:ids AS uuid[])) AS x(id) "
+        "CROSS JOIN LATERAL (" + job_issues_sql("j.id = x.id") + ") i"), {"ids": ids})).all()
+    return {r.job_id: _ab_mod.issue_text(r) for r in rows}
+
+
+def _compute_details(job: Job, issue: str = "") -> str:
     """Compute the per-row details string.
 
     Branches on terminal status first so a completed job never shows a
@@ -95,12 +109,14 @@ def _compute_details(job: Job) -> str:
     )
 
     # Terminal states: never show "Progress: X%" — the job is finished.
-    if job.status == JobStatus.COMPLETED:
+    if job.status in (JobStatus.COMPLETED, JobStatus.PARTIAL):
         if total_data > 0:
-            return f"{_fmt_bytes(data_backed_up or total_data)} backed up"
-        if data_backed_up > 0:
-            return f"{_fmt_bytes(data_backed_up)} backed up"
-        return "Completed"
+            done = f"{_fmt_bytes(data_backed_up or total_data)} backed up"
+        elif data_backed_up > 0:
+            done = f"{_fmt_bytes(data_backed_up)} backed up"
+        else:
+            done = "Completed"
+        return f"{done} · {issue}" if issue else done
     if job.status == JobStatus.FAILED:
         return job.error_message or "Failed"
     if job.status == JobStatus.CANCELLED:
@@ -194,7 +210,7 @@ def _group_batch_jobs(
         )
         any_failed = any(s == JobStatus.FAILED for s in statuses)
         all_cancelled = all(s == JobStatus.CANCELLED for s in statuses)
-        all_completed = all(s == JobStatus.COMPLETED for s in statuses)
+        all_completed = all(s in (JobStatus.COMPLETED, JobStatus.PARTIAL) for s in statuses)
 
         if any_active:
             group_status = "In Progress"
@@ -203,7 +219,7 @@ def _group_batch_jobs(
         elif all_cancelled:
             group_status = "Canceled"
         elif all_completed:
-            group_status = "Done"
+            group_status = "Partial" if JobStatus.PARTIAL in statuses else "Done"
         else:
             group_status = status_reverse_map.get(statuses[0], "In Progress")
 
@@ -247,7 +263,7 @@ def _group_batch_jobs(
         completed_at = [c.completed_at for c in children if c.completed_at]
         finish_iso = max(completed_at).isoformat() if completed_at and not any_active else ""
 
-        if group_status == "Done":
+        if group_status in ("Done", "Partial"):
             if total_data > 0:
                 details = f"{_fmt_bytes(data_backed_up or total_data)} backed up"
             elif data_backed_up > 0:
@@ -867,6 +883,11 @@ _DUP_STARTED_WINDOW_S = 120
 # raise it if a tenant ever legitimately exceeds it, and watch `total_capped`.
 ACTIVITY_SCAN_CAP = int(os.environ.get("ACTIVITY_SCAN_CAP", "5000"))
 
+# Statement timeout for the batch Activity feed's queries, under api-gateway's 60 s read timeout.
+# Without it a slow rollup kept running after the gateway had answered 504, and TM's ~15 s polls
+# stacked up behind it (catalogue #20). The rollup takes 0.5-0.8 s on TM's 30 days and ~9 s at 10x.
+ACTIVITY_ROLLUP_TIMEOUT_MS = int(os.environ.get("ACTIVITY_ROLLUP_TIMEOUT_MS", "20000"))
+
 M365_RESOURCE_TYPES = {
     ResourceType.MAILBOX,
     ResourceType.SHARED_MAILBOX,
@@ -946,7 +967,7 @@ def _batch_activity_sources(operation, status):
     if status == "Warning":
         include_backup = False
         include_discovery = False
-    elif status in ("Done", "In Progress", "Failed", "Canceled"):
+    elif status in ("Done", "Partial", "In Progress", "Failed", "Canceled"):
         include_warnings = False
     return include_backup, include_discovery, include_warnings
 
@@ -986,7 +1007,11 @@ async def _batch_backup_activity_rows(db, *, tenant_id, start_date, end_date, li
     for r in rows:
         row = shape_batch_row(r)
         if status and status != "Warning":
-            if row.get("status") != status:
+            w = row.get("warnings")
+            # "Partial" = Done with partial/failed warnings, the feed's view of a PARTIAL job.
+            partial = (row.get("status") == "Done" and isinstance(w, dict)
+                       and (w.get("partial") or 0) + (w.get("failed") or 0) > 0)
+            if row.get("status") != status and not (status == "Partial" and partial):
                 continue
         items.append(row)
     return items
@@ -1200,13 +1225,26 @@ async def _list_activities_batch(
     # the number is a floor rather than a count.
     fetch_limit = ACTIVITY_SCAN_CAP
     items: List[Dict[str, Any]] = []
+    backup_timed_out = False
 
     async with async_session_factory() as db:
+        await db.execute(text(f"SET LOCAL statement_timeout = {int(ACTIVITY_ROLLUP_TIMEOUT_MS)}"))
         if include_backup:
-            items.extend(await _batch_backup_activity_rows(
-                db, tenant_id=tenantId, start_date=start_date,
-                end_date=end_date, limit=fetch_limit, status=status,
-            ))
+            # A timed-out rollup costs only the backup rows: the savepoint keeps the
+            # transaction usable for the warning and discovery sources.
+            try:
+                async with db.begin_nested():
+                    rows = await _batch_backup_activity_rows(
+                        db, tenant_id=tenantId, start_date=start_date,
+                        end_date=end_date, limit=fetch_limit, status=status,
+                    )
+                items.extend(rows)
+            except DBAPIError as exc:
+                if first_db_sqlstate(exc) != "57014":  # query_canceled (statement timeout)
+                    raise
+                backup_timed_out = True
+                logging.getLogger(__name__).warning(
+                    "activity backup rollup hit its %d ms statement timeout", ACTIVITY_ROLLUP_TIMEOUT_MS)
         if include_warnings:
             stmt = _activity_event_query(
                 WARNING_ACTIVITY_ACTIONS, tenant_id=tenantId,
@@ -1238,6 +1276,7 @@ async def _list_activities_batch(
         "page":  page,
         "size":  size,
         "has_more": (page * size) < total,
+        "backup_rollup_timed_out": backup_timed_out,
     }
 
 
@@ -1292,8 +1331,11 @@ async def _list_activities_batch_v2(
                   AND s.created_at > b.created_at)                AS bytes_done,
               (SELECT array_agg(DISTINCT j.id)
                  FROM jobs j
-                WHERE COALESCE(j.spec::jsonb->>'batch_id','') = b.id::text) AS job_ids
+                WHERE COALESCE(j.spec::jsonb->>'batch_id','') = b.id::text) AS job_ids,
+              iss.issue_count, iss.issue_name, iss.issue_reason
               FROM backup_batches b
+              LEFT JOIN LATERAL ({job_issues_sql(
+                  "b.status IN ('PARTIAL','FAILED') AND COALESCE(j.spec::jsonb->>'batch_id','') = b.id::text")}) iss ON true
              WHERE {' AND '.join(where_clauses)}
              ORDER BY b.created_at DESC
              LIMIT :size
@@ -1330,7 +1372,10 @@ async def _list_activities_batch_v2(
             elif len(ids) == 0:
                 object_label = "No scope"
             else:
-                object_label = f"{len(ids)} users"
+                types = (await session.execute(text(
+                    "SELECT array_agg(type::text) FROM resources WHERE id = ANY(cast(:ids AS uuid[]))"),
+                    {"ids": [str(i) for i in ids]})).scalar()
+                object_label = _ab_mod.scope_label(len(ids), types)
 
             out.append({
                 "id": r.batch_id,
@@ -1340,7 +1385,8 @@ async def _list_activities_batch_v2(
                 "status": status_label,
                 "operation": "BACKUP",
                 "object": object_label,
-                "details": "",
+                # PARTIAL/FAILED say why (TM #35); others take the live rollup's text in the merge.
+                "details": _ab_mod.issue_details(r, bytes_done) if r.status in ("PARTIAL", "FAILED") else "",
                 "batchSource": r.source,
                 "jobIds": [str(j) for j in (r.job_ids or [])],
                 "progressPct": progress_pct,
@@ -1480,6 +1526,7 @@ async def list_activities(
             "page": page,
             "size": size,
             "has_more": (page * size) < total,
+            "backup_rollup_timed_out": bool(legacy.get("backup_rollup_timed_out")),
         })
     # Fall through to the legacy per-Job rollup below.
     async with async_session_factory() as db:
@@ -1493,6 +1540,7 @@ async def list_activities(
             "In Progress": JobStatus.RUNNING,
             "Failed": JobStatus.FAILED,
             "Canceled": JobStatus.CANCELLED,
+            "Partial": JobStatus.PARTIAL,
         }
         include_job_items = status != "Warning"
         include_warning_items = (not operation or operation.upper() == "BACKUP") and (not status or status == "Warning")
@@ -1626,6 +1674,7 @@ async def list_activities(
             JobStatus.RUNNING: "In Progress",
             JobStatus.FAILED: "Failed",
             JobStatus.CANCELLED: "Canceled",
+            JobStatus.PARTIAL: "Partial",
             JobStatus.QUEUED: "In Progress",
             JobStatus.RETRYING: "In Progress",
         }
@@ -1634,6 +1683,7 @@ async def list_activities(
         single_jobs = [j for j in jobs if j.resource_id is not None]
         batch_jobs = [j for j in jobs if j.resource_id is None]
 
+        issues = await _job_issue_texts(db, single_jobs)
         for job in single_jobs:
             resource_name = "Bulk Operation"
             resource = await db.get(Resource, job.resource_id)
@@ -1650,7 +1700,7 @@ async def list_activities(
                 "object": resource_name,
                 "status": status_reverse_map.get(job.status, "In Progress"),
                 "finish_time": job.completed_at.isoformat() if job.completed_at else "",
-                "details": _compute_details(job),
+                "details": _compute_details(job, issues.get(str(job.id), "")),
                 "data_backed_up": data_backed_up,
                 "total_data": total_data,
             })
@@ -1776,6 +1826,8 @@ async def list_activities(
                   b.scope_user_ids,
                   b.bytes_expected,
                   COALESCE(array_length(b.scope_user_ids, 1), 0) AS total_scope_count,
+                  (SELECT array_agg(r.type::text) FROM resources r
+                    WHERE r.id = ANY(b.scope_user_ids))             AS scope_types,
                   (SELECT COALESCE(SUM(s.bytes_added), 0)
                      FROM snapshots s
                      JOIN jobs j ON j.id = s.job_id
@@ -1788,8 +1840,11 @@ async def list_activities(
                   (SELECT COUNT(*)
                      FROM batch_pending_users bpu
                     WHERE bpu.batch_id = b.id
-                      AND bpu.state = 'WAITING_DISCOVERY')          AS waiting_discovery_count
+                      AND bpu.state = 'WAITING_DISCOVERY')          AS waiting_discovery_count,
+                  iss.issue_count, iss.issue_name, iss.issue_reason
                 FROM backup_batches b
+                LEFT JOIN LATERAL (""" + job_issues_sql(
+                    "b.status IN ('PARTIAL','FAILED') AND COALESCE(j.spec::jsonb->>'batch_id','') = b.id::text") + """) iss ON true
                 WHERE b.id::text = ANY(:bids)
             """), {"bids": batched_group_keys})).all()
             items.extend(shape_activity_row(r) for r in bb_rows)
@@ -2025,6 +2080,9 @@ async def export_activity_csv(
             operation=operation, status=status,
             page=1, size=5000,
         )
+        if data["backup_rollup_timed_out"]:
+            # An export without its backup rows would read as a complete record.
+            raise HTTPException(status_code=503, detail="Activity backup rows timed out; retry the export.")
         output = io.StringIO()
         writer = SafeCsvWriter(csv.writer(output))
         writer.writerow([
@@ -2061,6 +2119,7 @@ async def export_activity_csv(
         "In Progress": JobStatus.RUNNING,
         "Failed": JobStatus.FAILED,
         "Canceled": JobStatus.CANCELLED,
+        "Partial": JobStatus.PARTIAL,
     }
 
     async with async_session_factory() as db:
@@ -2116,6 +2175,7 @@ async def export_activity_csv(
             "ID", "Start Time", "Operation", "Object",
             "Status", "Finish Time", "Details"
         ])
+        issues = await _job_issue_texts(db, jobs)
         for job in jobs:
             writer.writerow([
                 str(job.id),
@@ -2124,7 +2184,7 @@ async def export_activity_csv(
                 str(job.resource_id) if job.resource_id else "Bulk",
                 job.status.value if hasattr(job.status, 'value') else str(job.status),
                 job.completed_at.isoformat() if job.completed_at else "",
-                _compute_details(job),
+                _compute_details(job, issues.get(str(job.id), "")),
             ])
 
         output.seek(0)
@@ -2218,7 +2278,7 @@ async def get_batch_children(batch_id: str):
                 job_statuses.append(str(status or "").upper())
                 for rid in (rids or []):
                     res_ids.add(rid)
-            if job_statuses and all(s in {"COMPLETED", "FAILED", "CANCELLED"} for s in job_statuses):
+            if job_statuses and all(s in {"COMPLETED", "PARTIAL", "FAILED", "CANCELLED"} for s in job_statuses):
                 batch_status = "COMPLETED"
 
         if not res_ids:
@@ -2295,7 +2355,8 @@ async def get_batch_children(batch_id: str):
                         THEN COALESCE(s.bytes_total, 0)
                         ELSE SUM(s.bytes_added) OVER (PARTITION BY s.resource_id) END
                                                                  AS bytes_added,
-                   s.bytes_total                                 AS bytes_total
+                   s.bytes_total                                 AS bytes_total,
+                   """ + SNAPSHOT_REASON_SQL.replace("ps.", "s.") + """ AS reason
               FROM snapshots s
               JOIN jobs j ON j.id = s.job_id
              WHERE s.resource_id = ANY(CAST(:rids AS UUID[]))
@@ -2315,6 +2376,8 @@ async def get_batch_children(batch_id: str):
                 "bytesAdded":     int(sr.bytes_added or 0),
                 "bytesTotal":     int(sr.bytes_total or 0),
             }
+            if sr.status in ("PARTIAL", "FAILED"):
+                snap_by_rid[sr.resource_id]["reason"] = sr.reason or "no reason recorded"
 
         snap_ids = [v["snapshotId"] for v in snap_by_rid.values()]
         parts_by_sid: Dict[str, Dict[str, int]] = {}
@@ -2363,6 +2426,7 @@ async def get_batch_children(batch_id: str):
 
         tier1: List[Dict[str, Any]] = []
         children_by_parent: Dict[Any, List[Dict[str, Any]]] = {}
+        batch_rids = {row[0] for row in rs}
         for rid, parent, rtype, name, license_missing, license_hint in rs:
             entry: Dict[str, Any] = {
                 "resourceId":  str(rid),
@@ -2385,7 +2449,9 @@ async def get_batch_children(batch_id: str):
                 entry["status"] = "SKIPPED_NO_LICENSE"
                 entry["skippedNoLicense"] = True
                 entry["licenseHint"] = license_hint
-            if rtype in TIER1_TYPES:
+            # Parentless resources of any type (Teams channels, Microsoft 365 / Entra groups, ...)
+            # and children whose parent is not in this batch are rows of their own.
+            if rtype in TIER1_TYPES or parent is None or parent not in batch_rids:
                 entry["children"] = []
                 tier1.append(entry)
             else:

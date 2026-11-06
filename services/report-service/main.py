@@ -851,7 +851,7 @@ async def generate_report(
             select(func.count(Job.id)).where(
                 and_(
                     Job.type == JobType.BACKUP,
-                    Job.status == JobStatus.COMPLETED,
+                    Job.status.in_([JobStatus.COMPLETED, JobStatus.PARTIAL]),
                     Job.created_at >= period_start,
                     Job.created_at <= period_end,
                 )
@@ -971,7 +971,7 @@ async def generate_report(
                 .where(
                     and_(
                         Job.type == JobType.BACKUP,
-                        Job.status == JobStatus.COMPLETED,
+                        Job.status.in_([JobStatus.COMPLETED, JobStatus.PARTIAL]),
                         Job.created_at >= period_start,
                         Job.created_at <= period_end,
                     )

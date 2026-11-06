@@ -19,7 +19,7 @@ from sqlalchemy.orm import aliased
 from shared.database import get_db, init_db, close_db, AsyncSession, async_session_factory
 from shared.models import Snapshot, SnapshotItem, Resource, SnapshotType, SnapshotStatus, ResourceType, ResourceStatus, Job, ChatItemVersion, SnapshotChatInventory, ChatCaptureAttempt, ChatThread, ChatThreadMessage, SnapshotChatPresentation
 from shared.chat_catalogue import materialize_chat_items, ChatCatalogueIntegrityError
-from shared.snapshot_reuse import resolve_snapshot_items_target, SnapshotNotFound
+from shared.snapshot_reuse import SnapshotNotFound, items_snapshot_id, items_scope, item_in_snapshot
 from shared.audit import internal_audit_headers
 from shared.config import settings
 # Producer-only; on-demand archive enrichment nudge. Defensive so this read API
@@ -344,6 +344,9 @@ async def _catalogue_snapshot(db, snapshot_id, *, resolve_chat_sibling=False):
     source = await db.get(Snapshot, UUID(str(snapshot_id)))
     if source is None:
         raise HTTPException(404, detail="Snapshot not found")
+    if source.reuse_chain_root_id is not None and (source.extra_data or {}).get("chat_inventory_format") == 1:
+        # Every chat was unchanged: the backup reuses this full backup's chats.
+        source = await db.get(Snapshot, source.reuse_chain_root_id) or source
     if (source.extra_data or {}).get("chat_inventory_format") == 1:
         if source.status == SnapshotStatus.PENDING_DELETION:
             raise HTTPException(404, detail="Snapshot is being deleted")
@@ -1325,16 +1328,12 @@ async def list_snapshot_items(
             number=page,
         )
 
-    # Resolve through the reuse chain so a reuse snapshot returns
-    # the chain root's items. Pre-deploy snapshots and full
-    # (non-reuse) snapshots have NULL reuse_chain_root_id and the
-    # resolver returns the input id unchanged.
+    # The snapshot's inventory: a pointer reads the snapshot it names, an overlay its base + own
+    # rows (shared.snapshot_reuse.items_scope); a full snapshot is snapshot_id = id as before.
     try:
-        _resolved = await resolve_snapshot_items_target(db, snapshot_id)
-        _target = _resolved.target_id
+        filters = [await items_scope(db, snapshot_id)]
     except SnapshotNotFound:
         raise HTTPException(status_code=404, detail="Snapshot not found")
-    filters = [SnapshotItem.snapshot_id == _target]
     if itemType:
         filters.append(SnapshotItem.item_type == itemType)
 
@@ -1396,16 +1395,13 @@ async def browse_snapshot_items(
             number=page,
         )
 
-    # Resolve through the reuse chain (see sibling list_snapshot_items
-    # comment). 404 a missing snapshot rather than returning an
-    # empty list — an empty result for a missing id would be silently
+    # The snapshot's inventory (see sibling list_snapshot_items comment). 404 a missing snapshot
+    # rather than returning an empty list — an empty result for a missing id would be silently
     # confusing in the Recovery UI.
     try:
-        _resolved = await resolve_snapshot_items_target(db, snapshot_id)
-        _target = _resolved.target_id
+        filters = [await items_scope(db, snapshot_id)]
     except SnapshotNotFound:
         raise HTTPException(status_code=404, detail="Snapshot not found")
-    filters = [SnapshotItem.snapshot_id == _target]
     if itemType:
         filters.append(SnapshotItem.item_type == itemType)
 
@@ -1976,7 +1972,7 @@ async def search_snapshot_items(
         Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL]),
     )
     if snapshot_id:
-        snapshot_ids_stmt = snapshot_ids_stmt.where(Snapshot.id == UUID(snapshot_id))
+        snapshot_ids_stmt = snapshot_ids_stmt.where(Snapshot.id == await items_snapshot_id(db, snapshot_id))
     snapshot_ids_result = await db.execute(snapshot_ids_stmt)
     # ``select(Snapshot.id)`` + ``.scalars()`` yields bare UUIDs, NOT ORM rows.
     # The old ``s.id`` therefore raised
@@ -1994,7 +1990,9 @@ async def search_snapshot_items(
             content=[], totalPages=0, totalElements=0, size=size, number=page,
         )
 
-    filters = [SnapshotItem.snapshot_id.in_(snapshot_ids)]
+    # One snapshot: its inventory (an overlay's base + own rows); otherwise every row of the
+    # resource's restore points.
+    filters = [await items_scope(db, snapshot_id) if snapshot_id else SnapshotItem.snapshot_id.in_(snapshot_ids)]
     if item_type:
         filters.append(SnapshotItem.item_type == item_type)
     if folder_path:
@@ -2037,13 +2035,10 @@ async def get_snapshot_item_detail(snapshot_id: str, item_id: str, db: AsyncSess
             raise HTTPException(status_code=404, detail="Snapshot item not found")
         return _item_to_response(item)
 
-    stmt = select(SnapshotItem).where(
-        SnapshotItem.snapshot_id == UUID(snapshot_id),
-        SnapshotItem.id == UUID(item_id),
-    )
-    result = await db.execute(stmt)
-    item = result.scalar_one_or_none()
-    if not item:
+    # Row X "in snapshot S": S's own row, the row of the snapshot a pointer names, or a base row
+    # an overlay inherits.
+    item = await db.get(SnapshotItem, UUID(item_id))
+    if not item or not await item_in_snapshot(db, item.id, snapshot_id):
         raise HTTPException(status_code=404, detail="Snapshot item not found")
     if item.chat_version_id is not None or (await _catalogue_snapshot(db, snapshot_id)) is not None:
         item = (await materialize_chat_items(db, [item]))[0]
@@ -2318,7 +2313,7 @@ _LIST_CACHE_TTL_S = int(os.getenv("SNAPSHOT_LIST_CACHE_TTL_S", "900"))
 # fingerprint containing either must not be cached (the id+status pair
 # wouldn't change while the rows do). FAILED appears only for an
 # explicitly-requested failed snapshot (post-mortem view) — inert rows.
-_CACHEABLE_SNAPSHOT_STATES = frozenset({"COMPLETED", "FAILED", "PARTIAL"})
+_CACHEABLE_SNAPSHOT_STATES = frozenset({"COMPLETED", "FAILED", "PARTIAL", "SKIPPED"})
 
 # Session factory for the concurrent COUNT in _paged_latest_items —
 # module-level indirection so unit tests can substitute a fake without
@@ -4521,7 +4516,7 @@ async def get_item_content(
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
 
-    if item.snapshot_id != UUID(snapshot_id):
+    if not await item_in_snapshot(db, item.id, snapshot_id):
         raise HTTPException(status_code=404, detail="Item not found")
     catalogue = await _catalogue_snapshot(db, snapshot_id)
     if catalogue is not None:
@@ -4731,14 +4726,17 @@ async def get_item_attachments(
     _iid = _safe_uuid(item_id)
     if _sid is None or _iid is None:
         return []
+    _requested = _sid
+    _sid = await items_snapshot_id(db, str(_sid))
     parent = await db.get(SnapshotItem, _iid)
     if not parent:
         raise HTTPException(status_code=404, detail="Item not found")
     # Defense in depth — the URL gives us both snapshot_id and item_id.
     # The auth layer enforces tenant ownership of the snapshot. Here we
-    # also require the item belong to that snapshot so callers can't
+    # also require the item belong to that snapshot (its inventory, which
+    # for an overlay includes inherited base rows) so callers can't
     # enumerate other snapshots' items by guessing a stray item_id.
-    if parent.snapshot_id != _sid:
+    if not await item_in_snapshot(db, parent.id, _requested):
         raise HTTPException(status_code=404, detail="Item not found")
 
     catalogue = await _catalogue_snapshot(db, snapshot_id)
@@ -4787,7 +4785,7 @@ async def get_item_attachments(
         or_(
             and_(
                 SnapshotItem.item_type.in_(["EMAIL_ATTACHMENT", "ARCHIVE_ATTACHMENT"]),
-                SnapshotItem.snapshot_id == _sid,
+                await items_scope(db, _requested),
             ),
             and_(
                 SnapshotItem.item_type == "CHAT_ATTACHMENT",

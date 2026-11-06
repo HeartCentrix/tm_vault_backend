@@ -9,10 +9,13 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import logging
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
 from sqlalchemy import func, select, text, update
+
+logger = logging.getLogger(__name__)
 from sqlalchemy.dialects.postgresql import insert
 
 from shared.models import ArchiveFolderWork as Folder, ArchiveItemWork as Item
@@ -434,8 +437,46 @@ class ArchiveCapture:
                 else:
                     await self._refresh_count(scope, read_folder, after=True)
 
+    async def _explain_hidden_children(self, read_folder):
+        """A short childFolders listing is no loss when Graph's hidden system folders make up the
+        difference (Contacts declares 7, lists 0, includeHiddenFolders=true returns all 7) or when
+        it is Conversation History's one child Graph never lists (v1.0 and beta, live 2026-11-06).
+        Hidden folders are counted, not backed up; any other shortfall stays a gap."""
+        async with self.factory() as db:
+            rows = list((await db.scalars(select(Folder).where(Folder.snapshot_id == self.fence.snapshot_id,
+                Folder.capture_generation == self.generation, Folder.state == 'unresolved',
+                Folder.phase == 'children', Folder.gap_kind == 'count_shortfall').limit(100))).all())
+            scopes = [{c.name: getattr(r, c.key) for c in Folder.__table__.columns} for r in rows]
+        for scope in scopes:
+            url, ids = f"{scope['base_url']}/{scope['folder_id']}/childFolders?includeHiddenFolders=true&$top=200", set()
+            try:
+                for _ in range(50):
+                    page = await read_folder(url)
+                    ids.update(c['id'] for c in page.get('value', []) if isinstance(c, dict) and c.get('id'))
+                    url = page.get('@odata.nextLink')
+                    if not url:
+                        break
+            except Exception:
+                continue  # unexplained: the normal repair path still re-reads it
+            declared, observed = scope['declared_count'] or 0, scope['observed_count'] or 0
+            # ponytail: matches the English folder name; a localized Conversation History stays a gap.
+            unlisted = 1 if (declared - max(len(ids), observed) == 1
+                             and (scope['display_path'] or '').rsplit('/', 1)[-1] == 'Conversation History') else 0
+            if len(ids) + unlisted < declared:
+                continue
+            async with self.factory.begin() as db:
+                await self.lock(db)
+                row = await self._scope(db, scope)
+                if (row.state, row.gap_kind) != ('unresolved', 'count_shortfall'):
+                    continue
+                row.state, row.gap_kind = 'complete', None
+                extra = {'unlisted_system_children': unlisted} if unlisted else {'hidden_children': len(ids) - observed}
+                row.evidence = {**(row.evidence or {}), **extra}
+
     async def repair(self, read_folder=None):
         """One finite repair turn, respecting persisted provider cooldowns."""
+        if read_folder:
+            await self._explain_hidden_children(read_folder)
         async with self.factory.begin() as db:
             await self.lock(db)
             rows = list((await db.scalars(select(Folder).where(Folder.snapshot_id == self.fence.snapshot_id,
@@ -512,8 +553,78 @@ class ArchiveCapture:
                         gap_kind=CASE WHEN c.proofs>1 OR c.failed THEN 'identity_conflict' ELSE NULL END
                     FROM current c WHERE i.snapshot_id=:sid AND i.capture_generation=:gen AND i.external_id=c.external_id
                     AND i.state='discovered' '''), self.params(ids=ids, prior=prior_id, full=force_full))
-                if prior_id:
-                    await self._carry(db, prior_id, ids, copy_collection)
+        if not prior_id or (not force_full and await self._point_at_prior(prior_id)):
+            return
+        after = ''
+        while batch := await self.manifest_batch(after=after):
+            after = batch[-1]['external_id']
+            async with self.factory.begin() as db:
+                await self.lock(db)
+                await self._carry(db, prior_id, [r['external_id'] for r in batch], copy_collection)
+
+    async def _point_at_prior(self, prior_id):
+        """An unchanged archive - complete census, every item copy_pending (same changeKey as a stored
+        prior row) and one-to-one with the prior's items - points at the prior instead of copying it:
+        every incremental copied the whole archive (TM's largest: 1.1 M items). Items are stored through
+        the pointer with a 'reuse' receipt (no copy to verify, nothing new). ARCHIVE_UNCHANGED_REUSE_ENABLED
+        =false copies as before."""
+        import os
+        if os.getenv('ARCHIVE_UNCHANGED_REUSE_ENABLED', 'true').strip().lower() in ('0', 'false', 'no', 'off'):
+            return False
+        census = await self.summary()
+        if census['scopes_pending'] or not census['items_enumerated']:
+            return False
+        from shared.snapshot_reuse import point_at
+        async with self.factory.begin() as db:
+            await self.lock(db)
+            prior = await db.get(Snapshot, prior_id, with_for_update={'read': True})
+            if (not prior or prior.resource_id != self.fence.resource_id
+                    or (prior.extra_data or {}).get('cancelled_at') or (prior.extra_data or {}).get('copy_required_failed')):
+                return False
+            # A PARTIAL prior qualifies only when this run failed on exactly the same folders, same
+            # step, same error (TM: the same 4 archive folders return Microsoft HTTP 500 every run).
+            gaps = []
+            if census['folders_failed'] or prior.status.value != 'COMPLETED':
+                if prior.status.value != 'PARTIAL':
+                    return False
+                gaps = await self._failed_folders(db, self.fence.snapshot_id, self.generation)
+                prior_generation = ((prior.extra_data or {}).get('archive_capture') or {}).get('generation')
+                if not gaps or not prior_generation or gaps != await self._failed_folders(db, prior_id, prior_generation):
+                    return False
+            counts = (await db.execute(text('''SELECT count(DISTINCT i.external_id) AS items,
+                    count(*) FILTER (WHERE i.state<>'copy_pending') AS changed
+                FROM archive_item_work i JOIN archive_folder_work f ON f.snapshot_id=i.snapshot_id
+                  AND f.capture_generation=i.capture_generation AND f.scope_key=i.scope_key AND f.scope_generation=i.scope_generation
+                WHERE i.snapshot_id=:sid AND i.capture_generation=:gen AND f.state<>'excluded' '''), self.params())).one()
+            prior_items = await db.scalar(text('''SELECT count(*) FROM snapshot_items
+                WHERE snapshot_id=:prior AND item_type='ARCHIVE_ITEM' '''), {'prior': prior_id})
+            if counts.changed or counts.items != prior_items:
+                return False
+            if not await point_at(db, target_snapshot_id=self.fence.snapshot_id, prior_snapshot_id=prior_id,
+                                  marker='archive_reused_partial_prior' if gaps else 'archive_reused_prior'):
+                return False
+            if gaps:
+                logger.warning('[ARCHIVE] reused PARTIAL prior %s: unchanged items and the same %d failed folder(s) '
+                               'as last run (%s); the gap stays recorded on this backup', prior_id, len(gaps),
+                               ', '.join(f'{path or "/"} [{kind}]' for _, path, kind in gaps[:5]))
+            await db.execute(text('''UPDATE archive_item_work i SET state='stored', receipt_item_id=s.id,
+                receipt=json_build_object('kind','reuse','change_key',i.change_key,'hash',s.content_hash,'size',s.content_size,
+                    'blob_path',s.blob_path,'backend_id',s.backend_id::text,'encryption_key_id',s.encryption_key_id,
+                    'backup_version',s.backup_version,'reused_snapshot_id',CAST(:prior AS text))
+                FROM snapshot_items s WHERE i.snapshot_id=:sid AND i.capture_generation=:gen AND i.state='copy_pending'
+                  AND s.snapshot_id=:prior AND s.item_type='ARCHIVE_ITEM' AND s.external_id=i.external_id'''),
+                self.params(prior=prior_id))
+        return True
+
+    @staticmethod
+    async def _failed_folders(db, snapshot_id, generation):
+        """Sorted (phase, path, gap) of a capture's unreadable folder scopes, as summary() counts them."""
+        rows = await db.execute(text('''SELECT phase, COALESCE(display_path,''), COALESCE(gap_kind,'') FROM archive_folder_work
+            WHERE snapshot_id=:sid AND capture_generation=:gen AND phase NOT IN ('receipt','membership') AND state<>'excluded'
+              AND (state<>'complete' OR NOT terminal_page OR (evidence->'count_reconciliation' IS NOT NULL AND
+                   COALESCE(evidence->'count_reconciliation'->>'stable','false')<>'true'))'''),
+            {'sid': snapshot_id, 'gen': generation})
+        return sorted(tuple(r) for r in rows)
 
     async def fail_items(self, ids, kind):
         async with self.factory.begin() as db:
@@ -596,7 +707,7 @@ class ArchiveCapture:
               AND COALESCE(s.metadata->>'changeKey',s.metadata->>'change_key') IS NOT DISTINCT FROM i.change_key) AS stored
             FROM archive_item_work i JOIN archive_folder_work f ON f.snapshot_id=i.snapshot_id AND f.capture_generation=i.capture_generation
               AND f.scope_key=i.scope_key AND f.scope_generation=i.scope_generation
-            LEFT JOIN snapshot_items s ON s.id=i.receipt_item_id AND s.snapshot_id=i.snapshot_id AND s.external_id=i.external_id AND s.item_type='ARCHIVE_ITEM'
+            LEFT JOIN snapshot_items s ON s.id=i.receipt_item_id AND s.snapshot_id=COALESCE((SELECT x.reuse_chain_root_id FROM snapshots x WHERE x.id=i.snapshot_id), i.snapshot_id) AND s.external_id=i.external_id AND s.item_type='ARCHIVE_ITEM'
             WHERE i.snapshot_id=:sid AND i.capture_generation=:gen AND f.state<>'excluded' GROUP BY i.external_id)
             SELECT count(*) AS items_enumerated,count(*) FILTER (WHERE stored) AS files_succeeded,
               count(*) FILTER (WHERE NOT COALESCE(stored,false)) AS items_failed FROM current'''), self.params())).mappings().one()
@@ -621,7 +732,8 @@ class ArchiveCapture:
             result['folders_failed'] += missing_members
             result['folder_failures'].append({'phase': 'membership', 'kind': 'required_folder_not_covered',
                 'count': missing_members})
-        totals = (await db.execute(text('SELECT COALESCE(sum(content_size),0) FROM snapshot_items WHERE snapshot_id=:sid'),
+        totals = (await db.execute(text('''SELECT COALESCE(sum(content_size),0) FROM snapshot_items WHERE snapshot_id=
+            COALESCE((SELECT reuse_chain_root_id FROM snapshots WHERE id=:sid), :sid)'''),
             {'sid': self.fence.snapshot_id})).scalar()
         exported = (await db.execute(text('''SELECT count(*),COALESCE(sum(size),0) FROM (
             SELECT DISTINCT i.external_id,(i.receipt->>'size')::bigint AS size FROM archive_item_work i

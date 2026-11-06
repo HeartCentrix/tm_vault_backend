@@ -73,7 +73,12 @@ class _CaptureSession:
     def __init__(self):
         self.stmt = None
 
-    async def execute(self, stmt):
+    async def execute(self, stmt, params=None):
+        if params is not None:  # the reuse-pointer lookup (shared.snapshot_reuse): not a reuse snapshot
+            class _None:
+                def first(self):
+                    return None
+            return _None()
         self.stmt = stmt
 
         class _R:

@@ -32,7 +32,9 @@ from botocore.exceptions import ClientError
 _SEAWEED_BOTO_CONFIG = _BotoConfig(
     connect_timeout=int(os.getenv("ONPREM_S3_CONNECT_TIMEOUT_S", "10")),
     read_timeout=int(os.getenv("ONPREM_S3_READ_TIMEOUT_S", "120")),
-    retries={"max_attempts": int(os.getenv("ONPREM_S3_MAX_ATTEMPTS", "3")),
+    # 12 retries ≈ 85 s mean backoff: rides out the ~60 s "No more writable
+    # volumes" gap while the master grows volumes (2026-11-06; 3 waited ~3.5 s).
+    retries={"max_attempts": int(os.getenv("ONPREM_S3_MAX_ATTEMPTS", "12")),
              "mode": "standard"},
     max_pool_connections=int(os.getenv("ONPREM_S3_MAX_POOL", "256")),
 )

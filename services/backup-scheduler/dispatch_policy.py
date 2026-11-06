@@ -416,8 +416,10 @@ def build_scheduled_inflight_query(policy_id: str):
 # IN_PROGRESS is the only live state. PENDING_DELETION is reached via
 # retention / the cancelled-sweep, never while the owning job is still
 # RUNNING, so it is left out on purpose (spec: COMPLETED/PARTIAL/FAILED).
+# SKIPPED is the concurrency placeholder: settled for its member.
 SNAPSHOT_TERMINAL_STATUSES = (
     SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL, SnapshotStatus.FAILED,
+    SnapshotStatus.SKIPPED,
 )
 
 
