@@ -4782,12 +4782,12 @@ class BackupWorker:
             from shared.copy_runtime import CopyWorkRunner
             self._copy_work_runner = CopyWorkRunner(
                 async_session_factory, self.resume_copy_workflow,
-                concurrency=int(os.getenv("COPY_WORK_CONCURRENCY", "2")),
-                batch_size=int(os.getenv("COPY_WORK_BATCH_ROWS", "512")),
+                concurrency=int(os.getenv("COPY_WORK_CONCURRENCY", "4")),
+                batch_size=int(os.getenv("COPY_WORK_BATCH_ROWS", "2000")),
                 statement_timeout_ms=int(os.getenv("COPY_WORK_STATEMENT_TIMEOUT_MS", "60000")),
-                lock_timeout_ms=int(os.getenv("COPY_WORK_LOCK_TIMEOUT_MS", "5000")),
+                lock_timeout_ms=int(os.getenv("COPY_WORK_LOCK_TIMEOUT_MS", "2000")),
                 poll_s=float(os.getenv("COPY_WORK_POLL_SECONDS", "1")),
-                recovery_s=float(os.getenv("COPY_WORK_RECOVERY_SECONDS", "10")),
+                recovery_s=float(os.getenv("COPY_WORK_RECOVERY_SECONDS", "5")),
             )
             await self._copy_work_runner.start()
         from shared.provider_work import guards_enabled as provider_guards
@@ -7429,7 +7429,7 @@ class BackupWorker:
                 storage=router, partition_filter=(message or {}).get("partitionFilter"),
                 partition_id=partition_id, policy_id=policy.id if policy is not None else None,
                 exclude_message=predicate, scope_filter_hash=filter_hash, check_cancelled=cancel_check,
-                concurrency=max(1, int(os.getenv("USER_CHATS_PARALLEL_CHATS", "4"))),
+                concurrency=max(1, int(os.getenv("USER_CHATS_PARALLEL_CHATS", "8"))),
                 snapshot_lease_token=getattr(snapshot, "lease_token", None), partition_lease_token=token,
                 job_lease_token=(message or {}).get("_job_lease_token"),
                 full_backup=bool((message or {}).get("forceFullBackup") or (message or {}).get("type") == "FULL"))
@@ -13392,7 +13392,7 @@ class BackupWorker:
                         # Bounding the outer gather keeps the network in
                         # a healthy zone.
                         _msg_concurrency = max(
-                            1, int(os.getenv("CHAT_HC_MSG_CONCURRENCY", "16"))
+                            1, int(os.getenv("CHAT_HC_MSG_CONCURRENCY", "24"))
                         )
                         _msg_sem = asyncio.Semaphore(_msg_concurrency)
 

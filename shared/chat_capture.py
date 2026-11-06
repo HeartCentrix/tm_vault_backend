@@ -1321,7 +1321,7 @@ async def capture_chat_inventory(*, scope, graph_client, storage, session_factor
     from shared.provider_runtime import provider_live_wait_scope, current_unit, ProviderBudgetExhausted
     loop = asyncio.get_running_loop()
     if loop not in _CAPTURE_SLOTS:
-        capacity = int(os.getenv('CHAT_CAPTURE_CONCURRENCY', '2'))
+        capacity = int(os.getenv('CHAT_CAPTURE_CONCURRENCY', '8'))
         if not 1 <= capacity <= 64:
             raise ValueError('chat capture concurrency must be between 1 and 64')
         _CAPTURE_SLOTS[loop] = asyncio.Semaphore(capacity)

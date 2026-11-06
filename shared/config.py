@@ -652,8 +652,9 @@ class Settings:
         # ── USER_CHATS cross-replica partition ──
         # Immutable catalogue writing is opt-in. Adopted resources fail
         # closed when disabled; they never return to history-union writes.
-        # Activate v2 only after the additive schema/readers are deployed.
-        self.CHAT_OBSERVATION_HASH_VERSION = int(os.getenv("CHAT_OBSERVATION_HASH_VERSION", "1"))
+        # v2 (default since 2026-11-06, validated on Railway) ignores Graph's rotating reaction
+        # presentation; the first run after switching rewrites each chat's observation once.
+        self.CHAT_OBSERVATION_HASH_VERSION = int(os.getenv("CHAT_OBSERVATION_HASH_VERSION", "2"))
         if self.CHAT_OBSERVATION_HASH_VERSION not in (1, 2):
             raise ValueError("CHAT_OBSERVATION_HASH_VERSION must be 1 or 2")
         self.CHAT_CATALOGUE_WRITER_ENABLED = os.getenv(
@@ -722,17 +723,17 @@ class Settings:
         # backup.high serially. Tiny users (<25 chats) still run inline
         # to avoid the per-shard publish overhead.
         self.CHATS_PARTITION_MIN_CHATS = int(os.getenv(
-            "CHATS_PARTITION_MIN_CHATS", "25",
+            "CHATS_PARTITION_MIN_CHATS", "5",
         ))
         self.CHATS_PARTITION_TARGET_CHATS_PER_SHARD = int(os.getenv(
-            "CHATS_PARTITION_TARGET_CHATS_PER_SHARD", "50",
+            "CHATS_PARTITION_TARGET_CHATS_PER_SHARD", "2",
         ))
         # 2026-05-17 prod tuning: 4 → 6 so power users (executives with
         # 500+ chats) drain ~33% faster. The 8-light × 12-prefetch =
         # 96-shard cluster budget for backup.chats_partition still
         # comfortably absorbs the new shard count.
         self.CHATS_PARTITION_MAX_SHARDS = int(os.getenv(
-            "CHATS_PARTITION_MAX_SHARDS", "6",
+            "CHATS_PARTITION_MAX_SHARDS", "8",
         ))
 
         # ── Phase 3.2: Mail partition (covers USER_MAIL / MAILBOX /
