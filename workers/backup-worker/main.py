@@ -115,11 +115,19 @@ _PG_MAX_BIND_PARAMS = 32767
 _INLINE_ATTACHMENT_MAX_BYTES = int(
     os.getenv("INLINE_ATTACHMENT_MAX_BYTES", str(256 * 1024)),
 )
+# Mail attachments (EMAIL_ATTACHMENT) are blob-backed by default: an inline
+# row's bytes are re-copied by every changed mailbox's carry-forward
+# (Railway 2026-11-06 incremental #1: 95% of copied bytes, Rohit 247 MB of
+# 261 MB). Storage is SeaweedFS/S3, not Azure block lists, so the reasons
+# above no longer pay for that. Set >0 to inline attachments up to that size
+# again (the old behaviour was 262144). Chat keeps INLINE_ATTACHMENT_MAX_BYTES.
+_MAIL_ATTACHMENT_INLINE_MAX_BYTES = int(os.getenv("MAIL_ATTACHMENT_INLINE_MAX_BYTES", "0"))
 
 
-def _maybe_inline_attachment(content_bytes: Optional[bytes]) -> Optional[str]:
-    """Return base64-encoded content if it fits the inline threshold;
-    None if the bytes should go to Azure Blob instead.
+def _maybe_inline_attachment(content_bytes: Optional[bytes], max_bytes: Optional[int] = None) -> Optional[str]:
+    """Return base64-encoded content if it fits the inline threshold
+    (``max_bytes``, default INLINE_ATTACHMENT_MAX_BYTES); None if the bytes
+    should go to blob storage instead.
 
     Callers MUST handle both branches — inline path sets
     extra_data["inline_b64"] and leaves blob_path=None; blob path runs
@@ -127,7 +135,7 @@ def _maybe_inline_attachment(content_bytes: Optional[bytes]) -> Optional[str]:
     """
     if content_bytes is None:
         return None
-    if len(content_bytes) > _INLINE_ATTACHMENT_MAX_BYTES:
+    if len(content_bytes) > (_INLINE_ATTACHMENT_MAX_BYTES if max_bytes is None else max_bytes):
         return None
     import base64 as _b64
     return _b64.b64encode(content_bytes).decode("ascii")
@@ -14189,7 +14197,7 @@ class BackupWorker:
                     # 200-500 ms per-blob block-list commit which
                     # dominates wall-time on small-attachment-heavy
                     # mailboxes.
-                    inline_b64 = _maybe_inline_attachment(content_bytes)
+                    inline_b64 = _maybe_inline_attachment(content_bytes, _MAIL_ATTACHMENT_INLINE_MAX_BYTES)
                     if inline_b64 is not None:
                         bytes_added = size
                     else:
@@ -14365,7 +14373,7 @@ class BackupWorker:
                             p_hash = hashlib.sha256(payload).hexdigest()
                             p_size = len(payload)
                             p_blob: Optional[str] = None
-                            p_inline_b64 = _maybe_inline_attachment(payload)
+                            p_inline_b64 = _maybe_inline_attachment(payload, _MAIL_ATTACHMENT_INLINE_MAX_BYTES)
                             if p_inline_b64 is None:
                                 try:
                                     p_blob = await _upload_once_per_hash(
