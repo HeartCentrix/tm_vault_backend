@@ -240,7 +240,7 @@ class Settings:
         # ONEDRIVE_LARGE_FILE_SEGMENT_CONCURRENCY=8 could feed it.
         self.ONPREM_UPLOAD_CONCURRENCY = int(os.getenv("ONPREM_UPLOAD_CONCURRENCY", "16"))
         self.ONPREM_MULTIPART_THRESHOLD_MB = int(os.getenv("ONPREM_MULTIPART_THRESHOLD_MB", "100"))
-        self.ONPREM_RETRY_MAX = int(os.getenv("ONPREM_RETRY_MAX", "3"))
+        self.ONPREM_RETRY_MAX = int(os.getenv("ONPREM_RETRY_MAX", "5"))
 
         # Azure ARM (Azure Resource Manager) credentials for VM/SQL/PostgreSQL backup
         # Service Principal for ARM API access
@@ -590,8 +590,8 @@ class Settings:
         self.ONEDRIVE_BACKUP_FILE_CONCURRENCY = int(os.getenv("ONEDRIVE_BACKUP_FILE_CONCURRENCY", "16"))
         self.MAX_CONCURRENT_ONEDRIVE_BACKUPS_PER_WORKER = int(os.getenv("MAX_CONCURRENT_ONEDRIVE_BACKUPS_PER_WORKER", "4"))
         self.ONEDRIVE_BACKUP_FILE_TIMEOUT_SECONDS = int(os.getenv("ONEDRIVE_BACKUP_FILE_TIMEOUT_SECONDS", "21600"))
-        self.ONEDRIVE_BACKUP_CHECKPOINT_EVERY_FILES = int(os.getenv("ONEDRIVE_BACKUP_CHECKPOINT_EVERY_FILES", "500"))
-        self.ONEDRIVE_BACKUP_CHECKPOINT_EVERY_BYTES = int(os.getenv("ONEDRIVE_BACKUP_CHECKPOINT_EVERY_BYTES", str(1024 * 1024 * 1024)))
+        self.ONEDRIVE_BACKUP_CHECKPOINT_EVERY_FILES = int(os.getenv("ONEDRIVE_BACKUP_CHECKPOINT_EVERY_FILES", "50"))
+        self.ONEDRIVE_BACKUP_CHECKPOINT_EVERY_BYTES = int(os.getenv("ONEDRIVE_BACKUP_CHECKPOINT_EVERY_BYTES", str(256 * 1024 * 1024)))
         # Parallel Range-GET for huge files: files above this size use
         # N concurrent Range requests against the Graph pre-signed URL
         # to saturate enterprise bandwidth (single TCP caps ~80 MB/s).
@@ -630,17 +630,17 @@ class Settings:
             "ONEDRIVE_PARTITION_ENABLED", "true",
         ).lower() in ("true", "1", "yes")
         self.ONEDRIVE_PARTITION_MIN_BYTES = int(os.getenv(
-            "ONEDRIVE_PARTITION_MIN_BYTES", str(5 * 1024 * 1024 * 1024),
+            "ONEDRIVE_PARTITION_MIN_BYTES", str(1024 * 1024 * 1024),
         ))
         self.ONEDRIVE_PARTITION_MIN_FILES = int(os.getenv(
-            "ONEDRIVE_PARTITION_MIN_FILES", "200",
+            "ONEDRIVE_PARTITION_MIN_FILES", "50",
         ))
         self.ONEDRIVE_PARTITION_MAX_SHARDS = int(os.getenv(
-            "ONEDRIVE_PARTITION_MAX_SHARDS", "4",
+            "ONEDRIVE_PARTITION_MAX_SHARDS", "8",
         ))
         self.ONEDRIVE_PARTITION_TARGET_BYTES_PER_SHARD = int(os.getenv(
             "ONEDRIVE_PARTITION_TARGET_BYTES_PER_SHARD",
-            str(20 * 1024 * 1024 * 1024),
+            str(128 * 1024 * 1024),
         ))
         # Partition consumer's per-shard timeout. Default 6h matches the
         # legacy per-file timeout; a stuck shard past this triggers
@@ -652,8 +652,9 @@ class Settings:
         # ── USER_CHATS cross-replica partition ──
         # Immutable catalogue writing is opt-in. Adopted resources fail
         # closed when disabled; they never return to history-union writes.
-        # Activate v2 only after the additive schema/readers are deployed.
-        self.CHAT_OBSERVATION_HASH_VERSION = int(os.getenv("CHAT_OBSERVATION_HASH_VERSION", "1"))
+        # v2 (default since 2026-11-06, validated on Railway) ignores Graph's rotating reaction
+        # presentation; the first run after switching rewrites each chat's observation once.
+        self.CHAT_OBSERVATION_HASH_VERSION = int(os.getenv("CHAT_OBSERVATION_HASH_VERSION", "2"))
         if self.CHAT_OBSERVATION_HASH_VERSION not in (1, 2):
             raise ValueError("CHAT_OBSERVATION_HASH_VERSION must be 1 or 2")
         self.CHAT_CATALOGUE_WRITER_ENABLED = os.getenv(
@@ -722,17 +723,17 @@ class Settings:
         # backup.high serially. Tiny users (<25 chats) still run inline
         # to avoid the per-shard publish overhead.
         self.CHATS_PARTITION_MIN_CHATS = int(os.getenv(
-            "CHATS_PARTITION_MIN_CHATS", "25",
+            "CHATS_PARTITION_MIN_CHATS", "5",
         ))
         self.CHATS_PARTITION_TARGET_CHATS_PER_SHARD = int(os.getenv(
-            "CHATS_PARTITION_TARGET_CHATS_PER_SHARD", "50",
+            "CHATS_PARTITION_TARGET_CHATS_PER_SHARD", "2",
         ))
         # 2026-05-17 prod tuning: 4 → 6 so power users (executives with
         # 500+ chats) drain ~33% faster. The 8-light × 12-prefetch =
         # 96-shard cluster budget for backup.chats_partition still
         # comfortably absorbs the new shard count.
         self.CHATS_PARTITION_MAX_SHARDS = int(os.getenv(
-            "CHATS_PARTITION_MAX_SHARDS", "6",
+            "CHATS_PARTITION_MAX_SHARDS", "8",
         ))
 
         # ── Phase 3.2: Mail partition (covers USER_MAIL / MAILBOX /
@@ -859,7 +860,7 @@ class Settings:
         # whale chats from monopolizing every partition slot on a
         # replica when other tenants also want service.
         self.MAX_CONCURRENT_PARTITIONS_PER_TENANT = int(os.getenv(
-            "MAX_CONCURRENT_PARTITIONS_PER_TENANT", "2",
+            "MAX_CONCURRENT_PARTITIONS_PER_TENANT", "16",
         ))
         # Stale-sweep retry budget — once retry_count crosses this
         # threshold, the partition row is marked FAILED and stops
@@ -920,14 +921,14 @@ class Settings:
         # override up (to 60-80) only after measuring 429 rates and
         # confirming no compliance flag.
         self.GRAPH_APP_PACE_REQS_PER_SEC = float(
-            os.getenv("GRAPH_APP_PACE_REQS_PER_SEC", "40.0")
+            os.getenv("GRAPH_APP_PACE_REQS_PER_SEC", "60.0")
         )
         # Per-stream (= per concurrent backup) sustained rate cap.
         # 1.0 → 2.0 so individual user backups can issue ~2 Graph calls/sec
         # of sustained work. The per-app rate-limiter still caps the
         # aggregate, so a single fat user can't monopolize an app.
         self.GRAPH_STREAM_PACE_REQS_PER_SEC = float(
-            os.getenv("GRAPH_STREAM_PACE_REQS_PER_SEC", "2.0")
+            os.getenv("GRAPH_STREAM_PACE_REQS_PER_SEC", "4.0")
         )
         # EXPERIMENTAL (default off): spread a single stream's page fetches
         # across the multi-app pool from the FIRST page instead of pinning
@@ -968,7 +969,7 @@ class Settings:
         # tail latency on hot tenants.
         self.GRAPH_THROTTLE_BACKOFF_SECONDS = [
             int(x) for x in os.getenv(
-                "GRAPH_THROTTLE_BACKOFF_SECONDS", "10,30,60,180,300"
+                "GRAPH_THROTTLE_BACKOFF_SECONDS", "60,120,240,480,600"
             ).split(",") if x.strip()
         ]
         # Sequence for transient network errors (not throttle).
@@ -984,7 +985,7 @@ class Settings:
         # only a 250ms safety margin is needed to avoid micro-burst
         # contention.
         self.GRAPH_POST_THROTTLE_BRAKE_MS = int(
-            os.getenv("GRAPH_POST_THROTTLE_BRAKE_MS", "250")
+            os.getenv("GRAPH_POST_THROTTLE_BRAKE_MS", "500")
         )
         # Hard cap on total wait time per stream. After this, raise and let
         # RabbitMQ redeliver (resume from last checkpoint).

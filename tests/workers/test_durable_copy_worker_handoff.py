@@ -366,8 +366,8 @@ async def test_resume_uses_persisted_continuation_and_never_restarts_graph(
 
 
 @pytest.mark.parametrize("environment,expected", [
-    ({}, {"concurrency": 2, "batch_size": 512, "statement_timeout_ms": 60000,
-          "lock_timeout_ms": 5000, "poll_s": 1, "recovery_s": 10}),
+    ({}, {"concurrency": 4, "batch_size": 2000, "statement_timeout_ms": 60000,
+          "lock_timeout_ms": 2000, "poll_s": 1, "recovery_s": 5}),
     ({"COPY_WORK_CONCURRENCY": "4", "COPY_WORK_BATCH_ROWS": "128",
       "COPY_WORK_STATEMENT_TIMEOUT_MS": "45000", "COPY_WORK_LOCK_TIMEOUT_MS": "2000",
       "COPY_WORK_POLL_SECONDS": "0.25", "COPY_WORK_RECOVERY_SECONDS": "3.5"},

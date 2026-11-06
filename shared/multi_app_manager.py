@@ -17,12 +17,14 @@ from shared.graph_ratelimit import AsyncTokenBucket
 # 429_WINDOW_S × 429_THRESHOLD: count 429s in this sliding window;
 # crossing the threshold escalates the ban instead of honoring just
 # Retry-After.
+# 2026-11-06: defaults below reverted to the pre-May values Railway runs with (validated
+# 10+10 replicas); the May tuning assumed a 20-app pool, TM runs 6.
 _WINDOW_S = float(__import__("os").getenv("GRAPH_APP_429_WINDOW_S", "60"))
 # 2026-05-17 prod tuning: 3 → 5. With 20 apps the rotator absorbs
 # transient 429s by migrating to a healthy app on the next attempt —
 # we don't need to ban an app after just 3 hits in a 60s window, that's
 # over-aggressive and wastes ~5% of our app fleet during a normal burst.
-_WINDOW_429_THRESHOLD = int(__import__("os").getenv("GRAPH_APP_429_THRESHOLD", "5"))
+_WINDOW_429_THRESHOLD = int(__import__("os").getenv("GRAPH_APP_429_THRESHOLD", "3"))
 
 # Escalating ban ladder (seconds). Each consecutive triggering window
 # moves one step up. Resets after RECOVERY_SUCCESS_COUNT consecutive
@@ -36,14 +38,14 @@ _WINDOW_429_THRESHOLD = int(__import__("os").getenv("GRAPH_APP_429_THRESHOLD", "
 #     2-3 are simultaneously banned.
 _BAN_LADDER = [
     int(x) for x in
-    (__import__("os").getenv("GRAPH_APP_BAN_LADDER", "10,60,300,900")).split(",")
+    (__import__("os").getenv("GRAPH_APP_BAN_LADDER", "5,30,300,1800")).split(",")
 ]
 _PROBATION_OK_COUNT = int(__import__("os").getenv("GRAPH_APP_PROBATION_OK", "3"))
 # 2026-05-17 prod tuning: 50 → 30. Faster reset means a recovered app
 # climbs back to full rate sooner — important for the 50-user manual
 # burst use case where one momentarily-banned app shouldn't sit at
 # probation rate for half a minute.
-_RECOVERY_SUCCESS_COUNT = int(__import__("os").getenv("GRAPH_APP_RESET_AFTER_OK", "30"))
+_RECOVERY_SUCCESS_COUNT = int(__import__("os").getenv("GRAPH_APP_RESET_AFTER_OK", "50"))
 
 # Adaptive rate: multiplicative decrease on 429, additive increase on
 # sustained quiet. Floor prevents rate dropping to zero on persistent
@@ -52,7 +54,7 @@ _RATE_DECREASE_FACTOR = float(__import__("os").getenv("GRAPH_APP_RATE_DEC", "0.5
 _RATE_INCREASE_FACTOR = float(__import__("os").getenv("GRAPH_APP_RATE_INC", "1.5"))
 # 2026-05-17 prod tuning: 30s → 15s quiet period before bumping rate
 # back up. Apps recover faster from transient throttle bursts.
-_RATE_RECOVERY_QUIET_S = float(__import__("os").getenv("GRAPH_APP_RATE_RECOVER_S", "15"))
+_RATE_RECOVERY_QUIET_S = float(__import__("os").getenv("GRAPH_APP_RATE_RECOVER_S", "30"))
 _RATE_FLOOR = float(__import__("os").getenv("GRAPH_APP_RATE_FLOOR", "0.25"))
 
 
