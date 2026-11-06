@@ -405,3 +405,15 @@ async def test_batch_is_capped_by_stored_bytes_but_always_takes_one_row(store, m
     monkeypatch.setattr(executor(), "BATCH_MAX_BYTES", 1)
     assert (await batch(store, task, 20))["rows"] == 1
     assert [r["external_id"] for r in await store.rows()] == ["a", "b", "c"]
+
+
+def test_batch_byte_cap_is_configurable(monkeypatch):
+    """COPY_BATCH_MAX_BYTES sizes copy batches without a rebuild (operators tune it against
+    COPY_WORK_STATEMENT_TIMEOUT_MS)."""
+    module = executor()
+    monkeypatch.setenv("COPY_BATCH_MAX_BYTES", str(48 * 1024 * 1024))
+    try:
+        assert importlib.reload(module).BATCH_MAX_BYTES == 48 * 1024 * 1024
+    finally:
+        monkeypatch.delenv("COPY_BATCH_MAX_BYTES")
+        importlib.reload(module)
