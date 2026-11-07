@@ -379,6 +379,19 @@ class StrictChatGraphSource:
                 found.append(row)
         return found
 
+    async def changed_chats_since(self, since, until):
+        """(chat ids with a message modified in (since, until), pages, messages): one per-user
+        getAllMessages sweep (export API, no charge since 2025-08-25, 200 rps/app/tenant) instead of
+        one request per chat. Rows are unordered; edits and soft deletes bump lastModifiedDateTime."""
+        window = (f"lastModifiedDateTime gt {since:%Y-%m-%dT%H:%M:%S.000Z}"
+                  f" and lastModifiedDateTime lt {until:%Y-%m-%dT%H:%M:%S.000Z}")
+        changed, pages, messages = set(), 0, 0
+        async for page in self._pages(f"/users/{_component(self.principal_id)}/chats/getAllMessages",
+                                      params={"$top": "250", "$filter": window}):
+            pages, messages = pages + 1, messages + len(page)
+            changed.update(row["chatId"] for row in page if isinstance(row.get("chatId"), str) and row["chatId"])
+        return changed, pages, messages
+
     async def latest_message_change(self, chat_id: str):
         """Modification time of the chat's most recently modified message (None when empty):
         one request, used by the incremental unchanged-chat check."""

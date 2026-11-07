@@ -712,6 +712,12 @@ class Settings:
         # chat, missing/deltalink cursor, no prior snapshot, or error → full
         # drain). DEFAULT OFF — needs a no-missed-message validation run
         # (add a chat message → incremental → confirm captured) before enabling.
+        # One getAllMessages sweep per user (lastModifiedDateTime window) names the chats changed since
+        # the source backup; the per-chat change check then runs only for those, not for every chat the
+        # delta feed shows unchanged (TM: 3,500 users -> 100k+ per-chat requests per run). Off by default.
+        self.CHAT_ALLMESSAGES_CHANGE_SWEEP = os.getenv(
+            "CHAT_ALLMESSAGES_CHANGE_SWEEP", "false",
+        ).lower() in ("true", "1", "yes")
         self.CHAT_USER_LEVEL_SKIP_ENABLED = os.getenv(
             "CHAT_USER_LEVEL_SKIP_ENABLED", "false",
         ).lower() in ("true", "1", "yes")

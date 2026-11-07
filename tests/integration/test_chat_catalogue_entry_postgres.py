@@ -6,7 +6,7 @@ import importlib
 import importlib.util
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 from types import SimpleNamespace
 from pathlib import Path
@@ -728,6 +728,87 @@ async def test_delta_feed_silence_never_links_a_chat_whose_message_was_edited(st
     after = await chat_state(store, second.snapshot_id)
     assert len(after[0]) == 2 and after[1] != before[1]
     assert await chat_state(store, first.snapshot_id) == before
+
+
+async def test_allmessages_sweep_replaces_the_per_chat_checks_of_unchanged_chats(store, source_adapter, monkeypatch, caplog):
+    """3,500 users x ~100 chats per-chat checks take hours at Teams' per-chat limit. With
+    CHAT_ALLMESSAGES_CHANGE_SWEEP one getAllMessages sweep per user names the chats changed since the
+    source backup read them: only those are checked, every other chat links with no request."""
+    import logging
+    from shared.config import settings
+    monkeypatch.setattr(settings, "CHAT_ALLMESSAGES_CHANGE_SWEEP", True, raising=False)
+    source = source_adapter.source
+    source.chats.append({"id": "chat-beta", "topic": "Beta"})
+    source.messages["chat-beta"] = [{"id": "message-beta", "body": {"content": "b"}, "attachments": []}]
+    old = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    feed, rounds, checks = [], [], []
+    delta_source(source, feed, rounds, checks, latest_at=old)
+    sweeps = []
+
+    async def sweep(since, until):
+        sweeps.append((since, until))
+        return set(swept), 1, len(swept)
+    source.changed_chats_since = sweep
+    first = await legacy_scope(store)
+    await source_adapter.run(first)
+    before, reads, checked = await chat_state(store, first.snapshot_id), len(source.message_calls), len(checks)
+
+    swept = set()
+    feed.append(set())
+    second = await store.new_scope()
+    with caplog.at_level(logging.INFO, logger="shared.chat_capture"):
+        assert (await source_adapter.run(second))["outcome"] == "complete"
+    assert checks[checked:] == [] and source.message_calls[reads:] == [] and len(sweeps) == 1
+    assert await chat_state(store, second.snapshot_id) == before
+    since, until = sweeps[0]
+    assert since < until and until - since < timedelta(hours=1)   # the source backup ran just now, minus margins
+    line = [r.getMessage() for r in caplog.records if r.getMessage().startswith("chat_allmessages_sweep")]
+    assert len(line) == 1 and "changed_chats=0" in line[0] and "fallback=False" in line[0]
+
+    # An edit the delta feed missed: the sweep names chat-beta, its check confirms, it is re-read.
+    source.messages["chat-beta"] = [{"id": "message-beta", "body": {"content": "edited"}, "attachments": []}]
+    async def latest(chat_id):
+        checks.append(chat_id)
+        return datetime.now(timezone.utc) if chat_id == "chat-beta" else old
+    source.latest_message_change = latest
+    swept, checked = {"chat-beta", "chat-not-listed"}, len(checks)
+    feed.append(set())
+    third = await store.new_scope()
+    assert (await source_adapter.run(third))["outcome"] == "complete"
+    assert set(checks[checked:]) == {"chat-beta"} and set(source.message_calls[reads:]) == {"chat-beta"}
+    assert (await chat_state(store, third.snapshot_id))[1] != before[1]
+
+
+async def test_allmessages_sweep_failure_falls_back_to_per_chat_checks(store, source_adapter, monkeypatch):
+    from shared.chat_capture_graph import ChatGraphError
+    from shared.config import settings
+    monkeypatch.setattr(settings, "CHAT_ALLMESSAGES_CHANGE_SWEEP", True, raising=False)
+    source = source_adapter.source
+    feed, rounds, checks = [], [], []
+    delta_source(source, feed, rounds, checks, latest_at=datetime(2020, 1, 1, tzinfo=timezone.utc))
+
+    async def refused(since, until):
+        raise ChatGraphError("Graph capture metadata failed with HTTP 403", status_code=403)
+    source.changed_chats_since = refused
+    await source_adapter.run(await legacy_scope(store))
+    reads = len(source.message_calls)
+    feed.append(set())
+    assert (await source_adapter.run(await store.new_scope()))["outcome"] == "complete"
+    assert checks == ["chat-alpha"] and len(source.message_calls) == reads
+
+
+async def test_allmessages_sweep_flag_off_keeps_per_chat_checks(store, source_adapter):
+    source = source_adapter.source
+    feed, rounds, checks = [], [], []
+    delta_source(source, feed, rounds, checks, latest_at=datetime(2020, 1, 1, tzinfo=timezone.utc))
+
+    async def never(since, until):
+        raise AssertionError("sweep used with the flag off")
+    source.changed_chats_since = never
+    await source_adapter.run(await legacy_scope(store))
+    feed.append(set())
+    assert (await source_adapter.run(await store.new_scope()))["outcome"] == "complete"
+    assert checks == ["chat-alpha"]
 
 
 async def test_bulk_link_uses_the_check_another_member_shared_for_this_run(store, source_adapter, monkeypatch):

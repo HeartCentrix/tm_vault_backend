@@ -1341,8 +1341,24 @@ async def _shared_latest_changes(run_key, tenant_id, chat_ids, probe) -> dict:
     return found
 
 
+async def _sweep_changed_chats(changed_since, principal_id, now, overlap, observed_times):
+    """Chats changed since the earliest reading (minus the overlap and CHAT_ALLMESSAGES_SWEEP_MARGIN_MIN),
+    or None: no sweep, or it failed and every chat takes its own check."""
+    if changed_since is None:
+        return None
+    since = min(observed_times) - overlap - timedelta(minutes=float(os.getenv("CHAT_ALLMESSAGES_SWEEP_MARGIN_MIN", "10")))
+    changed, pages, messages, failed = None, 0, 0, False
+    try:
+        changed, pages, messages = await changed_since(since, now)
+    except Exception as exc:
+        failed = type(exc).__name__
+    logger.info("chat_allmessages_sweep user=%s since=%s pages=%s msgs=%s changed_chats=%s fallback=%s",
+                principal_id, since.isoformat(), pages, messages, len(changed) if changed is not None else None, failed)
+    return changed
+
+
 async def link_unchanged_chats(*, scopes, folders, filter_hashes, session_factory, source_snapshot_id,
-                               latest_change, whole_snapshot=False, external_chats=None) -> set:
+                               latest_change, whole_snapshot=False, external_chats=None, changed_since=None) -> set:
     """Publish, in one step, every chat of ``scopes`` that the principal's delta feed showed unchanged
     since ``source_snapshot_id`` (whose run started the feed's cursor) from its COMPLETE publication
     there. Same scope, observation version, weekly full-read deadline and one-request change check
@@ -1350,7 +1366,9 @@ async def link_unchanged_chats(*, scopes, folders, filter_hashes, session_factor
     message (Railway 2026-11-05). Chats that do not qualify are left for the per-chat path. Returns
     the chat ids published. The change check of each chat is shared by every member of the run
     (_shared_latest_changes). ``whole_snapshot``: ``scopes`` are every chat of this backup; when all of
-    them link and match the source backup exactly, the backup points at it instead (_point_at_source)."""
+    them link and match the source backup exactly, the backup points at it instead (_point_at_source).
+    ``changed_since(since, until)``: one per-user sweep naming the chats with a message modified since the
+    earliest reading of these chats; only those take the per-chat check (any sweep error: all of them do)."""
     if not scopes:
         return set()
     from shared.snapshot_reuse import items_snapshot_id
@@ -1387,8 +1405,13 @@ async def link_unchanged_chats(*, scopes, folders, filter_hashes, session_factor
         eligible.append((attempt, inventory, observed, full))
 
     run_key = await run_catalogue_transaction(session_factory, run_of) or any_scope.snapshot_id
-    latest = await _shared_latest_changes(run_key, any_scope.tenant_id,
-                                          [attempt.chat_id for attempt, *_ in eligible], latest_change)
+    to_check = [attempt.chat_id for attempt, *_ in eligible]
+    swept = await _sweep_changed_chats(changed_since, any_scope.principal_id, now, overlap,
+                                       [observed for _, _, observed, _ in eligible]) if eligible else None
+    if swept is not None:
+        to_check = [cid for cid in to_check if cid in swept]
+    latest = {cid: None for cid in (attempt.chat_id for attempt, *_ in eligible)}
+    latest.update(await _shared_latest_changes(run_key, any_scope.tenant_id, to_check, latest_change))
     already_read = await _changes_already_read(session_factory, {
         attempt.chat_id: (inventory.id, latest[attempt.chat_id]) for attempt, inventory, observed, _ in eligible
         if latest[attempt.chat_id] and observed - overlap < latest[attempt.chat_id] <= observed})

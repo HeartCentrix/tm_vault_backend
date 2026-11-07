@@ -784,6 +784,29 @@ async def test_latest_message_change_reads_one_newest_modified_message(source_fa
     assert len([r for r in requests if r.url.host == "graph.microsoft.com"]) == 1
 
 
+async def test_changed_chats_since_sweeps_every_chat_of_the_user_in_one_window(source_factory):
+    """One getAllMessages sweep (lastModifiedDateTime window, nextLink pages) names the changed chats;
+    a message with no chat is ignored."""
+    from datetime import datetime, timezone
+    make, requests, *_ = source_factory
+    pages = [{"value": [{"id": "1", "chatId": "a"}, {"id": "2", "chatId": None}],
+              "@odata.nextLink": "https://graph.microsoft.com/v1.0/users/user/chats/getAllMessages?$skiptoken=x"},
+             {"value": [{"id": "3", "chatId": "b"}, {"id": "4", "chatId": "a"}]}]
+
+    def handler(request):
+        assert request.url.path == "/v1.0/users/user/chats/getAllMessages"
+        return httpx.Response(200, json=pages.pop(0))
+
+    since, until = datetime(2026, 11, 4, 1, 0, tzinfo=timezone.utc), datetime(2026, 11, 5, 2, 30, tzinfo=timezone.utc)
+    async with make(handler) as source:
+        changed, page_count, messages = await source.changed_chats_since(since, until)
+    assert (changed, page_count, messages) == ({"a", "b"}, 2, 4)
+    first = [r for r in requests if r.url.host == "graph.microsoft.com"][0]
+    assert first.url.params["$top"] == "250"
+    assert first.url.params["$filter"] == ("lastModifiedDateTime gt 2026-11-04T01:00:00.000Z"
+                                           " and lastModifiedDateTime lt 2026-11-05T02:30:00.000Z")
+
+
 async def test_latest_message_change_of_an_empty_chat_is_none_and_bad_rows_fail(source_factory):
     from shared.chat_capture_graph import ChatGraphError
     make, *_ = source_factory

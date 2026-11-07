@@ -707,12 +707,14 @@ async def run_chat_catalogue_resource(*, resource_id, snapshot_id, writer_enable
                 unchanged = [cid for cid in keys if changed is not None and cid not in changed and cid not in published]
                 if unchanged and since_snapshot and not full_backup:
                     from shared.chat_capture import link_unchanged_chats
+                    from shared.config import settings
                     # First turn, every chat unchanged: the backup may point at its source (exact match only).
                     linked = await link_unchanged_chats(scopes={cid: chat_scope(cid) for cid in unchanged},
                         folders={cid: chat_folder(chats[cid], principal) for cid in unchanged},
                         filter_hashes={cid: filters[cid][1] for cid in unchanged},
                         session_factory=session_factory, source_snapshot_id=since_snapshot,
                         latest_change=source.latest_message_change,
+                        changed_since=source.changed_chats_since if settings.CHAT_ALLMESSAGES_CHANGE_SWEEP else None,
                         whole_snapshot=not published and len(unchanged) == len(keys), external_chats=set(external))
                     if linked:
                         completed += len(linked)
