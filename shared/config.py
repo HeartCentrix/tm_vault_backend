@@ -714,9 +714,11 @@ class Settings:
         # (add a chat message → incremental → confirm captured) before enabling.
         # One getAllMessages sweep per user (lastModifiedDateTime window) names the chats changed since
         # the source backup; the per-chat change check then runs only for those, not for every chat the
-        # delta feed shows unchanged (TM: 3,500 users -> 100k+ per-chat requests per run). Off by default.
+        # delta feed shows unchanged (TM: 3,500 users -> 100k+ per-chat requests per run). On by default
+        # (Railway 2026-11-07: same changed-chat set as per-chat checks, 0 fallbacks); any sweep error
+        # falls back to the per-chat checks.
         self.CHAT_ALLMESSAGES_CHANGE_SWEEP = os.getenv(
-            "CHAT_ALLMESSAGES_CHANGE_SWEEP", "false",
+            "CHAT_ALLMESSAGES_CHANGE_SWEEP", "true",
         ).lower() in ("true", "1", "yes")
         self.CHAT_USER_LEVEL_SKIP_ENABLED = os.getenv(
             "CHAT_USER_LEVEL_SKIP_ENABLED", "false",
@@ -934,7 +936,7 @@ class Settings:
         # of sustained work. The per-app rate-limiter still caps the
         # aggregate, so a single fat user can't monopolize an app.
         self.GRAPH_STREAM_PACE_REQS_PER_SEC = float(
-            os.getenv("GRAPH_STREAM_PACE_REQS_PER_SEC", "4.0")
+            os.getenv("GRAPH_STREAM_PACE_REQS_PER_SEC", "8.0")
         )
         # EXPERIMENTAL (default off): spread a single stream's page fetches
         # across the multi-app pool from the FIRST page instead of pinning
