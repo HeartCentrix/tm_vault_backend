@@ -2853,6 +2853,7 @@ async def _dispatch_policy_backups_impl(
             dispatch_batch_id=dispatch_batch_id,
             deferred_resource_ids=deferred_resource_ids,
             overlap_held_resource_ids=overlap_held_resource_ids,
+            sla_skipped_resource_ids=[str(r.id) for r in skipped_resources],
             wave=1,
         )
 
@@ -2873,6 +2874,7 @@ async def _dispatch_resources(
     dispatch_batch_id: str,
     deferred_resource_ids: List[str],
     overlap_held_resource_ids: List[str],
+    sla_skipped_resource_ids: Sequence[str] = (),
     wave: int = 1,
 ) -> Tuple[int, set]:
     """Build one QUEUED Job per ``type:tenant`` group (1000-resource
@@ -2967,6 +2969,10 @@ async def _dispatch_resources(
                     # Separate key on purpose: same rollup treatment,
                     # different reason (cap = capacity, overlap = duration).
                     "overlap_held_resource_ids": overlap_held_resource_ids,
+                    # Resources the policy's workload flags exclude
+                    # (BACKUP_SKIPPED_SLA_SCOPE) — never dispatched, so the
+                    # rollup must not expect them as Tier-2 children.
+                    "sla_skipped_resource_ids": list(sla_skipped_resource_ids),
                     # Lane the message was published on. The outbox
                     # reconciler republishes on spec.queue (defaulting to
                     # backup.urgent when absent), so recording it keeps a
@@ -3225,6 +3231,10 @@ async def drain_policy_cycle(
                 dispatch_batch_id=batch_id,
                 deferred_resource_ids=[str(r.id) for r in remaining],
                 overlap_held_resource_ids=[str(r.id) for r in held],
+                # Re-derived: a drain-opened cycle has no cron wave carrying it.
+                sla_skipped_resource_ids=[str(row[0]) for row in (await session.execute(
+                    dispatch_policy.build_sla_skipped_ids_query(policy.id, enabled_types)
+                )).all()],
                 wave=wave,
             )
             details = dispatch_policy.wave_audit_details(

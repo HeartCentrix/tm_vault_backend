@@ -592,6 +592,16 @@ def build_drainable_policies_query():
     ))
 
 
+def build_sla_skipped_ids_query(policy_id: Any, enabled_types: Collection[str]):
+    """Ids of the policy's dispatchable resources whose workload the policy
+    disables — the drain's copy of the cron's BACKUP_SKIPPED_SLA_SCOPE list."""
+    return select(Resource.id).where(and_(
+        Resource.sla_policy_id == policy_id,
+        Resource.status.in_([ResourceStatus.DISCOVERED, ResourceStatus.ACTIVE]),
+        Resource.type.notin_([ResourceType(t) for t in enabled_types]),
+    ))
+
+
 def build_drain_candidates_query(
     policy_id: Any, since: datetime, enabled_types: Collection[str],
 ):

@@ -290,3 +290,36 @@ async def test_held_resources_are_not_dropped_forever(wired):
         "the retry lands under a NEW batch_id — which is exactly why the "
         "first batch can never observe it and needs the recorded hold"
     )
+
+
+@pytest.mark.parametrize("flag,rtype", [
+    ("backup_exchange_archive", "USER_ARCHIVE"),
+    ("backup_teams_chats", "USER_CHATS"),
+    ("backup_onedrive", "USER_ONEDRIVE"),
+])
+async def test_sla_scope_skips_are_written_into_every_job_spec(
+        wired, monkeypatch, flag, rtype):
+    """Railway 2026-11: Silver (no archives) + a USER_ARCHIVE child. The
+    policy-flag filter drops it from dispatch; unless the batch records
+    that, the rollup's expected_t2 wants it forever (In Progress 95 %).
+    Driven off the actual skipped list, so any disabled workload works."""
+    monkeypatch.setenv("ARCHIVE_BACKUP_ENABLED", "true")
+    users = [_resource("ENTRA_USER") for _ in range(2)]
+    skipped = [_resource(rtype) for _ in range(2)]
+    policy = _policy()
+    setattr(policy, flag, False)
+    session = await wired(resources=users + skipped, inflight_ids=set(),
+                          inflight_jobs=0, policy=policy)
+    assert session.added
+    dispatched = {str(rid) for j in session.added for rid in j.batch_resource_ids}
+    assert dispatched == {str(r.id) for r in users}
+    for spec in _specs(session):
+        assert sorted(spec["sla_skipped_resource_ids"]) == sorted(
+            str(r.id) for r in skipped)
+
+
+async def test_no_sla_skip_records_an_empty_list(wired):
+    users = [_resource("ENTRA_USER") for _ in range(2)]
+    session = await wired(resources=users, inflight_ids=set(), inflight_jobs=0)
+    for spec in _specs(session):
+        assert spec["sla_skipped_resource_ids"] == []

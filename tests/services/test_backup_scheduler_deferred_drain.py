@@ -81,6 +81,7 @@ class _Session:
         self.added = []
         self.committed = False
         self.seen = []
+        self.sla_skipped = []
 
     async def __aenter__(self):
         return self
@@ -105,6 +106,8 @@ class _Session:
             return _Result([(self.max_wave,)])
         if q is _Q_POLICIES:
             return _Result([(self.policy.id,)])
+        if q is _Q_SLA_SKIPPED:
+            return _Result([(rid,) for rid in self.sla_skipped])
         raise AssertionError(f"unexpected query {q!r}")
 
     def add(self, obj):
@@ -152,6 +155,7 @@ def wired(monkeypatch):
     monkeypatch.setattr(dp, "build_cycle_batch_id_query", lambda pid, since: _Q_BATCH_ID)
     monkeypatch.setattr(dp, "build_cycle_max_wave_query", lambda pid, since: _Q_MAX_WAVE)
     monkeypatch.setattr(dp, "build_drainable_policies_query", lambda: _Q_POLICIES)
+    monkeypatch.setattr(dp, "build_sla_skipped_ids_query", lambda pid, types_: _Q_SLA_SKIPPED)
     monkeypatch.setattr(sched, "_policy_cycle_trigger", lambda policy: SILVER_TRIGGER)
     monkeypatch.delenv("BACKUP_CYCLE_DRAIN", raising=False)
     sched._cycle_exhausted_until.clear()
@@ -181,6 +185,9 @@ def wired(monkeypatch):
         return policy, session
 
     return types.SimpleNamespace(make=make, events=events, audits=audits)
+
+
+_Q_SLA_SKIPPED = "Q:sla_skipped"
 
 
 def _ids(session):
@@ -440,3 +447,14 @@ def test_drain_tick_is_registered_with_safe_apscheduler_options():
                    "max_instances=1", "coalesce=True", "misfire_grace_time=30",
                    "dispatch_policy.drain_tick_seconds()"):
         assert needle in block, needle
+
+
+async def test_drain_wave_records_sla_scope_skips(wired):
+    """A drain-opened cycle has no cron wave carrying the policy-flag skips,
+    so the drain must stamp them too or the rollup waits on them forever."""
+    policy, session = wired.make(candidates=[_row() for _ in range(3)], batch_id=None)
+    skipped = uuid.uuid4()
+    session.sla_skipped = [skipped]
+    assert await sched.drain_policy_cycle(str(policy.id), now=NOW)
+    for j in session.added:
+        assert j.spec["sla_skipped_resource_ids"] == [str(skipped)]

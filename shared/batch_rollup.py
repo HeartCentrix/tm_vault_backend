@@ -385,7 +385,7 @@ def _withheld_children_cte(cte_name: str, spec_key: str, comment: str) -> str:
     )"""
 
 
-# The two withhold REASONS are stamped under separate spec keys and read
+# The withhold REASONS are stamped under separate spec keys and read
 # by separate CTEs on purpose. Conflating them into one list would lose
 # the information an operator needs to answer "why did this resource not
 # run this cycle?" — a concurrency-cap deferral is a capacity signal
@@ -424,6 +424,17 @@ _OVERLAP_HELD_COMMENT = """\
         -- (batch 2123e84f, 8 USER_CHATS snapshots), so batch 667734c3
         -- could never go terminal and its Activity row read
         -- "BACKUP · In Progress · 15 %" forever."""
+
+
+_SLA_SKIPPED_COMMENT = """\
+        -- Children whose workload the batch's SLA policy DISABLES
+        -- (spec.sla_skipped_resource_ids: the scheduler's / job-service's
+        -- policy-flag filter, audited as BACKUP_SKIPPED_SLA_SCOPE). They
+        -- are never dispatched, so expecting them wedged the row at
+        -- "In Progress 95 %" for the whole 48h horizon (Railway 2026-11:
+        -- Silver, no Online archives, user with a USER_ARCHIVE child).
+        -- Driven off the recorded list, not type names, so any custom SLA
+        -- with any workload flag off is covered."""
 
 
 def build_batch_rollup_query(
@@ -493,7 +504,7 @@ def build_batch_rollup_query(
                 f"expected one of {sorted(_ALLOWED_OPERATIONS)}"
             )
         op_filter = f"AND j.type = '{op}'"
-    # One generator for both withhold reasons: the CTEs are structurally
+    # One generator for every withhold reason: the CTEs are structurally
     # identical and a hand-copied second one is exactly how the jsonb_typeof
     # guard would silently go missing from the newer of the two.
     withheld_ctes = ",".join((
@@ -503,6 +514,10 @@ def build_batch_rollup_query(
         _withheld_children_cte(
             "overlap_held_t2", "overlap_held_resource_ids",
             _OVERLAP_HELD_COMMENT,
+        ),
+        _withheld_children_cte(
+            "sla_skipped_t2", "sla_skipped_resource_ids",
+            _SLA_SKIPPED_COMMENT,
         ),
     ))
     sql = f"""
@@ -776,7 +791,7 @@ def build_batch_rollup_query(
     ),
     fanout AS (
         -- A child counts as MISSING only when no job carried it AND no
-        -- dispatcher recorded withholding it. Both withhold reasons are
+        -- dispatcher recorded withholding it. All withhold reasons are
         -- recorded facts (see _withheld_children_cte); neither is
         -- inferred from coverage or timing.
         --
@@ -792,6 +807,7 @@ def build_batch_rollup_query(
             EXCEPT SELECT batch_id, child_resource_id FROM observed_t2
             EXCEPT SELECT batch_id, child_resource_id FROM deferred_t2
             EXCEPT SELECT batch_id, child_resource_id FROM overlap_held_t2
+            EXCEPT SELECT batch_id, child_resource_id FROM sla_skipped_t2
         ) missing
         GROUP BY 1
     ),

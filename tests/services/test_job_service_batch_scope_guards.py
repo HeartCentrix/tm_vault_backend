@@ -318,3 +318,31 @@ def test_deduped_single_trigger_409s_when_batch_has_no_job(monkeypatch, publishe
     assert exc.value.status_code == 409
     assert sess.added == []
     assert publishes == []
+
+
+def test_sla_disabled_children_are_recorded_on_every_job(publishes, monkeypatch):
+    """Manual click under a policy that disables a workload (Silver, no
+    archives): the USER_ARCHIVE child is filtered out and never gets a job.
+    Every job must record it so the Activity rollup doesn't wait on it."""
+    monkeypatch.setenv("ARCHIVE_BACKUP_ENABLED", "true")
+    pid = uuid.uuid4()
+    user = _resource(ResourceType.ENTRA_USER)
+    mail = _resource(ResourceType.USER_MAIL)
+    archive = _resource(ResourceType.USER_ARCHIVE)
+    for r in (user, mail, archive):
+        r.sla_policy_id = pid
+    sess = _FakeSession(orm_rows=[SlaPolicy(
+        id=pid, backup_entra_id=True, backup_exchange=True,
+        backup_exchange_archive=False)])
+
+    asyncio.run(_js._create_batch_backup_jobs(
+        resources_map={str(r.id): r for r in (user, mail, archive)},
+        db=sess, batch_id=str(uuid.uuid4()),
+    ))
+
+    jobs = [j for j in sess.added if getattr(j, "spec", None)]
+    assert jobs
+    fanned = {str(r) for j in jobs for r in (j.batch_resource_ids or [])}
+    assert str(archive.id) not in fanned
+    for j in jobs:
+        assert j.spec["sla_skipped_resource_ids"] == [str(archive.id)]

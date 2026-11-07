@@ -353,7 +353,8 @@ async def test_a_child_nobody_recorded_is_still_counted_missing(conn):
 
 
 @pytest.mark.parametrize("key", ["overlap_held_resource_ids",
-                                 "deferred_resource_ids"])
+                                 "deferred_resource_ids",
+                                 "sla_skipped_resource_ids"])
 async def test_a_malformed_hold_list_cannot_break_other_batches(conn, key):
     """j.spec is plain JSON, so a scalar under either withhold key makes
     jsonb_array_elements raise and takes down the rollup for EVERY batch
@@ -415,6 +416,42 @@ async def test_hold_and_cap_stay_separate_reasons(conn):
         " WHERE spec->>'batch_id' = $1", str(f.batch_id))
     rows = await run_rollup(conn)
     assert rows[str(f.batch_id)][0].missing_t2 == 7
+
+
+# ── SLA-scope skips: a workload the policy disables is never dispatched ─
+
+async def _silver_archive_batch(conn, *, spec_extra=None):
+    """Railway 2026-11 live shape: Silver (no Online archives), user Amit
+    has a USER_ARCHIVE child. The scheduler filters it out by policy flag
+    (BACKUP_SKIPPED_SLA_SCOPE); every job + snapshot COMPLETES, yet the
+    row sat "In Progress 95 %" for 48 h because expected_t2 wanted it."""
+    f = Fixture(conn)
+    user = await f.resource("ENTRA_USER")
+    mail = await f.resource("USER_MAIL", parent=user)
+    archive = await f.resource("USER_ARCHIVE", parent=user)
+    extra = spec_extra(archive) if spec_extra else {}
+    for ids in ([user], [mail]):
+        jid = await f.job(ids, spec_extra=extra)
+        for rid in ids:
+            await f.snapshot(jid, rid)
+    return f, archive
+
+
+async def test_recorded_sla_skip_lets_the_batch_go_terminal(conn, monkeypatch):
+    monkeypatch.setenv("ARCHIVE_BACKUP_ENABLED", "true")
+    f, _ = await _silver_archive_batch(
+        conn, spec_extra=lambda a: {"sla_skipped_resource_ids": [str(a)]})
+    row, shaped = (await run_rollup(conn))[str(f.batch_id)]
+    assert row.missing_t2 == 0
+    assert shaped["status"] == "Done"
+
+
+async def test_unrecorded_sla_skip_is_still_counted_missing(conn, monkeypatch):
+    monkeypatch.setenv("ARCHIVE_BACKUP_ENABLED", "true")
+    f, _ = await _silver_archive_batch(conn)
+    row, shaped = (await run_rollup(conn))[str(f.batch_id)]
+    assert row.missing_t2 == 1
+    assert shaped["status"] == "In Progress"
 
 
 # ── DEFECT 2: the progress bar must mean something ─────────────────────

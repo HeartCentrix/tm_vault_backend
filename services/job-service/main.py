@@ -692,6 +692,10 @@ async def _create_batch_backup_jobs(
                 # status / progress — only the displayed count omits
                 # them.
                 "tier2": bool(tier2),
+                # Resources the SLA's workload flags filtered out above:
+                # never dispatched, so the Activity rollup must not wait
+                # on them as Tier-2 children (shared/batch_rollup.py).
+                "sla_skipped_resource_ids": [s.resource_id for s in sla_skipped],
             },
         )
         db.add(job)
