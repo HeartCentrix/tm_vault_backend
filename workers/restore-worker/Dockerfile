@@ -2,7 +2,7 @@
 # Compiles the standalone C++17 PST writer (vendored from `PST Dev`) and
 # produces the `pst_convert` binary the worker shells out to. Aspose.Email
 # is no longer used; the .NET runtime stage was removed with this change.
-FROM debian:bookworm-slim AS pstwriter-build
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS pstwriter-build
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -35,7 +35,7 @@ RUN head -c 4 /src/build/bin/pst_convert | od -An -tx1 | grep -q "7f 45 4c 46" \
      && exit 1)
 
 # --- Stage 2: Python runtime ----------------------------------------------
-FROM python:3.11-slim
+FROM python:3.11.18-slim-trixie@sha256:07d4824036af339fa1b6ef769cc99d9c10a141769538b52b3b597c84f7a7b535
 
 WORKDIR /app
 
@@ -55,7 +55,7 @@ COPY shared /app/shared
 COPY workers/restore-worker /app/workers/restore-worker
 
 RUN pip install --default-timeout=300 --retries 5 --no-cache-dir \
-    -r /app/workers/restore-worker/requirements.txt
+    -r /app/workers/restore-worker/requirements.lock
 
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1

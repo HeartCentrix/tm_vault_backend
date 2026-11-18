@@ -21,3 +21,4 @@ prometheus_client>=0.20.0
 # Alembic for prod-safe schema migrations
 alembic>=1.13.0,<2
 python-jose[cryptography]==3.3.0
+greenlet==3.5.6  # SQLAlchemy asyncio needs it; explicit so a resolver change cannot drop it (2026-10-14 outage)
