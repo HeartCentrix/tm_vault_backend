@@ -98,6 +98,16 @@ async def _backfill_folder_paths():
         await session.commit()
 
 
+async def _maybe_backfill_folder_paths():
+    """Startup gate: the backfill scans all of snapshot_items, so it only runs
+    when SNAPSHOT_FOLDER_PATH_BACKFILL_ON_START=true. Call
+    _backfill_folder_paths() directly for a manual one-off."""
+    if not settings.snapshot_folder_path_backfill_on_start:
+        logger.info("[SNAPSHOT] folder_path backfill skipped (SNAPSHOT_FOLDER_PATH_BACKFILL_ON_START=false)")
+        return
+    await _backfill_folder_paths()
+
+
 async def _backfill_chat_topic_fallbacks():
     """One-shot: null out chat_threads.chat_topic rows that were poisoned with
     synthetic fallback display names ("Group Chat (19:abcd1)", "1-on-1 Chat
@@ -229,7 +239,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[SNAPSHOT] encryption hook install failed (non-fatal): {e}")
     try:
-        await _backfill_folder_paths()
+        await _maybe_backfill_folder_paths()
     except Exception as e:
         print(f"[SNAPSHOT] folder backfill failed (non-fatal): {e}")
     try:

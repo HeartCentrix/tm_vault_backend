@@ -1072,6 +1072,13 @@ class Settings:
             "CHAT_EXPORT_DYNAMIC_PREFETCH", "true"
         ).lower() in ("true", "1", "yes")
 
+        # snapshot-service folder_path backfill: three unbatched full-table
+        # UPDATEs on snapshot_items. Too heavy to run on every boot at
+        # customer scale; opt in for a one-off run.
+        self.snapshot_folder_path_backfill_on_start: bool = os.getenv(
+            "SNAPSHOT_FOLDER_PATH_BACKFILL_ON_START", "false"
+        ).lower() in ("true", "1", "yes")
+
         # Ceiling on how many chat bookkeeping DB writes (the
         # skip-by-activity pointer-write) may hold a pooled connection at
         # once, per worker PROCESS.
