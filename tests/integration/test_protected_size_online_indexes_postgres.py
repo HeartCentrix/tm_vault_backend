@@ -1,7 +1,8 @@
 """Migration 0014's snapshot_items/snapshots indexes are built without blocking writes. A plain
-CREATE INDEX locks writes for the whole build; TM's snapshot_items has ~532M rows in 16 hash
-partitions, and PostgreSQL cannot build an index on a partitioned parent CONCURRENTLY, so each
-partition is built concurrently and attached to an ON ONLY parent index."""
+CREATE INDEX locks writes for the whole build (TM's snapshot_items: ~806M rows, one plain table),
+and PostgreSQL cannot build an index on a partitioned parent CONCURRENTLY, so each partition is
+built concurrently and attached to an ON ONLY parent index. On a plain table an index an existing
+one already covers (PK btree(id)) is not built at all."""
 import os
 from uuid import uuid4
 
@@ -25,9 +26,10 @@ async def db(request):
     async with engine.begin() as conn:
         await conn.execute(text(f'CREATE SCHEMA "{schema}"'))
         await conn.execute(text("CREATE TABLE snapshots(id uuid PRIMARY KEY)"))
-        part = " PARTITION BY HASH(snapshot_id)" if request.param else ""
+        # Plain: TM's bootstrap shape, PK btree(id). Partitioned: the key must include snapshot_id.
+        key = "id, snapshot_id)) PARTITION BY HASH(snapshot_id)" if request.param else "id))"
         await conn.execute(text(f"CREATE TABLE snapshot_items(id uuid NOT NULL, snapshot_id uuid NOT NULL,"
-                                f" PRIMARY KEY(id, snapshot_id)){part}"))
+                                f" PRIMARY KEY({key}"))
         if request.param:
             for n in range(3):
                 await conn.execute(text(f"CREATE TABLE snapshot_items_p{n} PARTITION OF snapshot_items"
@@ -62,13 +64,30 @@ async def test_indexes_are_built_valid_and_attached_per_partition(db):
     await _build_all(engine)
     await _build_all(engine)  # idempotent
     state = await _state(engine)
+    # snapshots(id) and plain snapshot_items(id) are covered by their primary keys.
+    skipped = {"ix_protected_size_snapshots_page"} | (set() if partitioned else {"ix_protected_size_snapshot_items_identity"})
+    assert skipped.isdisjoint(state), state
     for name, table, _ in ONLINE_INDEXES:
+        if name in skipped:
+            continue
         valid, kids = state[name]
         assert valid, (name, state)
         assert kids == (3 if partitioned and table == "snapshot_items" else 0), (name, state)
     if partitioned:
         children = {k: v for k, v in state.items() if k not in {n for n, _, _ in ONLINE_INDEXES}}
         assert len(children) == 6 and all(v for v, _ in children.values()), state
+
+
+async def test_a_covered_index_left_invalid_is_dropped_not_rebuilt(db):
+    engine, partitioned = db
+    if partitioned:
+        pytest.skip("plain tables only")
+    async with engine.begin() as conn:
+        await conn.execute(text("CREATE INDEX ix_protected_size_snapshot_items_identity ON snapshot_items(id)"))
+        await conn.execute(text("UPDATE pg_index SET indisvalid = false WHERE indexrelid = "
+                                "to_regclass('ix_protected_size_snapshot_items_identity')"))
+    await _build_all(engine)
+    assert "ix_protected_size_snapshot_items_identity" not in await _state(engine)
 
 
 async def test_an_invalid_index_left_by_an_interrupted_build_is_rebuilt(db):

@@ -11,8 +11,9 @@ depends_on = None
 
 
 def upgrade():
-    # Build the big-table indexes first without blocking writes (TM: snapshot_items ~532M rows in
-    # 16 partitions); the plain CREATE INDEX IF NOT EXISTS in statements() then skips them.
+    # Build the big-table indexes first without blocking writes (TM: snapshot_items ~806M rows,
+    # 1.45 TB, one plain table); statements() then skips them, and skips any an existing index
+    # already covers (TM's PK btree(id) serves the (id) lookups).
     with op.get_context().autocommit_block():
         for name, table, columns in ONLINE_INDEXES:
             build_index_online(op.get_bind(), name, table, columns)
