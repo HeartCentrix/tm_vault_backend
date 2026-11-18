@@ -1,9 +1,9 @@
-FROM python:3.11-slim
+FROM python:3.11.18-slim-trixie@sha256:07d4824036af339fa1b6ef769cc99d9c10a141769538b52b3b597c84f7a7b535
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends gcc libpq-dev && rm -rf /var/lib/apt/lists/*
 COPY shared/ /app/shared/
-COPY services/alert-service/requirements.txt .
-RUN pip install --default-timeout=300 --retries 5 --no-cache-dir -r requirements.txt
+COPY services/alert-service/requirements.lock .
+RUN pip install --default-timeout=300 --retries 5 --no-cache-dir -r requirements.lock
 COPY services/alert-service/ .
 ENV PORT=8007
 EXPOSE ${PORT}

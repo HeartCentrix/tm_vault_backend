@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11.18-slim-trixie@sha256:07d4824036af339fa1b6ef769cc99d9c10a141769538b52b3b597c84f7a7b535
 
 WORKDIR /app
 
@@ -15,7 +15,7 @@ COPY services/exports_cleanup.py /app/services/exports_cleanup.py
 COPY services/backup-scheduler /app/services/backup-scheduler
 
 # Install dependencies
-RUN pip install --default-timeout=300 --retries 5 --no-cache-dir -r /app/services/backup-scheduler/requirements.txt
+RUN pip install --default-timeout=300 --retries 5 --no-cache-dir -r /app/services/backup-scheduler/requirements.lock
 
 ENV PYTHONPATH=/app
 ENV PORT=8008

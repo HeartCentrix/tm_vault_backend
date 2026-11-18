@@ -19,3 +19,4 @@ python-dotenv==1.0.0
 
 # Observability — Prometheus metrics scraped on CORE_METRICS_PORT (default 9103)
 prometheus_client>=0.20.0
+greenlet==3.5.6  # SQLAlchemy asyncio needs it; explicit so a resolver change cannot drop it (2026-10-14 outage)

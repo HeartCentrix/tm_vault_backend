@@ -18,7 +18,7 @@ httpx>=0.26,<0.28
 # other. Without h2 installed, httpx raises ImportError on http2=True.
 h2>=4.1.0,<5.0
 sqlalchemy[asyncio]==2.0.52
-greenlet>=3.0
+greenlet==3.5.6
 asyncpg>=0.29
 pydantic>=2.5
 pydantic-settings>=2.1
