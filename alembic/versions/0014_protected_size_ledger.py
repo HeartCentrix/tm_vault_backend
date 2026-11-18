@@ -2,6 +2,7 @@
 
 from alembic import context, op
 from sqlalchemy import text
+from shared.migration_guard import lock_timeout
 from shared.protected_size_schema import ONLINE_INDEXES, build_index_online, statements
 
 revision = "0014"
@@ -22,8 +23,10 @@ def upgrade():
     runtime_role = context.get_x_argument(as_dictionary=True).get(
         "protected_size_runtime_role"
     )
-    for statement in statements(schema, runtime_role=runtime_role):
-        op.execute(statement)
+    # Triggers on resources/snapshots/snapshot_items and ALTERs on resource_protected_bytes.
+    with lock_timeout(connection, "0014 protected-size triggers/DDL"):
+        for statement in statements(schema, runtime_role=runtime_role):
+            op.execute(statement)
 
 
 def downgrade():

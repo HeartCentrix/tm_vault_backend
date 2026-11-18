@@ -17,6 +17,7 @@ from typing import Union
 
 from alembic import op
 from shared.database import MAIL_OVERLAY_DDL
+from shared.migration_guard import lock_timeout
 
 revision: str = "0021"
 down_revision: Union[str, None] = "0020"
@@ -25,8 +26,9 @@ depends_on = None
 
 
 def upgrade() -> None:
-    for ddl in MAIL_OVERLAY_DDL:
-        op.execute(ddl)
+    with lock_timeout(op.get_bind(), "0021 snapshots ALTER/trigger"):
+        for ddl in MAIL_OVERLAY_DDL:
+            op.execute(ddl)
 
 
 def downgrade() -> None:

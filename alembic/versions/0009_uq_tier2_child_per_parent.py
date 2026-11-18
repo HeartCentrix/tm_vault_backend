@@ -50,6 +50,7 @@ from typing import Union
 
 from alembic import op
 import sqlalchemy as sa
+from shared.migration_guard import require_valid_index
 
 # revision identifiers, used by Alembic.
 revision: str = "0009"
@@ -100,6 +101,7 @@ def upgrade() -> None:
             "ON resources (tenant_id, type, parent_resource_id) "
             f"WHERE {_INDEX_PREDICATE}"
         )
+    require_valid_index(conn, "uq_resource_tier2_child_per_parent", revision)
 
 
 def downgrade() -> None:

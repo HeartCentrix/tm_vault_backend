@@ -8,6 +8,7 @@ them through a separately reviewed procedure before removing the schema.
 """
 from alembic import op
 import sqlalchemy as sa
+from shared.migration_guard import lock_timeout
 
 revision = "0011"
 down_revision = "0010"
@@ -96,12 +97,14 @@ def upgrade():
     _constraint(conn, "chat_capture_attempts", "fk_chat_attempt_staged_inventory",
         "ALTER TABLE chat_capture_attempts ADD CONSTRAINT fk_chat_attempt_staged_inventory "
         "FOREIGN KEY(staged_inventory_id) REFERENCES chat_inventories(id) DEFERRABLE INITIALLY DEFERRED")
-    op.execute("ALTER TABLE snapshot_items ADD COLUMN IF NOT EXISTS chat_version_id uuid")
     partitioned = conn.scalar(sa.text("SELECT relkind='p' FROM pg_class WHERE oid=to_regclass('snapshot_items')"))
-    if not partitioned:
-        _constraint(conn, "snapshot_items", "fk_snapshot_items_chat_version",
-            "ALTER TABLE snapshot_items ADD CONSTRAINT fk_snapshot_items_chat_version "
-            "FOREIGN KEY(chat_version_id) REFERENCES chat_item_versions(id) ON DELETE RESTRICT NOT VALID")
+    # Metadata-only, but ACCESS EXCLUSIVE on snapshot_items: never queue the fleet behind a blocker.
+    with lock_timeout(conn, "0011 snapshot_items ADD COLUMN chat_version_id / FK"):
+        op.execute("ALTER TABLE snapshot_items ADD COLUMN IF NOT EXISTS chat_version_id uuid")
+        if not partitioned:
+            _constraint(conn, "snapshot_items", "fk_snapshot_items_chat_version",
+                "ALTER TABLE snapshot_items ADD CONSTRAINT fk_snapshot_items_chat_version "
+                "FOREIGN KEY(chat_version_id) REFERENCES chat_item_versions(id) ON DELETE RESTRICT NOT VALID")
     indexes = (
         ("ix_chat_capture_attempts_snapshot_id", "chat_capture_attempts(snapshot_id)"),
         ("ix_chat_blob_objects_capture_attempt_id", "chat_blob_objects(capture_attempt_id)"),
@@ -146,9 +149,10 @@ def upgrade():
                         "FOREIGN KEY(chat_version_id) REFERENCES chat_item_versions(id) ON DELETE RESTRICT NOT VALID")
                 with op.get_context().autocommit_block():
                     op.execute(f"ALTER TABLE {target} VALIDATE CONSTRAINT {quote(name)}")
-            _constraint(conn, "snapshot_items", "fk_snapshot_items_chat_version",
-                "ALTER TABLE snapshot_items ADD CONSTRAINT fk_snapshot_items_chat_version "
-                "FOREIGN KEY(chat_version_id) REFERENCES chat_item_versions(id) ON DELETE RESTRICT")
+            with lock_timeout(conn, "0011 snapshot_items parent FK"):
+                _constraint(conn, "snapshot_items", "fk_snapshot_items_chat_version",
+                    "ALTER TABLE snapshot_items ADD CONSTRAINT fk_snapshot_items_chat_version "
+                    "FOREIGN KEY(chat_version_id) REFERENCES chat_item_versions(id) ON DELETE RESTRICT")
     else:
         # The concurrent-index boundary released initial ADD COLUMN/FK locks.
         op.execute("ALTER TABLE snapshot_items VALIDATE CONSTRAINT fk_snapshot_items_chat_version")
