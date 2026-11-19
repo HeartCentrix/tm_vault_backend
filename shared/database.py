@@ -1962,9 +1962,22 @@ async def init_db() -> None:
                 except Exception:
                     await conn.execute(text("ROLLBACK TO SAVEPOINT alter_sp"))  # Already converted
 
+            from shared import models  # noqa: F401  create_all only sees registered tables (chat catalogue)
             await conn.run_sync(Base.metadata.create_all)
             # Existing hot snapshot_items needs the explicit additive migration;
             # create_all cannot add its column/FK/index and boot must not build it.
+            # A fresh, empty snapshot_items (greenfield bootstrap) gets 0011's link here,
+            # instant on zero rows, else `init_db` + `alembic stamp head` can never succeed.
+            if not (await conn.execute(text("SELECT EXISTS (SELECT 1 FROM snapshot_items)"))).scalar():
+                await conn.execute(text("ALTER TABLE snapshot_items ADD COLUMN IF NOT EXISTS chat_version_id uuid"))
+                if not (await conn.execute(text(
+                        "SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='snapshot_items'::regclass "
+                        "AND conname='fk_snapshot_items_chat_version')"))).scalar():
+                    await conn.execute(text(
+                        "ALTER TABLE snapshot_items ADD CONSTRAINT fk_snapshot_items_chat_version "
+                        "FOREIGN KEY(chat_version_id) REFERENCES chat_item_versions(id) ON DELETE RESTRICT"))
+                await conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_snapshot_items_chat_version_id ON snapshot_items(chat_version_id)"))
             if (not await _has_required_columns(conn) or
                 not await _has_required_catalogue_constraints(conn)):
                 raise RuntimeError("Chat catalogue schema is incomplete; apply Alembic revision 0011")

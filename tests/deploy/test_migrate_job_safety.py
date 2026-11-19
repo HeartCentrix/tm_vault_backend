@@ -60,12 +60,14 @@ def _arms() -> dict:
     }
 
 
-def test_stamp_head_only_on_the_fresh_path():
-    """`alembic stamp head` must be reachable only on the fresh-install path."""
+def test_stamp_only_on_the_fresh_path():
+    """Stamping must be reachable only on the fresh-install path, and only at the
+    bootstrap baseline: `stamp head` would skip migration-only objects (0014+)."""
     cmd = _command_text()
-    assert "stamp head" in cmd, "fresh-install bootstrap should still stamp"
     arms = _arms()
-    assert "stamp head" in arms["FRESH"]
+    assert "alembic stamp 0006" in arms["FRESH"]
+    assert "stamp head" not in cmd
+    assert arms["FRESH"].index("alembic stamp 0006") < arms["FRESH"].index("alembic upgrade head")
     assert "stamp" not in arms["EXISTING"], (
         "stamping a populated database would falsely mark revisions 0007-0010 "
         f"applied against prod's 0006: {arms['EXISTING']!r}"

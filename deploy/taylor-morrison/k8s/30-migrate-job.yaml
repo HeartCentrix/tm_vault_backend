@@ -101,7 +101,10 @@ spec:
               case "$STATE" in
                 FRESH)
                   DB_SCHEMA_MODE=bootstrap python -c "import asyncio; from shared.database import init_db; asyncio.run(init_db())"
-                  alembic stamp head
+                  # init_db builds the 0006-era bootstrap schema; stamping head would skip
+                  # migration-only objects (protected-size ledger, copy-workflow guard).
+                  alembic stamp 0006
+                  alembic upgrade head
                   ;;
                 EXISTING)
                   CUR=$(alembic current | awk 'NF{r=$1} END{print r}')
