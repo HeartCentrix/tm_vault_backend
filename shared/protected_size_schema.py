@@ -57,9 +57,6 @@ DDL = (
     """CREATE TABLE protected_size_winners(resource_id uuid NOT NULL,identity_id bigint NOT NULL,
         size bigint NOT NULL,snapshot_id uuid,item_id uuid,created_at timestamp,PRIMARY KEY(resource_id,identity_id))""",
     "CREATE INDEX IF NOT EXISTS protected_size_winner_anchor ON protected_size_winners(resource_id,snapshot_id,item_id)",
-    "CREATE INDEX IF NOT EXISTS ix_protected_size_snapshot_items_identity ON snapshot_items(id)",
-    "CREATE INDEX IF NOT EXISTS ix_protected_size_snapshot_items_page ON snapshot_items(snapshot_id,id)",
-    "CREATE INDEX IF NOT EXISTS ix_protected_size_snapshots_page ON snapshots(id)",
 )
 
 
@@ -70,6 +67,25 @@ ONLINE_INDEXES = (
     ("ix_protected_size_snapshot_items_page", "snapshot_items", "(snapshot_id,id)"),
     ("ix_protected_size_snapshots_page", "snapshots", "(id)"),
 )
+
+
+def covered_sql(table, columns):
+    """SQL predicate: ``table`` is a plain (not partitioned) table that already has a valid,
+    non-partial btree index keyed on exactly ``columns``. A plain snapshot_items/snapshots keeps
+    PK btree(id) (Taylor Morrison's bootstrap schema), so another (id) index is pure build cost
+    (hours and tens of GB on ~806M rows) with no plan difference. Nothing names these indexes."""
+    key = columns.strip("()").replace(" ", "")
+    return f"""EXISTS(SELECT 1 FROM pg_index i JOIN pg_class t ON t.oid=i.indrelid
+      JOIN pg_class x ON x.oid=i.indexrelid JOIN pg_am a ON a.oid=x.relam
+      WHERE i.indrelid=to_regclass('{table}') AND t.relkind='r' AND i.indisvalid AND a.amname='btree'
+        AND i.indpred IS NULL AND i.indexprs IS NULL
+        AND (SELECT string_agg(p.attname,',' ORDER BY k.n) FROM unnest(i.indkey::int2[]) WITH ORDINALITY k(attnum,n)
+             JOIN pg_attribute p ON p.attrelid=i.indrelid AND p.attnum=k.attnum WHERE k.n<=i.indnkeyatts)='{key}')"""
+
+
+DDL += tuple(f"DO $$ BEGIN IF NOT {covered_sql(table, columns)} THEN "
+             f"CREATE INDEX IF NOT EXISTS {name} ON {table}{columns}; END IF; END $$"
+             for name, table, columns in ONLINE_INDEXES)
 
 
 # Migration 0027: per-item refs (one row per resource/snapshot/item) become one anchor per
@@ -86,11 +102,12 @@ ANCHOR_BACKFILL = """UPDATE protected_size_winners w SET snapshot_id=f.snapshot_
 def build_index_online(conn, name, table, columns):
     """Create index ``name`` without blocking writes; ``conn`` is a sync connection in autocommit.
 
-    A plain CREATE INDEX blocks writes for the whole build (TM: snapshot_items ~532M rows).
+    A plain CREATE INDEX blocks writes for the whole build (TM: snapshot_items ~806M rows, 1.45 TB).
     PostgreSQL cannot build on a partitioned parent CONCURRENTLY, so a partitioned table gets an
     ON ONLY parent index plus one concurrent build per partition, attached (the parent turns valid
     when every partition is attached). Idempotent; an invalid index left by an interrupted
-    concurrent build is dropped and rebuilt."""
+    concurrent build is dropped and rebuilt. Skipped when an existing index already covers it
+    (covered_sql); a leftover invalid copy is then dropped."""
     from sqlalchemy import text as _t
 
     def validity(index):
@@ -111,6 +128,10 @@ def build_index_online(conn, name, table, columns):
             conn.execute(_t(f'DROP INDEX CONCURRENTLY IF EXISTS "{index}"'))
         conn.execute(_t(f'CREATE INDEX CONCURRENTLY IF NOT EXISTS "{index}" ON {relation} {columns}'))
 
+    if conn.execute(_t("SELECT " + covered_sql(table, columns))).scalar():
+        if validity(name) is False:
+            conn.execute(_t(f'DROP INDEX CONCURRENTLY IF EXISTS "{name}"'))
+        return
     partitions = conn.execute(_t(
         "SELECT i.inhrelid::regclass::text FROM pg_inherits i WHERE i.inhparent = to_regclass(:t) "
         "ORDER BY i.inhrelid::regclass::text"), {"t": table}).scalars().all()

@@ -75,6 +75,7 @@ EXPECTED_CHAIN = [
     ('0026', '0025'),            # cross-mailbox mail attachment contents
     ('0027', '0026'),            # protected-size identity ledger (anchored winners)
     ('0028', '0027'),            # SharePoint overlay snapshots
+    ('0029', '0028'),            # tenant_dek + encryption_config
 ]
 
 # Substring that must appear in the module docstring of each pending revision,
@@ -102,6 +103,7 @@ PENDING_SUBJECTS = {
     "0026": "mail attachment contents",
     "0027": "Protected-size identity ledger",
     "0028": "SharePoint overlay snapshots",
+    "0029": "tenant_dek and encryption_config",
 }
 
 

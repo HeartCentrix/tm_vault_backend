@@ -12,12 +12,13 @@ every spec per batch: 12 s at 10x. TM log catalogue #20.
 
 Built CONCURRENTLY outside a transaction so a large snapshots table is never write-locked.
 Needs only table ownership, not superuser. If a concurrent build fails it leaves an INVALID
-index: drop it and re-run.
+index, which IF NOT EXISTS would keep: the upgrade refuses until it is dropped.
 """
 
 from typing import Union
 
 from alembic import op
+from shared.migration_guard import require_valid_index
 
 revision: str = "0020"
 down_revision: Union[str, None] = "0019"
@@ -37,6 +38,8 @@ def upgrade() -> None:
     with op.get_context().autocommit_block():
         for name, target in INDEXES.items():
             op.execute(f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {name} ON {target}")
+    for name in INDEXES:
+        require_valid_index(op.get_bind(), name, revision)
 
 
 def downgrade() -> None:

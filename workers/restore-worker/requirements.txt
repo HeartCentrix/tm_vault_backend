@@ -6,7 +6,7 @@ h2>=4.1.0,<5.0  # HTTP/2 client lib — required when GRAPHCLIENT_HTTP2=true
 azure-storage-blob>=12.19.0
 cryptography>=43.0.3,<44  # CVE-2024-12797 fixed in 43.0.3
 sqlalchemy[asyncio]==2.0.52
-greenlet>=3.0
+greenlet==3.5.6
 asyncpg>=0.29.0
 redis>=5.0.0
 pydantic>=2.5.0

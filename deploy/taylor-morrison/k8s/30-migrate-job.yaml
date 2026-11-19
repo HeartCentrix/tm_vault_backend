@@ -28,7 +28,8 @@ spec:
           image: harbor.taylormorrison.com/library/tmvault-job-service@sha256:30ee97e5e64283947f77345d200278e2b520fb9d4ba491d5bdea75fa98e29b75
           # TWO PATHS, decided from the database — never guessed.
           #
-          # FRESH (no alembic_version row): init_db() builds the full schema
+          # FRESH (no alembic_version row): init_db() with DB_SCHEMA_MODE=bootstrap
+          # (the default "verify" mode only checks and would refuse) builds the full schema
           # the app's models expect (jobs, snapshot_items, ...) and
           # `alembic stamp head` records every revision as applied WITHOUT
           # running it. Revision 0001 is an explicit stamp baseline; 0002/0003
@@ -37,7 +38,8 @@ spec:
           # not needed for a fresh install, and partitioning is transparent to
           # the ORM either way. This is the original behaviour, unchanged.
           #
-          # EXISTING (alembic_version has a row): `alembic upgrade head` ONLY.
+          # EXISTING (alembic_version has a row): phased `alembic upgrade` ONLY,
+          # then verify_runtime_schema() must pass.
           # A bare `stamp head` here is the trap this branch exists to close:
           # prod sits at 0006 with 0007-0010 pending, and stamping would jump
           # the row to 0010 so the Tier-2 unique index (0009) and the
@@ -46,13 +48,25 @@ spec:
           # is deliberately NOT run on this path — its create_all/index batch
           # on the ~87GB live schema is what froze prod for ~5 minutes.
           #
-          # The pending revisions are safe to run online: 0007/0008 are
-          # CREATE TABLE IF NOT EXISTS; 0009 refuses (RuntimeError) rather
-          # than deleting rows if duplicate Tier-2 children still exist, and
-          # builds its unique index CONCURRENTLY; 0010 builds only the small
-          # chat_url_cache index inline and SKIPS the snapshot_items one with
-          # a printed CREATE INDEX CONCURRENTLY runbook. Nothing here takes a
-          # long ACCESS EXCLUSIVE lock, so running backups are not stalled.
+          # Online, in two phases (each its own alembic run, so a failure
+          # resumes from the last committed revision and a phase's locks end
+          # with it). Hot-table DDL waits at most MIGRATION_LOCK_TIMEOUT for
+          # its lock, then fails with a "re-run; check idle in transaction"
+          # message instead of stalling every writer behind it: just re-run.
+          #   Phase 1, 0006 -> 0017 (the long one, hours at TM's ~806M-row
+          #     snapshot_items): 0009 refuses on duplicate Tier-2 children and
+          #     on an INVALID index (prints the DROP INDEX CONCURRENTLY);
+          #     0011 adds snapshot_items.chat_version_id + NOT VALID FK
+          #     (brief ACCESS EXCLUSIVE, lock-timeout bounded) then VALIDATEs
+          #     it with a full scan that does not block writes; 0014 builds
+          #     snapshot_items(snapshot_id,id) CONCURRENTLY (no (id) index:
+          #     the PK covers it) and installs capture triggers (brief lock).
+          #   Phase 2, 0017 -> head: 0020 concurrent snapshots/jobs indexes,
+          #     0021 snapshots column/trigger (brief lock), functions, 0029
+          #     tenant_dek/encryption_config.
+          # Migrations use the direct primary (DB_HOST override below), never
+          # the pgbouncer pooler: concurrent index builds and session
+          # settings need one stable backend.
           command:
             - sh
             - -c
@@ -86,13 +100,21 @@ spec:
               echo "tmvault-migrate: database state = ${STATE:-<undetermined>}"
               case "$STATE" in
                 FRESH)
-                  python -c "import asyncio; from shared.database import init_db; asyncio.run(init_db())"
+                  DB_SCHEMA_MODE=bootstrap python -c "import asyncio; from shared.database import init_db; asyncio.run(init_db())"
                   alembic stamp head
                   ;;
                 EXISTING)
-                  alembic current
+                  CUR=$(alembic current | awk 'NF{r=$1} END{print r}')
+                  echo "tmvault-migrate: current revision = $CUR"
+                  # A re-run past 0017 skips phase 1 (alembic refuses a backwards "upgrade").
+                  if [ "${CUR##*_}" -lt 17 ]; then
+                    alembic upgrade 0017
+                    alembic current
+                  fi
                   alembic upgrade head
                   alembic current
+                  python -c "import asyncio, sys; from shared.database import verify_runtime_schema; sys.exit(0 if asyncio.run(verify_runtime_schema()) else 1)"
+                  echo "tmvault-migrate: verify_runtime_schema OK"
                   ;;
                 *)
                   echo "tmvault-migrate: could not read ${DB_SCHEMA:-tm_vault}.alembic_version — refusing to migrate. Neither branch is safe to guess: stamping a populated database silently skips pending revisions, and init_db() on a populated database does heavy DDL." >&2
@@ -106,6 +128,10 @@ spec:
           envFrom:
             - configMapRef: { name: tmvault-config }
           env:
+            # Direct primary, not tmvault-pooler-rw (configmap DB_HOST).
+            - { name: DB_HOST, value: "postgres-ha-rw.databases.svc.cluster.local" }
+            - { name: DB_PGBOUNCER, value: "false" }
+            - { name: MIGRATION_LOCK_TIMEOUT, value: "10s" }
             - name: DB_PASSWORD
               valueFrom: { secretKeyRef: { name: tmvault-secrets, key: DB_PASSWORD } }
             - name: JWT_SECRET
